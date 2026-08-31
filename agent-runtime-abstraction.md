@@ -9,13 +9,13 @@
 
 ## 1. Problem
 
-`createAgentRuntime` currently hard-wires one generation flavor — `streamText` — into the engine. Everything else the runtime does (locks, event log, HITL, compaction, billing, redrive policy) is generation-agnostic, but the API gives users no way to say *"this agent streams"* vs *"this agent is a one-shot generate call"* without forking the engine.
+`createAgentRuntime` currently hard-wires one generation flavor — `streamText` — into the engine. Everything else the runtime does (locks, event log, HITL, compaction, token attribution, redrive policy) is generation-agnostic, but the API gives users no way to say *"this agent streams"* vs *"this agent is a one-shot generate call"* without forking the engine.
 
 The refactor, in one sentence: **the runtime keeps the platform services; agent flavors become first-class handles.**
 
 - `setupAgentCore(...)` (replacing `createAgentRuntime`) returns platform-level services plus two factories.
 - `createStreamTextAgent({...})` / `createGenerateTextAgent({...})` return an **agent handle** — an executor bound to a specific generation mode and to *your* generation arguments.
-- `execute()` inside the engine receives those bound arguments and composes them with the platform-owned machinery (history + compaction, run lock, HITL wrapping, event log, billing, finalize).
+- `execute()` inside the engine receives those bound arguments and composes them with the platform-owned machinery (history + compaction, run lock, HITL wrapping, event log, token attribution, finalize).
 
 ---
 
@@ -103,9 +103,10 @@ The factory args are **the `streamText` / `generateText` call options, minus the
 export type StreamTextAgentSpec = {
   name: string;   // unique handle key — the queue dispatch key (§5)
 
-  /** Optional default model (§2.3 registry key). Resolution order:
-   *  run input.model → spec.model → 'gpt-4o'. */
-  model?: string;
+  /** Model for this agent: a registry key or a provider instance
+   *  (`createOpenAI(…)('gpt-4o')`, `createAnthropic(…)`, `createDeepSeek(…)`)
+   *  — passed through untouched. Run `input.model` still wins per run. */
+  model?: string | LanguageModel;
 
   /** Opt-in subagent delegation (§2.7). When true, the platform constructs
    *  the run-scoped spawnSubagent tool (semaphore, depth, ports) — users
@@ -123,7 +124,7 @@ export type StreamTextAgentSpec = {
 
 export type GenerateTextAgentSpec = {
   name: string;
-  model?: string;   // same resolution order as above
+  model?: string | LanguageModel;
   subagents?: boolean;
 } & Omit<Parameters<typeof generateText>[0],
     'model' | 'messages' | 'prompt' | 'abortSignal' | 'onFinish'> & {
@@ -136,7 +137,7 @@ export type GenerateTextAgentSpec = {
 
 | Key | Owner | Why |
 | :--- | :--- | :--- |
-| `model` | **run input › spec default › `'gpt-4o'` fallback** | an agent may pin `model: 'gpt-4o-mini'`; a run may still override it per call |
+| `model` | **spec or run — passed through untouched** | a registry key or a provider instance (`createOpenAI(…)`, `createAnthropic(…)`, `createDeepSeek(…)`); the platform never resolves or prices it — it only attributes tokens |
 | `messages` / `prompt` | **platform** | built from thread history + compaction (§2.6); subagents get the brief only (§2.7) |
 | `abortSignal` | **platform** | wired to the stop poller (§2.1) |
 | `maxSteps` | **config** (`maxSteps`, §2.1 safety cap) | |
@@ -144,7 +145,7 @@ export type GenerateTextAgentSpec = {
 | `onChunk` / `onFinish` | **platform + user** | platform persists, bills, and publishes first, **then chains the user's callback** — replacing it would silently drop user code |
 | `system`, `temperature`, `toolChoice`, … | **user (spec)** | the agent's identity and behavior |
 
-Platform keys win: user args are spread first, platform assignments last. A user cannot opt out of persistence, billing, or the stop signal.
+Platform keys win: user args are spread first, platform assignments last. A user cannot opt out of persistence, token attribution, or the stop signal.
 
 ---
 
@@ -177,15 +178,8 @@ export async function execute(
     // 4. Dispatch on the bound flavor — user args spread FIRST,
     //    platform assignments LAST (ownership rule, §3.1)
     if (agent.kind === 'stream-text') {
-      // Resolve once: billing + events must record the model actually used.
-      // Resolution order: run input.model → spec.model → 'gpt-4o' (§3.1)
-      const resolved = deps.models[input.model] ? input.model
-        : agent.spec.model && deps.models[agent.spec.model] ? agent.spec.model
-        : 'gpt-4o';
-
       const result = streamText({
-        ...agent.args,                                   // user: system, temperature, toolChoice…
-        model: deps.models[resolved],                    // platform: resolved model
+        ...agent.args,                                   // user: model instance (createOpenAI(…) / createAnthropic(…) / createDeepSeek(…)), system, temperature, toolChoice…
         messages: history.map(toCoreMessage),            // platform: durable history
         tools: withHitl(deps, input.threadId, {          // platform: HITL wrap (§2.5) over the user's set.
           ...(agent.args.tools ?? {}),                   // spawnSubagent is added ONLY when the
@@ -201,7 +195,7 @@ export async function execute(
           agent.args.onChunk?.(para);                    // user callback still fires
         },
         onFinish: async (finishParams) => {
-          await finalize(deps, agent, input, finishParams, abort); // §5.6: messages, usage, state
+          await finalize(deps, agent, input, finishParams, abort); // §5.6: messages, tokens, state
           agent.args.onFinish?.(finishParams);           // user callback still fires
         },
       });
@@ -227,10 +221,11 @@ export async function execute(
 }
 ```
 
-`finalize` (the shared `onFinish` body) is unchanged from §5.6 in structure, with two hardenings:
+`finalize` (the shared `onFinish` body) is unchanged from §5.6 in structure, with three changes:
 
 1. **Persist `response.messages` before the state transition** (assistant turns, tool calls, tool results) so redrives, HITL resumes, and replay always see a valid history (§2.2, §2.8).
 2. **NaN-guard the usage counters.** Some OpenAI-compatible providers omit streaming usage; the AI SDK represents those as `NaN`. Clamp to `0` — optional metering must never keep a successfully completed run stuck in `RUNNING`.
+3. **Token attribution, not pricing.** A model may be any provider instance (`createOpenAI(…)`, `createAnthropic(…)`, `createDeepSeek(…)`), so the platform records **input / cached-input / output tokens** and leaves USD pricing to a downstream concern computed over the recorded counters (spec §4 migration item).
 
 ```typescript
 export async function finalize(
@@ -241,14 +236,16 @@ export async function finalize(
   abort: AbortController,
 ): Promise<void> {
   const { threadId } = input;
-  const resolved = deps.models[input.model] ? input.model : 'gpt-4o';
+  const u = finishParams.usage;
 
   // Some providers omit streaming usage — the SDK reports NaN for those.
   // Never let optional metering keep a completed run stuck in RUNNING.
-  const promptTokens = Number.isFinite(finishParams.usage.promptTokens)
-    ? finishParams.usage.promptTokens : 0;
-  const completionTokens = Number.isFinite(finishParams.usage.completionTokens)
-    ? finishParams.usage.completionTokens : 0;
+  const inputTokens = Number.isFinite(u.inputTokens) ? u.inputTokens
+    : Number.isFinite(u.promptTokens) ? u.promptTokens : 0;
+  const cachedInputTokens = Number.isFinite(u.cachedInputTokens)
+    ? u.cachedInputTokens : 0;                         // not all providers report cache hits
+  const outputTokens = Number.isFinite(u.outputTokens) ? u.outputTokens
+    : Number.isFinite(u.completionTokens) ? u.completionTokens : 0;
 
   // Persist the completed assistant turn(s) — including tool calls and tool
   // results — BEFORE the state transition (§2.2, §2.8)
@@ -259,6 +256,14 @@ export async function finalize(
     });
   }
 
+  // Token attribution only (§4 pricing becomes downstream over these counters)
+  await deps.storage.usage.record(threadId, {
+    agentId: agent.name,
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+  });
+
   const finalState: ExecutionState = abort.signal.aborted ? 'CANCELLED' : 'COMPLETED';
   const stopReason = abort.signal.aborted
     ? 'cancelled'
@@ -266,23 +271,13 @@ export async function finalize(
       ? 'max_steps' // safety cap hit (§2.1)
       : 'completed';
 
-  // Unpriced models are marked, never silently mispriced (§4)
-  const costUSD = calculateCost(deps, resolved, promptTokens, completionTokens);
-  if (costUSD === null) {
-    await publish(deps, threadId, 'BILLING_UNPRICED', {
-      model: resolved, promptTokens, completionTokens,
-    });
-  }
-  await deps.storage.usage.record(threadId, {
-    model: resolved, promptTokens, completionTokens, costUSD: costUSD ?? 0,
-  });
   await deps.kv.set(`agent:state:${threadId}`, finalState);
   await deps.storage.threads.setState(threadId, finalState);
   await publish(deps, threadId, 'STATE_CHANGE', { state: finalState, stopReason });
 }
 ```
 
-**Callback chaining order:** platform work (persist → bill → publish) runs first, then the user's `onChunk`/`onFinish` fires with the same parameters. A user callback that throws is its own problem — it must not prevent the state transition, so `finalize` completes before `args.onFinish` is invoked.
+**Callback chaining order:** platform work (persist → attribute tokens → publish) runs first, then the user's `onChunk`/`onFinish` fires with the same parameters. A user callback that throws is its own problem — it must not prevent the state transition, so `finalize` completes before `args.onFinish` is invoked.
 
 `executeWithPolicy` wraps `execute` with the §2.8 policy exactly as today: redrive `< maxAttempts`, else finalize `FAILED` on both homes; a user stop is never retried; the attempt counter resets on success.
 
@@ -294,7 +289,7 @@ export async function finalize(
 | Live events | `CHUNK` per delta (§2.2 fan-out) | single `TEXT_RESULT` on completion |
 | Typical UI | chat | summarization, extraction, batch |
 | Stop | aborts mid-generation | aborts the awaited call |
-| Everything else | identical: lock, history, HITL, billing, finalize, redrive | |
+| Everything else | identical: lock, history, HITL, token attribution, finalize, redrive | |
 
 ---
 
@@ -380,6 +375,7 @@ await chat.stop(threadId);
 | — new — | `runtime.getThreadSnapshot(threadId)` |
 | — new — | `runtime.createStreamTextAgent` / `createGenerateTextAgent` / `getAgent` |
 | `RunJob { threadId, model }` | `RunJob { threadId, model, agent }` (missing `agent` → default handle) |
+| `TokenUsage { model, promptTokens, completionTokens, costUSD }` | `{ agentId, inputTokens, cachedInputTokens, outputTokens }` — token attribution only; USD/credit pricing (spec §4) becomes a downstream concern computed over the recorded counters |
 
 Non-breaking rollout: ship `setupAgentCore` alongside `createAgentRuntime` (alias) for one minor, migrate the example app, then drop the old factory.
 
