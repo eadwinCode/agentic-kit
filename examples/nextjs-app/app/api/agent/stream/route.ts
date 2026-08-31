@@ -19,7 +19,9 @@ export async function GET(req: NextRequest) {
 
       const unsubscribe = await runtime.events.subscribe(threadId, (event) => {
         controller.enqueue(encoder.encode(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`));
-        if (event.type === 'HITL_ORPHANED') void runtime.hitl.reclaimIfOrphaned(threadId);
+        if (event.type === 'HITL_ORPHANED' || event.type === 'HEARTBEAT') {
+          void runtime.hitl.reclaimIfOrphaned(threadId);
+        }
       });
 
       req.signal.addEventListener('abort', () => {

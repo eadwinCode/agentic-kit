@@ -7,9 +7,9 @@ The [technical specification](./agent-platform-technical-spec.md) (§ numbers be
 ## Install
 
 ```bash
-npm install @agent/core ai zod
+bun add @agent/core ai zod
 # optional reference adapters:
-npm install @prisma/client @upstash/redis @upstash/qstash
+bun add @prisma/client @upstash/redis @upstash/qstash
 ```
 
 ## Quick start
@@ -81,7 +81,11 @@ Implement any of them for your own stack — `core/` imports nothing else. The [
 
 ## Development
 
+Requires [Bun](https://bun.sh) ≥ 1.1.
+
 ```bash
-npm install
-npm test    # tsc build + node --test over the in-memory adapters
+bun install
+bun test          # runs test/*.test.ts directly on Bun (no build step)
+bun run typecheck # tsc --noEmit over src + tests
+bun run build     # tsc emit → dist/ (published artifact)
 ```

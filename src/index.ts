@@ -58,5 +58,6 @@ export {
 // reference adapters
 export { PrismaStorage, type PrismaLike } from './adapters/prisma.js';
 export { UpstashBus, UpstashKv, THREAD_CHANNEL, type UpstashRedisLike, type UpstashSubscriberLike } from './adapters/upstash.js';
+export { RedisBus, RedisKv, type RedisClientLike, type RedisSubscriberLike } from './adapters/redis.js';
 export { QStashQueue, type QStashLike, type QStashQueueOptions } from './adapters/qstash.js';
 export { MemoryStorage, MemoryBus, MemoryQueue, MemoryKv } from './adapters/memory.js';

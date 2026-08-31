@@ -1,0 +1,3 @@
+[test]
+# Only run the TypeScript sources — dist/ output from tsc is not a test target
+root = "./test"

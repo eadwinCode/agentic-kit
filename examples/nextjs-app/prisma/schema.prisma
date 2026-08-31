@@ -1,0 +1,90 @@
+// Reference schema (spec §2.4) backing PrismaStorage.
+// bunx prisma migrate dev --name init
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum ExecutionState {
+  IDLE
+  RUNNING
+  WAITING_FOR_INPUT
+  CANCELLED
+  COMPLETED
+  FAILED
+}
+
+model Thread {
+  id        String         @id @default(cuid())
+  title     String         @default("New Thread")
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+  state     ExecutionState @default(IDLE)
+  model     String         @default("gpt-4o")
+
+  messages     Message[]
+  usage        TokenUsage[]
+  events       AgentEvent[]
+  subagentRuns SubagentRun[]
+}
+
+model Message {
+  id        String   @id @default(cuid())
+  threadId  String
+  agentId   String?  // producing agent; null = main agent (§2.7)
+  role      String   // 'user' | 'assistant' | 'system' | 'tool'
+  content   Json
+  createdAt DateTime @default(now())
+
+  thread Thread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@index([threadId, createdAt])
+}
+
+model AgentEvent {
+  id        String   @id @default(cuid())
+  threadId  String
+  seq       Int
+  type      String
+  payload   Json
+  createdAt DateTime @default(now())
+
+  thread Thread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@unique([threadId, seq])
+  @@index([threadId, type, createdAt])
+}
+
+model SubagentRun {
+  id        String         @id @default(cuid())
+  threadId  String
+  name      String
+  model     String
+  depth     Int            @default(1)
+  state     ExecutionState @default(RUNNING)
+  result    Json?
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  thread Thread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+}
+
+model TokenUsage {
+  id               String   @id @default(cuid())
+  threadId         String
+  agentId          String?  // subagent attribution; null = main agent (§2.7)
+  model            String
+  promptTokens     Int
+  completionTokens Int
+  costUSD          Decimal  @db.Decimal(10, 6)
+  createdAt        DateTime @default(now())
+
+  thread Thread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@index([threadId, agentId])
+}
