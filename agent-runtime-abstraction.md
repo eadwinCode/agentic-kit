@@ -463,16 +463,16 @@ export const POST = verifySignatureApprouter(async (req: NextRequest) => {
 
 Everything the route used to do by hand lives in the package: handle resolution (unknown agent → `{ accepted: false, reason: 'unknown-agent' }`), `tokenBudget` threading, and idempotency under at-least-once delivery (the per-thread run lock, §3.4). Only two concerns stay at the HTTP edge, where they belong: **signature verification** (QStash-specific transport trust) and **JSON parsing** (framework-specific).
 
-### 5.1 No-HTTP dispatch profile: Postgres
+### 5.1 Example: No-HTTP dispatch over Postgres
 
-For long-lived deployments (self-hosted Bun server, docker-compose), dispatch doesn't need HTTP at all — the job is a **row in Postgres**, the same database as the event log. Same `Queue` port, same `worker.handleJob` consumption:
+This profile is **example code for long-lived deployments** (self-hosted Bun server, docker-compose) that want dispatch without HTTP or QStash. It is *not* a shipped package adapter — copy it into your app (like the §5 routes) and adapt the table/client to your stack. Same `Queue` port, same `worker.handleJob` consumption:
 
 - **Dispatch = INSERT.** Durable by commit: a deploy or crash can never lose an accepted run.
 - **Wake-up = `pg_notify`.** Postgres's pub/sub is the *doorbell only* — fire-and-forget. Durable delivery comes from the row; a lost chime costs seconds of latency, never the job.
 - **Claim = `FOR UPDATE SKIP LOCKED`.** Exactly one worker per row, natively — multi-instance distributes rows with no coordination.
 - **Crash recovery = stale predicate.** A worker that died mid-run leaves its claim to age out and become claimable again.
 
-The job table (add to the reference schema, §2.4):
+The job table (in your own database — part of the example, not the package schema):
 
 ```prisma
 model AgentJob {
@@ -490,7 +490,7 @@ model AgentJob {
 Dispatch adapter (the `Queue` port):
 
 ```typescript
-// src/adapters/postgres.ts
+// example code — copy into your app, adapt the client to your stack
 import { randomUUID } from 'node:crypto';
 import type { RunJob } from '../core/types.js';
 import type { Queue } from '../ports/queue.js';
