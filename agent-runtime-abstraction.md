@@ -46,6 +46,14 @@ export interface AgentCore {
 
   /** Worker-side resolution of a registered handle from the queue job. */
   getAgent(name: string): AgentHandle | null;
+
+  /** The queue dispatch side of the platform (§2.8): resolves the handle,
+   *  applies the failure policy, and is idempotent under at-least-once
+   *  delivery (the per-thread run lock, §3.4). The HTTP layer only verifies
+   *  signatures, parses JSON, and calls this. */
+  worker: {
+    handleJob(job: RunJob): Promise<{ accepted: boolean; reason?: string }>;
+  };
 }
 ```
 
@@ -442,19 +450,18 @@ export interface RunJob {
 ```
 
 - `chatAgent.run({ prompt, model })` persists + enqueues `{ threadId, model, agent: 'chat' }`.
-- The worker route resolves the handle once and executes with the policy:
+- The worker route resolves the handle once and executes with the policy. That behavior is **part of `AgentCore`** — the route is a transport shell:
 
 ```typescript
-// app/api/queue/agent-run/route.ts (worker, §5.6)
+// app/api/queue/agent-run/route.ts (worker, §5.6) — transport shell only
 export const POST = verifySignatureApprouter(async (req: NextRequest) => {
-  const { threadId, model, tokenBudget, agent: agentName } = await req.json();
-  const agent = runtime.getAgent(agentName);
-  if (!agent) return NextResponse.json({ error: 'Unknown agent' }, { status: 400 });
-
-  waitUntil(agent.executeWithPolicy({ threadId, model, tokenBudget }));
+  const job = await req.json();
+  waitUntil(runtime.worker.handleJob(job));   // resolve handle → executeWithPolicy
   return NextResponse.json({ accepted: true });
 });
 ```
+
+Everything the route used to do by hand lives in the package: handle resolution (unknown agent → `{ accepted: false, reason: 'unknown-agent' }`), `tokenBudget` threading, and idempotency under at-least-once delivery (the per-thread run lock, §3.4). Only two concerns stay at the HTTP edge, where they belong: **signature verification** (QStash-specific transport trust) and **JSON parsing** (framework-specific).
 
 Backward compatibility: a job without `agent` dispatches to the **default handle** (`config.defaultAgent`, defaulting to the first registered `stream-text` agent).
 
@@ -539,6 +546,7 @@ await chat.stop(threadId);
 | — new — | `runtime.getThreadSnapshot(threadId)` |
 | — new — | `runtime.createStreamTextAgent` / `createGenerateTextAgent` / `getAgent` |
 | `RunJob { threadId, model }` | `RunJob { threadId, model, agent, tokenBudget }` (missing `agent` → default handle) |
+| worker route body (resolve handle → policy) | `runtime.worker.handleJob(job)` — the route becomes a transport shell (verify + parse + call) |
 | `TokenUsage { model, promptTokens, completionTokens, costUSD }` | `{ agentId, totalTokens }` — total tokens used; USD/credit pricing (spec §4) becomes a downstream concern computed over the recorded counters |
 
 Non-breaking rollout: ship `setupAgentCore` alongside `createAgentRuntime` (alias) for one minor, migrate the example app, then drop the old factory.
