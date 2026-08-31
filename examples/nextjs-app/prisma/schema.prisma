@@ -75,14 +75,11 @@ model SubagentRun {
 }
 
 model TokenUsage {
-  id               String   @id @default(cuid())
-  threadId         String
-  agentId          String?  // subagent attribution; null = main agent (§2.7)
-  model            String
-  promptTokens     Int
-  completionTokens Int
-  costUSD          Decimal  @db.Decimal(10, 6)
-  createdAt        DateTime @default(now())
+  id          String   @id @default(cuid())
+  threadId    String
+  agentId     String?  // subagent attribution; null = main agent (§2.7)
+  totalTokens Int      // total tokens used (§4) — pricing is downstream
+  createdAt   DateTime @default(now())
 
   thread Thread @relation(fields: [threadId], references: [id], onDelete: Cascade)
 

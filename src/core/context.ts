@@ -2,7 +2,7 @@ import { generateText } from 'ai';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { MessageDTO } from './types.js';
 import { publish } from './publish.js';
-import { calculateCost } from './billing.js';
+import { countTokens } from './usage.js';
 
 /** Universal context ceiling across all models (§2.6) */
 export const CONTEXT_TOKEN_CEILING = 265_000;
@@ -14,19 +14,29 @@ const DEFAULT_NATIVE_WINDOWS: Record<string, number> = {
   'gemini-1.5-pro': 1_000_000,
 };
 
-/** Effective budget = min(native window, ceiling). Models below the ceiling
- *  keep their native window (§2.6). */
+/** Effective budget = min(native window, ceiling). The model's declared
+ *  `contextWindow` (via `resolveModel`, §3.3) wins over the fallback tables;
+ *  models below the ceiling keep their native window. */
 export function contextBudget(deps: RuntimePorts, model: string): number {
-  const native = deps.config.nativeWindows?.[model] ?? DEFAULT_NATIVE_WINDOWS[model]
-    ?? deps.config.contextCeilingTokens;
+  let declared: number | undefined;
+  try {
+    declared = deps.resolveModel(model).contextWindow;
+  } catch {
+    // unknown registry key — fall through to the tables below
+  }
+  const native =
+    declared ??
+    deps.config.nativeWindows?.[model] ??
+    DEFAULT_NATIVE_WINDOWS[model] ??
+    deps.config.contextCeilingTokens;
   return Math.min(native, deps.config.contextCeilingTokens);
 }
 
 const estimateTokens = (content: unknown) => Math.ceil(JSON.stringify(content).length / 4);
 
-/** Returns a history array guaranteed to fit the model's budget. Compaction is
- *  durable: the summary is persisted as a Message, so every client and every
- *  reconnect replay (§2.2) reconstructs the exact same context. */
+// Returns a history array guaranteed to fit the model's budget. Compaction is
+// durable: the summary is persisted as a Message, so every client and every
+// reconnect replay (§2.2) reconstructs the exact same context.
 export async function compactContext(
   deps: RuntimePorts,
   threadId: string,
@@ -49,12 +59,9 @@ export async function compactContext(
   const older = history.slice(0, history.length - tail.length);
   if (older.length === 0) return history; // single oversized turn — blocked by the input guards above
 
-  // ... and summarize everything before it with a cheap model — one resolved
-  // key drives the call AND its billing, so usage never names a model that
-  // didn't run (§4)
-  const compactModel = 'gpt-4o-mini' in deps.models ? 'gpt-4o-mini' : 'gpt-4o';
+  // ... and summarize everything before it with a cheap model
   const { text, usage } = await generateText({
-    model: deps.models[compactModel] as any,
+    model: deps.resolveModel('gpt-4o-mini').instance(),
     prompt:
       'Summarize the following conversation history into a dense context brief ' +
       '(decisions, open threads, key facts) for an AI agent:\n\n' +
@@ -66,13 +73,10 @@ export async function compactContext(
     content: { type: 'CONTEXT_SUMMARY', text },
   });
 
-  // Compaction is an LLM call, so it is billed like any other (§4)
-  const costUSD = calculateCost(deps, compactModel, usage.promptTokens ?? 0, usage.completionTokens ?? 0);
+  // Token attribution: total tokens used (§4)
   await deps.storage.usage.record(threadId, {
-    model: compactModel,
-    promptTokens: usage.promptTokens ?? 0,
-    completionTokens: usage.completionTokens ?? 0,
-    costUSD: costUSD ?? 0,
+    agentId: null,
+    totalTokens: countTokens(usage),
   });
   await publish(deps, threadId, 'CONTEXT_COMPACTED', { summarizedMessages: older.length });
 

@@ -4,20 +4,31 @@ export type { EventBus } from './ports/bus.js';
 export type { Queue } from './ports/queue.js';
 export type { Kv } from './ports/kv.js';
 export type {
-  AgentRuntime,
-  RuntimeOptions,
-  RuntimePorts,
-  RunInput,
-  RunResult,
-  StopResult,
+  AgentCore,
+  AgentHandle,
+  AgentKind,
+  GenerateTextAgentSpec,
   RespondInput,
   RespondResult,
+  ResolvedModel,
+  RunInput,
+  RunResult,
+  RuntimeOptions,
+  RuntimePorts,
+  StopResult,
+  StreamTextAgentSpec,
+  SubagentsConfig,
   ThreadSnapshot,
 } from './ports/runtime.js';
+
+// runtime — the factory that binds ports to behaviors
+export { setupAgentCore } from './runtime.js';
+/** @deprecated use `setupAgentCore` — removed in the next minor (§7) */
 export { createAgentRuntime } from './runtime.js';
 
 // core — behaviors, all ports-only
-export { execute, executeWithPolicy, publish, publishNotice, markRequiresConfirmation } from './core/engine.js';
+export { execute, executeWithPolicy, finalize, markRequiresConfirmation } from './core/engine.js';
+export { countTokens } from './core/usage.js';
 export {
   waitForEvent,
   suspendForApproval,
@@ -25,16 +36,11 @@ export {
   HITL_TTL_MS,
   type HitlResponse,
   type SuspendInput,
+  type TimeoutOutcome,
 } from './core/hitl.js';
 export { reclaimIfOrphaned } from './core/reclaim.js';
 export { contextBudget, compactContext, CONTEXT_TOKEN_CEILING } from './core/context.js';
-export {
-  Semaphore,
-  spawnSubagentTool,
-  MAX_SUBAGENT_DEPTH,
-  MAX_CONCURRENT_SUBAGENTS,
-  type SubagentCtx,
-} from './core/subagent.js';
+export { Semaphore, spawnSubagentTool, type SubagentCtx } from './core/subagent.js';
 export { run } from './core/run.js';
 export { stop } from './core/stop.js';
 
@@ -47,10 +53,10 @@ export {
   type ExecutionState,
   type MessageDTO,
   type MessageRole,
-  type ModelRegistry,
   type NewMessage,
   type NewRun,
   type NewUsage,
+  type ResolvedModel as ResolvedModelDTO,
   type RunDTO,
   type RunJob,
   type ThreadDTO,

@@ -1,4 +1,4 @@
-import type { LanguageModel } from 'ai';
+import type { LanguageModel, ToolSet } from 'ai';
 
 /** Lifecycle of a thread. Durable truth lives in Storage.threads; the kv copy
  *  (`agent:state:{threadId}`) is a hot cache the engine polls (§2.1, §3.4). */
@@ -11,6 +11,9 @@ export type ExecutionState =
   | 'FAILED';
 
 export type MessageRole = 'user' | 'assistant' | 'system' | 'tool';
+
+/** Generation flavor of a handle / spawned subagent (§4). */
+export type AgentKind = 'stream-text' | 'generate-text';
 
 export interface ThreadDTO {
   id: string;
@@ -67,22 +70,44 @@ export interface NewRun {
   state: ExecutionState;
 }
 
+/** Token attribution only (§4): total tokens used. USD/credit pricing is a
+ *  downstream concern computed over the recorded counters. */
 export interface NewUsage {
   agentId?: string | null;
-  model: string;
-  promptTokens: number;
-  completionTokens: number;
-  costUSD: number;
+  totalTokens: number;
 }
 
-/** Dispatch ticket for the queue (§2.8). At-least-once — consumers must be idempotent. */
+/** Dispatch ticket for the queue (§2.8). At-least-once — consumers must be
+ *  idempotent. `agent` resolves via `AgentCore.getAgent`; when missing, the
+ *  default handle executes. */
 export interface RunJob {
   threadId: string;
   model: string;
+  agent?: string;
+  tokenBudget?: number;
 }
 
-/** Any model registered through the `ai` SDK works — users bring their own registry (§2.3). */
-export type ModelRegistry = Record<string, LanguageModel>;
+/** A model identity after resolution: the real provider instance (created
+ *  lazily per run) and the declared context window, which feeds the §2.6
+ *  compaction budget math. */
+export interface ResolvedModel {
+  instance: () => LanguageModel;
+  contextWindow?: number;
+}
+
+/** Opt-in subagent delegation config (§2.7): the platform constructs the
+ *  run-scoped spawnSubagent tool — users cannot build it themselves. */
+export interface SubagentsConfig {
+  /** Generation flavor for spawned subagents — picks the nested loop (§4).
+   *  Default: 'stream-text'. A 'generate-text' child publishes only
+   *  SUBAGENT_STARTED / SUBAGENT_COMPLETED / SUBAGENT_FAILED. */
+  kind?: AgentKind;
+  /** Registry key used when a delegation call omits `model`. */
+  model?: string;
+  /** Extra tools merged into every spawned subagent's toolset
+   *  (HITL-wrapped identically to the parent's tools). */
+  tools?: ToolSet;
+}
 
 export interface AgentConfig {
   /** How long a parked HITL wait may last before timing out (§2.5) */
@@ -93,6 +118,10 @@ export interface AgentConfig {
   maxSteps: number;
   /** Queue redrive attempts before a run finalizes FAILED (§2.8) */
   runMaxAttempts: number;
+  /** Default per-run token budget (input + output) when neither the execute
+   *  input nor the agent spec declares one. `undefined` = unbounded apart
+   *  from `maxSteps` (§2.1 safety cap). */
+  tokenBudget?: number;
   /** Subagent nesting cap (§2.7) */
   subagentMaxDepth: number;
   /** Concurrent subagents per run (§2.7) */
@@ -109,11 +138,9 @@ export interface AgentConfig {
   compactionTrigger: number;
   /** Share of budget kept verbatim as the recent tail (§2.6) */
   contextTailShare: number;
-  /** Per-model native windows below the ceiling (§2.6) — merged over defaults */
+  /** Per-model native windows below the ceiling (§2.6) — merged over defaults.
+   *  A `contextWindow` declared via `resolveModel` wins over this table. */
   nativeWindows?: Record<string, number>;
-  /** Per-model per-token billing rates (§4). Merged over defaults; a model
-   *  without a rate records cost 0 + a BILLING_UNPRICED warning event. */
-  billingRates?: Record<string, { prompt: number; completion: number }>;
   /** Lease (seconds) for the per-thread run lock — must exceed the longest
    *  possible run, including parked HITL waits (§2.8, §3.4). */
   runLockLeaseSeconds: number;

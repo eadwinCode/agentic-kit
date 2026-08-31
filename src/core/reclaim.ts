@@ -1,6 +1,6 @@
 import type { RuntimePorts } from '../ports/runtime.js';
 import { HITL_TTL_MS } from './hitl.js';
-import { publish } from './engine.js';
+import { publish } from './publish.js';
 
 // Small grace so a live waiter always times out first — reclamation only ever
 // sees true orphans. Concurrent callers are safe: threads.claimState is a

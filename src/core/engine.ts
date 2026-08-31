@@ -1,16 +1,15 @@
-import { streamText, tool } from 'ai';
+import { generateText, streamText } from 'ai';
 import { randomUUID } from 'node:crypto';
-import { z } from 'zod';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { ExecutionState } from './types.js';
 import { compactContext } from './context.js';
-import { calculateCost } from './billing.js';
-import { MAX_CONCURRENT_SUBAGENTS, Semaphore, spawnSubagentTool } from './subagent.js';
+import type { RegisteredAgent } from './agent.js';
 import { suspendForApproval, type SuspendInput } from './hitl.js';
 import { publish } from './publish.js';
+import { countTokens } from './usage.js';
+import { spawnSubagentTool } from './subagent.js';
 
-export { publish, publishNotice } from './publish.js';
-export { calculateCost } from './billing.js';
+export { countTokens } from './usage.js';
 
 const runLockKey = (threadId: string) => `agent:lock:${threadId}`;
 
@@ -59,9 +58,10 @@ function withHitl(deps: RuntimePorts, threadId: string, tools: Record<string, an
  *  genuine no-op apart from a completed run. */
 export async function execute(
   deps: RuntimePorts,
-  input: { threadId: string; model: string },
+  agent: RegisteredAgent,
+  input: { threadId: string; model: string; tokenBudget?: number },
 ): Promise<'executed' | 'lock-conflict'> {
-  const { threadId, model } = input;
+  const { threadId } = input;
   const abort = new AbortController();
 
   const locked = await deps.kv.set(runLockKey(threadId), randomUUID(), {
@@ -69,6 +69,13 @@ export async function execute(
     exSeconds: deps.config.runLockLeaseSeconds,
   });
   if (!locked) return 'lock-conflict'; // another worker owns this thread (§2.8)
+
+  // Token budget (§2.1 safety cap) — precedence: execute input → spec →
+  // config. Tracked cumulatively on every onStepFinish; the loop breaks
+  // BEFORE the next step once spent. This is NOT a user stop.
+  const tokenBudget = input.tokenBudget ?? agent.spec.tokenBudget ?? deps.config.tokenBudget;
+  let tokensUsed = 0;
+  let budgetExceeded = false;
 
   // One signal, one behavior: the moment the state key reads CANCELLED —
   // the user pressed stop (§2.1) — everything tears down immediately.
@@ -81,105 +88,79 @@ export async function execute(
   }, 500);
 
   try {
-    // The key that actually executes — requested model, falling back to
-    // gpt-4o. Billing must price THIS key, not the requested one (§4).
-    const resolved = model in deps.models ? model : 'gpt-4o';
+    // Durable compaction pass — history always fits the model budget (§2.6);
+    // the budget uses the resolved model's contextWindow (§3.3)
+    const history = await compactContext(deps, threadId, input.model);
+    const model = deps.resolveModel(input.model);
 
-    // Durable compaction pass — history always fits the model budget (§2.6)
-    const history = await compactContext(deps, threadId, resolved);
-
-    const result = streamText({
-      model: deps.models[resolved] as any,
-      messages: history.map(
-        (m) => ({ role: m.role, content: m.content }) as any,
-      ),
-      abortSignal: abort.signal,
-      maxSteps: deps.config.maxSteps,
-      tools: withHitl(deps, threadId, {
-        executeTask: tool({
-          description: 'Executes a long running task',
-          parameters: z.object({ stepName: z.string() }),
-          execute: async ({ stepName }, opts) => {
-            // Checkpoint: stop takes effect here even without the signal
-            if (opts?.abortSignal?.aborted) throw new Error('EXECUTION_CANCELLED');
-            return { status: 'SUCCESS', result: `Completed ${stepName}` };
-          },
-        }),
-        sendEmail: markRequiresConfirmation(
-          tool({
-            description: 'Sends an email (destructive — requires user approval)',
-            parameters: z.object({
-              to: z.string().email(),
-              subject: z.string(),
-              body: z.string(),
+    // Platform-owned tool wrapping: HITL (§2.5) over the user's set.
+    // spawnSubagent is added ONLY when the spec opts in (§2.7).
+    const sub = agent.spec.subagents
+      ? agent.spec.subagents === true
+        ? {}
+        : agent.spec.subagents
+      : null;
+    const tools = withHitl(deps, threadId, {
+      ...(agent.args.tools ?? {}),
+      ...(sub
+        ? {
+            spawnSubagent: spawnSubagentTool({
+              threadId,
+              depth: 0,
+              sem: agent.sem,
+              ports: deps,
+              sub,
             }),
-            execute: async ({ to, subject, body }) => ({ status: 'SENT', to, subject, body }),
-          }),
-        ),
-        spawnSubagent: spawnSubagentTool({
-          threadId,
-          depth: 0,
-          sem: new Semaphore(deps.config.subagentMaxConcurrent),
-          ports: deps,
-        }),
-      }),
-      onChunk: async ({ chunk }) => {
-        // One canonical path for every client: durable log + live Pub/Sub (§2.1, §2.2)
-        await publish(deps, threadId, 'CHUNK', chunk);
-      },
-      onFinish: async ({ usage, finishReason, response }) => {
-        // Some OpenAI-compatible providers omit streaming usage. The AI SDK
-        // represents those counters as NaN; never let optional metering keep a
-        // successfully completed run stuck in RUNNING.
-        const promptTokens = Number.isFinite(usage.promptTokens) ? usage.promptTokens : 0;
-        const completionTokens = Number.isFinite(usage.completionTokens)
-          ? usage.completionTokens
-          : 0;
-
-        // Persist the completed assistant turn(s) — including tool calls and
-        // tool results — BEFORE the state transition, so redrives, HITL
-        // resumes, and replay always see a valid history (§2.2, §2.8)
-        for (const message of response.messages) {
-          await deps.storage.messages.append(threadId, {
-            role: message.role,
-            content: message.content,
-          });
-        }
-
-        const finalState: ExecutionState = abort.signal.aborted ? 'CANCELLED' : 'COMPLETED';
-        const stopReason = abort.signal.aborted
-          ? 'cancelled'
-          : finishReason === 'tool-calls'
-            ? 'max_steps' // safety cap hit (§2.1)
-            : 'completed';
-
-        // Unpriced models are marked, never silently mispriced (§4)
-        const costUSD = calculateCost(deps, resolved, promptTokens, completionTokens);
-        if (costUSD === null) {
-          await publish(deps, threadId, 'BILLING_UNPRICED', {
-            model: resolved,
-            promptTokens,
-            completionTokens,
-          });
-        }
-        await deps.storage.usage.record(threadId, {
-          model: resolved,
-          promptTokens,
-          completionTokens,
-          costUSD: costUSD ?? 0,
-        });
-        await deps.kv.set(`agent:state:${threadId}`, finalState);
-        await deps.storage.threads.setState(threadId, finalState);
-        await publish(deps, threadId, 'STATE_CHANGE', { state: finalState, stopReason });
-      },
+          }
+        : {}),
     });
 
-    // streamText is lazy: its completion promises only resolve while one of
-    // its streams is being consumed. Drain the full stream so chunk/finish
-    // callbacks run, while still propagating provider errors to retry policy.
-    for await (const _part of result.fullStream) {
-      // All processing happens in onChunk/onFinish above.
+    // Ownership rule (§3.1): user args spread FIRST, platform keys LAST —
+    // persistence, billing, the stop signal, and the safety cap cannot be
+    // opted out of.
+    const shared = {
+      ...agent.args,
+      model: model.instance(),
+      messages: history.map((m) => ({ role: m.role, content: m.content }) as any),
+      tools,
+      abortSignal: abort.signal,
+      maxSteps: deps.config.maxSteps,
+      onStepFinish: (step: any) => {
+        agent.args.onStepFinish?.(step); // user callback still fires
+        // Budget tracking — break the loop BEFORE the next step
+        tokensUsed += countTokens(step.usage);
+        if (tokenBudget && tokensUsed >= tokenBudget) {
+          budgetExceeded = true;
+          abort.abort(); // not a user stop — see finalize below
+        }
+      },
+      onChunk: async ({ chunk }: any) => {
+        // One canonical path for every client: durable log + live Pub/Sub (§2.1, §2.2)
+        await publish(deps, threadId, 'CHUNK', chunk);
+        agent.args.onChunk?.({ chunk }); // user callback still fires
+      },
+      onFinish: async (finishParams: any) => {
+        await finalize(deps, agent, input, finishParams, abort, {
+          budgetExceeded,
+          tokensUsed,
+        });
+        agent.args.onFinish?.(finishParams); // user callback still fires
+      },
+    };
+
+    if (agent.kind === 'stream-text') {
+      const result = streamText(shared);
+      // streamText is lazy: drain the full stream so chunk/finish callbacks
+      // run, while still propagating provider errors to retry policy.
+      for await (const _part of result.fullStream) {
+        // All processing happens in onChunk/onFinish above.
+      }
+    } else {
+      const result = await generateText(shared);
+      // One-shot flavor: no CHUNK stream — publish the final text as one event
+      await publish(deps, threadId, 'TEXT_RESULT', { text: result.text });
     }
+
     return 'executed';
   } finally {
     clearInterval(controlPoll);
@@ -187,17 +168,82 @@ export async function execute(
   }
 }
 
+/** Finalize a finished run (§5.6): persist the completed assistant turn(s)
+ *  BEFORE the state transition, attribute total tokens, then flip state on
+ *  both homes and publish.
+ *
+ *  Hardened:
+ *  - Some providers omit streaming usage — the SDK reports NaN for those.
+ *    Never let optional metering keep a completed run stuck in RUNNING.
+ *  - A budget break is NOT a user stop: the run completes with
+ *    stopReason 'token_budget' and the partial usage it managed to spend. */
+export async function finalize(
+  deps: RuntimePorts,
+  agent: RegisteredAgent,
+  input: { threadId: string },
+  finishParams: {
+    usage?: { inputTokens?: number; outputTokens?: number; promptTokens?: number; completionTokens?: number };
+    finishReason: string;
+    response: { messages: Array<{ role: string; content: unknown }> };
+  },
+  abort: AbortController,
+  budget: { budgetExceeded: boolean; tokensUsed: number },
+): Promise<void> {
+  const { threadId } = input;
+
+  // Persist the completed assistant turn(s) — including tool calls and tool
+  // results — BEFORE the state transition, so redrives, HITL resumes, and
+  // replay always see a valid history (§2.2, §2.8). On a budget-broken run
+  // the recorded usage is partial by definition: the budget was spent.
+  for (const message of finishParams.response.messages) {
+    await deps.storage.messages.append(threadId, {
+      role: message.role as any,
+      content: message.content,
+    });
+  }
+
+  const totalTokens = countTokens(finishParams.usage);
+
+  // Token attribution only (§4): total tokens used. Pricing is downstream.
+  await deps.storage.usage.record(threadId, {
+    agentId: agent.name,
+    totalTokens,
+  });
+
+  const finalState: ExecutionState =
+    abort.signal.aborted && !budget.budgetExceeded ? 'CANCELLED' : 'COMPLETED';
+  const stopReason = budget.budgetExceeded
+    ? 'token_budget'
+    : abort.signal.aborted
+      ? 'cancelled'
+      : finishParams.finishReason === 'tool-calls'
+        ? 'max_steps' // safety cap hit (§2.1)
+        : 'completed';
+
+  await deps.kv.set(`agent:state:${threadId}`, finalState);
+  await deps.storage.threads.setState(threadId, finalState);
+  await publish(deps, threadId, 'STATE_CHANGE', {
+    state: finalState,
+    stopReason,
+    tokensUsed: budget.tokensUsed,
+  });
+}
+
 /** §2.8 failure policy: transient errors redrive through the queue; exhausted
  *  attempts finalize FAILED (hot cache + durable). A user stop is never
- *  retried, and a successful run resets the attempt counter. */
+ *  retried, and a successful run resets the attempt counter.
+ *
+ *  `exec` is an injection seam for tests (default: the real execute). */
 export async function executeWithPolicy(
   deps: RuntimePorts,
-  input: { threadId: string; model: string },
+  agent: RegisteredAgent,
+  input: { threadId: string; model: string; tokenBudget?: number },
   policy?: { maxAttempts?: number },
+  exec: typeof execute = execute,
 ): Promise<void> {
   const maxAttempts = policy?.maxAttempts ?? deps.config.runMaxAttempts;
   try {
-    const outcome = await execute(deps, input);
+    const outcome = await exec(deps, agent, input);
     // Only a run THIS worker executed may reset the retry budget — a
     // lock-conflict no-op must never clear it while the owning worker runs (§2.8)
     if (outcome === 'executed') {
@@ -209,7 +255,12 @@ export async function executeWithPolicy(
 
     const attempts = await deps.kv.incr(`agent:attempts:${input.threadId}`);
     if (attempts < maxAttempts) {
-      return deps.queue.enqueue({ threadId: input.threadId, model: input.model });
+      return deps.queue.enqueue({
+        threadId: input.threadId,
+        model: input.model,
+        agent: agent.name,
+        tokenBudget: input.tokenBudget,
+      });
     }
 
     // Attempts exhausted: finalize FAILED on BOTH the hot cache and durable

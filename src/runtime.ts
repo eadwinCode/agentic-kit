@@ -1,43 +1,61 @@
 import type { AgentEvent } from './core/types.js';
 import { resolveConfig } from './core/types.js';
 import type {
-  AgentRuntime,
+  AgentCore,
+  AgentHandle,
+  AgentKind,
   RespondInput,
   RespondResult,
-  RunInput,
-  RunResult,
+  RunJob,
   RuntimeOptions,
-  StopResult,
+  RuntimePorts,
   ThreadSnapshot,
 } from './ports/runtime.js';
-import { execute, executeWithPolicy } from './core/engine.js';
+import { createGenerateTextAgent, createStreamTextAgent } from './core/agent.js';
 import { reclaimIfOrphaned } from './core/reclaim.js';
 import { respond } from './core/hitl.js';
-import { run } from './core/run.js';
-import { stop } from './core/stop.js';
 
 /** Bind the ports to the core behaviors (§3.3). This is the package's public
  *  entry point — the only place where anything is wired together. */
-export function createAgentRuntime(opts: RuntimeOptions): AgentRuntime {
-  const deps = {
+export function setupAgentCore(opts: RuntimeOptions): AgentCore {
+  const deps: RuntimePorts = {
     storage: opts.storage,
     bus: opts.bus,
     queue: opts.queue,
     kv: opts.kv,
-    models: opts.models,
+    resolveModel: (modelName: string) => opts.resolveModel(modelName),
     config: resolveConfig(opts.config),
   };
 
-  return {
-    run: (input: RunInput): Promise<RunResult> => run(deps, input),
-    stop: (threadId: string): Promise<StopResult> => stop(deps, threadId),
+  // Handle registry — keyed by spec.name, resolved by the queue dispatch.
+  const registry = new Map<string, AgentHandle>();
+  // The first registered stream-text handle is the default for jobs that
+  // omit `agent` (§5).
+  let defaultAgent: string | null = null;
+
+  const register = (
+    name: string,
+    kind: AgentKind,
+    spec: import('./ports/runtime.js').StreamTextAgentSpec | import('./ports/runtime.js').GenerateTextAgentSpec,
+  ): AgentHandle => {
+    const handle: AgentHandle =
+      kind === 'stream-text'
+        ? createStreamTextAgent(deps, spec)
+        : createGenerateTextAgent(deps, spec);
+    registry.set(name, handle);
+    return handle;
+  };
+
+  const core: AgentCore = {
+    resolveModel: (modelName: string) => deps.resolveModel(modelName),
+
     getThreadSnapshot: async (threadId: string): Promise<ThreadSnapshot | null> => {
       const thread = await deps.storage.threads.get(threadId);
       if (!thread) return null;
-      const [messages, events] = await Promise.all([
-        deps.storage.messages.list(threadId),
-        deps.storage.events.listSince(threadId, -1),
-      ]);
+
+      const messages = await deps.storage.messages.list(threadId);
+      const events = await deps.storage.events.listSince(threadId, -1);
+
       const lastEventSeq = events.at(-1)?.seq ?? -1;
       let activeEvents: AgentEvent[] = [];
       if (thread.state === 'RUNNING' || thread.state === 'WAITING_FOR_INPUT') {
@@ -54,8 +72,10 @@ export function createAgentRuntime(opts: RuntimeOptions): AgentRuntime {
         }
         activeEvents = events.slice(Math.max(0, boundary));
       }
+
       return { thread, messages, lastEventSeq, activeEvents };
     },
+
     hitl: {
       respond: (input: RespondInput): Promise<RespondResult> => {
         // Heal an orphaned wait first — if reclamation claims the thread, the
@@ -67,15 +87,49 @@ export function createAgentRuntime(opts: RuntimeOptions): AgentRuntime {
       },
       reclaimIfOrphaned: (threadId: string) => reclaimIfOrphaned(deps, threadId),
     },
+
     events: {
       since: (threadId: string, sinceSeq: number): Promise<AgentEvent[]> =>
         deps.storage.events.listSince(threadId, sinceSeq),
       subscribe: async (threadId: string, handler: (event: AgentEvent) => void) =>
         deps.bus.subscribe(threadId, handler),
     },
-    engine: {
-      execute: (input: { threadId: string; model: string }) => execute(deps, input),
-      executeWithPolicy: (input, policy) => executeWithPolicy(deps, input, policy),
+
+    createStreamTextAgent: (spec) => {
+      const handle = register(spec.name, 'stream-text', spec);
+      if (defaultAgent === null) defaultAgent = spec.name;
+      return handle;
+    },
+
+    createGenerateTextAgent: (spec) => register(spec.name, 'generate-text', spec),
+
+    getAgent: (name: string) => registry.get(name) ?? null,
+
+    worker: {
+      handleJob: async (job: RunJob) => {
+        // Missing `agent` → the default handle (first registered stream-text)
+        const agent =
+          (job.agent ? registry.get(job.agent) : null) ??
+          (defaultAgent ? registry.get(defaultAgent) : null);
+        if (!agent) return { accepted: false, reason: 'unknown-agent' };
+
+        // executeWithPolicy: run lock (idempotent under at-least-once
+        // delivery, §3.4) + §2.8 failure policy — redrive < maxAttempts,
+        // else finalize FAILED; a user stop is never retried.
+        await agent.executeWithPolicy({
+          threadId: job.threadId,
+          model: job.model,
+          tokenBudget: job.tokenBudget,
+        });
+        return { accepted: true };
+      },
     },
   };
+  return core;
+}
+
+/** Deprecated alias for `setupAgentCore` — kept for the one-minor
+ *  migration window (§7). */
+export function createAgentRuntime(opts: RuntimeOptions): AgentCore {
+  return setupAgentCore(opts);
 }

@@ -1,5 +1,5 @@
 import type { RuntimePorts } from '../ports/runtime.js';
-import { publish } from './engine.js';
+import { publish } from './publish.js';
 import type { StopResult } from '../ports/runtime.js';
 
 /** The whole stop mechanism (§2.1): one button, one behavior — everything

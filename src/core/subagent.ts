@@ -1,17 +1,18 @@
-import { streamText, tool } from 'ai';
+import { generateText, streamText, tool } from 'ai';
 import { z } from 'zod';
+import type { SubagentsConfig } from './types.js';
 import type { RuntimePorts } from '../ports/runtime.js';
-import { publish } from './engine.js';
-import { calculateCost } from './billing.js';
-
-export const MAX_SUBAGENT_DEPTH = 2; // main (0) → sub (1) → sub-sub (2)
-export const MAX_CONCURRENT_SUBAGENTS = 3; // per run
+import { publish } from './publish.js';
+import { countTokens } from './usage.js';
 
 export interface SubagentCtx {
   threadId: string;
-  depth: number;      // 0 = called from the main agent
-  sem: Semaphore;     // per-run concurrency cap
+  depth: number; // 0 = called from the main agent
+  sem: Semaphore; // per-run concurrency cap
   ports: RuntimePorts; // the §3.2 ports bundle
+  /** Delegation config carried from the parent's spec (§2.7): flavor,
+   *  default model, and extra tools for every spawned child. */
+  sub: SubagentsConfig;
 }
 
 /** Run-scoped semaphore: sibling subagents queue instead of running away (§2.7) */
@@ -52,9 +53,13 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
         .describe('Complete, self-contained brief: goal, constraints, expected output format'),
       model: z.string().optional(),
     }),
-    execute: async (args: { name: string; instructions: string; model?: string }, opts: { toolCallId?: string; abortSignal?: AbortSignal }): Promise<any> => {
+    execute: async (
+      args: { name: string; instructions: string; model?: string },
+      opts: { toolCallId?: string; abortSignal?: AbortSignal },
+    ): Promise<any> => {
       const { name, instructions, model } = args;
-      if (ctx.depth >= ctx.ports.config.subagentMaxDepth) {
+      const depth = ctx.depth + 1;
+      if (depth > ctx.ports.config.subagentMaxDepth) {
         return { error: `Max subagent depth (${ctx.ports.config.subagentMaxDepth}) reached` };
       }
 
@@ -62,26 +67,28 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
       try {
         const run = await ctx.ports.storage.runs.create(ctx.threadId, {
           name,
-          model: model ?? 'gpt-4o',
-          depth: ctx.depth + 1,
+          model: model ?? ctx.sub.model ?? 'gpt-4o',
+          depth,
           state: 'RUNNING',
         });
         await publish(ctx.ports, ctx.threadId, 'SUBAGENT_STARTED', {
-          agentId: run.id, name, depth: ctx.depth + 1,
+          agentId: run.id, name, depth,
         });
 
         try {
-          const result = await runSubagent({
-            threadId: ctx.threadId,
-            depth: ctx.depth,
-            sem: ctx.sem,
-            ports: ctx.ports,
+          const job = {
             agentId: run.id,
             name,
             instructions,
-            model: model ?? 'gpt-4o',
+            model: model ?? ctx.sub.model ?? 'gpt-4o',
+            depth,
             abortSignal: opts.abortSignal, // cancellation propagates from the parent (§2.7)
-          });
+          };
+
+          const result =
+            ctx.sub.kind === 'generate-text'
+              ? await runGenerateSubagent(ctx, job) // single completion, lifecycle events only
+              : await runStreamSubagent(ctx, job); // live SUBAGENT_CHUNK fan-out (§2.2)
 
           await ctx.ports.storage.runs.update(run.id, {
             state: 'COMPLETED',
@@ -110,56 +117,83 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
   });
 }
 
-async function runSubagent(
-  opts: SubagentCtx & {
+/** stream-text child: live SUBAGENT_CHUNK fan-out (§2.2) */
+async function runStreamSubagent(
+  ctx: SubagentCtx,
+  job: {
     agentId: string;
     name: string;
     instructions: string;
     model: string;
+    depth: number;
     abortSignal?: AbortSignal;
   },
 ): Promise<string> {
-  const { threadId, depth, sem, ports, agentId, name, instructions, model, abortSignal } = opts;
-
-  // The key that actually executes — requested model, falling back to gpt-4o.
-  // Billing prices THIS key, not the requested one (§4).
-  const resolved = model in ports.models ? model : 'gpt-4o';
+  const { threadId, depth, sem, ports, sub, agentId, name, instructions, model, abortSignal } = {
+    ...ctx,
+    ...job,
+  };
 
   const result = streamText({
-    model: ports.models[resolved] as any,
+    model: (ports.resolveModel(model) || ports.resolveModel('gpt-4o')).instance(),
     // Isolated context: seeded with the brief only — never the parent history
     system: `You are the "${name}" subagent. Complete the task, then stop.`,
     prompt: instructions,
     abortSignal, // stop tears this down immediately (§2.7)
     maxSteps: ports.config.subagentMaxSteps,
     tools: {
-      // Nesting up to subagentMaxDepth. Default toolset is restricted:
-      // destructive tools (requiresConfirmation) are not included (§2.5, §2.7)
-      spawnSubagent: spawnSubagentTool({
-        threadId,
-        depth: depth + 1,
-        sem,
-        ports,
-      }),
+      // Nesting up to subagentMaxDepth, inheriting the delegation config.
+      // Default toolset is restricted: destructive tools are not included (§2.5, §2.7)
+      spawnSubagent: spawnSubagentTool({ threadId, depth: depth + 1, sem, ports, sub }),
     },
     onChunk: async ({ chunk }) => {
       // Namespaced into the shared thread event log → same multi-user pipeline (§2.2)
       await publish(ports, threadId, 'SUBAGENT_CHUNK', { agentId, chunk });
     },
     onFinish: async ({ usage }) => {
-      // Billing attribution per subagent (§4) — unpriced models are marked
-      const costUSD = calculateCost(ports, resolved, usage.promptTokens, usage.completionTokens);
-      if (costUSD === null) {
-        await publish(ports, threadId, 'BILLING_UNPRICED', { agentId, model: resolved });
-      }
+      // Billing attribution per subagent (§4): total tokens used
       await ports.storage.usage.record(threadId, {
         agentId,
-        model: resolved,
-        promptTokens: usage.promptTokens,
-        completionTokens: usage.completionTokens,
-        costUSD: costUSD ?? 0,
+        totalTokens: countTokens(usage),
       });
     },
+  });
+
+  return result.text;
+}
+
+/** generate-text child: single completion, lifecycle events only (§2.7) */
+async function runGenerateSubagent(
+  ctx: SubagentCtx,
+  job: {
+    agentId: string;
+    name: string;
+    instructions: string;
+    model: string;
+    depth: number;
+    abortSignal?: AbortSignal;
+  },
+): Promise<string> {
+  const { threadId, depth, sem, ports, sub, agentId, name, instructions, model, abortSignal } = {
+    ...ctx,
+    ...job,
+  };
+
+  const result = await generateText({
+    model: (ports.resolveModel(model) || ports.resolveModel('gpt-4o')).instance(),
+    system: `You are the "${name}" subagent. Complete the task, then stop.`,
+    prompt: instructions,
+    abortSignal,
+    maxSteps: ports.config.subagentMaxSteps,
+    tools: {
+      spawnSubagent: spawnSubagentTool({ threadId, depth: depth + 1, sem, ports, sub }),
+    },
+  });
+
+  // Billing attribution per subagent (§4): total tokens used
+  await ports.storage.usage.record(threadId, {
+    agentId,
+    totalTokens: countTokens(result.usage),
   });
 
   return result.text;

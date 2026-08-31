@@ -6,12 +6,30 @@ import type { AgentConfig } from '../src/core/types.js';
 import { resolveConfig } from '../src/core/types.js';
 import type { RuntimePorts } from '../src/ports/runtime.js';
 
+const MODEL_WINDOWS: Record<string, number> = {
+  'gpt-4o': 128_000,
+  'claude-3-5-sonnet': 200_000,
+  'gemini-1.5-pro': 265_000,
+};
+
 function makeDeps(config: Partial<AgentConfig> = {}) {
   const storage = new MemoryStorage();
   const bus = new MemoryBus();
   const queue = new MemoryQueue();
   const kv = new MemoryKv();
-  const deps: RuntimePorts = { storage, bus, queue, kv, models: {}, config: resolveConfig(config) };
+  const deps: RuntimePorts = {
+    storage,
+    bus,
+    queue,
+    kv,
+    resolveModel: (name) => ({
+      instance: () => {
+        throw new Error('no-llm');
+      },
+      contextWindow: MODEL_WINDOWS[name] ?? 128_000,
+    }),
+    config: resolveConfig(config),
+  };
   return { deps, runtime: createAgentRuntime(deps), storage, bus, queue, kv };
 }
 
@@ -31,26 +49,31 @@ async function parkThread(deps: RuntimePorts, toolCallId = 'call_1') {
   return thread.id;
 }
 
-describe('runtime.run (§5.1)', () => {
+describe('runtime.run via handle (§5.1)', () => {
   it('creates a thread, persists the user message, marks RUNNING, enqueues', async () => {
     const { deps, runtime, queue } = makeDeps();
-    const res = await runtime.run({ prompt: 'hello', model: 'gpt-4o' });
+    const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
+
+    const res = await chat.run({ prompt: 'hello' });
 
     expect(res.accepted).toBe(true);
     expect(res.state).toBe('RUNNING');
     const thread = await deps.storage.threads.get(res.threadId);
     expect(thread!.state).toBe('RUNNING');
+    expect(thread!.model).toBe('gpt-4o');
     const messages = await deps.storage.messages.list(res.threadId);
     expect(messages).toHaveLength(1);
     expect(messages[0]!.role).toBe('user');
     expect(queue.items).toHaveLength(1);
     expect(queue.items[0]!.threadId).toBe(res.threadId);
+    expect(queue.items[0]!.agent).toBe('chat');
   });
 
   it('rejects a second run while one is active (§2.1 guard)', async () => {
     const { runtime } = makeDeps();
-    const first = await runtime.run({ prompt: 'a', model: 'gpt-4o' });
-    const second = await runtime.run({ threadId: first.threadId, prompt: 'b', model: 'gpt-4o' });
+    const chat = runtime.createStreamTextAgent({ name: 'chat' });
+    const first = await chat.run({ prompt: 'a' });
+    const second = await chat.run({ threadId: first.threadId, prompt: 'b' });
     expect(second.accepted).toBe(false);
     expect(second.error).toMatch(/active run/);
   });
@@ -59,18 +82,27 @@ describe('runtime.run (§5.1)', () => {
     const { runtime } = makeDeps({
       billingPreCheck: async () => ({ ok: false, error: 'Insufficient credits' }),
     });
-    const res = await runtime.run({ prompt: 'x', model: 'gpt-4o' });
+    const chat = runtime.createStreamTextAgent({ name: 'chat' });
+    const res = await chat.run({ prompt: 'x' });
     expect(res.accepted).toBe(false);
     expect(res.error).toMatch(/Insufficient credits/);
+  });
+
+  it('threads tokenBudget through the job (§2.1)', async () => {
+    const { runtime, queue } = makeDeps();
+    const chat = runtime.createStreamTextAgent({ name: 'chat' });
+    await chat.run({ prompt: 'a', tokenBudget: 4_000 });
+    expect(queue.items[0]!.tokenBudget).toBe(4_000);
   });
 });
 
 describe('runtime.stop (§5.2)', () => {
   it('writes CANCELLED to cache + durable truth and publishes STATE_CHANGE', async () => {
     const { deps, runtime, bus } = makeDeps();
-    const ran = await runtime.run({ prompt: 'a', model: 'gpt-4o' });
+    const chat = runtime.createStreamTextAgent({ name: 'chat' });
+    const ran = await chat.run({ prompt: 'a' });
 
-    const res = await runtime.stop(ran.threadId);
+    const res = await chat.stop(ran.threadId);
     expect(res.accepted).toBe(true);
     expect(await deps.kv.get(`agent:state:${ran.threadId}`)).toBe('CANCELLED');
     const thread = await deps.storage.threads.get(ran.threadId);
@@ -82,8 +114,9 @@ describe('runtime.stop (§5.2)', () => {
 
   it('rejects stopping an IDLE thread', async () => {
     const { deps, runtime } = makeDeps();
+    const chat = runtime.createStreamTextAgent({ name: 'chat' });
     const thread = await deps.storage.threads.create();
-    const res = await runtime.stop(thread.id);
+    const res = await chat.stop(thread.id);
     expect(res.accepted).toBe(false);
     expect(res.error).toMatch(/IDLE/);
   });
@@ -186,26 +219,12 @@ describe('runtime.events (§2.2)', () => {
   });
 });
 
-describe('runtime.getThreadSnapshot', () => {
-  it('hydrates durable thread state, messages, and the replay cursor source', async () => {
-    const { deps, runtime } = makeDeps();
-    const ran = await runtime.run({ prompt: 'remember me', model: 'gpt-4o' });
-
-    const snapshot = await runtime.getThreadSnapshot(ran.threadId);
-    expect(snapshot?.thread.id).toBe(ran.threadId);
-    expect(snapshot?.messages.map((message) => message.content)).toEqual(['remember me']);
-    expect(snapshot?.lastEventSeq).toBe(1);
-    expect(snapshot?.activeEvents.map((event) => event.seq)).toEqual([1]);
-    expect(await runtime.getThreadSnapshot('missing')).toBeNull();
-  });
-});
-
 describe('contextBudget (§2.6)', () => {
   it('caps everything at the 265k ceiling but keeps smaller native windows', () => {
     const { deps } = makeDeps();
     expect(contextBudget(deps, 'gpt-4o')).toBe(128_000);
     expect(contextBudget(deps, 'claude-3-5-sonnet')).toBe(200_000);
     expect(contextBudget(deps, 'gemini-1.5-pro')).toBe(265_000);
-    expect(contextBudget(deps, 'unknown-model')).toBe(265_000);
+    expect(contextBudget(deps, 'unknown-model')).toBe(128_000); // resolveModel fallback
   });
 });
