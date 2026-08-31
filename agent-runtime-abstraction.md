@@ -73,17 +73,26 @@ export interface AgentHandle {
 
   /** Worker-side only (§5.6). Throws on failure — see executeWithPolicy.
    *  Returns 'lock-conflict' when another worker owns the thread's run lock
-   *  (at-least-once duplicate delivery, §2.8) and nothing was executed. */
-  execute(input: { threadId: string; model: string }): Promise<'executed' | 'lock-conflict'>;
+   *  (at-least-once duplicate delivery, §2.8) and nothing was executed.
+   *
+   *  tokenBudget: max cumulative tokens (input + output) for the whole run.
+   *  Tracked on every onStepFinish; the generation loop breaks BEFORE the
+   *  next step once spent, and the run finalizes COMPLETED with
+   *  stopReason 'token_budget' (§2.1 safety cap). */
+  execute(input: {
+    threadId: string;
+    model: string;
+    tokenBudget?: number;
+  }): Promise<'executed' | 'lock-conflict'>;
 
   /** execute + §2.8 failure policy: redrive < maxAttempts, else finalize FAILED */
   executeWithPolicy(
-    input: { threadId: string; model: string },
+    input: { threadId: string; model: string; tokenBudget?: number },
     policy?: { maxAttempts?: number },
   ): Promise<void>;
 
   /** Persist user message → state RUNNING → enqueue a job dispatched back to
-   *  THIS handle (the job carries `agent: this.name`). */
+   *  THIS handle (the job carries `agent: this.name` and `tokenBudget`). */
   run(input: RunInput): Promise<RunResult>;
 
   /** Platform stop (§2.1) — works regardless of which agent's run is active. */
@@ -112,6 +121,11 @@ export type StreamTextAgentSpec = {
    *  the run-scoped spawnSubagent tool (semaphore, depth, ports) — users
    *  cannot build it themselves. Default: false. */
   subagents?: boolean;
+
+  /** Default per-run token budget (input + output) for runs dispatched to
+   *  this handle. Per-run `input.tokenBudget` wins; `undefined` = unbounded
+   *  apart from `maxSteps`. */
+  tokenBudget?: number;
 } & Omit<Parameters<typeof streamText>[0],
     'model' | 'messages' | 'prompt' | 'system' | 'abortSignal'
     | 'maxSteps' | 'onStepFinish' | 'onError'> & {
@@ -126,6 +140,7 @@ export type GenerateTextAgentSpec = {
   name: string;
   model?: string | LanguageModel;
   subagents?: boolean;
+  tokenBudget?: number;
 } & Omit<Parameters<typeof generateText>[0],
     'model' | 'messages' | 'prompt' | 'abortSignal' | 'onFinish'> & {
   tools?: ToolSet;
@@ -154,8 +169,8 @@ Platform keys win: user args are spread first, platform assignments last. A user
 ```typescript
 export async function execute(
   deps: RuntimePorts,
-  agent: RegisteredAgent,                 // { name, kind, args } resolved from the registry
-  input: { threadId: string; model: string },
+  agent: RegisteredAgent,                 // { name, kind, spec, args } resolved from the registry
+  input: { threadId: string; model: string; tokenBudget?: number },
 ): Promise<'executed' | 'lock-conflict'> {
   const abort = new AbortController();
 
@@ -166,14 +181,20 @@ export async function execute(
   });
   if (!locked) return 'lock-conflict';    // duplicate delivery: nothing executed
 
+  // 2. Token budget (§2.1 safety cap) — precedence: execute input → spec →
+  //    config. Tracked cumulatively on every onStepFinish; the loop breaks
+  //    BEFORE the next step once spent. This is NOT a user stop.
+  const tokenBudget = input.tokenBudget
+    ?? agent.spec.tokenBudget
+    ?? deps.config.tokenBudget;          // undefined = unbounded apart from maxSteps
+  let tokensUsed = 0;
+  let budgetExceeded = false;
+
   const controlPoll = setInterval(/* stop poller (§2.1) — aborts on CANCELLED */);
 
   try {
-    // 2. Durable history + compaction (§2.6)
+    // 3. Durable history + compaction (§2.6)
     const history = await compactContext(deps, input.threadId, input.model);
-
-    // 3. Platform-owned tool wrapping: HITL (§2.5). spawnSubagent is injected
-    //    only when the spec opts in (subagents: true) — see step 4.
 
     // 4. Dispatch on the bound flavor — user args spread FIRST,
     //    platform assignments LAST (ownership rule, §3.1)
@@ -189,13 +210,24 @@ export async function execute(
         }),
         abortSignal: abort.signal,                       // platform: stop signal
         maxSteps: deps.config.maxSteps,                  // platform: safety cap
+        onStepFinish: (step) => {
+          agent.args.onStepFinish?.(step);               // user callback still fires
+          // 5. Budget tracking — break the loop BEFORE the next step
+          tokensUsed += countTokens(step.usage);         // NaN-guarded input + output (§finalize)
+          if (tokenBudget && tokensUsed >= tokenBudget) {
+            budgetExceeded = true;
+            abort.abort();                               // not a user stop — see finalize below
+          }
+        },
         onChunk: async (para) => {
           // One canonical path for every client: durable log + live Pub/Sub (§2.1, §2.2)
           await publish(deps, input.threadId, 'CHUNK', para.chunk);
           agent.args.onChunk?.(para);                    // user callback still fires
         },
         onFinish: async (finishParams) => {
-          await finalize(deps, agent, input, finishParams, abort); // §5.6: messages, tokens, state
+          await finalize(deps, agent, input, finishParams, abort, {
+            budgetExceeded, tokensUsed,
+          });
           agent.args.onFinish?.(finishParams);           // user callback still fires
         },
       });
@@ -234,6 +266,7 @@ export async function finalize(
   input: { threadId: string; model: string },
   finishParams: { usage: LanguageModelUsage; finishReason: FinishReason; response: ... },
   abort: AbortController,
+  budget: { budgetExceeded: boolean; tokensUsed: number },
 ): Promise<void> {
   const { threadId } = input;
   const u = finishParams.usage;
@@ -248,15 +281,8 @@ export async function finalize(
     : Number.isFinite(u.completionTokens) ? u.completionTokens : 0;
 
   // Persist the completed assistant turn(s) — including tool calls and tool
-  // results — BEFORE the state transition (§2.2, §2.8)
-  for (const message of finishParams.response.messages) {
-    await deps.storage.messages.append(threadId, {
-      role: message.role,
-      content: message.content,
-    });
-  }
-
-  // Token attribution only (§4 pricing becomes downstream over these counters)
+  // results — BEFORE the state transition (§2.2, §2.8). On a budget-broken
+  // run the recorded usage is partial by definition: the budget was spent.
   await deps.storage.usage.record(threadId, {
     agentId: agent.name,
     inputTokens,
@@ -264,20 +290,44 @@ export async function finalize(
     outputTokens,
   });
 
-  const finalState: ExecutionState = abort.signal.aborted ? 'CANCELLED' : 'COMPLETED';
-  const stopReason = abort.signal.aborted
-    ? 'cancelled'
+  // Stop classification (§2.1). A budget break is NOT a user stop — the run
+  // still completes successfully with the tokens it managed to spend.
+  const finalState: ExecutionState = abort.signal.aborted && !budget.budgetExceeded
+    ? 'CANCELLED' : 'COMPLETED';
+  const stopReason = budget.budgetExceeded ? 'token_budget'
+    : abort.signal.aborted ? 'cancelled'
     : finishParams.finishReason === 'tool-calls'
       ? 'max_steps' // safety cap hit (§2.1)
       : 'completed';
 
   await deps.kv.set(`agent:state:${threadId}`, finalState);
   await deps.storage.threads.setState(threadId, finalState);
-  await publish(deps, threadId, 'STATE_CHANGE', { state: finalState, stopReason });
+  await publish(deps, threadId, 'STATE_CHANGE', {
+    state: finalState, stopReason, tokensUsed: budget.tokensUsed,
+  });
+}
+
+/** NaN-guarded billable count: input + output. cachedInputTokens are a
+ *  subset of input on providers that report them — not counted twice. */
+function countTokens(usage: LanguageModelUsage): number {
+  const input = Number.isFinite(usage.inputTokens) ? usage.inputTokens
+    : Number.isFinite(usage.promptTokens) ? usage.promptTokens : 0;
+  const output = Number.isFinite(usage.outputTokens) ? usage.outputTokens
+    : Number.isFinite(usage.completionTokens) ? usage.completionTokens : 0;
+  return input + output;
 }
 ```
 
 **Callback chaining order:** platform work (persist → attribute tokens → publish) runs first, then the user's `onChunk`/`onFinish` fires with the same parameters. A user callback that throws is its own problem — it must not prevent the state transition, so `finalize` completes before `args.onFinish` is invoked.
+
+#### Token Budget Semantics
+
+- **Precedence:** `execute input.tokenBudget` → `spec.tokenBudget` → `config.tokenBudget` (default `undefined` = unbounded apart from `maxSteps`).
+- **Counted:** NaN-guarded `input + output` per step, accumulated across steps (`onStepFinish` fires once per step, including tool-call steps). `cachedInputTokens` are a subset of input on providers that report them — never double-counted.
+- **Break:** the shared abort signal fires at a step boundary, so generation stops *before* the next step — the in-flight step completes and its tokens count. The run finalizes `COMPLETED` with `stopReason: 'token_budget'`; `STATE_CHANGE.tokensUsed` reports the actual spend.
+- **Not a user stop:** the stop poller and the budget tracker are separate triggers of the same signal — `budgetExceeded` disambiguates them in `finalize`, so a budget break can never be misclassified as `cancelled` (or vice versa).
+- **Partial is correct:** on a budget break the recorded usage is partial by definition — the budget was spent.
+- **Queue path:** `run({ …, tokenBudget })` flows through `RunJob.tokenBudget` to the worker's `executeWithPolicy`.
 
 `executeWithPolicy` wraps `execute` with the §2.8 policy exactly as today: redrive `< maxAttempts`, else finalize `FAILED` on both homes; a user stop is never retried; the attempt counter resets on success.
 
@@ -289,6 +339,7 @@ export async function finalize(
 | Live events | `CHUNK` per delta (§2.2 fan-out) | single `TEXT_RESULT` on completion |
 | Typical UI | chat | summarization, extraction, batch |
 | Stop | aborts mid-generation | aborts the awaited call |
+| Token budget | tracked on `onStepFinish`, breaks before the next step | same |
 | Everything else | identical: lock, history, HITL, token attribution, finalize, redrive | |
 
 ---
@@ -301,7 +352,8 @@ export async function finalize(
 export interface RunJob {
   threadId: string;
   model: string;
-  agent: string;   // registered handle name — the worker resolves it via runtime.getAgent()
+  agent: string;       // registered handle name — the worker resolves it via runtime.getAgent()
+  tokenBudget?: number; // flows from RunInput to the worker's executeWithPolicy (§2.1)
 }
 ```
 
@@ -311,11 +363,11 @@ export interface RunJob {
 ```typescript
 // app/api/queue/agent-run/route.ts (worker, §5.6)
 export const POST = verifySignatureApprouter(async (req: NextRequest) => {
-  const { threadId, model, agent: agentName } = await req.json();
+  const { threadId, model, tokenBudget, agent: agentName } = await req.json();
   const agent = runtime.getAgent(agentName);
   if (!agent) return NextResponse.json({ error: 'Unknown agent' }, { status: 400 });
 
-  waitUntil(agent.executeWithPolicy({ threadId, model }));
+  waitUntil(agent.executeWithPolicy({ threadId, model, tokenBudget }));
   return NextResponse.json({ accepted: true });
 });
 ```
@@ -374,7 +426,7 @@ await chat.stop(threadId);
 | `runtime.hitl` / `runtime.events` | unchanged on `AgentRuntime` |
 | — new — | `runtime.getThreadSnapshot(threadId)` |
 | — new — | `runtime.createStreamTextAgent` / `createGenerateTextAgent` / `getAgent` |
-| `RunJob { threadId, model }` | `RunJob { threadId, model, agent }` (missing `agent` → default handle) |
+| `RunJob { threadId, model }` | `RunJob { threadId, model, agent, tokenBudget }` (missing `agent` → default handle) |
 | `TokenUsage { model, promptTokens, completionTokens, costUSD }` | `{ agentId, inputTokens, cachedInputTokens, outputTokens }` — token attribution only; USD/credit pricing (spec §4) becomes a downstream concern computed over the recorded counters |
 
 Non-breaking rollout: ship `setupAgentCore` alongside `createAgentRuntime` (alias) for one minor, migrate the example app, then drop the old factory.
