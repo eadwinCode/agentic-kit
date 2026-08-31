@@ -463,6 +463,118 @@ export const POST = verifySignatureApprouter(async (req: NextRequest) => {
 
 Everything the route used to do by hand lives in the package: handle resolution (unknown agent → `{ accepted: false, reason: 'unknown-agent' }`), `tokenBudget` threading, and idempotency under at-least-once delivery (the per-thread run lock, §3.4). Only two concerns stay at the HTTP edge, where they belong: **signature verification** (QStash-specific transport trust) and **JSON parsing** (framework-specific).
 
+### 5.1 No-HTTP dispatch profile: Postgres
+
+For long-lived deployments (self-hosted Bun server, docker-compose), dispatch doesn't need HTTP at all — the job is a **row in Postgres**, the same database as the event log. Same `Queue` port, same `worker.handleJob` consumption:
+
+- **Dispatch = INSERT.** Durable by commit: a deploy or crash can never lose an accepted run.
+- **Wake-up = `pg_notify`.** Postgres's pub/sub is the *doorbell only* — fire-and-forget. Durable delivery comes from the row; a lost chime costs seconds of latency, never the job.
+- **Claim = `FOR UPDATE SKIP LOCKED`.** Exactly one worker per row, natively — multi-instance distributes rows with no coordination.
+- **Crash recovery = stale predicate.** A worker that died mid-run leaves its claim to age out and become claimable again.
+
+The job table (add to the reference schema, §2.4):
+
+```prisma
+model AgentJob {
+  id        BigInt    @id @default(autoincrement())
+  payload   Json                     // RunJob: { threadId, model, agent, tokenBudget }
+  runAt     DateTime  @default(now()) // visibility time (redrive backoff, §2.8)
+  pickedBy  String?                  // NULL = unclaimed
+  pickedAt  DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([runAt])
+}
+```
+
+Dispatch adapter (the `Queue` port):
+
+```typescript
+// src/adapters/postgres.ts
+import { randomUUID } from 'node:crypto';
+import type { RunJob } from '../core/types.js';
+import type { Queue } from '../ports/queue.js';
+
+const WORKER_ID = randomUUID();
+const STALE_AFTER_MS = 40 * 60_000; // must exceed the longest possible run —
+                                    // same rule as the run-lock lease (§2.8);
+                                    // covers parked HITL waits (§2.5)
+
+export class PostgresQueue implements Queue {
+  constructor(private readonly prisma: PrismaLike) {}
+
+  // Dispatch = INSERT (durable) + pg_notify (doorbell)
+  async enqueue(job: RunJob): Promise<void> {
+    await this.prisma.$executeRaw`
+      INSERT INTO agent_jobs (payload) VALUES (${JSON.stringify(job)}::jsonb)`;
+    await this.prisma.$executeRaw`SELECT pg_notify('agent_jobs', '')`;
+  }
+
+  /** Atomic claim — exactly one worker per row. A row claimed by a worker
+   *  that died becomes claimable again once its pick ages past STALE_AFTER_MS. */
+  async claim(): Promise<{ id: bigint; payload: RunJob } | null> {
+    const rows = await this.prisma.$queryRaw<
+      { id: bigint; payload: RunJob }[]
+    >`
+      UPDATE agent_jobs SET picked_by = ${WORKER_ID}, picked_at = now()
+      WHERE id = (
+        SELECT id FROM agent_jobs
+        WHERE picked_by IS NULL AND run_at <= now()
+        ORDER BY run_at
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+      )
+      RETURNING id, payload`;
+    return rows[0] ?? null;
+  }
+
+  async complete(id: bigint): Promise<void> {
+    await this.prisma.agentJob.delete({ where: { id } });
+  }
+
+  /** Release a row the worker could not finish — visible again after backoff */
+  async release(id: bigint, backoffMs: number): Promise<void> {
+    await this.prisma.$executeRaw`
+      UPDATE agent_jobs
+      SET picked_by = NULL, run_at = now() + (${backoffMs} || ' milliseconds')::interval
+      WHERE id = ${id}`;
+  }
+}
+```
+
+Consumption loop — claims a row, executes through `AgentCore`, no HTTP anywhere:
+
+```typescript
+// started once at boot (instrumentation.ts / lib/runtime.ts)
+export function startPostgresWorker(deps: RuntimePorts, opts?: { pollMs?: number }) {
+  const dispatch = new PostgresQueue(deps.storage['prisma']); // or a dedicated client
+  let running = true;
+
+  void (async () => {
+    while (running) {
+      const job = await dispatch.claim();
+      if (!job) {
+        await sleep(opts?.pollMs ?? 2_000); // fallback cadence; pg_notify wakes earlier
+        continue;
+      }
+      try {
+        // Engine: run lock + §2.8 policy + token budget (§5.6)
+        await runtime.worker.handleJob(job.payload);
+        await dispatch.complete(job.id);
+      } catch (err) {
+        // executeWithPolicy already applied the §2.8 policy — a throw here is
+        // a transport problem: release the row for stale-reclaim
+        await dispatch.release(job.id);
+      }
+    }
+  })();
+
+  return () => { running = false; };
+}
+```
+
+Guarantees, compared to the QStash profile: both are **at-least-once with idempotent consumption** (the engine's run lock makes double dispatch a no-op, §3.4). Differences: the Postgres profile needs a live worker process (it *is* your app process on a long-lived deployment), redrive backoff is a row update instead of a queue-level delay, and crash recovery ages out through the stale predicate instead of QStash redelivery. The §2.8 failure policy itself — redrive, exhausted → `FAILED`, never retry a stop — is identical in both.
+
 Backward compatibility: a job without `agent` dispatches to the **default handle** (`config.defaultAgent`, defaulting to the first registered `stream-text` agent).
 
 ---
