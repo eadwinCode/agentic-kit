@@ -7,22 +7,24 @@ import { THREAD_CHANNEL } from './upstash.js';
  *  satisfies it without importing the SDK here. Works against any Redis:
  *  local Docker, self-hosted, or managed. */
 export interface RedisClientLike {
-  connect(): Promise<void>;
-  get(key: string): Promise<string | null>;
-  set(key: string, value: string, opts?: { EX?: number; NX?: boolean }): Promise<unknown>;
-  del(...keys: string[]): Promise<unknown>;
-  incr(key: string): Promise<number>;
-  publish(channel: string, value: string): Promise<unknown>;
-  duplicate(): RedisSubscriberLike;
+  connect(): Promise<unknown>;
+  // node-redis exposes these commands as overloaded generic signatures. Keep
+  // the structural boundary permissive and normalize results in the adapter.
+  get: any;
+  set: any;
+  del: any;
+  incr: any;
+  publish: any;
+  duplicate(): any;
 }
 
 /** A dedicated connection for subscriptions (node-redis `client.duplicate()`). */
 export interface RedisSubscriberLike {
-  connect(): Promise<void>;
-  subscribe(channel: string, handler: (message: string) => void): Promise<void>;
-  unsubscribe(channel: string): Promise<unknown>;
-  quit(): Promise<unknown>;
-  on(event: string, handler: (...args: string[]) => void): unknown;
+  connect(): Promise<unknown>;
+  subscribe: any;
+  unsubscribe: any;
+  quit: any;
+  on: any;
 }
 
 /** Reference Kv adapter over plain Redis (node-redis). */
@@ -70,7 +72,7 @@ export class RedisBus implements EventBus {
   async subscribe(threadId: string, handler: (event: AgentEvent) => void) {
     const sub = this.client.duplicate();
     await sub.connect();
-    await sub.subscribe(THREAD_CHANNEL(threadId), (message) => {
+    await sub.subscribe(THREAD_CHANNEL(threadId), (message: string) => {
       try {
         handler(JSON.parse(message) as AgentEvent);
       } catch {

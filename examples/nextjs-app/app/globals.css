@@ -37,6 +37,48 @@ header h1 {
 .hint { color: var(--muted); margin: 0 0 20px; }
 .hint code { color: var(--accent); }
 
+.activity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 48px;
+  margin: 0 0 16px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(88, 166, 255, 0.06);
+}
+.activity-mark {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 10px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.activity div { display: flex; flex-direction: column; min-width: 0; }
+.activity strong { font-size: 13px; }
+.activity span:not(.activity-mark) {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.activity.loading .activity-mark,
+.activity.thinking .activity-mark,
+.activity.responding .activity-mark,
+.activity.tool-call .activity-mark,
+.activity.tool-result .activity-mark {
+  background: var(--accent);
+  animation: pulse 1.2s infinite;
+}
+.activity.waiting-input { border-color: var(--yellow); }
+.activity.waiting-input .activity-mark { background: var(--yellow); }
+.activity.completed .activity-mark { background: var(--green); }
+.activity.failed,
+.activity.stopped { border-color: rgba(248, 81, 73, 0.55); }
+.activity.failed .activity-mark,
+.activity.stopped .activity-mark { background: var(--red); }
+
 .dot {
   display: inline-block;
   width: 9px;
@@ -51,16 +93,37 @@ header h1 {
 
 @keyframes pulse { 50% { opacity: 0.35; } }
 
-.thread { display: flex; flex-direction: column; gap: 10px; }
+.thread { display: flex; flex-direction: column; gap: 12px; }
 .empty { color: var(--muted); }
 
+.message {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+.message.user { align-items: flex-end; }
+.message-role {
+  color: var(--muted);
+  padding: 0 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
 .bubble {
+  max-width: 88%;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 10px 14px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+.message.user .bubble {
+  background: rgba(88, 166, 255, 0.12);
+  border-color: rgba(88, 166, 255, 0.45);
 }
 
 .tool {

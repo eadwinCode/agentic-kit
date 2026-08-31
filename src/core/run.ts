@@ -1,5 +1,6 @@
 import type { RuntimePorts, RunInput, RunResult } from '../ports/runtime.js';
 import { reclaimIfOrphaned } from './reclaim.js';
+import { publish } from './publish.js';
 
 /** The §5.1 behavior: heal orphans → billing pre-check (§4) → persist the user
  *  message → state RUNNING (hot + durable) → enqueue on `agent-runs` (§2.8).
@@ -30,6 +31,9 @@ export async function run(deps: RuntimePorts, input: RunInput): Promise<RunResul
   await deps.storage.messages.append(threadId, { role: 'user', content: input.prompt });
   await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
   await deps.storage.threads.setState(threadId, 'RUNNING');
+  // A durable run boundary lets reconnecting clients distinguish this turn's
+  // in-flight chunks from earlier completed turns.
+  await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
 
   await deps.queue.enqueue({ threadId, model: input.model });
 

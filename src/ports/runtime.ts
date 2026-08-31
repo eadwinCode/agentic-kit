@@ -1,4 +1,10 @@
-import type { AgentEvent, AgentConfig, ExecutionState } from '../core/types.js';
+import type {
+  AgentEvent,
+  AgentConfig,
+  ExecutionState,
+  MessageDTO,
+  ThreadDTO,
+} from '../core/types.js';
 import type { Storage } from './storage.js';
 import type { EventBus } from './bus.js';
 import type { Queue } from './queue.js';
@@ -55,9 +61,20 @@ export interface RespondResult {
   error?: string;
 }
 
+/** Durable state used to hydrate a client before it starts live event replay. */
+export interface ThreadSnapshot {
+  thread: ThreadDTO;
+  messages: MessageDTO[];
+  /** Cursor for starting live replay without duplicating snapshot state. */
+  lastEventSeq: number;
+  /** Only the unfinished run's events, used to restore transient activity. */
+  activeEvents: AgentEvent[];
+}
+
 export interface AgentRuntime {
   run(input: RunInput): Promise<RunResult>;
   stop(threadId: string): Promise<StopResult>;
+  getThreadSnapshot(threadId: string): Promise<ThreadSnapshot | null>;
   hitl: {
     respond(input: RespondInput): Promise<RespondResult>;
     reclaimIfOrphaned(threadId: string): Promise<boolean>;

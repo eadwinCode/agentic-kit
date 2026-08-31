@@ -20,9 +20,11 @@ export async function GET(req: NextRequest) {
     async start(controller) {
       let lastSeq = since;
       let live = false;
+      let closed = false;
       const buffer: AgentEvent[] = [];
 
       const send = (e: AgentEvent) => {
+        if (closed) return;
         if (e.seq !== 0) lastSeq = e.seq;
         controller.enqueue(encoder.encode(`id: ${e.seq}\ndata: ${JSON.stringify(e)}\n\n`));
       };
@@ -53,11 +55,19 @@ export async function GET(req: NextRequest) {
       }
 
       req.signal.addEventListener('abort', () => {
+        if (closed) return;
+        closed = true;
         void (async () => {
           await unsubscribe();
-          controller.close();
+          // The runtime may already have closed the controller when the
+          // browser disconnected; cleanup must never become an unhandled error.
+          try {
+            controller.close();
+          } catch {
+            // already closed
+          }
         })();
-      });
+      }, { once: true });
     },
   });
 

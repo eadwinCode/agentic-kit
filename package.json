@@ -50,7 +50,8 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
     "test": "bun test",
-    "prepublishOnly": "bun run typecheck && bun run build"
+    "prepublishOnly": "bun run typecheck && bun run build",
+    "prepare": "bun run build"
   },
   "engines": {
     "bun": ">=1.1.0"

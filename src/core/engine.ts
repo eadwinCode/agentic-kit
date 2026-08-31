@@ -128,6 +128,14 @@ export async function execute(
         await publish(deps, threadId, 'CHUNK', chunk);
       },
       onFinish: async ({ usage, finishReason, response }) => {
+        // Some OpenAI-compatible providers omit streaming usage. The AI SDK
+        // represents those counters as NaN; never let optional metering keep a
+        // successfully completed run stuck in RUNNING.
+        const promptTokens = Number.isFinite(usage.promptTokens) ? usage.promptTokens : 0;
+        const completionTokens = Number.isFinite(usage.completionTokens)
+          ? usage.completionTokens
+          : 0;
+
         // Persist the completed assistant turn(s) — including tool calls and
         // tool results — BEFORE the state transition, so redrives, HITL
         // resumes, and replay always see a valid history (§2.2, §2.8)
@@ -146,18 +154,18 @@ export async function execute(
             : 'completed';
 
         // Unpriced models are marked, never silently mispriced (§4)
-        const costUSD = calculateCost(deps, resolved, usage.promptTokens, usage.completionTokens);
+        const costUSD = calculateCost(deps, resolved, promptTokens, completionTokens);
         if (costUSD === null) {
           await publish(deps, threadId, 'BILLING_UNPRICED', {
             model: resolved,
-            promptTokens: usage.promptTokens,
-            completionTokens: usage.completionTokens,
+            promptTokens,
+            completionTokens,
           });
         }
         await deps.storage.usage.record(threadId, {
           model: resolved,
-          promptTokens: usage.promptTokens,
-          completionTokens: usage.completionTokens,
+          promptTokens,
+          completionTokens,
           costUSD: costUSD ?? 0,
         });
         await deps.kv.set(`agent:state:${threadId}`, finalState);
@@ -166,7 +174,12 @@ export async function execute(
       },
     });
 
-    await result.text; // keep the worker invocation alive until the stream drains
+    // streamText is lazy: its completion promises only resolve while one of
+    // its streams is being consumed. Drain the full stream so chunk/finish
+    // callbacks run, while still propagating provider errors to retry policy.
+    for await (const _part of result.fullStream) {
+      // All processing happens in onChunk/onFinish above.
+    }
     return 'executed';
   } finally {
     clearInterval(controlPoll);

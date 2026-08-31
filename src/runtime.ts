@@ -8,6 +8,7 @@ import type {
   RunResult,
   RuntimeOptions,
   StopResult,
+  ThreadSnapshot,
 } from './ports/runtime.js';
 import { execute, executeWithPolicy } from './core/engine.js';
 import { reclaimIfOrphaned } from './core/reclaim.js';
@@ -30,6 +31,31 @@ export function createAgentRuntime(opts: RuntimeOptions): AgentRuntime {
   return {
     run: (input: RunInput): Promise<RunResult> => run(deps, input),
     stop: (threadId: string): Promise<StopResult> => stop(deps, threadId),
+    getThreadSnapshot: async (threadId: string): Promise<ThreadSnapshot | null> => {
+      const thread = await deps.storage.threads.get(threadId);
+      if (!thread) return null;
+      const [messages, events] = await Promise.all([
+        deps.storage.messages.list(threadId),
+        deps.storage.events.listSince(threadId, -1),
+      ]);
+      const lastEventSeq = events.at(-1)?.seq ?? -1;
+      let activeEvents: AgentEvent[] = [];
+      if (thread.state === 'RUNNING' || thread.state === 'WAITING_FOR_INPUT') {
+        let boundary = -1;
+        for (let index = events.length - 1; index >= 0; index -= 1) {
+          const event = events[index];
+          if (
+            event.type === 'STATE_CHANGE' &&
+            (event.payload as { state?: string } | null)?.state === 'RUNNING'
+          ) {
+            boundary = index;
+            break;
+          }
+        }
+        activeEvents = events.slice(Math.max(0, boundary));
+      }
+      return { thread, messages, lastEventSeq, activeEvents };
+    },
     hitl: {
       respond: (input: RespondInput): Promise<RespondResult> => {
         // Heal an orphaned wait first — if reclamation claims the thread, the

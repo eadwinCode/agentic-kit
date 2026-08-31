@@ -11,11 +11,11 @@ export interface PrismaLike {
     updateMany(a: { where: { id: string; state: ExecutionState }; data: { state: ExecutionState } }): Promise<{ count: number }>;
   };
   message: {
-    create(a: { data: { threadId: string; agentId?: string | null; role: string; content: unknown } }): Promise<MessageDTO>;
-    findMany(a: { where: { threadId: string }; orderBy: { createdAt: 'asc' } }): Promise<MessageDTO[]>;
+    create(a: { data: { threadId: string; agentId?: string | null; role: string; content: any } }): Promise<any>;
+    findMany(a: { where: { threadId: string }; orderBy: { createdAt: 'asc' } }): Promise<any[]>;
   };
   agentEvent: {
-    create(a: { data: { threadId: string; seq: number; type: string; payload: unknown } }): Promise<unknown>;
+    create(a: { data: { threadId: string; seq: number; type: string; payload: any } }): Promise<unknown>;
     findMany(a: { where: { threadId: string; seq?: { gt: number } }; orderBy: { seq: 'asc' } }): Promise<AgentEvent[]>;
     findFirst(a: { where: { threadId: string; type: string }; orderBy: { seq: 'desc' } }): Promise<AgentEvent | null>;
   };

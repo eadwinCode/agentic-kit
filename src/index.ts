@@ -12,6 +12,7 @@ export type {
   StopResult,
   RespondInput,
   RespondResult,
+  ThreadSnapshot,
 } from './ports/runtime.js';
 export { createAgentRuntime } from './runtime.js';
 

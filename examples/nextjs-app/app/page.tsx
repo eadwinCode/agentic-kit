@@ -13,10 +13,21 @@ const stateLabel: Record<string, string> = {
 };
 
 export default function Page() {
-  const { threadId, entries, agentState, pendingInput, subagents, run, stop, respondToInput } =
-    useAgentThread();
+  const {
+    threadId,
+    entries,
+    agentState,
+    activity,
+    historyLoading,
+    pendingInput,
+    subagents,
+    run,
+    stop,
+    respondToInput,
+  } = useAgentThread();
   const [prompt, setPrompt] = useState('');
-  const busy = agentState === 'RUNNING' || agentState === 'WAITING_FOR_INPUT';
+  const busy =
+    historyLoading || agentState === 'RUNNING' || agentState === 'WAITING_FOR_INPUT';
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -43,16 +54,29 @@ export default function Page() {
         </p>
       </header>
 
+      {(threadId || activity.phase !== 'idle') && (
+        <section className={`activity ${activity.phase}`} aria-live="polite">
+          <span className="activity-mark" aria-hidden="true" />
+          <div>
+            <strong>{activity.label}</strong>
+            {activity.detail && <span>{activity.detail}</span>}
+          </div>
+        </section>
+      )}
+
       <section className="thread">
-        {entries.length === 0 && <p className="empty">No events yet.</p>}
-        {entries.map((e, i) =>
+        {entries.length === 0 && (
+          <p className="empty">{historyLoading ? 'Loading previous messages…' : 'No messages yet.'}</p>
+        )}
+        {entries.map((e) =>
           e.kind === 'tool' ? (
-            <p key={i} className="tool">
+            <p key={e.id} className="tool">
               {e.text}
             </p>
           ) : (
-            <div key={i} className="bubble">
-              {e.text}
+            <div key={e.id} className={`message ${e.role}`}>
+              <span className="message-role">{e.role === 'user' ? 'You' : 'Agent'}</span>
+              <div className="bubble">{e.text}</div>
             </div>
           ),
         )}
@@ -94,7 +118,7 @@ export default function Page() {
         <input
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
-          placeholder={busy ? 'run in progress…' : 'Ask the agent something…'}
+          placeholder={historyLoading ? 'loading conversation…' : busy ? 'run in progress…' : 'Ask the agent something…'}
           disabled={busy}
         />
         <button type="submit" disabled={busy || !prompt.trim()}>

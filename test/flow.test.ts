@@ -186,6 +186,20 @@ describe('runtime.events (§2.2)', () => {
   });
 });
 
+describe('runtime.getThreadSnapshot', () => {
+  it('hydrates durable thread state, messages, and the replay cursor source', async () => {
+    const { deps, runtime } = makeDeps();
+    const ran = await runtime.run({ prompt: 'remember me', model: 'gpt-4o' });
+
+    const snapshot = await runtime.getThreadSnapshot(ran.threadId);
+    expect(snapshot?.thread.id).toBe(ran.threadId);
+    expect(snapshot?.messages.map((message) => message.content)).toEqual(['remember me']);
+    expect(snapshot?.lastEventSeq).toBe(1);
+    expect(snapshot?.activeEvents.map((event) => event.seq)).toEqual([1]);
+    expect(await runtime.getThreadSnapshot('missing')).toBeNull();
+  });
+});
+
 describe('contextBudget (§2.6)', () => {
   it('caps everything at the 265k ceiling but keeps smaller native windows', () => {
     const { deps } = makeDeps();

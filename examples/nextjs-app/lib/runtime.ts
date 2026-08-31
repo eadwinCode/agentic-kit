@@ -4,6 +4,7 @@ import { PrismaClient } from '@prisma/client';
 import {
   createAgentRuntime,
   PrismaStorage,
+  QStashQueue,
   RedisBus,
   RedisKv,
 } from '@agent/core';
