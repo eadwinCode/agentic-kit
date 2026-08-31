@@ -59,7 +59,7 @@ export interface ResolvedModel {
 }
 ```
 
-`createAgentRuntime` remains as a deprecated alias for `setupAgentCore` for one minor release. Registration accepts either a bare `LanguageModel` (normalized to `{ instance: () => it }`) or a full `ResolvedModel` with a declared `contextWindow`.
+`createAgentRuntime` remains as a deprecated alias for `setupAgentCore` for one minor release. There is **no models registry** on the options — the consumer supplies `resolveModel(modelName)` and models can live in any shape on their side.
 
 ### 2.1 `ThreadSnapshot`
 
@@ -117,6 +117,20 @@ export interface AgentHandle {
 ```
 
 `StreamTextAgent` and `GenerateTextAgent` are both `AgentHandle`; they differ only in what `execute()` invokes and in the accepted `spec.args`.
+
+```typescript
+// ports/runtime.ts
+export interface RunInput {
+  /** Omit to create a fresh thread first (threads.create, §3.2) */
+  threadId?: string;
+  prompt: string;
+  model: string;
+  /** Max cumulative tokens (input + output) for this run — overrides
+   *  spec.tokenBudget / config (§2.1 safety cap). Flows to the worker
+   *  via RunJob.tokenBudget. */
+  tokenBudget?: number;
+}
+```
 
 ### 3.1 Spec types
 
@@ -345,21 +359,19 @@ export async function finalize(
 
   // Some providers omit streaming usage — the SDK reports NaN for those.
   // Never let optional metering keep a completed run stuck in RUNNING.
-  const inputTokens = Number.isFinite(u.inputTokens) ? u.inputTokens
-    : Number.isFinite(u.promptTokens) ? u.promptTokens : 0;
-  const cachedInputTokens = Number.isFinite(u.cachedInputTokens)
-    ? u.cachedInputTokens : 0;                         // not all providers report cache hits
-  const outputTokens = Number.isFinite(u.outputTokens) ? u.outputTokens
-    : Number.isFinite(u.completionTokens) ? u.completionTokens : 0;
+  // Token attribution is TOTAL TOKENS USED — input + cached + output.
+  const totalTokens = countTokens(u);
 
   // Persist the completed assistant turn(s) — including tool calls and tool
   // results — BEFORE the state transition (§2.2, §2.8). On a budget-broken
   // run the recorded usage is partial by definition: the budget was spent.
+  await deps.storage.messages.append(threadId, { /* response.messages, §5.6 */ });
+
+  // Token attribution: total tokens used — that is all (§4 pricing is
+  // downstream over these counters, if ever needed)
   await deps.storage.usage.record(threadId, {
     agentId: agent.name,
-    inputTokens,
-    cachedInputTokens,
-    outputTokens,
+    totalTokens,
   });
 
   // Stop classification (§2.1). A budget break is NOT a user stop — the run
@@ -379,14 +391,14 @@ export async function finalize(
   });
 }
 
-/** NaN-guarded billable count: input + output. cachedInputTokens are a
- *  subset of input on providers that report them — not counted twice. */
+/** Total tokens used — input + cached + output, NaN-guarded. Providers that
+ *  omit streaming usage report NaN; optional metering must never keep a
+ *  completed run stuck in RUNNING. */
 function countTokens(usage: LanguageModelUsage): number {
-  const input = Number.isFinite(usage.inputTokens) ? usage.inputTokens
-    : Number.isFinite(usage.promptTokens) ? usage.promptTokens : 0;
-  const output = Number.isFinite(usage.outputTokens) ? usage.outputTokens
-    : Number.isFinite(usage.completionTokens) ? usage.completionTokens : 0;
-  return input + output;
+  const pick = (v: number | undefined) => (Number.isFinite(v) ? v : 0);
+  return pick(usage.inputTokens ?? usage.promptTokens)
+       + pick(usage.cachedInputTokens)
+       + pick(usage.outputTokens ?? usage.completionTokens);
 }
 ```
 
@@ -456,21 +468,32 @@ const agent = setupAgentCore({
   bus: new RedisBus(redis),
   queue: new QStashQueue(client, { url: `${APP_URL}/api/queue/agent-run` }),
   kv: new UpstashKv(redis),
-  models: {
-    // Bare provider instance — normalized to { instance: () => it }
-    'gpt-4o': createOpenAI({ apiKey: OPENAI_KEY })('gpt-4o'),
 
-    // Full ResolvedModel — declaring contextWindow feeds §2.6 compaction
-    'claude-3-5-sonnet': {
-      instance: () => createAnthropic({ apiKey: ANTHROPIC_KEY })('claude-3-5-sonnet-20240620'),
-      contextWindow: 200_000,
-    },
-    'deepseek-chat': {
-      instance: () => createDeepSeek({ apiKey: DEEPSEEK_KEY })('deepseek-chat'),
-      contextWindow: 128_000,
-    },
+  // Models can come in any shape — config files, a database, a hardcoded
+  // map, provider SDKs. The platform only ever sees the resolved result:
+  // { instance, contextWindow }.
+  resolveModel: (modelName) => {
+    const m = MY_MODELS[modelName];               // your shape, your lookup
+    if (!m) throw new Error(`Unknown model: ${modelName}`);
+    return {
+      instance: () => m.create(),                 // the real model object, lazily
+      contextWindow: m.contextWindow,             // feeds §2.6 compaction
+    };
   },
 });
+
+// anywhere on your side — models are plain provider instances in your shape:
+const MY_MODELS = {
+  'gpt-4o': {
+    provider: () => createOpenAI({ apiKey: OPENAI_KEY })('gpt-4o'),
+    contextWindow: 128_000,
+  },
+  'deepseek-chat': {
+    provider: () => createDeepSeek({ apiKey: DEEPSEEK_KEY })('deepseek-chat'),
+    contextWindow: 128_000,
+  },
+};
+```
 
 // A streaming chat agent — model pinned at the spec level, overridable per run
 const chat = agent.createStreamTextAgent({
@@ -512,11 +535,11 @@ await chat.stop(threadId);
 | `runtime.engine.execute(input)` | `handle.execute(input)` → returns `'executed' \| 'lock-conflict'` |
 | `runtime.engine.executeWithPolicy(input)` | `handle.executeWithPolicy(input, policy?)` |
 | `runtime.hitl` / `runtime.events` | unchanged on `AgentCore` |
-| — new — | `AgentCore.resolveModel(key)` → `ResolvedModel { instance, contextWindow }` — models registered as bare `LanguageModel` or full `ResolvedModel` |
+| — new — | `AgentCore.resolveModel(key)` → `ResolvedModel { instance, contextWindow }` — **user-provided function**: models can live in any shape on the consumer side |
 | — new — | `runtime.getThreadSnapshot(threadId)` |
 | — new — | `runtime.createStreamTextAgent` / `createGenerateTextAgent` / `getAgent` |
 | `RunJob { threadId, model }` | `RunJob { threadId, model, agent, tokenBudget }` (missing `agent` → default handle) |
-| `TokenUsage { model, promptTokens, completionTokens, costUSD }` | `{ agentId, inputTokens, cachedInputTokens, outputTokens }` — token attribution only; USD/credit pricing (spec §4) becomes a downstream concern computed over the recorded counters |
+| `TokenUsage { model, promptTokens, completionTokens, costUSD }` | `{ agentId, totalTokens }` — total tokens used; USD/credit pricing (spec §4) becomes a downstream concern computed over the recorded counters |
 
 Non-breaking rollout: ship `setupAgentCore` alongside `createAgentRuntime` (alias) for one minor, migrate the example app, then drop the old factory.
 
