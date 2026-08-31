@@ -7,7 +7,9 @@ import type { Kv } from '../ports/kv.js';
 const id = () => Math.random().toString(36).slice(2, 12);
 interface MemEntry { value: string; expiresAt?: number }
 
-/** In-memory Kv — tests and local prototyping. Expiry is enforced lazily on read. */
+/** In-memory Kv — tests and local prototyping. Expiry is enforced lazily on
+ *  read; incr is synchronous internally, so concurrent callers can never
+ *  collide on the same counter (§3.4). */
 export class MemoryKv implements Kv {
   private m = new Map<string, MemEntry>();
   async get(key: string) {
@@ -16,13 +18,23 @@ export class MemoryKv implements Kv {
     if (e.expiresAt && e.expiresAt < Date.now()) { this.m.delete(key); return null; }
     return e.value;
   }
-  async set(key: string, value: string, opts?: { exSeconds?: number }) {
-    this.m.set(key, { value, expiresAt: opts?.exSeconds ? Date.now() + opts.exSeconds * 1000 : undefined });
+  async set(key: string, value: string, opts?: { exSeconds?: number; onlyIfNotExists?: boolean }) {
+    if (opts?.onlyIfNotExists) {
+      const existing = this.m.get(key);
+      if (existing && !(existing.expiresAt && existing.expiresAt < Date.now())) return false;
+    }
+    this.m.set(key, {
+      value,
+      expiresAt: opts?.exSeconds ? Date.now() + opts.exSeconds * 1000 : undefined,
+    });
+    return true;
   }
   async del(key: string) { this.m.delete(key); }
   async incr(key: string) {
-    const n = Number((await this.get(key)) ?? 0) + 1;
-    await this.set(key, String(n));
+    // No awaits between read and write — atomic within the event loop
+    const e = this.m.get(key);
+    const n = Number(e?.value ?? 0) + 1;
+    this.m.set(key, { value: String(n), expiresAt: e?.expiresAt });
     return n;
   }
 }

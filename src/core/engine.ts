@@ -4,11 +4,15 @@ import { z } from 'zod';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { ExecutionState } from './types.js';
 import { compactContext } from './context.js';
+import { calculateCost } from './billing.js';
 import { MAX_CONCURRENT_SUBAGENTS, Semaphore, spawnSubagentTool } from './subagent.js';
 import { suspendForApproval, type SuspendInput } from './hitl.js';
 import { publish } from './publish.js';
 
 export { publish, publishNotice } from './publish.js';
+export { calculateCost } from './billing.js';
+
+const runLockKey = (threadId: string) => `agent:lock:${threadId}`;
 
 /** Tools the engine treats as destructive: parked behind suspendForApproval
  *  (§2.5) instead of executing directly. Purely a marker — see withHitl. */
@@ -46,13 +50,23 @@ function withHitl(deps: RuntimePorts, threadId: string, tools: Record<string, an
 }
 
 /** The engine (§2.1, §5.6). Worker-side only — runs are dispatched via the
- *  queue (§2.8) and may outlive any HTTP response. */
+ *  queue (§2.8) and may outlive any HTTP response.
+ *
+ *  Concurrency: acquires the per-thread run lock (`agent:lock:{threadId}`,
+ *  SET NX + lease) before any work — two workers can never run one thread,
+ *  and a crashed worker's lock expires instead of blocking forever (§3.4). */
 export async function execute(
   deps: RuntimePorts,
   input: { threadId: string; model: string },
 ): Promise<void> {
   const { threadId, model } = input;
   const abort = new AbortController();
+
+  const locked = await deps.kv.set(runLockKey(threadId), randomUUID(), {
+    onlyIfNotExists: true,
+    exSeconds: deps.config.runLockLeaseSeconds,
+  });
+  if (!locked) return; // another worker owns this thread — at-least-once dispatch (§2.8)
 
   // One signal, one behavior: the moment the state key reads CANCELLED —
   // the user pressed stop (§2.1) — everything tears down immediately.
@@ -107,7 +121,17 @@ export async function execute(
         // One canonical path for every client: durable log + live Pub/Sub (§2.1, §2.2)
         await publish(deps, threadId, 'CHUNK', chunk);
       },
-      onFinish: async ({ usage, finishReason }) => {
+      onFinish: async ({ usage, finishReason, response }) => {
+        // Persist the completed assistant turn(s) — including tool calls and
+        // tool results — BEFORE the state transition, so redrives, HITL
+        // resumes, and replay always see a valid history (§2.2, §2.8)
+        for (const message of response.messages) {
+          await deps.storage.messages.append(threadId, {
+            role: message.role,
+            content: message.content,
+          });
+        }
+
         const finalState: ExecutionState = abort.signal.aborted ? 'CANCELLED' : 'COMPLETED';
         const stopReason = abort.signal.aborted
           ? 'cancelled'
@@ -115,11 +139,20 @@ export async function execute(
             ? 'max_steps' // safety cap hit (§2.1)
             : 'completed';
 
+        // Unpriced models are marked, never silently mispriced (§4)
+        const costUSD = calculateCost(deps, model, usage.promptTokens, usage.completionTokens);
+        if (costUSD === null) {
+          await publish(deps, threadId, 'BILLING_UNPRICED', {
+            model,
+            promptTokens: usage.promptTokens,
+            completionTokens: usage.completionTokens,
+          });
+        }
         await deps.storage.usage.record(threadId, {
           model,
           promptTokens: usage.promptTokens,
           completionTokens: usage.completionTokens,
-          costUSD: calculateCost(model, usage.promptTokens, usage.completionTokens),
+          costUSD: costUSD ?? 0,
         });
         await deps.kv.set(`agent:state:${threadId}`, finalState);
         await deps.storage.threads.setState(threadId, finalState);
@@ -130,11 +163,13 @@ export async function execute(
     await result.text; // keep the worker invocation alive until the stream drains
   } finally {
     clearInterval(controlPoll);
+    await deps.kv.del(runLockKey(threadId)); // release — success, failure, or stop
   }
 }
 
 /** §2.8 failure policy: transient errors redrive through the queue; exhausted
- *  attempts finalize FAILED. A user stop is never retried. */
+ *  attempts finalize FAILED (hot cache + durable). A user stop is never
+ *  retried, and a successful run resets the attempt counter. */
 export async function executeWithPolicy(
   deps: RuntimePorts,
   input: { threadId: string; model: string },
@@ -143,6 +178,8 @@ export async function executeWithPolicy(
   const maxAttempts = policy?.maxAttempts ?? deps.config.runMaxAttempts;
   try {
     await execute(deps, input);
+    // Success resets the retry budget — past failures must not count forever
+    await deps.kv.del(`agent:attempts:${input.threadId}`);
   } catch (err) {
     // A user stop already finalized the thread — never retry a stop
     if ((await deps.kv.get(`agent:state:${input.threadId}`)) === 'CANCELLED') return;
@@ -152,19 +189,11 @@ export async function executeWithPolicy(
       return deps.queue.enqueue({ threadId: input.threadId, model: input.model });
     }
 
+    // Attempts exhausted: finalize FAILED on BOTH the hot cache and durable
+    // truth, or subsequent runs would still treat the thread as active (§2.1)
+    await deps.kv.set(`agent:state:${input.threadId}`, 'FAILED');
     await deps.storage.threads.setState(input.threadId, 'FAILED');
     await publish(deps, input.threadId, 'STATE_CHANGE', { state: 'FAILED' });
     await deps.kv.del(`agent:attempts:${input.threadId}`);
   }
-}
-
-function calculateCost(model: string, promptTokens: number, completionTokens: number): number {
-  // Simplified pricing calculation logic (§4) — override via billing hooks if needed
-  const rates: Record<string, { prompt: number; completion: number }> = {
-    'gpt-4o': { prompt: 0.0000025, completion: 0.00001 },
-    'gpt-4o-mini': { prompt: 0.00000015, completion: 0.0000006 },
-    'claude-3-5-sonnet': { prompt: 0.000003, completion: 0.000015 },
-  };
-  const rate = rates[model] ?? rates['gpt-4o'];
-  return promptTokens * rate.prompt + completionTokens * rate.completion;
 }

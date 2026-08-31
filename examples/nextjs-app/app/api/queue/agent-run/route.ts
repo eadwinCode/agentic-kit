@@ -7,14 +7,16 @@ import { runtime } from '@/lib/runtime';
 // execution leash: runs — including parked HITL waits — outlive this HTTP
 // response inside the worker. executeWithPolicy redrives transient failures
 // and finalizes FAILED when attempts are exhausted.
-export async function POST(req: NextRequest) {
-  if (!(await verifySignatureApprouter(req))) {
-    return new NextResponse('invalid signature', { status: 401 });
-  }
+async function handler(req: NextRequest) {
   const { threadId, model } = await req.json();
 
   waitUntil(runtime.engine.executeWithPolicy({ threadId, model }));
 
-  // Ack immediately — at-least-once delivery; double dispatch is a no-op (§3.4)
+  // Ack immediately. Delivery is at-least-once, so double dispatch is possible;
+  // the per-thread run lock (§3.4) makes it a no-op.
   return NextResponse.json({ accepted: true });
 }
+
+// Signature verification WRAPS the handler — only genuine QStash deliveries
+// ever reach the runtime (§2.8).
+export const POST = verifySignatureApprouter(handler);

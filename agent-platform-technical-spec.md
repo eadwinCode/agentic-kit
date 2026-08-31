@@ -274,6 +274,7 @@ export async function suspendForApproval(deps: RuntimePorts, i: {
   const { threadId, toolCallId, toolName, ttlMs, signal } = i;
 
   await deps.kv.set(`agent:state:${threadId}`, 'WAITING_FOR_INPUT');
+  await deps.storage.threads.setState(threadId, 'WAITING_FOR_INPUT'); // durable truth (§3.4)
   await publish(deps, threadId, 'INPUT_REQUIRED', {
     toolCallId, toolName, agentId: i.agentId, arguments: i.args, inputSchema: i.inputSchema,
   });
@@ -281,26 +282,24 @@ export async function suspendForApproval(deps: RuntimePorts, i: {
 
   const response = await waitForEvent(deps, toolCallId, { ttlMs, signal });
 
-  if (signal.aborted) throw new Error('EXECUTION_CANCELLED'); // stop during the wait (§2.1)
-
-  await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
-  await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
-
   if (!response) {
-    // TTL expired: the user had no response — the action is cancelled and the
-    // AI is told, so it decides what to do next
-    await deps.storage.messages.append(threadId, {
-      role: 'tool',
-      content: { toolCallId, result: { responded: false, cancelled: true, reason: 'timeout' } },
-    });
+    if (signal.aborted) return null; // stop during the wait (§2.1) — engine tears down
+
+    // TTL expired: flip the thread back to RUNNING and publish; the timeout
+    // tool result itself is recorded by the SDK in response.messages and
+    // persisted at finish (§5.6) — no manual append here.
+    await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
+    await deps.storage.threads.setState(threadId, 'RUNNING');
+    await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
     await publish(deps, threadId, 'INPUT_EXPIRED', { toolCallId });
     return { responded: false, cancelled: true, reason: 'timeout' };
   }
 
-  await deps.storage.messages.append(threadId, {
-    role: 'tool',
-    content: { toolCallId, result: response.approved ? response.payload : { denied: true } },
-  });
+  await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
+  await deps.storage.threads.setState(threadId, 'RUNNING');
+  await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
+  // The SDK records the tool result (approved payload / { denied: true }) in
+  // response.messages; the engine persists it at finish (§5.6).
   return response;
 }
 ```
@@ -489,11 +488,12 @@ export async function compactContext(deps: RuntimePorts, threadId: string, model
   });
 
   // Compaction is an LLM call, so it is billed like any other (§4)
+  const costUSD = calculateCost(deps, 'gpt-4o-mini', usage.promptTokens ?? 0, usage.completionTokens ?? 0);
   await deps.storage.usage.record(threadId, {
     model: 'gpt-4o-mini',
     promptTokens: usage.promptTokens ?? 0,
     completionTokens: usage.completionTokens ?? 0,
-    costUSD: 0, // price via calculateCost()
+    costUSD: costUSD ?? 0,
   });
   await publish(deps, threadId, 'CONTEXT_COMPACTED', { summarizedMessages: older.length });
 
@@ -659,7 +659,7 @@ catch (err) {
 Every top-level run is dispatched through a durable message queue (QStash-style HTTP queues; Inngest works equally well). The queue is the backbone between the API and the engine:
 
 - **Dispatch:** `/api/agent/run` never executes anything — it validates, persists the user message, marks the thread `RUNNING`, enqueues `{ threadId, model }` on the `agent-runs` queue, and returns `202 Accepted`. A deploy can never strand an accepted request: the job is already durable.
-- **Consumer:** a signature-verified worker route (`/api/queue/agent-run`, §5.6) consumes the queue. The message is a **dispatch ticket, not an execution leash** — the worker acknowledges immediately and runs the engine via `waitUntil`, so runs (including parked HITL waits, §2.5) outlive any single HTTP response inside the long-running worker runtime.
+- **Consumer:** a signature-verified worker route (`/api/queue/agent-run`, §5.6) consumes the queue. The message is a **dispatch ticket, not an execution leash** — the worker acknowledges immediately and runs the engine via `waitUntil`, so runs (including parked HITL waits, §2.5) outlive any single HTTP response inside the long-running worker runtime. Before any work, the engine acquires the **per-thread run lock** (`agent:lock:{threadId}`, `SET NX` + lease via `kv.set`): a redelivered job or second worker finds the lock held and exits, and a crashed worker's lock expires instead of blocking forever.
 - **At-least-once delivery:** queues redeliver, so consumers must be idempotent. Double dispatch is already a no-op: the state guard plus the §6.1 Redlock mean a second worker finds the thread busy and exits.
 - **Failure policy:** transient failures (provider 5xx, network) are re-enqueued with exponential backoff, tracked by an attempt counter in Redis (max 3). Exhausted attempts finalize the thread `FAILED` with a `STATE_CHANGE` event instead of retrying forever. A user stop (`CANCELLED`) is never retried.
 - **Flow control:** queue-level concurrency limits (e.g., QStash flow control) cap total concurrent runs platform-wide — in addition to the per-thread lock (§6.1) and the per-run subagent semaphore (§2.7). HITL reclamation (§2.5) re-enqueues the same message, so healed threads re-enter through the identical path.
@@ -799,8 +799,9 @@ The engine's correctness depends on adapters honoring these contracts:
 2. **`claimState` must be atomic** (a single conditional `UPDATE` or equivalent). HITL reclamation and double-dispatch protection rely on exactly one caller winning.
 3. **`queue.enqueue` is at-least-once; the engine is idempotent.** The state guard + `claimState` make double dispatch a no-op — adapters must not drop jobs to "help".
 4. **`bus` is at-most-once.** The §2.5 death-notice/heartbeat/watchdog pattern exists because pub/sub drops; stronger buses may simplify the heartbeat, but reclamation stays.
-5. **Two state homes, one truth:** durable thread state lives in `storage.threads`; the kv copy (`agent:state:{threadId}`) is a hot cache the engine polls (500 ms). Behavior functions write both; the durable copy decides recovery.
+5. **Two state homes, one truth:** durable thread state lives in `storage.threads`; the kv copy (`agent:state:{threadId}`) is a hot cache the engine polls (500 ms). Behavior functions write both — including terminal transitions like `FAILED` — and the durable copy decides recovery.
 6. **No vendor on the core path:** `core/` imports nothing from `adapters/`; adapters never import each other's clients.
+7. **Run lock:** `engine.execute` begins by acquiring `agent:lock:{threadId}` via `kv.set` with `onlyIfNotExists` (SET NX) and a lease (`runLockLeaseSeconds`) — queued→running is thus atomic, double dispatch is a no-op, and a crashed worker's lock self-expires. The lock is released in a `finally`.
 
 ---
 
@@ -822,7 +823,7 @@ $$\text{Credits Used} = (\text{Prompt Tokens} \times \text{Multiplier}_{\text{pr
 
 1. **Pre-execution Check:** Ensure user balance >= Threshold (e.g., minimum 10 Credits).
 2. **Streaming Counter:** Count incoming tokens during the Stream using `onFinish` hooks provided by `streamText`.
-3. **Deduction:** Atomically decrement user credit balance in PostgreSQL/Stripe Metered Billing upon step or stream completion.
+3. **Deduction:** Atomically decrement user credit balance in PostgreSQL/Stripe Metered Billing upon step or stream completion. Per-model rates come from `config.billingRates` merged over built-in defaults (GPT-4o, GPT-4o-mini, Claude 3.5 Sonnet, Gemini 1.5 Pro). A model with **no configured rate records cost 0 and publishes a `BILLING_UNPRICED` warning event** — it is never silently priced at another model's rate.
 
 ---
 
@@ -1092,13 +1093,17 @@ async function runSubagent(opts: SubagentCtx & {
       await publish(ports, threadId, 'SUBAGENT_CHUNK', { agentId, chunk });
     },
     onFinish: async ({ usage }) => {
-      // Billing attribution per subagent (§4)
+      // Billing attribution per subagent (§4) — unpriced models are marked
+      const costUSD = calculateCost(ports, model, usage.promptTokens, usage.completionTokens);
+      if (costUSD === null) {
+        await publish(ports, threadId, 'BILLING_UNPRICED', { agentId, model });
+      }
       await ports.storage.usage.record(threadId, {
         agentId,
         model,
         promptTokens: usage.promptTokens,
         completionTokens: usage.completionTokens,
-        costUSD: 0, // price via calculateCost()
+        costUSD: costUSD ?? 0,
       });
     },
   });
@@ -1116,11 +1121,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { waitUntil } from '@vercel/functions';
 import { runtime } from '@/lib/runtime';
 
-export async function POST(req: NextRequest) {
-  // QStash signs every delivery — reject anything else
-  if (!(await verifySignatureApprouter(req))) {
-    return new NextResponse('invalid signature', { status: 401 });
-  }
+async function handler(req: NextRequest) {
   const { threadId, model } = await req.json();
 
   // The message is a dispatch ticket, not an execution leash: runs — including
@@ -1129,18 +1130,27 @@ export async function POST(req: NextRequest) {
   waitUntil(runtime.engine.executeWithPolicy({ threadId, model }));
 
   // Ack immediately. Delivery is at-least-once, so double dispatch is possible;
-  // the state guard + §3.4 CAS make it a no-op.
+  // the per-thread run lock (§3.4) makes it a no-op.
   return NextResponse.json({ accepted: true });
 }
+
+// Signature verification WRAPS the handler — only genuine QStash deliveries
+// ever reach the runtime (§2.8).
+export const POST = verifySignatureApprouter(handler);
 ```
 
 ```typescript
 // src/core/engine.ts — ships in the package
 import { streamText, tool } from 'ai';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { RuntimePorts } from '../ports/runtime';
+import type { ExecutionState } from './types';
 import { compactContext } from './context';
+import { calculateCost } from './billing';
 import { MAX_CONCURRENT_SUBAGENTS, Semaphore, spawnSubagentTool } from './subagent';
+
+const runLockKey = (threadId: string) => `agent:lock:${threadId}`;
 
 // Persist to the replayable event log, then fan out live to all subscribers
 export async function publish(deps: RuntimePorts, threadId: string, type: string, payload: unknown) {
@@ -1153,6 +1163,15 @@ export async function publish(deps: RuntimePorts, threadId: string, type: string
 export async function execute(deps: RuntimePorts, input: { threadId: string; model: string }) {
   const { threadId, model } = input;
   const abort = new AbortController();
+
+  // Concurrency: acquire the per-thread run lock (SET NX + lease, §3.4) before
+  // any work — two workers can never run one thread; a crashed worker's lock
+  // self-expires instead of blocking forever.
+  const locked = await deps.kv.set(runLockKey(threadId), randomUUID(), {
+    onlyIfNotExists: true,
+    exSeconds: deps.config.runLockLeaseSeconds,
+  });
+  if (!locked) return; // another worker owns this thread — at-least-once dispatch (§2.8)
 
   // One signal, one behavior: the moment the state key reads CANCELLED —
   // the user pressed stop (§5.2) — everything tears down immediately.
@@ -1198,18 +1217,34 @@ export async function execute(deps: RuntimePorts, input: { threadId: string; mod
         // One canonical path for every client: durable log + live Pub/Sub (§2.1, §2.2)
         await publish(deps, threadId, 'CHUNK', chunk);
       },
-      onFinish: async ({ usage, finishReason }) => {
+      onFinish: async ({ usage, finishReason, response }) => {
+        // Persist the completed assistant turn(s) — including tool calls and
+        // tool results — BEFORE the state transition, so redrives, HITL
+        // resumes, and replay always see a valid history (§2.2, §2.8)
+        for (const message of response.messages) {
+          await deps.storage.messages.append(threadId, {
+            role: message.role,
+            content: message.content,
+          });
+        }
+
         const finalState = abort.signal.aborted ? 'CANCELLED' : 'COMPLETED';
         const stopReason = abort.signal.aborted ? 'cancelled'
           : finishReason === 'tool-calls' ? 'max_steps' // safety cap hit (§2.1)
           : 'completed';
 
+        // Unpriced models are marked, never silently mispriced (§4)
+        const costUSD = calculateCost(deps, model, usage.promptTokens, usage.completionTokens);
+        if (costUSD === null) {
+          await publish(deps, threadId, 'BILLING_UNPRICED', { model });
+        }
         await deps.storage.usage.record(threadId, {
           model,
           promptTokens: usage.promptTokens,
           completionTokens: usage.completionTokens,
-          costUSD: calculateCost(model, usage.promptTokens, usage.completionTokens),
+          costUSD: costUSD ?? 0,
         });
+        await deps.kv.set(`agent:state:${threadId}`, finalState);
         await deps.storage.threads.setState(threadId, finalState as ExecutionState);
         await publish(deps, threadId, 'STATE_CHANGE', { state: finalState, stopReason });
       },
@@ -1218,6 +1253,7 @@ export async function execute(deps: RuntimePorts, input: { threadId: string; mod
     await result.text; // keep the worker invocation alive until the stream drains
   } finally {
     clearInterval(controlPoll);
+    await deps.kv.del(runLockKey(threadId)); // release — success, failure, or stop
   }
 }
 
@@ -1225,10 +1261,12 @@ export async function execute(deps: RuntimePorts, input: { threadId: string; mod
 export async function executeWithPolicy(
   deps: RuntimePorts,
   input: { threadId: string; model: string },
-  policy: { maxAttempts: number } = { maxAttempts: 3 },
+  policy: { maxAttempts: number } = { maxAttempts: deps.config.runMaxAttempts },
 ): Promise<void> {
   try {
     await execute(deps, input);
+    // Success resets the retry budget — past failures must not count forever
+    await deps.kv.del(`agent:attempts:${input.threadId}`);
   } catch (err) {
     // A user stop already finalized the thread — never retry a stop
     if ((await deps.kv.get(`agent:state:${input.threadId}`)) === 'CANCELLED') return;
@@ -1239,23 +1277,17 @@ export async function executeWithPolicy(
       return deps.queue.enqueue({ threadId: input.threadId, model: input.model });
     }
 
-    // Attempts exhausted: finalize FAILED instead of retrying forever
+    // Attempts exhausted: finalize FAILED on BOTH the hot cache and durable
+    // truth, or subsequent runs would still treat the thread as active (§2.1)
+    await deps.kv.set(`agent:state:${input.threadId}`, 'FAILED');
     await deps.storage.threads.setState(input.threadId, 'FAILED');
     await publish(deps, input.threadId, 'STATE_CHANGE', { state: 'FAILED' });
     await deps.kv.del(`agent:attempts:${input.threadId}`);
   }
 }
-
-function calculateCost(model: string, promptTokens: number, completionTokens: number): number {
-  // Simplified pricing calculation logic
-  const rates: Record<string, { prompt: number; completion: number }> = {
-    'gpt-4o': { prompt: 0.0000025, completion: 0.00001 },
-    'claude-3-5-sonnet': { prompt: 0.000003, completion: 0.000015 },
-  };
-  const rate = rates[model] || rates['gpt-4o'];
-  return (promptTokens * rate.prompt) + (completionTokens * rate.completion);
-}
 ```
+
+> `calculateCost` ships in the package (`src/core/billing.ts`): built-in rates for GPT-4o, GPT-4o-mini, Claude 3.5 Sonnet, and Gemini 1.5 Pro (§4), overridable via `config.billingRates`. It returns `null` for unpriced models instead of guessing a rate.
 
 ---
 

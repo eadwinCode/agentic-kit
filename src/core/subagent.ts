@@ -2,6 +2,7 @@ import { streamText, tool } from 'ai';
 import { z } from 'zod';
 import type { RuntimePorts } from '../ports/runtime.js';
 import { publish } from './engine.js';
+import { calculateCost } from './billing.js';
 
 export const MAX_SUBAGENT_DEPTH = 2; // main (0) → sub (1) → sub-sub (2)
 export const MAX_CONCURRENT_SUBAGENTS = 3; // per run
@@ -9,9 +10,9 @@ const PARENT_RESULT_CAP = 8_000; // chars handed back to the parent (§2.6)
 
 export interface SubagentCtx {
   threadId: string;
-  depth: number; // 0 = called from the main agent
-  sem: Semaphore;
-  ports: RuntimePorts;
+  depth: number;      // 0 = called from the main agent
+  sem: Semaphore;     // per-run concurrency cap
+  ports: RuntimePorts; // the §3.2 ports bundle
 }
 
 /** Run-scoped semaphore: sibling subagents queue instead of running away (§2.7) */
@@ -128,20 +129,29 @@ async function runSubagent(
     tools: {
       // Nesting up to subagentMaxDepth. Default toolset is restricted:
       // destructive tools (requiresConfirmation) are not included (§2.5, §2.7)
-      spawnSubagent: spawnSubagentTool({ threadId, depth: depth + 1, sem, ports }),
+      spawnSubagent: spawnSubagentTool({
+        threadId,
+        depth: depth + 1,
+        sem,
+        ports,
+      }),
     },
     onChunk: async ({ chunk }) => {
       // Namespaced into the shared thread event log → same multi-user pipeline (§2.2)
       await publish(ports, threadId, 'SUBAGENT_CHUNK', { agentId, chunk });
     },
     onFinish: async ({ usage }) => {
-      // Billing attribution per subagent (§4)
+      // Billing attribution per subagent (§4) — unpriced models are marked
+      const costUSD = calculateCost(ports, model, usage.promptTokens, usage.completionTokens);
+      if (costUSD === null) {
+        await publish(ports, threadId, 'BILLING_UNPRICED', { agentId, model });
+      }
       await ports.storage.usage.record(threadId, {
         agentId,
         model,
         promptTokens: usage.promptTokens,
         completionTokens: usage.completionTokens,
-        costUSD: 0, // price via calculateCost()
+        costUSD: costUSD ?? 0,
       });
     },
   });

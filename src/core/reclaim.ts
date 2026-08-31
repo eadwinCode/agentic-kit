@@ -37,7 +37,12 @@ export async function reclaimIfOrphaned(deps: RuntimePorts, threadId: string): P
   await publish(deps, threadId, 'INPUT_EXPIRED', { toolCallId });
   await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
 
+  // Keep the hot cache in sync with the durable claim (§3.4 invariant 5)
+  await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
+
   const thread = await deps.storage.threads.get(threadId);
-  await deps.queue.enqueue({ threadId, model: thread!.model }); // re-enter via the queue (§2.8)
+  if (thread) {
+    await deps.queue.enqueue({ threadId, model: thread.model }); // re-enter via the queue (§2.8)
+  }
   return true;
 }

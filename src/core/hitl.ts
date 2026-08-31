@@ -79,14 +79,12 @@ export async function suspendForApproval(
   if (!response) {
     if (signal.aborted) return null; // stop during the wait (§2.1) — engine tears down
 
-    // TTL expired: append the timeout tool result, then let the AI decide
+    // TTL expired: flip the thread back to RUNNING and publish; the timeout
+    // tool result itself is recorded by the SDK in response.messages and
+    // persisted at finish (§5.6) — no manual append here.
     await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
     await deps.storage.threads.setState(threadId, 'RUNNING');
     await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
-    await deps.storage.messages.append(threadId, {
-      role: 'tool',
-      content: { toolCallId, result: { responded: false, cancelled: true, reason: 'timeout' } },
-    });
     await publish(deps, threadId, 'INPUT_EXPIRED', { toolCallId });
     return { responded: false, cancelled: true, reason: 'timeout' };
   }
@@ -94,11 +92,8 @@ export async function suspendForApproval(
   await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
   await deps.storage.threads.setState(threadId, 'RUNNING');
   await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
-
-  await deps.storage.messages.append(threadId, {
-    role: 'tool',
-    content: { toolCallId, result: response.approved ? response.payload : { denied: true } },
-  });
+  // The SDK records the tool result (approved payload / { denied: true }) in
+  // response.messages; the engine persists it at finish (§5.6).
   return response;
 }
 

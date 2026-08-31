@@ -6,7 +6,7 @@ import type { EventBus } from '../ports/bus.js';
  *  client satisfies it without importing the SDK here. */
 export interface UpstashRedisLike {
   get(key: string): Promise<string | null>;
-  set(key: string, value: string, opts?: { ex?: number }): Promise<unknown>;
+  set(key: string, value: string, opts?: { ex?: number; nx?: boolean }): Promise<unknown>;
   del(...keys: string[]): Promise<unknown>;
   incr(key: string): Promise<number>;
   publish(channel: string, value: string): Promise<unknown>;
@@ -17,8 +17,22 @@ export class UpstashKv implements Kv {
   constructor(private readonly redis: UpstashRedisLike) {}
 
   get(key: string) { return this.redis.get(key); }
-  async set(key: string, value: string, opts?: { exSeconds?: number }) {
-    await this.redis.set(key, value, opts?.exSeconds ? { ex: opts.exSeconds } : undefined);
+  async set(
+    key: string,
+    value: string,
+    opts?: { exSeconds?: number; onlyIfNotExists?: boolean },
+  ): Promise<boolean> {
+    const res = await this.redis.set(
+      key,
+      value,
+      opts?.onlyIfNotExists
+        ? { nx: true, ex: opts.exSeconds }
+        : opts?.exSeconds
+          ? { ex: opts.exSeconds }
+          : undefined,
+    );
+    // SET NX returns null when the key exists
+    return opts?.onlyIfNotExists ? res === 'OK' : true;
   }
   del(key: string) { return this.redis.del(key).then(() => undefined); }
   incr(key: string) { return this.redis.incr(key); }

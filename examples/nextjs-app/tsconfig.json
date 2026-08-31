@@ -16,8 +16,8 @@
     "plugins": [{ "name": "next" }],
     "paths": {
       "@/*": ["./*"],
-      "@agent/core": ["../../dist/index.d.ts"],
-      "@agent/core/adapters/*": ["../../dist/adapters/*.d.ts"]
+      "@agent/core": ["../../src/index.ts"],
+      "@agent/core/adapters/*": ["../../src/adapters/*"]
     }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],

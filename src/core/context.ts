@@ -1,6 +1,8 @@
 import { generateText } from 'ai';
 import type { RuntimePorts } from '../ports/runtime.js';
-import { publish } from './engine.js';
+import type { MessageDTO } from './types.js';
+import { publish } from './publish.js';
+import { calculateCost } from './billing.js';
 
 /** Universal context ceiling across all models (§2.6) */
 export const CONTEXT_TOKEN_CEILING = 265_000;
@@ -29,7 +31,7 @@ export async function compactContext(
   deps: RuntimePorts,
   threadId: string,
   model: string,
-): Promise<ReturnType<RuntimePorts['storage']['messages']['list']>> {
+): Promise<MessageDTO[]> {
   const budget = contextBudget(deps, model) - deps.config.contextOutputReserveTokens;
   const history = await deps.storage.messages.list(threadId);
 
@@ -62,11 +64,12 @@ export async function compactContext(
   });
 
   // Compaction is an LLM call, so it is billed like any other (§4)
+  const costUSD = calculateCost(deps, 'gpt-4o-mini', usage.promptTokens ?? 0, usage.completionTokens ?? 0);
   await deps.storage.usage.record(threadId, {
     model: 'gpt-4o-mini',
     promptTokens: usage.promptTokens ?? 0,
     completionTokens: usage.completionTokens ?? 0,
-    costUSD: 0, // price via calculateCost()
+    costUSD: costUSD ?? 0,
   });
   await publish(deps, threadId, 'CONTEXT_COMPACTED', { summarizedMessages: older.length });
 

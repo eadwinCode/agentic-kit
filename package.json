@@ -4,16 +4,43 @@
   "description": "Headless multi-tenant real-time AI agent platform — engine, HITL suspension, subagents, context compaction. Bring your own storage, queue, and pub/sub via ports.",
   "license": "MIT",
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js",
+      "default": "./dist/src/index.js"
+    },
+    "./adapters/prisma": {
+      "types": "./dist/src/adapters/prisma.d.ts",
+      "import": "./dist/src/adapters/prisma.js",
+      "default": "./dist/src/adapters/prisma.js"
+    },
+    "./adapters/redis": {
+      "types": "./dist/src/adapters/redis.d.ts",
+      "import": "./dist/src/adapters/redis.js",
+      "default": "./dist/src/adapters/redis.js"
+    },
+    "./adapters/qstash": {
+      "types": "./dist/src/adapters/qstash.d.ts",
+      "import": "./dist/src/adapters/qstash.js",
+      "default": "./dist/src/adapters/qstash.js"
+    },
+    "./adapters/upstash": {
+      "types": "./dist/src/adapters/upstash.d.ts",
+      "import": "./dist/src/adapters/upstash.js",
+      "default": "./dist/src/adapters/upstash.js"
+    },
+    "./adapters/memory": {
+      "types": "./dist/src/adapters/memory.d.ts",
+      "import": "./dist/src/adapters/memory.js",
+      "default": "./dist/src/adapters/memory.js"
     },
     "./adapters/*": {
-      "types": "./dist/adapters/*.d.ts",
-      "import": "./dist/adapters/*.js"
+      "types": "./dist/src/adapters/*.d.ts",
+      "import": "./dist/src/adapters/*.js",
+      "default": "./dist/src/adapters/*.js"
     }
   },
   "files": [
@@ -55,7 +82,7 @@
   "devDependencies": {
     "@types/bun": "^1.2.0",
     "@types/node": "^22.10.0",
-    "redis": "^4.7.0",
+    "redis": "^6.2.1",
     "typescript": "^5.6.3"
   }
 }

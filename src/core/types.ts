@@ -109,6 +109,12 @@ export interface AgentConfig {
   contextTailShare: number;
   /** Per-model native windows below the ceiling (§2.6) — merged over defaults */
   nativeWindows?: Record<string, number>;
+  /** Per-model per-token billing rates (§4). Merged over defaults; a model
+   *  without a rate records cost 0 + a BILLING_UNPRICED warning event. */
+  billingRates?: Record<string, { prompt: number; completion: number }>;
+  /** Lease (seconds) for the per-thread run lock — must exceed the longest
+   *  possible run, including parked HITL waits (§2.8, §3.4). */
+  runLockLeaseSeconds: number;
   /** Billing pre-execution check (§4). Return `{ ok: false, error }` to reject a run. */
   billingPreCheck?: (threadId: string) => Promise<{ ok: boolean; error?: string }>;
 }
@@ -125,6 +131,7 @@ export const DEFAULT_CONFIG: AgentConfig = {
   contextOutputReserveTokens: 16_000,
   compactionTrigger: 0.8,
   contextTailShare: 0.25,
+  runLockLeaseSeconds: 30 * 60,
 };
 
 export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
