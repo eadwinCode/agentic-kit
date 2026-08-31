@@ -1,10 +1,12 @@
 import { createClient } from 'redis';
 import { Client } from '@upstash/qstash';
 import { PrismaClient } from '@prisma/client';
-import { createAgentRuntime } from '@agent/core';
-import { PrismaStorage } from '@agent/core/adapters/prisma';
-import { RedisBus, RedisKv } from '@agent/core/adapters/redis';
-import { QStashQueue } from '@agent/core/adapters/qstash';
+import {
+  createAgentRuntime,
+  PrismaStorage,
+  RedisBus,
+  RedisKv,
+} from '@agent/core';
 import { modelRegistry } from './models'; // §2.3 — users register any `ai`-SDK models
 
 // Local Docker / self-hosted Redis — no Upstash required.

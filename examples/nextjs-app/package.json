@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@agent/core": "file:../..",
+    "@ai-sdk/openai": "^4.0.52",
     "@prisma/client": "^5.22.0",
     "@upstash/qstash": "^2.7.0",
     "@upstash/redis": "^1.34.0",
