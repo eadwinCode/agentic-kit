@@ -234,13 +234,32 @@ export async function execute(
       await result.text;
     } else {
       const result = await generateText({
-        ...agent.args,
-        model: deps.models[input.model],
-        messages: history.map(toCoreMessage),
-        tools,
-        abortSignal: abort.signal,
-        onFinish: finalize(deps, threadId, input.model, abort),
+        ...agent.args,                                   // user: model instance, system, temperature, toolChoice…
+        messages: history.map(toCoreMessage),            // platform: durable history
+        tools: withHitl(deps, input.threadId, {          // platform: HITL wrap (§2.5) over the user's set.
+          ...(agent.args.tools ?? {}),                   // spawnSubagent only when spec opts in (§2.7)
+          ...(agent.spec.subagents ? {
+            spawnSubagent: spawnSubagentTool({ threadId, depth: 0, sem, ports: deps }),
+          } : {}),
+        }),
+        abortSignal: abort.signal,                       // platform: stop signal
+        maxSteps: deps.config.maxSteps,                  // platform: safety cap
+        onStepFinish: (step) => {
+          agent.args.onStepFinish?.(step);               // user callback still fires
+          tokensUsed += countTokens(step.usage);         // budget tracking — break BEFORE next step
+          if (tokenBudget && tokensUsed >= tokenBudget) {
+            budgetExceeded = true;
+            abort.abort();
+          }
+        },
+        onFinish: async (finishParams) => {
+          await finalize(deps, agent, input, finishParams, abort, {
+            budgetExceeded, tokensUsed,
+          });
+          agent.args.onFinish?.(finishParams);           // user callback still fires
+        },
       });
+
       // One-shot flavor: no CHUNK stream — publish the final text as one event
       await publish(deps, input.threadId, 'TEXT_RESULT', { text: result.text });
     }
