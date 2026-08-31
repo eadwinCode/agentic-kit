@@ -3,7 +3,7 @@
 **Status:** Implemented (v1) — target surface for the next minor release of `@agent/core`.
 **Builds on:** the [technical specification](./agent-platform-technical-spec.md) (§ references below point there).
 
-> **Implementation status:** `setupAgentCore` and the registered-handle execution path live in `src/core/agent.ts` and `src/runtime.ts`. `spawnSubagent` is constructed by the platform **only when `spec.subagents === true`**, and model precedence is **run `input.model` → `spec.model` → `'gpt-4o'`**. The deprecated compatibility engine remains available through `createAgentRuntime` for the one-minor migration window.
+> **Implementation status:** `setupAgentCore` and the registered-handle execution path live in `src/core/agent.ts` and `src/runtime.ts`. `spawnSubagent` is constructed by the platform **only when the spec enables subagents**, and model precedence is **run `input.model` → `spec.model` → `'gpt-4o'`**. The deprecated compatibility engine remains available through `createAgentRuntime` for the one-minor migration window.
 
 ---
 
@@ -132,10 +132,11 @@ export type StreamTextAgentSpec = {
    *  `AgentCore.resolveModel` (instance + contextWindow). */
   model?: string;
 
-  /** Opt-in subagent delegation (§2.7). When true, the platform constructs
-   *  the run-scoped spawnSubagent tool (semaphore, depth, ports) — users
-   *  cannot build it themselves. Default: false. */
-  subagents?: boolean;
+  /** Opt-in subagent delegation (§2.7). The platform constructs the
+   *  run-scoped spawnSubagent tool (semaphore, depth, ports) — users cannot
+   *  build it themselves. `true` = defaults; an object configures the
+   *  spawned subagents (flavor, default model, extra tools). Default: off. */
+  subagents?: boolean | SubagentsConfig;
 
   /** Default per-run token budget (input + output) for runs dispatched to
    *  this handle. Per-run `input.tokenBudget` wins; `undefined` = unbounded
@@ -146,7 +147,7 @@ export type StreamTextAgentSpec = {
     | 'maxSteps' | 'onStepFinish' | 'onError'> & {
   /** `system` is allowed here (static persona); per-run system is not. */
   system?: string;
-  tools?: ToolSet;               // user tools — platform wraps HITL (§2.5). Nothing is injected unless subagents: true.
+  tools?: ToolSet;               // user tools — platform wraps HITL (§2.5). Nothing is injected unless subagents is enabled.
   onChunk?: Parameters<typeof streamText>[0]['onChunk'];   // chained after platform persistence
   onFinish?: Parameters<typeof streamText>[0]['onFinish']; // chained after platform finalize
 };
@@ -154,13 +155,31 @@ export type StreamTextAgentSpec = {
 export type GenerateTextAgentSpec = {
   name: string;
   model?: string;   // registry key — resolved via resolveModel (§3.3)
-  subagents?: boolean;
+  subagents?: boolean | SubagentsConfig;
   tokenBudget?: number;
 } & Omit<Parameters<typeof generateText>[0],
     'model' | 'messages' | 'prompt' | 'abortSignal' | 'onFinish'> & {
   tools?: ToolSet;
   onFinish?: Parameters<typeof generateText>[0]['onFinish']; // chained after platform finalize
 };
+```
+
+```typescript
+// ports/runtime.ts — delegation config (§2.7)
+export interface SubagentsConfig {
+  /** Generation flavor for spawned subagents — picks the nested loop the
+   *  platform runs for them (§4). Default: 'stream-text'. A 'generate-text'
+   *  child publishes only SUBAGENT_STARTED / SUBAGENT_COMPLETED /
+   *  SUBAGENT_FAILED — no chunk stream. */
+  kind?: 'stream-text' | 'generate-text';
+
+  /** Registry key used when a delegation call omits `model`. */
+  model?: string;
+
+  /** Extra tools merged into every spawned subagent's toolset
+   *  (HITL-wrapped identically to the parent's tools). */
+  tools?: ToolSet;
+}
 ```
 
 **Ownership rule (the whole point of the abstraction):**
@@ -171,7 +190,7 @@ export type GenerateTextAgentSpec = {
 | `messages` / `prompt` | **platform** | built from thread history + compaction (§2.6); subagents get the brief only (§2.7) |
 | `abortSignal` | **platform** | wired to the stop poller (§2.1) |
 | `maxSteps` | **config** (`maxSteps`, §2.1 safety cap) | |
-| `tools` | **user + platform** | user-supplied set; platform wraps `requiresConfirmation` tools. `spawnSubagent` is **opt-in** (`subagents: true`) — never injected silently |
+| `tools` | **user + platform** | user-supplied set; platform wraps `requiresConfirmation` tools. `spawnSubagent` is **opt-in** (`subagents` config) — never injected silently |
 | `onChunk` / `onFinish` | **platform + user** | platform persists, bills, and publishes first, **then chains the user's callback** — replacing it would silently drop user code |
 | `system`, `temperature`, `toolChoice`, … | **user (spec)** | the agent's identity and behavior |
 
@@ -205,6 +224,10 @@ export async function execute(
   let tokensUsed = 0;
   let budgetExceeded = false;
 
+  // Delegation config (§3.2): false/undefined = off; true = defaults
+  const subCfg: SubagentsConfig =
+    agent.spec.subagents === true ? {} : (agent.spec.subagents ?? {});
+
   const controlPoll = setInterval(/* stop poller (§2.1) — aborts on CANCELLED */);
 
   try {
@@ -225,7 +248,12 @@ export async function execute(
         tools: withHitl(deps, input.threadId, {          // platform: HITL wrap (§2.5) over the user's set.
           ...(agent.args.tools ?? {}),                   // spawnSubagent is added ONLY when the
           ...(agent.spec.subagents ? {                   // spec opts in (§2.7) — never silently
-            spawnSubagent: spawnSubagentTool({ threadId, depth: 0, sem, ports: deps }),
+            spawnSubagent: spawnSubagentTool({
+              threadId, depth: 0, sem, ports: deps,
+              kind: subCfg.kind ?? 'stream-text',        // streamText OR generateText nested loop
+              defaultModel: subCfg.model,                // used when delegation omits model
+              tools: subCfg.tools,                       // extra tools merged into children
+            }),
           } : {}),
         }),
         abortSignal: abort.signal,                       // platform: stop signal
@@ -259,7 +287,12 @@ export async function execute(
         tools: withHitl(deps, input.threadId, {          // platform: HITL wrap (§2.5) over the user's set.
           ...(agent.args.tools ?? {}),                   // spawnSubagent only when spec opts in (§2.7)
           ...(agent.spec.subagents ? {
-            spawnSubagent: spawnSubagentTool({ threadId, depth: 0, sem, ports: deps }),
+            spawnSubagent: spawnSubagentTool({
+              threadId, depth: 0, sem, ports: deps,
+              kind: subCfg.kind ?? 'stream-text',
+              defaultModel: subCfg.model,
+              tools: subCfg.tools,
+            }),
           } : {}),
         }),
         abortSignal: abort.signal,                       // platform: stop signal
@@ -445,7 +478,10 @@ const chat = agent.createStreamTextAgent({
   model: 'gpt-4o',                       // spec default; run input.model wins if provided
   system: 'You are a concise product assistant.',
   temperature: 0.3,
-  subagents: true,                       // opt-in: platform injects the scoped spawnSubagent tool
+  subagents: {                           // opt-in delegation with a configured flavor
+    kind: 'stream-text',                 // nested loop: streamText (or generateText)
+    model: 'gpt-4o-mini',                // default model for delegations
+  },
 });
 await chat.run({ prompt: 'Say hello' });                    // uses the spec default model
 // worker: await chat.executeWithPolicy({ threadId, model: 'gpt-4o' });
