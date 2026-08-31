@@ -54,11 +54,13 @@ function withHitl(deps: RuntimePorts, threadId: string, tools: Record<string, an
  *
  *  Concurrency: acquires the per-thread run lock (`agent:lock:{threadId}`,
  *  SET NX + lease) before any work — two workers can never run one thread,
- *  and a crashed worker's lock expires instead of blocking forever (§3.4). */
+ *  and a crashed worker's lock expires instead of blocking forever (§3.4).
+ *  Returns 'lock-conflict' when the lock is held, so callers can tell a
+ *  genuine no-op apart from a completed run. */
 export async function execute(
   deps: RuntimePorts,
   input: { threadId: string; model: string },
-): Promise<void> {
+): Promise<'executed' | 'lock-conflict'> {
   const { threadId, model } = input;
   const abort = new AbortController();
 
@@ -66,7 +68,7 @@ export async function execute(
     onlyIfNotExists: true,
     exSeconds: deps.config.runLockLeaseSeconds,
   });
-  if (!locked) return; // another worker owns this thread — at-least-once dispatch (§2.8)
+  if (!locked) return 'lock-conflict'; // another worker owns this thread (§2.8)
 
   // One signal, one behavior: the moment the state key reads CANCELLED —
   // the user pressed stop (§2.1) — everything tears down immediately.
@@ -79,11 +81,15 @@ export async function execute(
   }, 500);
 
   try {
+    // The key that actually executes — requested model, falling back to
+    // gpt-4o. Billing must price THIS key, not the requested one (§4).
+    const resolved = model in deps.models ? model : 'gpt-4o';
+
     // Durable compaction pass — history always fits the model budget (§2.6)
-    const history = await compactContext(deps, threadId, model);
+    const history = await compactContext(deps, threadId, resolved);
 
     const result = streamText({
-      model: (deps.models[model] || deps.models['gpt-4o']) as any,
+      model: deps.models[resolved] as any,
       messages: history.map(
         (m) => ({ role: m.role, content: m.content }) as any,
       ),
@@ -140,16 +146,16 @@ export async function execute(
             : 'completed';
 
         // Unpriced models are marked, never silently mispriced (§4)
-        const costUSD = calculateCost(deps, model, usage.promptTokens, usage.completionTokens);
+        const costUSD = calculateCost(deps, resolved, usage.promptTokens, usage.completionTokens);
         if (costUSD === null) {
           await publish(deps, threadId, 'BILLING_UNPRICED', {
-            model,
+            model: resolved,
             promptTokens: usage.promptTokens,
             completionTokens: usage.completionTokens,
           });
         }
         await deps.storage.usage.record(threadId, {
-          model,
+          model: resolved,
           promptTokens: usage.promptTokens,
           completionTokens: usage.completionTokens,
           costUSD: costUSD ?? 0,
@@ -161,6 +167,7 @@ export async function execute(
     });
 
     await result.text; // keep the worker invocation alive until the stream drains
+    return 'executed';
   } finally {
     clearInterval(controlPoll);
     await deps.kv.del(runLockKey(threadId)); // release — success, failure, or stop
@@ -177,9 +184,12 @@ export async function executeWithPolicy(
 ): Promise<void> {
   const maxAttempts = policy?.maxAttempts ?? deps.config.runMaxAttempts;
   try {
-    await execute(deps, input);
-    // Success resets the retry budget — past failures must not count forever
-    await deps.kv.del(`agent:attempts:${input.threadId}`);
+    const outcome = await execute(deps, input);
+    // Only a run THIS worker executed may reset the retry budget — a
+    // lock-conflict no-op must never clear it while the owning worker runs (§2.8)
+    if (outcome === 'executed') {
+      await deps.kv.del(`agent:attempts:${input.threadId}`);
+    }
   } catch (err) {
     // A user stop already finalized the thread — never retry a stop
     if ((await deps.kv.get(`agent:state:${input.threadId}`)) === 'CANCELLED') return;

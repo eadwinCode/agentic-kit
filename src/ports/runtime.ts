@@ -67,8 +67,10 @@ export interface AgentRuntime {
     subscribe(threadId: string, handler: (event: AgentEvent) => void): Promise<() => void>;
   };
   engine: {
-    /** Worker-side only (§5.6). Throws on failure — see executeWithPolicy. */
-    execute(input: { threadId: string; model: string }): Promise<void>;
+    /** Worker-side only (§5.6). Throws on failure — see executeWithPolicy.
+     *  Returns 'lock-conflict' when another worker owns the thread's run lock
+     *  (at-least-once duplicate delivery, §2.8) and nothing was executed. */
+    execute(input: { threadId: string; model: string }): Promise<'executed' | 'lock-conflict'>;
     /** execute + §2.8 failure policy: redrive < maxAttempts, else finalize FAILED */
     executeWithPolicy(
       input: { threadId: string; model: string },

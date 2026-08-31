@@ -25,3 +25,8 @@ export const runtime = createAgentRuntime({
   kv: new RedisKv(redis),
   models: modelRegistry,
 });
+
+/** Local dev without QStash cloud: when INLINE_WORKER=1, the run route
+ *  executes the engine in-process (same code path as the worker) instead of
+ *  relying on the queue delivery. Set to 0 in production. */
+export const INLINE_WORKER = process.env.INLINE_WORKER === '1';

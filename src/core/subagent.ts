@@ -121,8 +121,12 @@ async function runSubagent(
 ): Promise<string> {
   const { threadId, depth, sem, ports, agentId, name, instructions, model, abortSignal } = opts;
 
+  // The key that actually executes — requested model, falling back to gpt-4o.
+  // Billing prices THIS key, not the requested one (§4).
+  const resolved = model in ports.models ? model : 'gpt-4o';
+
   const result = streamText({
-    model: (ports.models[model] || ports.models['gpt-4o']) as any,
+    model: ports.models[resolved] as any,
     // Isolated context: seeded with the brief only — never the parent history
     system: `You are the "${name}" subagent. Complete the task, then stop.`,
     prompt: instructions,
@@ -144,13 +148,13 @@ async function runSubagent(
     },
     onFinish: async ({ usage }) => {
       // Billing attribution per subagent (§4) — unpriced models are marked
-      const costUSD = calculateCost(ports, model, usage.promptTokens, usage.completionTokens);
+      const costUSD = calculateCost(ports, resolved, usage.promptTokens, usage.completionTokens);
       if (costUSD === null) {
-        await publish(ports, threadId, 'BILLING_UNPRICED', { agentId, model });
+        await publish(ports, threadId, 'BILLING_UNPRICED', { agentId, model: resolved });
       }
       await ports.storage.usage.record(threadId, {
         agentId,
-        model,
+        model: resolved,
         promptTokens: usage.promptTokens,
         completionTokens: usage.completionTokens,
         costUSD: costUSD ?? 0,

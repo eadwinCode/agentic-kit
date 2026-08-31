@@ -1,4 +1,4 @@
-import { verifySignatureApprouter } from '@upstash/qstash/nextjs';
+import { verifySignatureAppRouter } from '@upstash/qstash/nextjs';
 import { NextRequest, NextResponse } from 'next/server';
 import { waitUntil } from '@vercel/functions';
 import { runtime } from '@/lib/runtime';
@@ -19,4 +19,4 @@ async function handler(req: NextRequest) {
 
 // Signature verification WRAPS the handler — only genuine QStash deliveries
 // ever reach the runtime (§2.8).
-export const POST = verifySignatureApprouter(handler);
+export const POST = verifySignatureAppRouter(handler);

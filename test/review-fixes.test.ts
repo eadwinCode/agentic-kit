@@ -34,6 +34,22 @@ describe('per-thread run lock (§2.8, §3.4)', () => {
     expect(queue.items.length).toBe(before);
   });
 
+  it('a lock-conflict no-op preserves the retry counter', async () => {
+    const { deps, runtime } = makeDeps();
+    const ran = await runtime.run({ prompt: 'a', model: 'gpt-4o' });
+
+    // A past failure left an attempt behind, and another worker holds the lock
+    await deps.kv.set(`agent:attempts:${ran.threadId}`, '1');
+    await deps.kv.set(`agent:lock:${ran.threadId}`, 'other-worker', {
+      onlyIfNotExists: true,
+      exSeconds: deps.config.runLockLeaseSeconds,
+    });
+
+    await runtime.engine.executeWithPolicy({ threadId: ran.threadId, model: 'gpt-4o' });
+    // The no-op must not reset the budget while the owning worker still runs
+    expect(await deps.kv.get(`agent:attempts:${ran.threadId}`)).toBe('1');
+  });
+
   it('Kv.set with onlyIfNotExists is SET-NX semantics across adapters', async () => {
     const kv = new MemoryKv();
     expect(await kv.set('k', 'v1', { onlyIfNotExists: true })).toBe(true);
@@ -103,8 +119,8 @@ describe('executeWithPolicy failure handling (§2.8)', () => {
     void spyExecute;
     const policy = await (async () => {
       // call executeWithPolicy but stub engine.execute through runtime override
-      const rt = runtime as unknown as { engine: { execute: (i: unknown) => Promise<void> } };
-      rt.engine.execute = async () => undefined; // simulate success
+      const rt = runtime as unknown as { engine: { execute: (i: unknown) => Promise<'executed'> } };
+      rt.engine.execute = async () => 'executed'; // simulate success
       await runtime.engine.executeWithPolicy({ threadId: ran.threadId, model: 'gpt-4o' });
       return deps.kv.get(`agent:attempts:${ran.threadId}`);
     })();

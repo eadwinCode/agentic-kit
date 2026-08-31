@@ -145,5 +145,12 @@ export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
       `Invalid config: subagentMaxSteps (${config.subagentMaxSteps}) must be between 1 and maxSteps (${config.maxSteps})`,
     );
   }
+  if (!Number.isInteger(config.runLockLeaseSeconds) || config.runLockLeaseSeconds < 1) {
+    // The lease is the only thing that heals a crashed worker's lock — a
+    // zero/fractional value would deadlock the thread forever (§3.4)
+    throw new Error(
+      `Invalid config: runLockLeaseSeconds (${config.runLockLeaseSeconds}) must be an integer of at least 1`,
+    );
+  }
   return config;
 }

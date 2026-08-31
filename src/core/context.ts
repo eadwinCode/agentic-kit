@@ -49,9 +49,12 @@ export async function compactContext(
   const older = history.slice(0, history.length - tail.length);
   if (older.length === 0) return history; // single oversized turn — blocked by the input guards above
 
-  // ... and summarize everything before it with a cheap model
+  // ... and summarize everything before it with a cheap model — one resolved
+  // key drives the call AND its billing, so usage never names a model that
+  // didn't run (§4)
+  const compactModel = 'gpt-4o-mini' in deps.models ? 'gpt-4o-mini' : 'gpt-4o';
   const { text, usage } = await generateText({
-    model: (deps.models['gpt-4o-mini'] || deps.models['gpt-4o']) as any,
+    model: deps.models[compactModel] as any,
     prompt:
       'Summarize the following conversation history into a dense context brief ' +
       '(decisions, open threads, key facts) for an AI agent:\n\n' +
@@ -64,9 +67,9 @@ export async function compactContext(
   });
 
   // Compaction is an LLM call, so it is billed like any other (§4)
-  const costUSD = calculateCost(deps, 'gpt-4o-mini', usage.promptTokens ?? 0, usage.completionTokens ?? 0);
+  const costUSD = calculateCost(deps, compactModel, usage.promptTokens ?? 0, usage.completionTokens ?? 0);
   await deps.storage.usage.record(threadId, {
-    model: 'gpt-4o-mini',
+    model: compactModel,
     promptTokens: usage.promptTokens ?? 0,
     completionTokens: usage.completionTokens ?? 0,
     costUSD: costUSD ?? 0,
