@@ -97,21 +97,25 @@ The factory args are **the `streamText` / `generateText` call options, minus the
 
 ```typescript
 // Everything streamText accepts, except what the platform sets per-run.
+// onChunk / onFinish ARE allowed — the platform chains them (§4).
 export type StreamTextAgentSpec = {
   name: string;   // unique handle key — the queue dispatch key (§5)
 } & Omit<Parameters<typeof streamText>[0],
     'model' | 'messages' | 'prompt' | 'system' | 'abortSignal'
-    | 'maxSteps' | 'onChunk' | 'onFinish' | 'onStepFinish' | 'onError'> & {
+    | 'maxSteps' | 'onStepFinish' | 'onError'> & {
   /** `system` is allowed here (static persona); per-run system is not. */
   system?: string;
   tools?: ToolSet;               // user tools — platform wraps HITL (§2.5) + injects spawnSubagent (§2.7)
+  onChunk?: Parameters<typeof streamText>[0]['onChunk'];   // chained after platform persistence
+  onFinish?: Parameters<typeof streamText>[0]['onFinish']; // chained after platform finalize
 };
 
 export type GenerateTextAgentSpec = {
   name: string;
 } & Omit<Parameters<typeof generateText>[0],
-    'model' | 'messages' | 'prompt' | 'abortSignal' | 'onFinish' | 'onStepFinish'> & {
+    'model' | 'messages' | 'prompt' | 'abortSignal' | 'onFinish'> & {
   tools?: ToolSet;
+  onFinish?: Parameters<typeof generateText>[0]['onFinish']; // chained after platform finalize
 };
 ```
 
@@ -123,9 +127,9 @@ export type GenerateTextAgentSpec = {
 | `messages` / `prompt` | **platform** | built from thread history + compaction (§2.6); subagents get the brief only (§2.7) |
 | `abortSignal` | **platform** | wired to the stop poller (§2.1) |
 | `maxSteps` | **config** (`maxSteps`, §2.1 safety cap) | |
-| `onChunk` / `onFinish` / `onStepFinish` | **platform** | event log, billing, finalize (§2.2, §4) |
 | `tools` | **user + platform** | user-supplied set; platform wraps `requiresConfirmation` tools and injects `spawnSubagent` |
-| `system`, `temperature`, `tools`, `toolChoice`, … | **user (spec)** | the agent's identity and behavior |
+| `onChunk` / `onFinish` | **platform + user** | platform persists, bills, and publishes first, **then chains the user's callback** — replacing it would silently drop user code |
+| `system`, `temperature`, `toolChoice`, … | **user (spec)** | the agent's identity and behavior |
 
 Platform keys win: user args are spread first, platform assignments last. A user cannot opt out of persistence, billing, or the stop signal.
 
@@ -163,15 +167,29 @@ export async function execute(
     // 4. Dispatch on the bound flavor — user args spread FIRST,
     //    platform assignments LAST (ownership rule, §3.1)
     if (agent.kind === 'stream-text') {
+      // Resolve once: billing + events must record the model actually used,
+      // not the raw input (registry fallback applies, §2.3)
+      const resolved = deps.models[input.model] ? input.model : 'gpt-4o';
+
       const result = streamText({
         ...agent.args,                                   // user: system, temperature, toolChoice…
-        model: deps.models[input.model],                 // platform: per-run model
+        model: deps.models[resolved],                    // platform: per-run model
         messages: history.map(toCoreMessage),            // platform: durable history
-        tools,                                           // platform: wrapped
+        tools: withHitl(deps, input.threadId, {          // platform: HITL wrap (§2.5) + spawnSubagent (§2.7)
+          ...(agent.args.tools ?? {}),
+          spawnSubagent: spawnSubagentTool({ threadId, depth: 0, sem, ports: deps }),
+        }),
         abortSignal: abort.signal,                       // platform: stop signal
         maxSteps: deps.config.maxSteps,                  // platform: safety cap
-        onChunk: ({ chunk }) => publish(deps, threadId, 'CHUNK', chunk),
-        onFinish: finalize(deps, threadId, input.model, abort),  // §5.6: messages, usage, state
+        onChunk: async (para) => {
+          // One canonical path for every client: durable log + live Pub/Sub (§2.1, §2.2)
+          await publish(deps, input.threadId, 'CHUNK', para.chunk);
+          agent.args.onChunk?.(para);                    // user callback still fires
+        },
+        onFinish: async (finishParams) => {
+          await finalize(deps, agent, input, finishParams, abort); // §5.6: messages, usage, state
+          agent.args.onFinish?.(finishParams);           // user callback still fires
+        },
       });
       await result.text;
     } else {
@@ -195,7 +213,62 @@ export async function execute(
 }
 ```
 
-`finalize` (the shared `onFinish`) is unchanged from §5.6: persist `response.messages` **before** the state transition, record usage (`BILLING_UNPRICED` marking, §4), flip state to `COMPLETED`/`CANCELLED` on both homes, publish `STATE_CHANGE`.
+`finalize` (the shared `onFinish` body) is unchanged from §5.6 in structure, with two hardenings:
+
+1. **Persist `response.messages` before the state transition** (assistant turns, tool calls, tool results) so redrives, HITL resumes, and replay always see a valid history (§2.2, §2.8).
+2. **NaN-guard the usage counters.** Some OpenAI-compatible providers omit streaming usage; the AI SDK represents those as `NaN`. Clamp to `0` — optional metering must never keep a successfully completed run stuck in `RUNNING`.
+
+```typescript
+export async function finalize(
+  deps: RuntimePorts,
+  agent: RegisteredAgent,
+  input: { threadId: string; model: string },
+  finishParams: { usage: LanguageModelUsage; finishReason: FinishReason; response: ... },
+  abort: AbortController,
+): Promise<void> {
+  const { threadId } = input;
+  const resolved = deps.models[input.model] ? input.model : 'gpt-4o';
+
+  // Some providers omit streaming usage — the SDK reports NaN for those.
+  // Never let optional metering keep a completed run stuck in RUNNING.
+  const promptTokens = Number.isFinite(finishParams.usage.promptTokens)
+    ? finishParams.usage.promptTokens : 0;
+  const completionTokens = Number.isFinite(finishParams.usage.completionTokens)
+    ? finishParams.usage.completionTokens : 0;
+
+  // Persist the completed assistant turn(s) — including tool calls and tool
+  // results — BEFORE the state transition (§2.2, §2.8)
+  for (const message of finishParams.response.messages) {
+    await deps.storage.messages.append(threadId, {
+      role: message.role,
+      content: message.content,
+    });
+  }
+
+  const finalState: ExecutionState = abort.signal.aborted ? 'CANCELLED' : 'COMPLETED';
+  const stopReason = abort.signal.aborted
+    ? 'cancelled'
+    : finishParams.finishReason === 'tool-calls'
+      ? 'max_steps' // safety cap hit (§2.1)
+      : 'completed';
+
+  // Unpriced models are marked, never silently mispriced (§4)
+  const costUSD = calculateCost(deps, resolved, promptTokens, completionTokens);
+  if (costUSD === null) {
+    await publish(deps, threadId, 'BILLING_UNPRICED', {
+      model: resolved, promptTokens, completionTokens,
+    });
+  }
+  await deps.storage.usage.record(threadId, {
+    model: resolved, promptTokens, completionTokens, costUSD: costUSD ?? 0,
+  });
+  await deps.kv.set(`agent:state:${threadId}`, finalState);
+  await deps.storage.threads.setState(threadId, finalState);
+  await publish(deps, threadId, 'STATE_CHANGE', { state: finalState, stopReason });
+}
+```
+
+**Callback chaining order:** platform work (persist → bill → publish) runs first, then the user's `onChunk`/`onFinish` fires with the same parameters. A user callback that throws is its own problem — it must not prevent the state transition, so `finalize` completes before `args.onFinish` is invoked.
 
 `executeWithPolicy` wraps `execute` with the §2.8 policy exactly as today: redrive `< maxAttempts`, else finalize `FAILED` on both homes; a user stop is never retried; the attempt counter resets on success.
 
