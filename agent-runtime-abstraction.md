@@ -100,18 +100,29 @@ The factory args are **the `streamText` / `generateText` call options, minus the
 // onChunk / onFinish ARE allowed — the platform chains them (§4).
 export type StreamTextAgentSpec = {
   name: string;   // unique handle key — the queue dispatch key (§5)
+
+  /** Optional default model (§2.3 registry key). Resolution order:
+   *  run input.model → spec.model → 'gpt-4o'. */
+  model?: string;
+
+  /** Opt-in subagent delegation (§2.7). When true, the platform constructs
+   *  the run-scoped spawnSubagent tool (semaphore, depth, ports) — users
+   *  cannot build it themselves. Default: false. */
+  subagents?: boolean;
 } & Omit<Parameters<typeof streamText>[0],
     'model' | 'messages' | 'prompt' | 'system' | 'abortSignal'
     | 'maxSteps' | 'onStepFinish' | 'onError'> & {
   /** `system` is allowed here (static persona); per-run system is not. */
   system?: string;
-  tools?: ToolSet;               // user tools — platform wraps HITL (§2.5) + injects spawnSubagent (§2.7)
+  tools?: ToolSet;               // user tools — platform wraps HITL (§2.5). Nothing is injected unless subagents: true.
   onChunk?: Parameters<typeof streamText>[0]['onChunk'];   // chained after platform persistence
   onFinish?: Parameters<typeof streamText>[0]['onFinish']; // chained after platform finalize
 };
 
 export type GenerateTextAgentSpec = {
   name: string;
+  model?: string;   // same resolution order as above
+  subagents?: boolean;
 } & Omit<Parameters<typeof generateText>[0],
     'model' | 'messages' | 'prompt' | 'abortSignal' | 'onFinish'> & {
   tools?: ToolSet;
@@ -123,11 +134,11 @@ export type GenerateTextAgentSpec = {
 
 | Key | Owner | Why |
 | :--- | :--- | :--- |
-| `model` | **run input** | chosen per run, resolved via the registry (§2.3) |
+| `model` | **run input › spec default › `'gpt-4o'` fallback** | an agent may pin `model: 'gpt-4o-mini'`; a run may still override it per call |
 | `messages` / `prompt` | **platform** | built from thread history + compaction (§2.6); subagents get the brief only (§2.7) |
 | `abortSignal` | **platform** | wired to the stop poller (§2.1) |
 | `maxSteps` | **config** (`maxSteps`, §2.1 safety cap) | |
-| `tools` | **user + platform** | user-supplied set; platform wraps `requiresConfirmation` tools and injects `spawnSubagent` |
+| `tools` | **user + platform** | user-supplied set; platform wraps `requiresConfirmation` tools. `spawnSubagent` is **opt-in** (`subagents: true`) — never injected silently |
 | `onChunk` / `onFinish` | **platform + user** | platform persists, bills, and publishes first, **then chains the user's callback** — replacing it would silently drop user code |
 | `system`, `temperature`, `toolChoice`, … | **user (spec)** | the agent's identity and behavior |
 
@@ -158,26 +169,27 @@ export async function execute(
     // 2. Durable history + compaction (§2.6)
     const history = await compactContext(deps, input.threadId, input.model);
 
-    // 3. Platform-owned tool wrapping: HITL (§2.5) + spawnSubagent (§2.7)
-    const tools = withHitl(deps, input.threadId, {
-      ...agent.args.tools,
-      spawnSubagent: spawnSubagentTool({ threadId, depth: 0, sem, ports: deps }),
-    });
+    // 3. Platform-owned tool wrapping: HITL (§2.5). spawnSubagent is injected
+    //    only when the spec opts in (subagents: true) — see step 4.
 
     // 4. Dispatch on the bound flavor — user args spread FIRST,
     //    platform assignments LAST (ownership rule, §3.1)
     if (agent.kind === 'stream-text') {
-      // Resolve once: billing + events must record the model actually used,
-      // not the raw input (registry fallback applies, §2.3)
-      const resolved = deps.models[input.model] ? input.model : 'gpt-4o';
+      // Resolve once: billing + events must record the model actually used.
+      // Resolution order: run input.model → spec.model → 'gpt-4o' (§3.1)
+      const resolved = deps.models[input.model] ? input.model
+        : agent.spec.model && deps.models[agent.spec.model] ? agent.spec.model
+        : 'gpt-4o';
 
       const result = streamText({
         ...agent.args,                                   // user: system, temperature, toolChoice…
-        model: deps.models[resolved],                    // platform: per-run model
+        model: deps.models[resolved],                    // platform: resolved model
         messages: history.map(toCoreMessage),            // platform: durable history
-        tools: withHitl(deps, input.threadId, {          // platform: HITL wrap (§2.5) + spawnSubagent (§2.7)
-          ...(agent.args.tools ?? {}),
-          spawnSubagent: spawnSubagentTool({ threadId, depth: 0, sem, ports: deps }),
+        tools: withHitl(deps, input.threadId, {          // platform: HITL wrap (§2.5) over the user's set.
+          ...(agent.args.tools ?? {}),                   // spawnSubagent is added ONLY when the
+          ...(agent.spec.subagents ? {                   // spec opts in (§2.7) — never silently
+            spawnSubagent: spawnSubagentTool({ threadId, depth: 0, sem, ports: deps }),
+          } : {}),
         }),
         abortSignal: abort.signal,                       // platform: stop signal
         maxSteps: deps.config.maxSteps,                  // platform: safety cap
@@ -326,18 +338,21 @@ const agent = setupAgentCore({
   models: modelRegistry,
 });
 
-// A streaming chat agent
+// A streaming chat agent — model pinned at the spec level, overridable per run
 const chat = agent.createStreamTextAgent({
   name: 'chat',
+  model: 'gpt-4o',                       // spec default; run input.model wins if provided
   system: 'You are a concise product assistant.',
   temperature: 0.3,
+  subagents: true,                       // opt-in: platform injects the scoped spawnSubagent tool
 });
-await chat.run({ prompt: 'Say hello', model: 'gpt-4o' });   // client-side: 202 + enqueue
+await chat.run({ prompt: 'Say hello' });                    // uses the spec default model
 // worker: await chat.executeWithPolicy({ threadId, model: 'gpt-4o' });
 
-// A one-shot summarizer — same platform, different flavor
+// A one-shot summarizer — same platform, different flavor, cheap model pinned
 const summarizer = agent.createGenerateTextAgent({
   name: 'summarizer',
+  model: 'gpt-4o-mini',
   system: 'Summarize threads into a dense brief.',
 });
 await summarizer.execute({ threadId, model: 'gpt-4o-mini' });
