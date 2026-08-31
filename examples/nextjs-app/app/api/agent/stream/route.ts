@@ -9,10 +9,11 @@ import type { AgentEvent } from '@agent/core';
 export async function GET(req: NextRequest) {
   const threadId = req.nextUrl.searchParams.get('threadId')!;
   // EventSource sends Last-Event-ID automatically on auto-reconnect — honor it
-  // so clients never replay events they've already seen (§2.2)
-  const since = Number(
-    req.headers.get('last-event-id') ?? req.nextUrl.searchParams.get('since') ?? -1,
-  );
+  // so clients never replay events they've already seen (§2.2). A malformed
+  // cursor falls back to -1 (full replay) rather than silently dropping it.
+  const rawCursor = req.headers.get('last-event-id') ?? req.nextUrl.searchParams.get('since');
+  const parsedCursor = rawCursor === null ? -1 : Number(rawCursor);
+  const since = Number.isFinite(parsedCursor) ? parsedCursor : -1;
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({

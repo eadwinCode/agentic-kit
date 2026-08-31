@@ -97,6 +97,8 @@ export interface AgentConfig {
   subagentMaxDepth: number;
   /** Concurrent subagents per run (§2.7) */
   subagentMaxConcurrent: number;
+  /** AI-SDK step ceiling per subagent run (§2.7) — tighter than `maxSteps` */
+  subagentMaxSteps: number;
   /** Characters of a subagent result handed back to the parent (§2.7) */
   subagentResultCapChars: number;
   /** Universal context ceiling (§2.6) */
@@ -126,6 +128,7 @@ export const DEFAULT_CONFIG: AgentConfig = {
   runMaxAttempts: 3,
   subagentMaxDepth: 2,
   subagentMaxConcurrent: 3,
+  subagentMaxSteps: 10,
   subagentResultCapChars: 8_000,
   contextCeilingTokens: 265_000,
   contextOutputReserveTokens: 16_000,
@@ -135,5 +138,12 @@ export const DEFAULT_CONFIG: AgentConfig = {
 };
 
 export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
-  return { ...DEFAULT_CONFIG, ...partial };
+  const config = { ...DEFAULT_CONFIG, ...partial };
+  if (config.subagentMaxSteps < 1 || config.subagentMaxSteps > config.maxSteps) {
+    // A subagent must never get a looser step ceiling than its parent run (§2.7)
+    throw new Error(
+      `Invalid config: subagentMaxSteps (${config.subagentMaxSteps}) must be between 1 and maxSteps (${config.maxSteps})`,
+    );
+  }
+  return config;
 }

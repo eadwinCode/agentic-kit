@@ -6,7 +6,6 @@ import { calculateCost } from './billing.js';
 
 export const MAX_SUBAGENT_DEPTH = 2; // main (0) → sub (1) → sub-sub (2)
 export const MAX_CONCURRENT_SUBAGENTS = 3; // per run
-const PARENT_RESULT_CAP = 8_000; // chars handed back to the parent (§2.6)
 
 export interface SubagentCtx {
   threadId: string;
@@ -91,7 +90,10 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
           await publish(ctx.ports, ctx.threadId, 'SUBAGENT_COMPLETED', { agentId: run.id });
 
           // The parent receives a capped result, keeping its own context small (§2.6)
-          return { agentId: run.id, result: result.slice(0, PARENT_RESULT_CAP) };
+          return {
+            agentId: run.id,
+            result: result.slice(0, ctx.ports.config.subagentResultCapChars),
+          };
         } catch (err) {
           const state =
             (await ctx.ports.kv.get(`agent:state:${ctx.threadId}`)) === 'CANCELLED'
@@ -125,7 +127,7 @@ async function runSubagent(
     system: `You are the "${name}" subagent. Complete the task, then stop.`,
     prompt: instructions,
     abortSignal, // stop tears this down immediately (§2.7)
-    maxSteps: 10,
+    maxSteps: ports.config.subagentMaxSteps,
     tools: {
       // Nesting up to subagentMaxDepth. Default toolset is restricted:
       // destructive tools (requiresConfirmation) are not included (§2.5, §2.7)

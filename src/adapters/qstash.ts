@@ -1,9 +1,9 @@
 import type { Queue } from '../ports/queue.js';
 
-/** Minimal structural type of the @upstash/qstash client we use. */
+/** Minimal structural type of the @upstash/qstash (v2) client we use. */
 export interface QStashLike {
-  messages: {
-    enqueue(a: { queue: string; url: string; body: unknown }): Promise<unknown>;
+  queue(a: { queueName: string }): {
+    enqueueJSON(a: { url: string; body: unknown }): Promise<unknown>;
   };
 }
 
@@ -19,12 +19,9 @@ export class QStashQueue implements Queue {
   constructor(private readonly client: QStashLike, private readonly opts: QStashQueueOptions) {}
 
   enqueue(job: { threadId: string; model: string }): Promise<void> {
-    return this.client.messages
-      .enqueue({
-        queue: this.opts.queueName ?? 'agent-runs',
-        url: this.opts.url,
-        body: job,
-      })
+    return this.client
+      .queue({ queueName: this.opts.queueName ?? 'agent-runs' })
+      .enqueueJSON({ url: this.opts.url, body: job })
       .then(() => undefined);
   }
 }
