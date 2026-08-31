@@ -3,6 +3,8 @@
 **Status:** Draft (v1) — implementation target for the next minor release of `@agent/core`.
 **Builds on:** the [technical specification](./agent-platform-technical-spec.md) (§ references below point there).
 
+> **Implementation status:** the legacy `src/core/engine.ts` still auto-injects `spawnSubagent` into every run and ignores `spec.model` — that is retained behavior, **not** a spec change to make piecemeal. The target behavior defined in this document is: `spawnSubagent` is constructed by the platform **only when `spec.subagents === true`**, and the model resolves as **run `input.model` → `spec.model` → `'gpt-4o'`**. The in-progress `setupAgentCore` refactor (see `src/core/agent.ts` and the port additions) lands both together; until it ships, the legacy engine remains as-is.
+
 ---
 
 ## 1. Problem
