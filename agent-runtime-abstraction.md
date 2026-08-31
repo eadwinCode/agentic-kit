@@ -1,0 +1,298 @@
+# Design Doc: `setupAgentCore` — Splitting Agent Flavors from Platform Services
+
+**Status:** Draft (v1) — implementation target for the next minor release of `@agent/core`.
+**Builds on:** the [technical specification](./agent-platform-technical-spec.md) (§ references below point there).
+
+---
+
+## 1. Problem
+
+`createAgentRuntime` currently hard-wires one generation flavor — `streamText` — into the engine. Everything else the runtime does (locks, event log, HITL, compaction, billing, redrive policy) is generation-agnostic, but the API gives users no way to say *"this agent streams"* vs *"this agent is a one-shot generate call"* without forking the engine.
+
+The refactor, in one sentence: **the runtime keeps the platform services; agent flavors become first-class handles.**
+
+- `setupAgentCore(...)` (replacing `createAgentRuntime`) returns platform-level services plus two factories.
+- `createStreamTextAgent({...})` / `createGenerateTextAgent({...})` return an **agent handle** — an executor bound to a specific generation mode and to *your* generation arguments.
+- `execute()` inside the engine receives those bound arguments and composes them with the platform-owned machinery (history + compaction, run lock, HITL wrapping, event log, billing, finalize).
+
+---
+
+## 2. Public Surface
+
+```typescript
+export interface AgentRuntime {
+  /** One call for UIs / history routes: thread + messages + recent events +
+   *  usage + subagent runs (replaces the ad-hoc /agent/history route). */
+  getThreadSnapshot(threadId: string): Promise<ThreadSnapshot | null>;
+
+  hitl: {
+    respond(input: RespondInput): Promise<RespondResult>;
+    reclaimIfOrphaned(threadId: string): Promise<boolean>;
+  };
+
+  events: {
+    since(threadId: string, sinceSeq: number): Promise<AgentEvent[]>;
+    subscribe(threadId: string, handler: (event: AgentEvent) => void): Promise<() => void>;
+  };
+
+  /** Agent factories — see §4. Each call registers a handle under `spec.name`. */
+  createStreamTextAgent(spec: StreamTextAgentSpec): StreamTextAgent;
+  createGenerateTextAgent(spec: GenerateTextAgentSpec): GenerateTextAgent;
+
+  /** Worker-side resolution of a registered handle from the queue job. */
+  getAgent(name: string): AgentHandle | null;
+}
+```
+
+`createAgentRuntime` remains as a deprecated alias for `setupAgentCore` for one minor release.
+
+### 2.1 `ThreadSnapshot`
+
+```typescript
+export interface ThreadSnapshot {
+  thread: ThreadDTO;          // id, state, model, timestamps
+  messages: MessageDTO[];     // full history, ascending (incl. CONTEXT_SUMMARY, §2.6)
+  events: AgentEvent[];       // last `snapshotEventLimit` (default 200), ascending
+  usage: UsageDTO[];          // per-model, per-agentId cost rows (§4)
+  runs: RunDTO[];             // subagent runs (§2.7)
+}
+```
+
+Backs the `/agent/history` route and any UI "thread view" — one storage round-trip set, no client-side stitching.
+
+---
+
+## 3. Agent Handles
+
+```typescript
+export interface AgentHandle {
+  readonly name: string;
+  readonly kind: 'stream-text' | 'generate-text';
+
+  /** Worker-side only (§5.6). Throws on failure — see executeWithPolicy.
+   *  Returns 'lock-conflict' when another worker owns the thread's run lock
+   *  (at-least-once duplicate delivery, §2.8) and nothing was executed. */
+  execute(input: { threadId: string; model: string }): Promise<'executed' | 'lock-conflict'>;
+
+  /** execute + §2.8 failure policy: redrive < maxAttempts, else finalize FAILED */
+  executeWithPolicy(
+    input: { threadId: string; model: string },
+    policy?: { maxAttempts?: number },
+  ): Promise<void>;
+
+  /** Persist user message → state RUNNING → enqueue a job dispatched back to
+   *  THIS handle (the job carries `agent: this.name`). */
+  run(input: RunInput): Promise<RunResult>;
+
+  /** Platform stop (§2.1) — works regardless of which agent's run is active. */
+  stop(threadId: string): Promise<StopResult>;
+}
+```
+
+`StreamTextAgent` and `GenerateTextAgent` are both `AgentHandle`; they differ only in what `execute()` invokes and in the accepted `spec.args`.
+
+### 3.1 Spec types
+
+The factory args are **the `streamText` / `generateText` call options, minus the platform-owned keys**:
+
+```typescript
+// Everything streamText accepts, except what the platform sets per-run.
+export type StreamTextAgentSpec = {
+  name: string;   // unique handle key — the queue dispatch key (§5)
+} & Omit<Parameters<typeof streamText>[0],
+    'model' | 'messages' | 'prompt' | 'system' | 'abortSignal'
+    | 'maxSteps' | 'onChunk' | 'onFinish' | 'onStepFinish' | 'onError'> & {
+  /** `system` is allowed here (static persona); per-run system is not. */
+  system?: string;
+  tools?: ToolSet;               // user tools — platform wraps HITL (§2.5) + injects spawnSubagent (§2.7)
+};
+
+export type GenerateTextAgentSpec = {
+  name: string;
+} & Omit<Parameters<typeof generateText>[0],
+    'model' | 'messages' | 'prompt' | 'abortSignal' | 'onFinish' | 'onStepFinish'> & {
+  tools?: ToolSet;
+};
+```
+
+**Ownership rule (the whole point of the abstraction):**
+
+| Key | Owner | Why |
+| :--- | :--- | :--- |
+| `model` | **run input** | chosen per run, resolved via the registry (§2.3) |
+| `messages` / `prompt` | **platform** | built from thread history + compaction (§2.6); subagents get the brief only (§2.7) |
+| `abortSignal` | **platform** | wired to the stop poller (§2.1) |
+| `maxSteps` | **config** (`maxSteps`, §2.1 safety cap) | |
+| `onChunk` / `onFinish` / `onStepFinish` | **platform** | event log, billing, finalize (§2.2, §4) |
+| `tools` | **user + platform** | user-supplied set; platform wraps `requiresConfirmation` tools and injects `spawnSubagent` |
+| `system`, `temperature`, `tools`, `toolChoice`, … | **user (spec)** | the agent's identity and behavior |
+
+Platform keys win: user args are spread first, platform assignments last. A user cannot opt out of persistence, billing, or the stop signal.
+
+---
+
+## 4. What `execute()` Does With the Bound Args
+
+```typescript
+export async function execute(
+  deps: RuntimePorts,
+  agent: RegisteredAgent,                 // { name, kind, args } resolved from the registry
+  input: { threadId: string; model: string },
+): Promise<'executed' | 'lock-conflict'> {
+  const abort = new AbortController();
+
+  // 1. Per-thread run lock (§2.8, §3.4) — SET NX + lease
+  const locked = await deps.kv.set(runLockKey(input.threadId), randomUUID(), {
+    onlyIfNotExists: true,
+    exSeconds: deps.config.runLockLeaseSeconds,
+  });
+  if (!locked) return 'lock-conflict';    // duplicate delivery: nothing executed
+
+  const controlPoll = setInterval(/* stop poller (§2.1) — aborts on CANCELLED */);
+
+  try {
+    // 2. Durable history + compaction (§2.6)
+    const history = await compactContext(deps, input.threadId, input.model);
+
+    // 3. Platform-owned tool wrapping: HITL (§2.5) + spawnSubagent (§2.7)
+    const tools = withHitl(deps, input.threadId, {
+      ...agent.args.tools,
+      spawnSubagent: spawnSubagentTool({ threadId, depth: 0, sem, ports: deps }),
+    });
+
+    // 4. Dispatch on the bound flavor — user args spread FIRST,
+    //    platform assignments LAST (ownership rule, §3.1)
+    if (agent.kind === 'stream-text') {
+      const result = streamText({
+        ...agent.args,                                   // user: system, temperature, toolChoice…
+        model: deps.models[input.model],                 // platform: per-run model
+        messages: history.map(toCoreMessage),            // platform: durable history
+        tools,                                           // platform: wrapped
+        abortSignal: abort.signal,                       // platform: stop signal
+        maxSteps: deps.config.maxSteps,                  // platform: safety cap
+        onChunk: ({ chunk }) => publish(deps, threadId, 'CHUNK', chunk),
+        onFinish: finalize(deps, threadId, input.model, abort),  // §5.6: messages, usage, state
+      });
+      await result.text;
+    } else {
+      const result = await generateText({
+        ...agent.args,
+        model: deps.models[input.model],
+        messages: history.map(toCoreMessage),
+        tools,
+        abortSignal: abort.signal,
+        onFinish: finalize(deps, threadId, input.model, abort),
+      });
+      // One-shot flavor: no CHUNK stream — publish the final text as one event
+      await publish(deps, input.threadId, 'TEXT_RESULT', { text: result.text });
+    }
+
+    return 'executed';
+  } finally {
+    clearInterval(controlPoll);
+    await deps.kv.del(runLockKey(input.threadId));
+  }
+}
+```
+
+`finalize` (the shared `onFinish`) is unchanged from §5.6: persist `response.messages` **before** the state transition, record usage (`BILLING_UNPRICED` marking, §4), flip state to `COMPLETED`/`CANCELLED` on both homes, publish `STATE_CHANGE`.
+
+`executeWithPolicy` wraps `execute` with the §2.8 policy exactly as today: redrive `< maxAttempts`, else finalize `FAILED` on both homes; a user stop is never retried; the attempt counter resets on success.
+
+### 4.1 Flavor differences at a glance
+
+| | `stream-text` | `generate-text` |
+| :--- | :--- | :--- |
+| SDK call | `streamText` | `generateText` |
+| Live events | `CHUNK` per delta (§2.2 fan-out) | single `TEXT_RESULT` on completion |
+| Typical UI | chat | summarization, extraction, batch |
+| Stop | aborts mid-generation | aborts the awaited call |
+| Everything else | identical: lock, history, HITL, billing, finalize, redrive | |
+
+---
+
+## 5. Queue Dispatch With Multiple Agents
+
+`RunJob` gains the handle key:
+
+```typescript
+export interface RunJob {
+  threadId: string;
+  model: string;
+  agent: string;   // registered handle name — the worker resolves it via runtime.getAgent()
+}
+```
+
+- `chatAgent.run({ prompt, model })` persists + enqueues `{ threadId, model, agent: 'chat' }`.
+- The worker route resolves the handle once and executes with the policy:
+
+```typescript
+// app/api/queue/agent-run/route.ts (worker, §5.6)
+export const POST = verifySignatureApprouter(async (req: NextRequest) => {
+  const { threadId, model, agent: agentName } = await req.json();
+  const agent = runtime.getAgent(agentName);
+  if (!agent) return NextResponse.json({ error: 'Unknown agent' }, { status: 400 });
+
+  waitUntil(agent.executeWithPolicy({ threadId, model }));
+  return NextResponse.json({ accepted: true });
+});
+```
+
+Backward compatibility: a job without `agent` dispatches to the **default handle** (`config.defaultAgent`, defaulting to the first registered `stream-text` agent).
+
+---
+
+## 6. Usage
+
+```typescript
+const agent = setupAgentCore({
+  storage: new PrismaStorage(prisma),
+  bus: new RedisBus(redis),
+  queue: new QStashQueue(client, { url: `${APP_URL}/api/queue/agent-run` }),
+  kv: new UpstashKv(redis),
+  models: modelRegistry,
+});
+
+// A streaming chat agent
+const chat = agent.createStreamTextAgent({
+  name: 'chat',
+  system: 'You are a concise product assistant.',
+  temperature: 0.3,
+});
+await chat.run({ prompt: 'Say hello', model: 'gpt-4o' });   // client-side: 202 + enqueue
+// worker: await chat.executeWithPolicy({ threadId, model: 'gpt-4o' });
+
+// A one-shot summarizer — same platform, different flavor
+const summarizer = agent.createGenerateTextAgent({
+  name: 'summarizer',
+  system: 'Summarize threads into a dense brief.',
+});
+await summarizer.execute({ threadId, model: 'gpt-4o-mini' });
+
+// Platform services, unchanged
+const snap = await agent.getThreadSnapshot(threadId);
+await agent.hitl.respond({ threadId, toolCallId, approved: true, payload });
+const unsub = await agent.events.subscribe(threadId, handler);
+await chat.stop(threadId);
+```
+
+---
+
+## 7. Migration From `createAgentRuntime`
+
+| Today (§3.3) | After |
+| :--- | :--- |
+| `runtime.run(input)` | `handle.run(input)` — same behavior, job now tagged with the handle name |
+| `runtime.stop(threadId)` | `handle.stop(threadId)` (or a future `agent.stop` on the runtime) |
+| `runtime.engine.execute(input)` | `handle.execute(input)` → returns `'executed' \| 'lock-conflict'` |
+| `runtime.engine.executeWithPolicy(input)` | `handle.executeWithPolicy(input, policy?)` |
+| `runtime.hitl` / `runtime.events` | unchanged on `AgentRuntime` |
+| — new — | `runtime.getThreadSnapshot(threadId)` |
+| — new — | `runtime.createStreamTextAgent` / `createGenerateTextAgent` / `getAgent` |
+| `RunJob { threadId, model }` | `RunJob { threadId, model, agent }` (missing `agent` → default handle) |
+
+Non-breaking rollout: ship `setupAgentCore` alongside `createAgentRuntime` (alias) for one minor, migrate the example app, then drop the old factory.
+
+### 7.1 Why `setupAgentCore` and not just a rename
+
+The name change signals the split: the factory no longer *is* the agent — it **sets up the platform core** and hands out agent handles. "Setup" also leaves room for future registration-style config (`registerTool`, `registerBillingHook`) without widening the runtime interface.
