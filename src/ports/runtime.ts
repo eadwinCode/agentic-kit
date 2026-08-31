@@ -157,6 +157,9 @@ export interface AgentCore {
    *  by execution, compaction, usage attribution, and persisted run metadata. */
   resolveModel(modelName: string): ResolvedModel;
 
+  /** Most recent first — thread pickers / sidebars. */
+  listThreads(): Promise<ThreadDTO[]>;
+
   /** One call for UIs / history routes: thread + messages + recent events. */
   getThreadSnapshot(threadId: string): Promise<ThreadSnapshot | null>;
 

@@ -20,10 +20,67 @@ body {
   font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, sans-serif;
 }
 
-main {
-  max-width: 760px;
+.shell {
+  max-width: 980px;
   margin: 0 auto;
   padding: 24px 16px 96px;
+  display: flex;
+  gap: 20px;
+  align-items: flex-start;
+}
+
+main {
+  flex: 1;
+  min-width: 0;
+}
+
+.sidebar {
+  flex: 0 0 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  position: sticky;
+  top: 24px;
+}
+.sidebar h2 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 10px 2px 2px;
+}
+.thread-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  font-size: 12px;
+  padding: 7px 10px;
+}
+.thread-item.active { border-color: var(--accent); }
+.thread-item .thread-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.thread-item code {
+  color: var(--text);
+  font-size: 11px;
+}
+.thread-item .thread-state { color: var(--muted); font-size: 11px; }
+.new-thread { width: 100%; }
+
+@media (max-width: 720px) {
+  .shell { flex-direction: column; }
+  .sidebar { position: static; flex: none; width: 100%; }
+}
+
+main {
+  flex: 1;
+  min-width: 0;
 }
 
 header h1 {

@@ -52,6 +52,13 @@ export interface PendingInput {
   arguments: unknown;
 }
 
+export interface ThreadListItem {
+  id: string;
+  state: AgentState;
+  model: string;
+  updatedAt: string;
+}
+
 interface SnapshotMessage {
   id: string;
   role: MessageRole;
@@ -148,8 +155,45 @@ export function useAgentThread(initialThreadId?: string) {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [pendingInput, setPendingInput] = useState<PendingInput | null>(null);
   const [subagents, setSubagents] = useState<SubagentView[]>([]);
+  const [threads, setThreads] = useState<ThreadListItem[]>([]);
   const threadRef = useRef<string | undefined>(threadId);
   threadRef.current = threadId;
+
+  /** Thread picker / sidebar: best-effort refresh, most recent first. */
+  const loadThreads = useCallback(async () => {
+    try {
+      const res = await fetch('/api/threads');
+      if (!res.ok) return;
+      const data = await res.json();
+      setThreads(data.threads ?? []);
+    } catch {
+      // sidebar is best-effort — ignore transport errors
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadThreads();
+  }, [loadThreads]);
+
+  /** Start a new thread: clear the pointer so the next Run creates one. */
+  const newThread = useCallback(() => {
+    setThreadId(undefined);
+    setEntries([]);
+    setSubagents([]);
+    setPendingInput(null);
+    setAgentState('IDLE');
+    setActivity(stateActivity('IDLE'));
+    window.localStorage.removeItem(LAST_THREAD_KEY);
+    const url = new URL(window.location.href);
+    url.searchParams.delete('threadId');
+    window.history.replaceState({}, '', url);
+  }, []);
+
+  /** Select an existing thread — hydration + SSE resume run in the
+   *  threadId effect below. */
+  const selectThread = useCallback((id: string) => {
+    setThreadId(id);
+  }, []);
 
   useEffect(() => {
     if (initialThreadId || threadRef.current) return;
@@ -390,6 +434,7 @@ export function useAgentThread(initialThreadId?: string) {
         throw new Error(data.error ?? `Run request failed (${response.status})`);
       }
       setThreadId(data.threadId);
+      void loadThreads(); // sidebar reflects the new thread immediately
       return data;
     } catch (error) {
       setAgentState('FAILED');
@@ -438,6 +483,10 @@ export function useAgentThread(initialThreadId?: string) {
     historyLoading,
     pendingInput,
     subagents,
+    threads,
+    loadThreads,
+    newThread,
+    selectThread,
     run,
     stop,
     respondToInput,

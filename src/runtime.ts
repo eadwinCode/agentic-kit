@@ -49,6 +49,8 @@ export function setupAgentCore(opts: RuntimeOptions): AgentCore {
   const core: AgentCore = {
     resolveModel: (modelName: string) => deps.resolveModel(modelName),
 
+    listThreads: () => deps.storage.threads.list(),
+
     getThreadSnapshot: async (threadId: string): Promise<ThreadSnapshot | null> => {
       const thread = await deps.storage.threads.get(threadId);
       if (!thread) return null;

@@ -6,6 +6,7 @@ import type { Storage } from '../ports/storage.js';
 export interface PrismaLike {
   thread: {
     findUnique(a: { where: { id: string } }): Promise<(Omit<ThreadDTO, 'createdAt' | 'updatedAt'> & { createdAt: Date; updatedAt: Date }) | null>;
+    findMany(a: { orderBy: { updatedAt: 'desc' } }): Promise<ThreadDTO[]>;
     create(a: { data: { model?: string } }): Promise<ThreadDTO>;
     update(a: { where: { id: string }; data: { state: ExecutionState } }): Promise<unknown>;
     updateMany(a: { where: { id: string; state: ExecutionState }; data: { state: ExecutionState } }): Promise<{ count: number }>;
@@ -36,6 +37,8 @@ export class PrismaStorage implements Storage {
     get: (threadId: string) => this.prisma.thread.findUnique({ where: { id: threadId } }),
     create: (init?: { model?: string }) =>
       this.prisma.thread.create({ data: { model: init?.model } }),
+    list: () =>
+      this.prisma.thread.findMany({ orderBy: { updatedAt: 'desc' } }),
     setState: async (threadId: string, state: ExecutionState) => {
       await this.prisma.thread.update({ where: { id: threadId }, data: { state } });
     },

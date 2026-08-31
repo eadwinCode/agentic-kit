@@ -16,6 +16,8 @@ export interface Storage {
   threads: {
     get(threadId: string): Promise<ThreadDTO | null>;
     create(init?: { model?: string }): Promise<ThreadDTO>;
+    /** Most recent first — thread pickers / sidebars. */
+    list(): Promise<ThreadDTO[]>;
     setState(threadId: string, state: ExecutionState): Promise<void>;
     /** Compare-and-set: returns true iff THIS caller performed the transition.
      *  Backs HITL reclamation + double-dispatch protection (§2.5, §2.8).

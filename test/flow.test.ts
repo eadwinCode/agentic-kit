@@ -89,10 +89,20 @@ describe('runtime.run via handle (§5.1)', () => {
   });
 
   it('threads tokenBudget through the job (§2.1)', async () => {
-    const { runtime, queue } = makeDeps();
+    const { deps, runtime, queue } = makeDeps();
     const chat = runtime.createStreamTextAgent({ name: 'chat' });
     await chat.run({ prompt: 'a', tokenBudget: 4_000 });
     expect(queue.items[0]!.tokenBudget).toBe(4_000);
+  });
+
+  it('lists threads most recent first (thread picker)', async () => {
+    const { deps, runtime } = makeDeps();
+    const first = await deps.storage.threads.create();
+    await new Promise((r) => setTimeout(r, 5)); // ensure distinct updatedAt
+    const second = await deps.storage.threads.create();
+
+    const threads = await runtime.listThreads();
+    expect(threads.map((t) => t.id)).toEqual([second.id, first.id]);
   });
 });
 

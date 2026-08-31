@@ -83,6 +83,9 @@ export class MemoryStorage implements Storage {
       this.store.set(t.id, t);
       return t;
     },
+    async list() {
+      return [...this.store.values()].sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
+    },
     async setState(t: string, state: ExecutionState) {
       const thread = this.store.get(t);
       if (!thread) throw new Error(`Unknown thread ${t}`);
