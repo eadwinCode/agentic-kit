@@ -152,6 +152,54 @@ describe('edit + resend (§5.1)', () => {
   });
 });
 
+describe('a second client watching the same thread (§2.2)', () => {
+  const busTypes = (bus: MemoryBus, threadId: string) =>
+    bus.published.filter((e) => e.threadId === threadId).map((e) => e.type);
+
+  // The sending tab adds the user's message to its own state before the
+  // request goes out. Every OTHER tab only ever learns about it from the bus,
+  // so if it is not published there, a second client watching the thread sees
+  // the reply stream in with no question in front of it.
+  it('publishes the user turn, before the run starts', async () => {
+    const r = await makeRuntime();
+    const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
+
+    const started = await chat.run({ prompt: 'question one' });
+    const bus = r.deps.bus as MemoryBus;
+    const types = busTypes(bus, started.threadId);
+
+    expect(types).toContain('MESSAGE_APPENDED');
+    // ... and ahead of RUNNING, so a client never renders a live reply before
+    // the turn that asked for it
+    expect(types.indexOf('MESSAGE_APPENDED')).toBeLessThan(types.indexOf('STATE_CHANGE'));
+
+    const event = bus.published.find((e) => e.type === 'MESSAGE_APPENDED')!;
+    const p = event.payload as any;
+    expect(p.role).toBe('user');
+    expect(p.content).toBe('question one');
+    // The durable id, not a placeholder — editing a message needs it
+    const stored = r.storage.messages.store.get(started.threadId)!;
+    expect(p.id).toBe(stored[0]!.id);
+  });
+
+  it('tells other clients when an edit drops history', async () => {
+    const r = await makeRuntime();
+    const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
+
+    const first = await chat.run({ prompt: 'question one' });
+    await r.runtime.worker.handleJob(r.queue.items[0]!);
+    const target = r.storage.messages.store.get(first.threadId)![0]!.id;
+
+    await chat.run({ threadId: first.threadId, prompt: 'edited', editMessageId: target });
+
+    const dropped = (r.deps.bus as MemoryBus).published.find(
+      (e) => e.type === 'MESSAGES_DROPPED',
+    );
+    expect(dropped).toBeDefined();
+    expect((dropped!.payload as any).fromMessageId).toBe(target);
+  });
+});
+
 describe('messages.deleteFrom', () => {
   it('drops the message and its suffix, and reports the count', async () => {
     const storage = new MemoryStorage();

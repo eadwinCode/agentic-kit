@@ -338,6 +338,45 @@ export function useAgentThread(initialThreadId?: string) {
         break;
       }
 
+      // Another tab sent a message on this thread (§2.2). The sending tab
+      // added it to its own state before the request went out, so this is
+      // where every OTHER tab learns what was asked.
+      case 'MESSAGE_APPENDED': {
+        const entry = messageToEntry({
+          id: String(p.id),
+          role: p.role as MessageRole,
+          content: p.content,
+          agentId: (p.agentId ?? null) as string | null,
+        } as SnapshotMessage);
+        if (!entry) break;
+        setEntries((prev) => {
+          // Already have it — a replayed event, or our own optimistic copy
+          // now confirmed. Replace the optimistic one so the real id lands
+          // (editing a message needs it), otherwise it would show twice.
+          if (prev.some((e) => e.id === entry.id)) return prev;
+          const optimistic = prev.findIndex(
+            (e) => e.id.startsWith('optimistic:user:') && e.text === entry.text,
+          );
+          if (optimistic !== -1) {
+            const next = [...prev];
+            next[optimistic] = entry;
+            return next;
+          }
+          return [...prev, entry];
+        });
+        break;
+      }
+
+      // An edit dropped that turn and everything after it. The editing tab
+      // already truncated its own view; this is for the others.
+      case 'MESSAGES_DROPPED': {
+        setEntries((prev) => {
+          const at = prev.findIndex((e) => e.id === p.fromMessageId);
+          return at === -1 ? prev : prev.slice(0, at);
+        });
+        break;
+      }
+
       case 'CHUNK': {
         if (p?.type === 'text-delta' && typeof p.textDelta === 'string') {
           setActivity({ phase: 'responding', label: 'Responding' });

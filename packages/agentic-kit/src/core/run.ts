@@ -53,9 +53,27 @@ export async function run(
       return { accepted: false, threadId, error: 'Only a user message can be edited' };
     }
     await deps.storage.messages.deleteFrom(threadId, input.editMessageId);
+    // Other clients are showing turns that no longer exist (§2.2). The tab
+    // that made the edit truncated its own view; every other one needs telling.
+    await publish(deps, threadId, 'MESSAGES_DROPPED', { fromMessageId: input.editMessageId });
   }
 
-  await deps.storage.messages.append(threadId, { role: 'user', content: input.prompt });
+  const userMessage = await deps.storage.messages.append(threadId, {
+    role: 'user',
+    content: input.prompt,
+  });
+
+  // The user's turn goes on the bus like everything else (§2.2). Without it a
+  // second client watching the same thread sees the reply stream in with no
+  // question in front of it — the sending tab had only ever added the message
+  // to its own local state.
+  await publish(deps, threadId, 'MESSAGE_APPENDED', {
+    id: userMessage.id,
+    role: userMessage.role,
+    content: userMessage.content,
+    agentId: userMessage.agentId,
+    createdAt: userMessage.createdAt,
+  });
 
   // Claim the thread for THIS run before the state key is touched (§2.1). The
   // next line overwrites whatever stop() may have just written, so the run id
