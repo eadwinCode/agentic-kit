@@ -1,5 +1,5 @@
 import type { RuntimePorts } from '../ports/runtime.js';
-import { publish } from './publish.js';
+import { publish, setThreadState } from './publish.js';
 import type { StopResult } from '../ports/runtime.js';
 
 /** The whole stop mechanism (§2.1): one button, one behavior — everything
@@ -12,7 +12,7 @@ export async function stop(deps: RuntimePorts, threadId: string): Promise<StopRe
   }
 
   await deps.kv.set(`agent:state:${threadId}`, 'CANCELLED');
-  await deps.storage.threads.setState(threadId, 'CANCELLED');
+  await setThreadState(deps, threadId, 'CANCELLED', thread.model);
   await publish(deps, threadId, 'STATE_CHANGE', { state: 'CANCELLED' });
 
   return { accepted: true };

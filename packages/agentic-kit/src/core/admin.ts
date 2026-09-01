@@ -1,5 +1,5 @@
 import type { RuntimePorts } from '../ports/runtime.js';
-import type { RunFilter } from '../ports/storage.js';
+import type { RunFilter, StepRecord } from '../ports/admin.js';
 import type {
   AgentEvent,
   ExecutionState,
@@ -8,18 +8,6 @@ import type {
 } from './types.js';
 
 /** One completed loop iteration, read back off the event log (§2.9). */
-export interface StepMarker {
-  runId?: string;
-  /** Which stream ran it — null is the main agent (§2.7). */
-  agentId: string | null;
-  index: number;
-  durationMs: number;
-  finishReason: string;
-  tokens: UsageTotals;
-  tools: string[];
-  at: Date;
-}
-
 export interface Percentiles {
   p50: number;
   p95: number;
@@ -40,8 +28,12 @@ export interface RunStats {
 }
 
 export interface AdminOverview {
-  threads: Partial<Record<ExecutionState, number>>;
   runs: RunStats;
+  /** Threads by state, from the platform's own view — never a read of the
+   *  caller's database (§2.9). */
+  threads: Partial<Record<ExecutionState, number>>;
+  /** Every run ever, by state, unbounded by the stats window. */
+  runsByState: Partial<Record<ExecutionState, number>>;
   /** Runs still in flight, newest first. */
   active: RunRecord[];
 }
@@ -49,7 +41,7 @@ export interface AdminOverview {
 /** Everything about one run, assembled for a timeline view. */
 export interface RunDetail {
   run: RunRecord;
-  steps: StepMarker[];
+  steps: StepRecord[];
   /** Nested runs spawned beneath it (§2.7) — the same RunRecord shape. */
   subagents: RunRecord[];
   /** The run's events with CHUNKs stripped — the readable spine, not the
@@ -67,25 +59,6 @@ function percentiles(values: number[]): Percentiles | null {
   const at = (q: number) => s[Math.min(s.length - 1, Math.floor(q * s.length))]!;
   return { p50: at(0.5), p95: at(0.95), max: s[s.length - 1]! };
 }
-
-/** Thrown when the configured Storage does not provide the optional admin
- *  queries (§2.9). Deliberately explicit: silently returning nothing would
- *  look like "no traffic" rather than "not wired up". */
-export class AdminUnavailableError extends Error {
-  constructor() {
-    super(
-      'This Storage adapter does not implement the optional `admin` queries. ' +
-        'Cross-thread views need them; per-thread reads work without.',
-    );
-    this.name = 'AdminUnavailableError';
-  }
-}
-
-const requireAdmin = (deps: RuntimePorts) => {
-  const admin = deps.storage.admin;
-  if (!admin) throw new AdminUnavailableError();
-  return admin;
-};
 
 export function summarise(runs: RunRecord[]): RunStats {
   const byState: Partial<Record<ExecutionState, number>> = {};
@@ -126,7 +99,7 @@ export async function listRuns(
   deps: RuntimePorts,
   filter: RunFilter = {},
 ): Promise<RunRecord[]> {
-  return requireAdmin(deps).listRuns({ ...filter, limit: filter.limit ?? DEFAULT_LIMIT });
+  return deps.admin.runs.list({ ...filter, limit: filter.limit ?? DEFAULT_LIMIT });
 }
 
 export async function runStats(
@@ -142,47 +115,28 @@ export async function overview(
   deps: RuntimePorts,
   range: { since?: Date } = {},
 ): Promise<AdminOverview> {
-  const admin = requireAdmin(deps);
-  const [threads, recent, active] = await Promise.all([
-    admin.countThreadsByState(),
+  const [threads, runsByState, recent, active] = await Promise.all([
+    deps.admin.threads.countByState(),
+    deps.admin.runs.countByState(),
     listRuns(deps, { since: range.since, limit: 1_000 }),
-    admin.listRuns({ state: ['RUNNING', 'WAITING_FOR_INPUT'], limit: 50 }),
+    deps.admin.runs.list({ state: ['RUNNING', 'WAITING_FOR_INPUT'], limit: 50 }),
   ]);
-  return { threads, runs: summarise(recent), active };
+  return { runs: summarise(recent), threads, runsByState, active };
 }
 
-/** Step markers for a thread, newest run last. Reads the event log rather than
- *  a step table — the log is already written and indexed by (thread, type). */
-export async function listSteps(
-  deps: RuntimePorts,
-  threadId: string,
-  runId?: string,
-): Promise<StepMarker[]> {
-  const events = await deps.storage.events.listByType(threadId, 'STEP_FINISHED');
-  return events
-    .map((e) => {
-      const p = (e.payload ?? {}) as Partial<StepMarker> & { tokens?: UsageTotals };
-      return {
-        runId: p.runId,
-        agentId: p.agentId ?? null,
-        index: p.index ?? 0,
-        durationMs: p.durationMs ?? 0,
-        finishReason: p.finishReason ?? '',
-        tokens: p.tokens ?? { ...EMPTY },
-        tools: p.tools ?? [],
-        at: new Date(e.createdAt),
-      };
-    })
-    .filter((s) => !runId || s.runId === runId);
+/** A run's steps, in order (§2.9). Rows in the platform's own store rather
+ *  than a scan of the caller's event log. */
+export async function listSteps(deps: RuntimePorts, runId: string): Promise<StepRecord[]> {
+  return deps.admin.steps.listByRun(runId);
 }
 
 export async function getRun(deps: RuntimePorts, runId: string): Promise<RunDetail | null> {
-  const run = await deps.storage.runs.get(runId);
+  const run = await deps.admin.runs.get(runId);
   if (!run) return null;
 
-  const [steps, subagents, events] = await Promise.all([
-    listSteps(deps, run.threadId, runId),
-    deps.storage.runs.listByThread(run.threadId),
+  const [steps, siblings, events] = await Promise.all([
+    listSteps(deps, runId),
+    deps.admin.runs.listByThread(run.threadId),
     deps.storage.events.listSince(run.threadId, -1),
   ]);
 
@@ -192,7 +146,7 @@ export async function getRun(deps: RuntimePorts, runId: string): Promise<RunDeta
     run,
     steps,
     // Its children: same table, distinguished by depth (§2.7).
-    subagents: subagents.filter((c) => c.parentRunId === runId),
+    subagents: siblings.filter((c: RunRecord) => c.parentRunId === runId),
     // CHUNK is the token firehose; a timeline wants the spine.
     events: events.filter((e: AgentEvent) => {
       if (e.type === 'CHUNK' || e.type === 'SUBAGENT_CHUNK') return false;

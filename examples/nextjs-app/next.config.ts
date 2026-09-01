@@ -9,6 +9,7 @@ const nextConfig: NextConfig = {
   outputFileTracingRoot: repoRoot,
   transpilePackages: ['@agent/core'],
   webpack: (config) => {
+
     // The package is authored with NodeNext-compatible `.js` specifiers while
     // these aliases point Webpack at the TypeScript sources during local dev.
     config.resolve.extensionAlias = {

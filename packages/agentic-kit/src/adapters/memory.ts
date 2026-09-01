@@ -1,5 +1,5 @@
-import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewRunRecord, NewUsage, RunJob, RunPatch, RunRecord, ThreadDTO, UsageTotals } from '../core/types.js';
-import type { RunFilter, Storage } from '../ports/storage.js';
+import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewUsage, RunJob, ThreadDTO, UsageTotals } from '../core/types.js';
+import type { Storage } from '../ports/storage.js';
 import type { EventBus } from '../ports/bus.js';
 import type { EnqueueOptions, Queue } from '../ports/queue.js';
 import type { Kv } from '../ports/kv.js';
@@ -98,14 +98,14 @@ export class MemoryStorage implements Storage {
       thread.state = state; thread.updatedAt = new Date();
     },
     // Arrow-bound to the MemoryStorage instance: the cascade reaches the
-    // sibling sections (messages / events / usage / runs) — §3.2 contract
+    // sibling sections (messages / events / usage) — §3.2 contract. Run
+    // records are not here; they are the platform's own (§2.9).
     delete: async (t: string) => {
       if (!this.threads.store.has(t)) throw new Error(`Unknown thread ${t}`);
       this.threads.store.delete(t);
       this.messages.store.delete(t);
       this.events.store.delete(t);
       this.usage.recorded = this.usage.recorded.filter((u) => u.threadId !== t);
-      for (const [runId, run] of this.runs.store) if (run.threadId === t) this.runs.store.delete(runId);
     },
     async claimState(t: string, from: ExecutionState, to: ExecutionState) {
       const thread = this.store.get(t);
@@ -180,47 +180,6 @@ export class MemoryStorage implements Storage {
     },
   };
 
-  runs = {
-    store: new Map<string, RunRecord>(),
-    async start(r: NewRunRecord) {
-      const rec: RunRecord = {
-        parentRunId: null, depth: 0, ...r,
-        state: 'RUNNING', startedAt: new Date(), steps: 0, attempts: 0,
-        inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0,
-      };
-      this.store.set(rec.id, rec);
-      return rec;
-    },
-    async patch(runId: string, patch: RunPatch) {
-      const cur = this.store.get(runId);
-      if (cur) this.store.set(runId, { ...cur, ...patch });
-    },
-    async get(runId: string) { return this.store.get(runId) ?? null; },
-    async listByThread(t: string) {
-      return [...this.store.values()]
-        .filter((r) => r.threadId === t)
-        .sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime());
-    },
-  };
 
-  admin = {
-    parent: this as MemoryStorage,
-    async listRuns(f: RunFilter) {
-      let rows = [...this.parent.runs.store.values()];
-      if (f.state?.length) rows = rows.filter((r) => f.state!.includes(r.state));
-      if (f.agent) rows = rows.filter((r) => r.agent === f.agent);
-      if (f.since) rows = rows.filter((r) => r.startedAt >= f.since!);
-      if (f.until) rows = rows.filter((r) => r.startedAt <= f.until!);
-      rows.sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime());
-      return rows.slice(0, f.limit ?? 100);
-    },
-    async countThreadsByState() {
-      const out: Record<string, number> = {};
-      for (const t of this.parent.threads.store.values()) {
-        out[t.state] = (out[t.state] ?? 0) + 1;
-      }
-      return out as any;
-    },
-  };
 
 }

@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import type { RuntimePorts } from '../ports/runtime.js';
-import type { AgentKind, ExecutionState, ProviderOptions, ResumeInfo } from './types.js';
+import type { ExecutionState, ProviderOptions, ResumeInfo } from './types.js';
 import { compactContext } from './context.js';
-import { attributeTokens, countTokens, type TokenAttribution } from './usage.js';
+import type { TokenAttribution } from './usage.js';
 import { markPromptCaching } from './cache.js';
 import { mergeProviderOptions } from './types.js';
 import type { RegisteredAgent } from './agent.js';
@@ -12,10 +12,11 @@ import {
   withHitl,
   type PendingHitl,
 } from './hitl.js';
-import { publish } from './publish.js';
+import { publish, setThreadState } from './publish.js';
 import { runNestedAgent, spawnSubagentTool, type SubagentCtx } from './subagent.js';
 import { redriveKey, runIdKey } from './keys.js';
-import { isParked, runLoop, type RunLedger } from './loop.js';
+import { withRunState, type AgentRunState } from './state.js';
+import { runLoop, type RunLedger } from './loop.js';
 
 export { countTokens } from './usage.js';
 // executeStep and the loop live in ./loop.js so a nested run can share them
@@ -124,7 +125,7 @@ async function unwindVerdict(
     if (outcome.parked) return false; // parked again, one level down
     if (outcome.aborted) return false; // user stop mid-unwind (§2.1)
 
-    await deps.storage.runs.patch(producer.agentId, {
+    await deps.admin.runs.patch(producer.agentId, {
       state: 'COMPLETED',
       result: { text: outcome.text },
       endedAt: new Date(),
@@ -159,10 +160,10 @@ async function closeRunRecord(
   f: FinalizeInput,
 ): Promise<void> {
   try {
-    const prior = await deps.storage.runs.get(runId);
+    const prior = await deps.admin.runs.get(runId);
     if (!prior) return; // a run started before §2.9, or a foreign dispatch
     const endedAt = new Date();
-    await deps.storage.runs.patch(runId, {
+    await deps.admin.runs.patch(runId, {
       state: f.state,
       stopReason: f.stopReason,
       ...(f.error ? { error: f.error } : {}),
@@ -189,7 +190,7 @@ async function failRun(
   error: string,
 ): Promise<void> {
   await deps.kv.set(`agent:state:${threadId}`, 'FAILED');
-  await deps.storage.threads.setState(threadId, 'FAILED');
+  await setThreadState(deps, threadId, 'FAILED');
   if (runId) {
     await closeRunRecord(deps, runId, {
       state: 'FAILED',
@@ -235,7 +236,7 @@ async function resumePendingHitl(
   }
 
   await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
-  await deps.storage.threads.setState(threadId, 'RUNNING');
+  await setThreadState(deps, threadId, 'RUNNING');
   await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
   void expiredAny;
   return true;
@@ -269,6 +270,8 @@ export interface ExecuteInput {
   runId?: string;
   /** Epoch ms at enqueue, for the queue-wait measurement (§2.9). */
   enqueuedAt?: number;
+  /** The run's state (§2.10) — carried so a redrive keeps it. */
+  state?: AgentRunState;
   tokenBudget?: number;
   providerOptions?: ProviderOptions;
 }
@@ -356,7 +359,7 @@ export async function execute(
 
     // How long the dispatch sat in the queue before a worker took it (§2.9).
     if (runId && input.enqueuedAt) {
-      await deps.storage.runs
+      await deps.admin.runs
         .patch(runId, { queuedMs: Date.now() - input.enqueuedAt })
         .catch(() => undefined);
     }
@@ -384,6 +387,7 @@ export async function execute(
           tokenBudget,
           providerOptions,
           abortSignal: abort.signal,
+          state: input.state,
         }
       : null;
     const rawTools: Record<string, any> = {
@@ -391,7 +395,11 @@ export async function execute(
       ...(subCtx ? { spawnSubagent: spawnSubagentTool(subCtx) } : {}),
     };
     // The main agent's own toolset: nothing is waiting on its parks (§2.7).
-    const tools = withHitl(deps, threadId, rawTools, { resume, agentId: null, frames: [] });
+    // Every tool also sees the run's state (§2.10).
+    const tools = withRunState(
+      withHitl(deps, threadId, rawTools, { resume, agentId: null, frames: [] }),
+      input.state ?? {},
+    );
 
     // §2.5 resume: a WAITING thread at segment start is either the /respond
     // continuation or a redelivery of the original job while still parked.
@@ -537,7 +545,7 @@ export async function finalize(
   }
 
   await deps.kv.set(`agent:state:${threadId}`, f.state);
-  await deps.storage.threads.setState(threadId, f.state);
+  await setThreadState(deps, threadId, f.state);
   await publish(deps, threadId, 'STATE_CHANGE', {
     state: f.state,
     stopReason: f.stopReason,

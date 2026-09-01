@@ -30,7 +30,6 @@ model Thread {
   messages     Message[]
   usage        TokenUsage[]
   events       AgentEvent[]
-  runs         AgentRun[]
 }
 
 model Message {
@@ -58,40 +57,6 @@ model AgentEvent {
 
   @@unique([threadId, seq])
   @@index([threadId, type, createdAt])
-}
-
-// One row per run — dispatched or nested (§2.7, §2.9). A subagent IS a run:
-// same loop, same steps, same duration, same tokens. It is distinguished by
-// depth > 0 and a parentRunId, not by living in a separate table.
-model AgentRun {
-  id          String         @id
-  threadId    String
-  parentRunId String? // null = a dispatched run (§2.1)
-  depth       Int            @default(0) // 0 = the main agent
-  agent       String // handle name, or the delegation's name when nested
-  model       String
-  state       ExecutionState @default(RUNNING)
-  stopReason  String?
-  error       String? // why it failed — previously dropped entirely (§2.8)
-  startedAt   DateTime       @default(now())
-  endedAt     DateTime?
-  durationMs  Int?
-  queuedMs    Int? // enqueue -> pickup; the worker backlog signal (§2.8)
-  attempts    Int            @default(0)
-  steps       Int            @default(0)
-
-  inputTokens       Int @default(0)
-  cachedInputTokens Int @default(0)
-  outputTokens      Int @default(0)
-  totalTokens       Int @default(0)
-
-  result Json? // a nested run's capped result (§2.7)
-
-  thread Thread @relation(fields: [threadId], references: [id], onDelete: Cascade)
-
-  @@index([threadId, startedAt])
-  @@index([state, startedAt])
-  @@index([parentRunId])
 }
 
 model TokenUsage {

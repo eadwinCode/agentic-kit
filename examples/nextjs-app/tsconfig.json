@@ -17,7 +17,8 @@
     "paths": {
       "@/*": ["./*"],
       "@agentic-kit/core": ["../../packages/agentic-kit/src/index.ts"],
-      "@agentic-kit/core/adapters/*": ["../../packages/agentic-kit/src/adapters/*"]
+      "@agentic-kit/core/adapters/*": ["../../packages/agentic-kit/src/adapters/*"],
+      "@agentic-kit/core/admin/*": ["../../packages/agentic-kit/src/admin/*"]
     }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],

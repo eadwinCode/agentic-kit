@@ -14,22 +14,46 @@ import type {
 import type { ThreadUsage } from './ports/runtime.js';
 import { contextUsage } from './core/context.js';
 import { createGenerateTextAgent, createStreamTextAgent } from './core/agent.js';
-import * as admin from './core/admin.js';
+import * as adminReads from './core/admin.js';
+import { bindStorage, type AgentRunState } from './core/state.js';
+import { openDefaultAdminStore } from './admin/default.js';
 import { reclaimIfOrphaned } from './core/reclaim.js';
 import { respond } from './core/hitl.js';
 import { deleteThread } from './core/deleteThread.js';
 
 /** Bind the ports to the core behaviors (§3.3). This is the package's public
  *  entry point — the only place where anything is wired together. */
-export function setupAgentCore(opts: RuntimeOptions): AgentCore {
-  const deps: RuntimePorts = {
-    storage: opts.storage,
+export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
+  // Operational history is the platform's own (§2.9). Nothing configured means
+  // SQLite on disk: history that survives a restart should be the default, not
+  // something you have to remember to switch on.
+  //
+  // Opened here, eagerly, which is why this function is async: a store that
+  // cannot be opened is a startup error you see immediately, rather than a
+  // surprise on the first run — and losing run history silently looks exactly
+  // like having no traffic.
+  const admin = opts.admin ?? (await openDefaultAdminStore());
+
+  const shared = {
+    admin,
     bus: opts.bus,
     queue: opts.queue,
     kv: opts.kv,
     resolveModel: (modelName: string) => opts.resolveModel(modelName),
     config: resolveConfig(opts.config),
   };
+
+  /** Ports for ONE run: the caller's storage with that run's state bound, so
+   *  every query, insert and update their implementation makes can see it
+   *  (§2.10). Called per entry point rather than once, because state belongs
+   *  to a run and a runtime outlives many. */
+  const scope = (state: AgentRunState = {}, runId?: string): RuntimePorts => ({
+    ...shared,
+    storage: bindStorage(opts.storage, { state, runId }),
+  });
+
+  // For reads that are not on behalf of any particular run.
+  const deps = scope();
 
   // Handle registry — keyed by spec.name, resolved by the queue dispatch.
   const registry = new Map<string, AgentHandle>();
@@ -44,8 +68,8 @@ export function setupAgentCore(opts: RuntimeOptions): AgentCore {
   ): AgentHandle => {
     const handle: AgentHandle =
       kind === 'stream-text'
-        ? createStreamTextAgent(deps, spec)
-        : createGenerateTextAgent(deps, spec);
+        ? createStreamTextAgent(scope, spec)
+        : createGenerateTextAgent(scope, spec);
     registry.set(name, handle);
     return handle;
   };
@@ -61,8 +85,8 @@ export function setupAgentCore(opts: RuntimeOptions): AgentCore {
       const thread = await deps.storage.threads.get(threadId);
       if (!thread) return null;
 
-      const messages = await deps.storage.messages.list(threadId);
-      const runs = await deps.storage.runs.listByThread(threadId);
+      const messages = await deps.storage.messages.list(threadId, undefined);
+      const runs = await deps.admin.runs.listByThread(threadId);
       const events = await deps.storage.events.listSince(threadId, -1);
 
       const lastEventSeq = events.at(-1)?.seq ?? -1;
@@ -86,15 +110,12 @@ export function setupAgentCore(opts: RuntimeOptions): AgentCore {
     },
 
     admin: {
-      get available() {
-        return deps.storage.admin !== undefined;
-      },
-      overview: (range) => admin.overview(deps, range),
-      listRuns: (filter) => admin.listRuns(deps, filter),
-      stats: (range) => admin.runStats(deps, range),
-      getRun: (runId: string) => admin.getRun(deps, runId),
-      listRunsByThread: (threadId: string) => deps.storage.runs.listByThread(threadId),
-      listSteps: (threadId: string, runId?: string) => admin.listSteps(deps, threadId, runId),
+      overview: (range) => adminReads.overview(deps, range),
+      listRuns: (filter) => adminReads.listRuns(deps, filter),
+      stats: (range) => adminReads.runStats(deps, range),
+      getRun: (runId: string) => adminReads.getRun(deps, runId),
+      listRunsByThread: (threadId: string) => deps.admin.runs.listByThread(threadId),
+      listSteps: (runId: string) => adminReads.listSteps(deps, runId),
     },
 
     getThreadUsage: async (threadId: string): Promise<ThreadUsage | null> => {
@@ -154,6 +175,8 @@ export function setupAgentCore(opts: RuntimeOptions): AgentCore {
           runId: job.runId,
           // Carries the queue wait through to the run record (§2.9).
           enqueuedAt: job.enqueuedAt,
+          // Rehydrated from the ticket: this worker never saw the caller (§2.10).
+          state: job.state,
           model: job.model,
           tokenBudget: job.tokenBudget,
           providerOptions: job.providerOptions,

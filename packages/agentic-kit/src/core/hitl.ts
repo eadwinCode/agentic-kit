@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { RespondInput, RespondResult } from '../ports/runtime.js';
 import type { AgentEvent, NestedDescriptor, ResumeInfo } from './types.js';
-import { publish } from './publish.js';
+import { publish, setThreadState } from './publish.js';
 import { currentRunId } from './keys.js';
 import { reclaimGraceAfterMs, reclaimIfOrphaned } from './reclaim.js';
 
@@ -110,7 +110,7 @@ export function withHitl(
  *  run lock makes the other a no-op. */
 export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise<void> {
   await deps.kv.set(`agent:state:${i.threadId}`, 'WAITING_FOR_INPUT');
-  await deps.storage.threads.setState(i.threadId, 'WAITING_FOR_INPUT');
+  await setThreadState(deps, i.threadId, 'WAITING_FOR_INPUT', i.resume.model);
   await publish(deps, i.threadId, 'INPUT_REQUIRED', {
     toolCallId: i.toolCallId,
     toolName: i.toolName,
@@ -213,7 +213,7 @@ export async function loadOpenHitls(
     ),
   );
   const answered = new Set<string>();
-  for (const m of await deps.storage.messages.list(threadId)) {
+  for (const m of await deps.storage.messages.list(threadId, undefined)) {
     if (m.role !== 'tool') continue;
     for (const part of Array.isArray(m.content) ? m.content : []) {
       const id = (part as { toolCallId?: string } | null)?.toolCallId;

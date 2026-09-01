@@ -2,7 +2,7 @@ import type { RuntimePorts, RunInput, RunResult } from '../ports/runtime.js';
 import type { RegisteredAgent } from './agent.js';
 import { reclaimIfOrphaned } from './reclaim.js';
 import { claimRun } from './keys.js';
-import { publish } from './publish.js';
+import { publish, setThreadState } from './publish.js';
 
 /** The §5.1 behavior: heal orphans → billing pre-check (§4) → persist the user
  *  message → state RUNNING (hot + durable) → enqueue on the dispatch queue
@@ -64,7 +64,7 @@ export async function run(
   const runId = await claimRun(deps, threadId);
 
   await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
-  await deps.storage.threads.setState(threadId, 'RUNNING');
+  await setThreadState(deps, threadId, 'RUNNING', model);
   // A durable run boundary lets reconnecting clients distinguish this turn's
   // in-flight chunks from earlier completed turns.
   await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
@@ -72,11 +72,14 @@ export async function run(
   // The run's durable record opens here (§2.9): a thread accumulates many runs
   // and Thread.state only ever describes the latest, so this is the only place
   // "what happened, how long, what did it cost" can be answered from.
-  await deps.storage.runs.start({ id: runId, threadId, agent: agent.name, model });
+  await deps.admin.runs.start({ id: runId, threadId, agent: agent.name, model });
 
   await deps.queue.enqueue({
     threadId, runId, model, agent: agent.name,
     enqueuedAt: Date.now(),
+    // Persisted on the ticket so a worker — or a resume after an approval,
+    // hours later, in another process — rehydrates the same state (§2.10).
+    ...(input.state ? { state: input.state } : {}),
     tokenBudget: input.tokenBudget,
     providerOptions: input.providerOptions,
   });

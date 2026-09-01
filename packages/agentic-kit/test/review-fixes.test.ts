@@ -1,19 +1,23 @@
 import { describe, expect, it } from 'bun:test';
 import { setupAgentCore } from '../src/runtime.js';
+import { MemoryAdminStore } from '../src/admin/memory.js';
+import { bindStorage } from '../src/core/state.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import { RedisKv } from '../src/adapters/redis.js';
-import type { RuntimePorts } from '../src/ports/runtime.js';
+import type { RuntimeOptions } from '../src/ports/runtime.js';
 import type { AgentConfig } from '../src/core/types.js';
 import type { AgentConfig as AgentConfigType } from '../src/core/types.js';
 import { resolveConfig } from '../src/core/types.js';
 
-function makeDeps(config: Partial<AgentConfig> = {}) {
+async function makeDeps(config: Partial<AgentConfig> = {}) {
   const storage = new MemoryStorage();
   const bus = new MemoryBus();
   const queue = new MemoryQueue();
   const kv = new MemoryKv();
-  const deps: RuntimePorts = {
+  const deps: RuntimeOptions = {
     storage,
+    // Isolated per test: the default store is a file on disk.
+    admin: new MemoryAdminStore(),
     bus,
     queue,
     kv,
@@ -25,23 +29,23 @@ function makeDeps(config: Partial<AgentConfig> = {}) {
     }),
     config: resolveConfig(config),
   };
-  return { deps, runtime: setupAgentCore(deps), storage, bus, queue, kv };
+  return { deps, store: bindStorage(storage, { state: {} }), runtime: await setupAgentCore(deps), storage, bus, queue, kv };
 }
 
-function chatHandle(runtime: ReturnType<typeof setupAgentCore>) {
+function chatHandle(runtime: Awaited<ReturnType<typeof setupAgentCore>>) {
   return runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 }
 
 describe('per-thread run lock (§2.8, §3.4)', () => {
   it('a second worker is a no-op while the lock is held', async () => {
-    const { deps, runtime, queue } = makeDeps();
+    const { deps, store, runtime, queue } = await makeDeps();
     const chat = chatHandle(runtime);
     const ran = await chat.run({ prompt: 'a' });
 
     // Simulate a live worker holding the lock (engine acquires it in execute)
     const locked = await deps.kv.set(`agent:lock:${ran.threadId}`, 'worker-1', {
       onlyIfNotExists: true,
-      exSeconds: deps.config.runLockLeaseSeconds,
+      exSeconds: deps.config!.runLockLeaseSeconds,
     });
     expect(locked).toBe(true);
 
@@ -53,7 +57,7 @@ describe('per-thread run lock (§2.8, §3.4)', () => {
   });
 
   it('a lock-conflict no-op preserves the retry counter', async () => {
-    const { deps, runtime } = makeDeps();
+    const { deps, store, runtime } = await makeDeps();
     const chat = chatHandle(runtime);
     const ran = await chat.run({ prompt: 'a' });
 
@@ -61,7 +65,7 @@ describe('per-thread run lock (§2.8, §3.4)', () => {
     await deps.kv.set(`agent:attempts:${ran.threadId}`, '1');
     await deps.kv.set(`agent:lock:${ran.threadId}`, 'other-worker', {
       onlyIfNotExists: true,
-      exSeconds: deps.config.runLockLeaseSeconds,
+      exSeconds: deps.config!.runLockLeaseSeconds,
     });
 
     await chat.executeWithPolicy({ threadId: ran.threadId, model: 'gpt-4o' });
@@ -103,7 +107,7 @@ describe('per-thread run lock (§2.8, §3.4)', () => {
 
 describe('executeWithPolicy failure handling (§2.8)', () => {
   it('redrives transient failures, then finalizes FAILED on BOTH cache and durable state', async () => {
-    const { deps, runtime, queue } = makeDeps({
+    const { deps, store, runtime, queue } = await makeDeps({
       // resolveModel hands out instances that always throw → deterministic failure
       runMaxAttempts: 2,
     });
@@ -117,13 +121,13 @@ describe('executeWithPolicy failure handling (§2.8)', () => {
     await chat.executeWithPolicy({ threadId: ran.threadId, model: 'gpt-4o' });
     // Attempts exhausted → FAILED on both homes (the review's critical #3)
     expect(await deps.kv.get(`agent:state:${ran.threadId}`)).toBe('FAILED');
-    const thread = await deps.storage.threads.get(ran.threadId);
+    const thread = await store.threads.get(ran.threadId);
     expect(thread!.state).toBe('FAILED');
     expect(queue.items.length).toBe(initialJobs + 1); // no further redrive
   });
 
   it('resets the attempt counter after a successful run', async () => {
-    const { deps, runtime } = makeDeps();
+    const { deps, store, runtime } = await makeDeps();
     const chat = chatHandle(runtime);
     const ran = await chat.run({ prompt: 'a' });
 
@@ -147,7 +151,7 @@ describe('executeWithPolicy failure handling (§2.8)', () => {
       sem: { acquire: async () => () => {} },
     };
     await policyFn(
-      deps,
+      { ...deps, storage: store } as any,
       fakeAgent as any,
       { threadId: ran.threadId, model: 'gpt-4o' },
       undefined,
@@ -171,7 +175,7 @@ describe('MemoryKv.incr atomicity (§3.4)', () => {
 
 describe('runtime.worker.handleJob (§2.8)', () => {
   it('rejects unknown agents', async () => {
-    const { runtime } = makeDeps();
+    const { runtime } = await makeDeps();
     const res = await runtime.worker.handleJob({
       threadId: 't1', model: 'gpt-4o', agent: 'nope',
     });
@@ -180,9 +184,9 @@ describe('runtime.worker.handleJob (§2.8)', () => {
   });
 
   it('dispatches to the default handle when agent is omitted', async () => {
-    const { deps, runtime, queue } = makeDeps();
+    const { deps, store, runtime, queue } = await makeDeps();
     runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
-    const thread = await deps.storage.threads.create();
+    const thread = await store.threads.create(undefined);
 
     const res = await runtime.worker.handleJob({ threadId: thread.id, model: 'gpt-4o' });
     expect(res.accepted).toBe(true);
@@ -192,7 +196,7 @@ describe('runtime.worker.handleJob (§2.8)', () => {
   });
 
   it('a job for a missing (deleted) thread is a no-op', async () => {
-    const { runtime, queue } = makeDeps();
+    const { runtime, queue } = await makeDeps();
     runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 
     const res = await runtime.worker.handleJob({ threadId: 'deleted-thread', model: 'gpt-4o' });

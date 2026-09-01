@@ -3,10 +3,12 @@ import { simulateReadableStream } from 'ai';
 import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
 import { MockLanguageModelV1 } from 'ai/test';
 import { setupAgentCore } from '../src/runtime.js';
+import { MemoryAdminStore } from '../src/admin/memory.js';
+import { bindStorage } from '../src/core/state.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import { contextUsage } from '../src/core/context.js';
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
-import type { RuntimePorts } from '../src/ports/runtime.js';
+import type { RuntimeOptions } from '../src/ports/runtime.js';
 
 function replyModel(text: string) {
   return new MockLanguageModelV1({
@@ -25,17 +27,19 @@ function replyModel(text: string) {
   });
 }
 
-function makeRuntime(model: any, config: Partial<AgentConfig> = {}) {
+async function makeRuntime(model: any, config: Partial<AgentConfig> = {}) {
   const storage = new MemoryStorage();
   const bus = new MemoryBus();
   const queue = new MemoryQueue();
   const kv = new MemoryKv();
-  const deps: RuntimePorts = {
+  const deps: RuntimeOptions = {
     storage, bus, queue, kv,
+    // Isolated per test: the default store is a file on disk.
+    admin: new MemoryAdminStore(),
     resolveModel: () => ({ instance: () => model, contextWindow: 128_000 }),
     config: resolveConfig(config),
   };
-  return { deps, runtime: setupAgentCore(deps), storage, queue };
+  return { deps, store: bindStorage(storage, { state: {} }), runtime: await setupAgentCore(deps), storage, queue };
 }
 
 describe('thread usage (§4)', () => {
@@ -56,7 +60,7 @@ describe('thread usage (§4)', () => {
   });
 
   it('getThreadUsage reports what a finished run actually spent', async () => {
-    const { runtime, queue } = makeRuntime(replyModel('hello'));
+    const { runtime, queue } = await makeRuntime(replyModel('hello'));
     const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 
     const ran = await chat.run({ prompt: 'hi' });
@@ -71,39 +75,45 @@ describe('thread usage (§4)', () => {
   });
 
   it('getThreadUsage is null for a thread that does not exist', async () => {
-    const { runtime } = makeRuntime(replyModel('hello'));
+    const { runtime } = await makeRuntime(replyModel('hello'));
     expect(await runtime.getThreadUsage('nope')).toBeNull();
   });
 });
 
 describe('context usage (§2.6)', () => {
   it('measures the same budget compaction acts on, and grows with history', async () => {
-    const { deps, runtime, queue } = makeRuntime(replyModel('hello'));
+    const { deps, store, runtime, queue } = await makeRuntime(replyModel('hello'));
     const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
     const ran = await chat.run({ prompt: 'hi' });
 
-    const budget = 128_000 - deps.config.contextOutputReserveTokens;
-    const empty = await contextUsage(deps, ran.threadId, 'gpt-4o');
+    const cfg = deps.config!;
+    const budget = 128_000 - cfg.contextOutputReserveTokens!;
+    const empty = await contextUsage({ ...deps, storage: store } as any, ran.threadId, 'gpt-4o');
     expect(empty.budgetTokens).toBe(budget);
-    expect(empty.compactAtTokens).toBe(Math.floor(budget * deps.config.compactionTrigger));
+    expect(empty.compactAtTokens).toBe(Math.floor(budget * cfg.compactionTrigger!));
     expect(empty.messages).toBe(1);
     expect(empty.usedTokens).toBeGreaterThan(0);
 
     await runtime.worker.handleJob(queue.items[0]!);
 
-    const after = await contextUsage(deps, ran.threadId, 'gpt-4o');
+    const after = await contextUsage({ ...deps, storage: store } as any, ran.threadId, 'gpt-4o');
     expect(after.messages).toBe(2);
     expect(after.usedTokens).toBeGreaterThan(empty.usedTokens);
   });
 
   it('honours a model window smaller than the ceiling', async () => {
     const storage = new MemoryStorage();
-    const deps: RuntimePorts = {
+    const deps: RuntimeOptions = {
       storage, bus: new MemoryBus(), queue: new MemoryQueue(), kv: new MemoryKv(),
+      // Isolated per test: the default store is a file on disk.
+      admin: new MemoryAdminStore(),
       resolveModel: () => ({ instance: () => null as any, contextWindow: 32_000 }),
       config: resolveConfig({ contextOutputReserveTokens: 2_000 }),
     };
-    const thread = await storage.threads.create({ model: 'small' });
-    expect((await contextUsage(deps, thread.id, 'small')).budgetTokens).toBe(30_000);
+    const scoped = bindStorage(storage, { state: {} });
+    const thread = await scoped.threads.create({ model: 'small' });
+    expect(
+      (await contextUsage({ ...deps, storage: scoped } as any, thread.id, 'small')).budgetTokens,
+    ).toBe(30_000);
   });
 });

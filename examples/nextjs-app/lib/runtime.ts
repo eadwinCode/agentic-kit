@@ -42,7 +42,7 @@ if (dev) {
 /** The ONLY vendor-wiring file in the example app (spec §5). Swap any adapter
  *  here — Mongo/Dynamo storage, SQS/BullMQ queue, Ably/Kafka bus — and every
  *  route below keeps working unchanged. */
-export const runtime = setupAgentCore({
+export const runtime = await setupAgentCore({
   storage: new PrismaStorage(prisma),
   bus: new RedisBus(redis), // emits HEARTBEAT notices driving the §2.5 watchdog
   queue: new QStashQueue(

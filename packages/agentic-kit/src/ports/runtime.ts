@@ -15,6 +15,11 @@ import type {
   UsageTotals,
 } from '../core/types.js';
 import type { Storage } from './storage.js';
+import type { AdminStore, RunFilter, StepRecord } from './admin.js';
+import type { AgentRunState, BoundStorage } from '../core/state.js';
+
+export type { AdminStore, NewStepRecord, RunFilter, StepRecord } from './admin.js';
+export type { AgentRunState, BoundStorage, StorageContext } from '../core/state.js';
 import type { EventBus } from './bus.js';
 import type { Queue } from './queue.js';
 import type { Kv } from './kv.js';
@@ -23,27 +28,27 @@ import type {
   AdminOverview,
   RunDetail,
   RunStats,
-  StepMarker,
 } from '../core/admin.js';
-import type { RunFilter } from './storage.js';
-
 export type {
   AdminOverview,
-  Percentiles,
   RunDetail,
   RunStats,
-  StepMarker,
 } from '../core/admin.js';
-export type { RunFilter } from './storage.js';
 
 export type { ExecuteInput, ExecuteOutcome } from '../core/engine.js';
 
 // Re-exported for consumers: these flow through RuntimeOptions/RunJob/AgentCore.
 export type { AgentKind, ProviderOptions, ResolvedModel, RunJob, SubagentsConfig } from '../core/types.js';
 
-/** The ports bundle — everything in core/ receives this and nothing else. */
+/** The ports bundle — everything in core/ receives this and nothing else.
+ *
+ *  `storage` is the caller's implementation with THIS run's context already
+ *  bound (§2.10), so core keeps calling `messages.append(threadId, msg)` while
+ *  the implementation still receives the state. `admin` is the platform's own
+ *  operational store (§2.9) — never the caller's. */
 export interface RuntimePorts {
-  storage: Storage;
+  storage: BoundStorage;
+  admin: AdminStore;
   bus: EventBus;
   queue: Queue;
   kv: Kv;
@@ -55,6 +60,10 @@ export interface RuntimePorts {
 
 export interface RuntimeOptions {
   storage: Storage;
+  /** Where operational history goes (§2.9). Omitted, it is chosen from the
+   *  environment: Postgres when AGENTIC_KIT_ADMIN_DATABASE_URL is set, SQLite
+   *  on disk otherwise. Pass one to decide for yourself. */
+  admin?: AdminStore;
   bus: EventBus;
   queue: Queue;
   kv: Kv;
@@ -68,6 +77,11 @@ export interface RunInput {
   /** Omit to create a fresh thread first (threads.create, §3.2) */
   threadId?: string;
   prompt: string;
+  /** Carried through this whole run (§2.10): every storage call, every tool,
+   *  every nested run. Persisted on the dispatch, so a worker picking the job
+   *  up later — or resuming it after an approval — sees the same thing. The
+   *  platform never reads it. */
+  state?: AgentRunState;
   /** Edit + resend (§5.1): replace this user message with `prompt` and drop
    *  every message after it, then answer again from that point. Must name a
    *  message in this thread whose role is 'user'. Omit for a normal turn. */
@@ -203,7 +217,7 @@ export interface AgentHandle {
   run(input: RunInput): Promise<RunResult>;
 
   /** Platform stop (§2.1) — works regardless of which agent's run is active. */
-  stop(threadId: string): Promise<StopResult>;
+  stop(threadId: string, state?: AgentRunState): Promise<StopResult>;
 }
 
 export interface AgentCore {
@@ -244,18 +258,15 @@ export interface AgentCore {
   getAgent(name: string): AgentHandle | null;
 
   /** Operational reads (§2.9). The platform records what runs did; building a
-   *  view over it is the caller's business. Cross-thread methods need the
-   *  optional `Storage.admin` queries and throw AdminUnavailableError without
-   *  them — `available` says which you have. */
+   *  view over it is the caller's business. Everything here comes from the
+   *  platform's OWN store — it never reads the caller's database. */
   admin: {
-    readonly available: boolean;
     overview(range?: { since?: Date }): Promise<AdminOverview>;
     listRuns(filter?: RunFilter): Promise<RunRecord[]>;
     stats(range?: { since?: Date; until?: Date }): Promise<RunStats>;
-    /** Per-thread reads — these work on any adapter. */
     getRun(runId: string): Promise<RunDetail | null>;
     listRunsByThread(threadId: string): Promise<RunRecord[]>;
-    listSteps(threadId: string, runId?: string): Promise<StepMarker[]>;
+    listSteps(runId: string): Promise<StepRecord[]>;
   };
 
   /** The queue dispatch side of the platform (§2.8): resolves the handle,

@@ -4,11 +4,13 @@ import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
 import { MockLanguageModelV1 } from 'ai/test';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
+import { MemoryAdminStore } from '../src/admin/memory.js';
+import { bindStorage } from '../src/core/state.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import { QStashQueue } from '../src/adapters/qstash.js';
 import { markRequiresConfirmation } from '../src/core/engine.js';
 import { resolveConfig, type AgentConfig, type RunJob } from '../src/core/types.js';
-import type { RuntimePorts } from '../src/ports/runtime.js';
+import type { RuntimeOptions } from '../src/ports/runtime.js';
 
 /** Records which QStash API each dispatch actually used. The live server
  *  rejects Upstash-Delay on enqueue outright, so the two paths must differ. */
@@ -49,17 +51,19 @@ describe('QStash dispatch (§2.8)', () => {
   });
 });
 
-function makeRuntime(model: any, config: Partial<AgentConfig> = {}) {
+async function makeRuntime(model: any, config: Partial<AgentConfig> = {}) {
   const storage = new MemoryStorage();
   const bus = new MemoryBus();
   const queue = new MemoryQueue();
   const kv = new MemoryKv();
-  const deps: RuntimePorts = {
+  const deps: RuntimeOptions = {
     storage, bus, queue, kv,
+    // Isolated per test: the default store is a file on disk.
+    admin: new MemoryAdminStore(),
     resolveModel: () => ({ instance: () => model, contextWindow: 128_000 }),
     config: resolveConfig(config),
   };
-  return { deps, runtime: setupAgentCore(deps), storage, bus, queue, kv };
+  return { deps, store: bindStorage(storage, { state: {} }), runtime: await setupAgentCore(deps), storage, bus, queue, kv };
 }
 
 const parkingModel = () =>
@@ -82,7 +86,7 @@ const parkingModel = () =>
 
 describe('a queue that cannot schedule the HITL expiry (§2.5)', () => {
   it('still parks: the failure never reaches the run', async () => {
-    const r = makeRuntime(parkingModel());
+    const r = await makeRuntime(parkingModel());
     // Every delayed dispatch fails, the way QStash fails a delayed enqueue.
     const realEnqueue = r.queue.enqueue.bind(r.queue);
     r.deps.queue.enqueue = async (j, opts) => {
@@ -120,7 +124,7 @@ describe('the failure-retry dispatch (§2.8)', () => {
       modelId: 'mock-broken',
       doStream: async () => { throw new Error('provider exploded'); },
     });
-    const r = makeRuntime(broken);
+    const r = await makeRuntime(broken);
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 
     const ran = await chat.run({ prompt: 'hi' });
@@ -158,7 +162,7 @@ describe('a subagent whose model call fails (§2.7)', () => {
       },
     });
 
-    const r = makeRuntime(model);
+    const r = await makeRuntime(model);
     const chat = r.runtime.createStreamTextAgent({
       name: 'chat', model: 'gpt-4o', subagents: true,
     });

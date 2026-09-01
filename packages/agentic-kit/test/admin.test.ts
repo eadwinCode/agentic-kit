@@ -3,10 +3,11 @@ import { simulateReadableStream } from 'ai';
 import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
 import { MockLanguageModelV1 } from 'ai/test';
 import { setupAgentCore } from '../src/runtime.js';
+import { MemoryAdminStore } from '../src/admin/memory.js';
+import { bindStorage } from '../src/core/state.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
-import { AdminUnavailableError } from '../src/core/admin.js';
 import { resolveConfig } from '../src/core/types.js';
-import type { RuntimePorts } from '../src/ports/runtime.js';
+import type { RuntimeOptions } from '../src/ports/runtime.js';
 
 const model = (text = 'ok') =>
   new MockLanguageModelV1({
@@ -23,19 +24,21 @@ const model = (text = 'ok') =>
     }),
   });
 
-function makeRuntime(m: any = model()) {
+async function makeRuntime(m: any = model()) {
   const storage = new MemoryStorage();
-  const deps: RuntimePorts = {
+  const deps: RuntimeOptions = {
     storage, bus: new MemoryBus(), queue: new MemoryQueue(), kv: new MemoryKv(),
+    // Isolated per test: the default store is a file on disk.
+    admin: new MemoryAdminStore(),
     resolveModel: () => ({ instance: () => m, contextWindow: 128_000 }),
     config: resolveConfig(),
   };
-  return { deps, runtime: setupAgentCore(deps), storage, queue: deps.queue as MemoryQueue };
+  return { deps, store: bindStorage(storage, { state: {} }), runtime: await setupAgentCore(deps), storage, queue: deps.queue as MemoryQueue };
 }
 
 describe('run records (§2.9)', () => {
   it('opens on run() and closes with timing, tokens and steps', async () => {
-    const r = makeRuntime();
+    const r = await makeRuntime();
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 
     const ran = await chat.run({ prompt: 'hi' });
@@ -62,7 +65,7 @@ describe('run records (§2.9)', () => {
       provider: 'mock', modelId: 'broken',
       doStream: async () => { throw new Error('provider is down'); },
     });
-    const r = makeRuntime(broken);
+    const r = await makeRuntime(broken);
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
     const ran = await chat.run({ prompt: 'hi' });
 
@@ -77,24 +80,24 @@ describe('run records (§2.9)', () => {
   });
 
   it('records a step marker per loop iteration', async () => {
-    const r = makeRuntime();
+    const r = await makeRuntime();
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
     const ran = await chat.run({ prompt: 'hi' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
-    const steps = await r.runtime.admin.listSteps(ran.threadId, ran.runId);
+    const steps = await r.runtime.admin.listSteps(ran.runId!);
     expect(steps).toHaveLength(1);
     expect(steps[0]).toMatchObject({
       runId: ran.runId, agentId: null, index: 1, finishReason: 'stop', tools: [],
+      totalTokens: 15,
     });
-    expect(steps[0]!.tokens.totalTokens).toBe(15);
     expect(typeof steps[0]!.durationMs).toBe('number');
   });
 });
 
 describe('cross-thread views (§2.9)', () => {
   it('summarises runs with percentiles and state counts', async () => {
-    const r = makeRuntime();
+    const r = await makeRuntime();
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
     for (let i = 0; i < 3; i++) {
       const ran = await chat.run({ prompt: `hi ${i}` });
@@ -111,20 +114,20 @@ describe('cross-thread views (§2.9)', () => {
     expect(stats.failed).toBe(0);
 
     const view = await r.runtime.admin.overview();
+    // Both come from the platform's own store — a dashboard never reads the
+    // caller's database (§2.9).
     expect(view.threads.COMPLETED).toBe(3);
+    expect(view.runsByState.COMPLETED).toBe(3);
     expect(view.active).toEqual([]);
   });
 
-  it('says plainly when the adapter has no admin queries', async () => {
-    const r = makeRuntime();
-    // An adapter that implements only what running agents needs (§3.2).
-    delete (r.deps.storage as any).admin;
-    expect(r.runtime.admin.available).toBe(false);
-    await expect(r.runtime.admin.stats()).rejects.toBeInstanceOf(AdminUnavailableError);
-
-    // Per-thread reads keep working without it.
+  it("reads a thread's runs without touching the caller's storage", async () => {
+    const r = await makeRuntime();
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
     const ran = await chat.run({ prompt: 'hi' });
+
     expect(await r.runtime.admin.listRunsByThread(ran.threadId)).toHaveLength(1);
+    // Nothing about runs is in the caller's Storage any more (§2.9).
+    expect('runs' in (r.storage as object)).toBe(false);
   });
 });

@@ -3,9 +3,11 @@ import { simulateReadableStream } from 'ai';
 import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
 import { MockLanguageModelV1 } from 'ai/test';
 import { setupAgentCore } from '../src/runtime.js';
+import { MemoryAdminStore } from '../src/admin/memory.js';
+import { bindStorage } from '../src/core/state.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import { resolveConfig } from '../src/core/types.js';
-import type { RuntimePorts } from '../src/ports/runtime.js';
+import type { RuntimeOptions } from '../src/ports/runtime.js';
 
 /** Answers whichever user turn it was last given, so the tests can tell an
  *  edited conversation apart from the original. */
@@ -30,17 +32,19 @@ function echoModel() {
   });
 }
 
-function makeRuntime() {
+async function makeRuntime() {
   const storage = new MemoryStorage();
   const bus = new MemoryBus();
   const queue = new MemoryQueue();
   const kv = new MemoryKv();
-  const deps: RuntimePorts = {
+  const deps: RuntimeOptions = {
     storage, bus, queue, kv,
+    // Isolated per test: the default store is a file on disk.
+    admin: new MemoryAdminStore(),
     resolveModel: () => ({ instance: () => echoModel(), contextWindow: 128_000 }),
     config: resolveConfig(),
   };
-  return { deps, runtime: setupAgentCore(deps), storage, queue, kv };
+  return { deps, store: bindStorage(storage, { state: {} }), runtime: await setupAgentCore(deps), storage, queue, kv };
 }
 
 const shape = (storage: MemoryStorage, threadId: string) =>
@@ -52,7 +56,7 @@ const shape = (storage: MemoryStorage, threadId: string) =>
 
 describe('edit + resend (§5.1)', () => {
   it('replaces the edited turn and everything it led to, then answers again', async () => {
-    const r = makeRuntime();
+    const r = await makeRuntime();
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 
     const first = await chat.run({ prompt: 'question one' });
@@ -86,7 +90,7 @@ describe('edit + resend (§5.1)', () => {
   });
 
   it('is a fresh run: it claims a new run id', async () => {
-    const r = makeRuntime();
+    const r = await makeRuntime();
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 
     const first = await chat.run({ prompt: 'a' });
@@ -101,7 +105,7 @@ describe('edit + resend (§5.1)', () => {
   });
 
   it('refuses to edit anything but a user turn', async () => {
-    const r = makeRuntime();
+    const r = await makeRuntime();
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 
     const first = await chat.run({ prompt: 'a' });
@@ -119,7 +123,7 @@ describe('edit + resend (§5.1)', () => {
   });
 
   it('refuses an unknown message id, leaving the thread alone', async () => {
-    const r = makeRuntime();
+    const r = await makeRuntime();
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
     const first = await chat.run({ prompt: 'a' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
@@ -133,7 +137,7 @@ describe('edit + resend (§5.1)', () => {
   });
 
   it('is refused outright while a run is live', async () => {
-    const r = makeRuntime();
+    const r = await makeRuntime();
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
     const first = await chat.run({ prompt: 'a' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);

@@ -5,7 +5,7 @@ import type { AgentKind, ProviderOptions } from './types.js';
 import type { RegisteredAgent } from './agent.js';
 import { attributeTokens, type TokenAttribution } from './usage.js';
 import { drainOrThrow } from './stream.js';
-import { publish } from './publish.js';
+import { publishNotice } from './publish.js';
 import { HITL_PARKED } from './hitl.js';
 
 /** True for the sentinel a parked `requiresConfirmation` tool returns (§2.5).
@@ -237,18 +237,25 @@ export async function runLoop(
     lastFinishReason = step.finishReason;
     stepsRun += 1;
 
-    // §2.9: one marker per step, so a timeline can be read straight off the
-    // event log. A step TABLE would be write amplification on every iteration
-    // for something read rarely; the log is already indexed by (thread, type).
-    await publish(deps, threadId, 'STEP_FINISHED', {
-      runId: input.runId,
+    // §2.9: one row per step in the platform's OWN store, plus a bus-only
+    // notice so live dashboards see it. The notice is not persisted to the
+    // caller's event log — operational history is not their data to carry.
+    const marker = {
+      runId: input.runId ?? '',
       agentId: input.agentId,
       index: stepsRun,
       durationMs: Date.now() - stepStartedAt,
       finishReason: step.finishReason,
-      tokens: a,
-      tools: (step.toolResults ?? []).map((r: any) => r?.toolName).filter(Boolean),
-    });
+      inputTokens: a.inputTokens,
+      cachedInputTokens: a.cachedInputTokens,
+      outputTokens: a.outputTokens,
+      totalTokens: a.totalTokens,
+      tools: (step.toolResults ?? [])
+        .map((r: any) => r?.toolName)
+        .filter(Boolean) as string[],
+    };
+    if (input.runId) await deps.admin.steps.record(marker);
+    await publishNotice(deps, threadId, 'STEP_FINISHED', marker);
 
     // §2.5 park: a requiresConfirmation tool returned the sentinel — the
     // segment ends here on WAITING_FOR_INPUT (set by parkForApproval).

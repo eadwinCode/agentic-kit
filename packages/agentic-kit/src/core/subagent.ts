@@ -12,6 +12,7 @@ import type { RuntimePorts } from '../ports/runtime.js';
 import type { RegisteredAgent } from './agent.js';
 import { publish } from './publish.js';
 import { HITL_PARKED, withHitl, type HitlFrame } from './hitl.js';
+import { withRunState, type AgentRunState } from './state.js';
 import { runLoop, type LoopOutcome, type RunLedger } from './loop.js';
 
 /** Everything a nested run needs from the run that spawned it (§2.7). The
@@ -43,6 +44,8 @@ export interface SubagentCtx {
   tokenBudget?: number;
   providerOptions?: ProviderOptions;
   abortSignal?: AbortSignal;
+  /** The run's state, handed down unchanged (§2.10). */
+  state?: AgentRunState;
 }
 
 /** Run-scoped semaphore: sibling subagents queue instead of running away (§2.7) */
@@ -97,7 +100,7 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
       try {
         // A nested run is a run (§2.9): same table, distinguished by depth and
         // a parent. Its id is also the agentId its messages and events carry.
-        const run = await ctx.ports.storage.runs.start({
+        const run = await ctx.ports.admin.runs.start({
           id: randomUUID(),
           threadId: ctx.threadId,
           // The spawner: another nested run, or the dispatched run itself.
@@ -195,7 +198,7 @@ async function closeNested(
   end: { state: RunRecord['state']; result?: unknown; error?: string },
 ): Promise<void> {
   const endedAt = new Date();
-  await ctx.ports.storage.runs.patch(run.id, {
+  await ctx.ports.admin.runs.patch(run.id, {
     ...end,
     endedAt,
     durationMs: endedAt.getTime() - new Date(run.startedAt).getTime(),
@@ -232,12 +235,16 @@ function nestedTools(
       abortSignal,
     }),
   };
-  return withHitl(ctx.ports, ctx.threadId, raw, {
-    resume: ctx.resume,
-    agentId: d.agentId,
-    frames,
-    nested: d,
-  });
+  // A nested run's tools see the same state as its parent's (§2.10).
+  return withRunState(
+    withHitl(ctx.ports, ctx.threadId, raw, {
+      resume: ctx.resume,
+      agentId: d.agentId,
+      frames,
+      nested: d,
+    }),
+    ctx.state ?? {},
+  );
 }
 
 /** The delegation tool lets the MODEL name the child's model, so an unknown

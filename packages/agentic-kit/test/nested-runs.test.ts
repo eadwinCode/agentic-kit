@@ -4,11 +4,13 @@ import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
 import { MockLanguageModelV1 } from 'ai/test';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
+import { MemoryAdminStore } from '../src/admin/memory.js';
+import { bindStorage } from '../src/core/state.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import { markRequiresConfirmation } from '../src/core/engine.js';
 import { compactContext } from '../src/core/context.js';
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
-import type { RuntimePorts } from '../src/ports/runtime.js';
+import type { RuntimeOptions } from '../src/ports/runtime.js';
 
 const finish = (reason: string, usage = { promptTokens: 10, completionTokens: 5 }) =>
   ({ type: 'finish', finishReason: reason, usage }) as LanguageModelV1StreamPart;
@@ -39,17 +41,19 @@ const toolResults = (prompt: any) =>
     m.role === 'tool' ? (Array.isArray(m.content) ? m.content : []) : [],
   );
 
-function makeRuntime(model: any, config: Partial<AgentConfig> = {}) {
+async function makeRuntime(model: any, config: Partial<AgentConfig> = {}) {
   const storage = new MemoryStorage();
   const bus = new MemoryBus();
   const queue = new MemoryQueue();
   const kv = new MemoryKv();
-  const deps: RuntimePorts = {
+  const deps: RuntimeOptions = {
     storage, bus, queue, kv,
+    // Isolated per test: the default store is a file on disk.
+    admin: new MemoryAdminStore(),
     resolveModel: () => ({ instance: () => model, contextWindow: 128_000 }),
     config: resolveConfig(config),
   };
-  return { deps, runtime: setupAgentCore(deps), storage, bus, queue, kv };
+  return { deps, store: bindStorage(storage, { state: {} }), runtime: await setupAgentCore(deps), storage, bus, queue, kv };
 }
 
 /** Parent delegates once; the child calls a destructive tool and parks. */
@@ -76,10 +80,10 @@ function delegatingModel(state: { childCalls: number; parentCalls: number }) {
   });
 }
 
-function delegatingRuntime(config: Partial<AgentConfig> = {}) {
+async function delegatingRuntime(config: Partial<AgentConfig> = {}) {
   const state = { childCalls: 0, parentCalls: 0 };
   const sent: Array<{ to: string }> = [];
-  const r = makeRuntime(delegatingModel(state), config);
+  const r = await makeRuntime(delegatingModel(state), config);
   const chat = r.runtime.createStreamTextAgent({
     name: 'chat',
     model: 'gpt-4o',
@@ -103,7 +107,7 @@ const streams = (storage: MemoryStorage, threadId: string) =>
 
 describe('a nested run parks (§2.7)', () => {
   it('suspends the whole thread and records the chain waiting on the answer', async () => {
-    const r = delegatingRuntime();
+    const r = await delegatingRuntime();
     const ran = await r.chat.run({ prompt: 'send the mail' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
@@ -119,7 +123,7 @@ describe('a nested run parks (§2.7)', () => {
   });
 
   it("keeps the child's turns in its own stream, out of the parent's context", async () => {
-    const r = delegatingRuntime();
+    const r = await delegatingRuntime();
     const ran = await r.chat.run({ prompt: 'send the mail' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
@@ -132,7 +136,7 @@ describe('a nested run parks (§2.7)', () => {
     ]);
 
     // §2.6 compaction must never see the delegated turns
-    const parentContext = await compactContext(r.deps, ran.threadId, 'gpt-4o');
+    const parentContext = await compactContext({ ...r.deps, storage: r.store } as any, ran.threadId, 'gpt-4o');
     expect(parentContext.every((m) => m.agentId === null)).toBe(true);
     expect(parentContext).toHaveLength(2);
   });
@@ -140,7 +144,7 @@ describe('a nested run parks (§2.7)', () => {
 
 describe('approving a nested park (§2.7)', () => {
   it('re-enters the child where it stopped and unwinds to the parent', async () => {
-    const r = delegatingRuntime();
+    const r = await delegatingRuntime();
     const ran = await r.chat.run({ prompt: 'send the mail' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
     const childCallsAtPark = r.state.childCalls;
@@ -179,7 +183,7 @@ describe('approving a nested park (§2.7)', () => {
   });
 
   it('a denial unwinds the same way, without running the tool', async () => {
-    const r = delegatingRuntime();
+    const r = await delegatingRuntime();
     const ran = await r.chat.run({ prompt: 'send the mail' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
@@ -196,7 +200,7 @@ describe('approving a nested park (§2.7)', () => {
   });
 
   it('an unanswered park still times out into the denial and unwinds', async () => {
-    const r = delegatingRuntime({ hitlTtlMs: 30 });
+    const r = await delegatingRuntime({ hitlTtlMs: 30 });
     const ran = await r.chat.run({ prompt: 'send the mail' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
@@ -217,7 +221,7 @@ describe('approving a nested park (§2.7)', () => {
   });
 
   it('a redelivery while still unanswered leaves the thread parked', async () => {
-    const r = delegatingRuntime();
+    const r = await delegatingRuntime();
     const ran = await r.chat.run({ prompt: 'send the mail' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
     const before = streams(r.storage, ran.threadId);
@@ -230,7 +234,7 @@ describe('approving a nested park (§2.7)', () => {
 });
 
 /** Parent delegates once, the child answers, nobody parks. */
-function plainDelegatingRuntime(config: Partial<AgentConfig> = {}) {
+async function plainDelegatingRuntime(config: Partial<AgentConfig> = {}) {
   const state = { childCalls: 0, parentCalls: 0 };
   const model = new MockLanguageModelV1({
     provider: 'mock',
@@ -249,7 +253,7 @@ function plainDelegatingRuntime(config: Partial<AgentConfig> = {}) {
           ]);
     },
   });
-  const r = makeRuntime(model, config);
+  const r = await makeRuntime(model, config);
   const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', subagents: true });
   return { ...r, chat, state };
 }
@@ -259,7 +263,7 @@ const terminal = (bus: MemoryBus) =>
 
 describe('the run-wide token ledger (§2.7)', () => {
   it("counts a child's spend into the run's total, and still attributes it", async () => {
-    const r = plainDelegatingRuntime();
+    const r = await plainDelegatingRuntime();
     const ran = await r.chat.run({ prompt: 'delegate' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
@@ -277,7 +281,7 @@ describe('the run-wide token ledger (§2.7)', () => {
   it("stops the run when the CHILD's spend crosses the budget", async () => {
     // The parent's first step alone spends 15; the child inside it spends
     // another 15. A cap of 20 is only reached because the child counts.
-    const r = plainDelegatingRuntime({ tokenBudget: 20 });
+    const r = await plainDelegatingRuntime({ tokenBudget: 20 });
     await r.chat.run({ prompt: 'delegate' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
@@ -287,7 +291,7 @@ describe('the run-wide token ledger (§2.7)', () => {
 });
 
 /** Parent delegates to TWO children in one step; both park. */
-function twoSiblingsRuntime(config: Partial<AgentConfig> = {}) {
+async function twoSiblingsRuntime(config: Partial<AgentConfig> = {}) {
   const sent: string[] = [];
   const firstUserText = (prompt: any) => {
     const u = (prompt ?? []).find((m: any) => m.role === 'user');
@@ -314,7 +318,7 @@ function twoSiblingsRuntime(config: Partial<AgentConfig> = {}) {
           ]);
     },
   });
-  const r = makeRuntime(model, config);
+  const r = await makeRuntime(model, config);
   const chat = r.runtime.createStreamTextAgent({
     name: 'chat',
     model: 'gpt-4o',
@@ -334,7 +338,7 @@ function twoSiblingsRuntime(config: Partial<AgentConfig> = {}) {
 
 describe('two siblings park in one step (§2.7)', () => {
   it('waits for BOTH approvals, then unwinds both chains', async () => {
-    const r = twoSiblingsRuntime();
+    const r = await twoSiblingsRuntime();
     const ran = await r.chat.run({ prompt: 'send both' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
@@ -369,7 +373,7 @@ describe('two siblings park in one step (§2.7)', () => {
   });
 
   it('a mixed verdict still releases the run: one approved, one denied', async () => {
-    const r = twoSiblingsRuntime();
+    const r = await twoSiblingsRuntime();
     const ran = await r.chat.run({ prompt: 'send both' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
@@ -408,8 +412,10 @@ describe('a model name the LLM invented (§2.7)', () => {
     const bus = new MemoryBus();
     const queue = new MemoryQueue();
     const kv = new MemoryKv();
-    const deps: RuntimePorts = {
+    const deps: RuntimeOptions = {
       storage, bus, queue, kv,
+      // Isolated per test: the default store is a file on disk.
+      admin: new MemoryAdminStore(),
       // A strict registry, like the reference app's (§3.3)
       resolveModel: (name) => {
         if (name !== 'gpt-4o') throw new Error(`Unknown model: ${name}`);
@@ -417,7 +423,7 @@ describe('a model name the LLM invented (§2.7)', () => {
       },
       config: resolveConfig(),
     };
-    const runtime = setupAgentCore(deps);
+    const runtime = await setupAgentCore(deps);
     const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', subagents: true });
 
     const ran = await chat.run({ prompt: 'delegate' });
@@ -431,7 +437,7 @@ describe('a model name the LLM invented (§2.7)', () => {
 
 describe('rebuilding the subagent panel after a reload (§2.7)', () => {
   it('the snapshot carries nested runs, which outlive their events', async () => {
-    const r = plainDelegatingRuntime();
+    const r = await plainDelegatingRuntime();
     const ran = await r.chat.run({ prompt: 'delegate' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
@@ -475,7 +481,7 @@ describe('a nested run that fails (§2.7)', () => {
             ]);
       },
     });
-    const r = makeRuntime(model);
+    const r = await makeRuntime(model);
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', subagents: true });
 
     const ran = await chat.run({ prompt: 'delegate' });
@@ -508,7 +514,7 @@ describe('a nested run that fails (§2.7)', () => {
               finish('tool-calls'),
             ]),
     });
-    const r = makeRuntime(model);
+    const r = await makeRuntime(model);
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', subagents: true });
     const ran = await chat.run({ prompt: 'delegate' });
     // The user pressed stop while the child was in flight.
@@ -526,7 +532,7 @@ describe('a nested run that fails (§2.7)', () => {
 });
 
 /** main → child → grandchild, and the deepest one parks. */
-function threeLevelRuntime() {
+async function threeLevelRuntime() {
   const sent: string[] = [];
   const firstUserText = (prompt: any) => {
     const u = (prompt ?? []).find((m: any) => m.role === 'user');
@@ -561,7 +567,7 @@ function threeLevelRuntime() {
         : stream([call('grand_call', 'sendEmail', { to: 'deep@x.c' }), finish('tool-calls')]);
     },
   });
-  const r = makeRuntime(model);
+  const r = await makeRuntime(model);
   const chat = r.runtime.createStreamTextAgent({
     name: 'chat',
     model: 'gpt-4o',
@@ -581,7 +587,7 @@ function threeLevelRuntime() {
 
 describe('a park two levels down (§2.7)', () => {
   it('records both waiting calls and unwinds through both', async () => {
-    const r = threeLevelRuntime();
+    const r = await threeLevelRuntime();
     const ran = await r.chat.run({ prompt: 'go deep' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
@@ -638,14 +644,14 @@ describe('the depth cap (§2.7)', () => {
         ]);
       },
     });
-    const r = makeRuntime(model);
+    const r = await makeRuntime(model);
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', subagents: true });
 
     const ran = await chat.run({ prompt: 'keep delegating' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
     // main (0) → sub (1) → sub-sub (2), and no further.
-    const runs = await r.storage.runs.listByThread(ran.threadId);
+    const runs = await r.runtime.admin.listRunsByThread(ran.threadId);
     // depth 0 is the dispatched run itself; its children are 1 and 2.
     expect(runs.map((x: any) => x.depth).sort()).toEqual([0, 1, 2]);
 

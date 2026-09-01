@@ -4,10 +4,12 @@ import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
 import { z } from 'zod';
 import { MockLanguageModelV1 } from 'ai/test';
 import { setupAgentCore } from '../src/runtime.js';
+import { MemoryAdminStore } from '../src/admin/memory.js';
+import { bindStorage } from '../src/core/state.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import { markRequiresConfirmation } from '../src/core/engine.js';
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
-import type { RuntimePorts } from '../src/ports/runtime.js';
+import type { RuntimeOptions } from '../src/ports/runtime.js';
 
 interface ScriptedStep {
   text?: string;
@@ -69,20 +71,22 @@ function scriptedModel(steps: ScriptedStep[]) {
   });
 }
 
-function makeRuntime(model: any, config: Partial<AgentConfig> = {}) {
+async function makeRuntime(model: any, config: Partial<AgentConfig> = {}) {
   const storage = new MemoryStorage();
   const bus = new MemoryBus();
   const queue = new MemoryQueue();
   const kv = new MemoryKv();
-  const deps: RuntimePorts = {
+  const deps: RuntimeOptions = {
     storage,
+    // Isolated per test: the default store is a file on disk.
+    admin: new MemoryAdminStore(),
     bus,
     queue,
     kv,
     resolveModel: () => ({ instance: () => model, contextWindow: 128_000 }),
     config: resolveConfig(config),
   };
-  return { deps, runtime: setupAgentCore(deps), storage, bus, queue, kv };
+  return { deps, store: bindStorage(storage, { state: {} }), runtime: await setupAgentCore(deps), storage, bus, queue, kv };
 }
 
 const states = (bus: MemoryBus) =>
@@ -97,7 +101,7 @@ const roles = (storage: MemoryStorage, threadId: string) =>
 describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
   it('feeds tool results back between single-round-trip steps and persists per step', async () => {
     const executed: string[] = [];
-    const { runtime, storage, bus, queue } = makeRuntime(
+    const { runtime, storage, bus, queue } = await makeRuntime(
       scriptedModel([
         { toolCalls: [{ toolCallId: 'call_1', toolName: 'lookup', args: { q: 'x' } }] },
         { text: 'done' },
@@ -145,7 +149,7 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
 
   it('checks the budget BETWEEN steps: the step that crosses the line is kept in full', async () => {
     const executed: string[] = [];
-    const { runtime, storage, bus, queue } = makeRuntime(
+    const { runtime, storage, bus, queue } = await makeRuntime(
       scriptedModel([
         { toolCalls: [{ toolCallId: 'call_1', toolName: 'lookup', args: { q: 'x' } }], usage: [100, 20] },
         { text: 'done', usage: [100, 20] },
@@ -182,7 +186,7 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
   });
 
   it('finalizes max_steps when the ceiling is hit with pending tool calls', async () => {
-    const { runtime, storage, bus, queue } = makeRuntime(
+    const { runtime, storage, bus, queue } = await makeRuntime(
       scriptedModel([
         { toolCalls: [{ toolCallId: 'call_1', toolName: 'lookup', args: { q: 'x' } }] },
         { toolCalls: [{ toolCallId: 'call_2', toolName: 'lookup', args: { q: 'y' } }] },
@@ -208,7 +212,7 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
   });
 
   it('one-shot flavor publishes TEXT_RESULT and needs no CHUNK stream', async () => {
-    const { runtime, bus, queue } = makeRuntime(scriptedModel([{ text: 'answer' }]));
+    const { runtime, bus, queue } = await makeRuntime(scriptedModel([{ text: 'answer' }]));
     const agent = runtime.createGenerateTextAgent({ name: 'oneshot', model: 'gpt-4o' });
 
     const ran = await agent.run({ prompt: 'hi' });
@@ -224,9 +228,9 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
 });
 
 describe('HITL run-segment park (§2.5)', () => {
-  function makeHitlRuntime(config: Partial<AgentConfig> = {}) {
+  async function makeHitlRuntime(config: Partial<AgentConfig> = {}) {
     const sent: number[] = [];
-    const { runtime, storage, bus, queue, kv } = makeRuntime(
+    const { runtime, storage, bus, queue, kv } = await makeRuntime(
       scriptedModel([
         { toolCalls: [{ toolCallId: 'call_1', toolName: 'sendEmail', args: { to: 'a@b.c' } }] },
         { text: 'sent it' },
@@ -253,14 +257,14 @@ describe('HITL run-segment park (§2.5)', () => {
   }
 
   /** run + dispatch the first job → the segment parks on INPUT_REQUIRED. */
-  async function park(r: ReturnType<typeof makeHitlRuntime>) {
+  async function park(r: Awaited<ReturnType<typeof makeHitlRuntime>>) {
     const ran = await r.chat.run({ prompt: 'hi' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
     return ran.threadId;
   }
 
   it('parks as a durable state transition — no tool run, no blocking process, no lock', async () => {
-    const r = makeHitlRuntime();
+    const r = await makeHitlRuntime();
     const threadId = await park(r);
 
     expect(r.sent).toEqual([]);
@@ -288,7 +292,7 @@ describe('HITL run-segment park (§2.5)', () => {
   });
 
   it('a redelivered job while parked is a no-op — the thread stays parked', async () => {
-    const r = makeHitlRuntime();
+    const r = await makeHitlRuntime();
     const threadId = await park(r);
     const before = r.storage.messages.store.get(threadId)!.length;
 
@@ -300,7 +304,7 @@ describe('HITL run-segment park (§2.5)', () => {
   });
 
   it('respond(approved) resumes via the queue: the real tool runs and the loop continues', async () => {
-    const r = makeHitlRuntime();
+    const r = await makeHitlRuntime();
     const threadId = await park(r);
 
     const res = await r.runtime.hitl.respond({ threadId, toolCallId: 'call_1', approved: true });
@@ -323,7 +327,7 @@ describe('HITL run-segment park (§2.5)', () => {
   });
 
   it('respond(denied) appends the denial — the tool never runs', async () => {
-    const r = makeHitlRuntime();
+    const r = await makeHitlRuntime();
     const threadId = await park(r);
 
     await r.runtime.hitl.respond({ threadId, toolCallId: 'call_1', approved: false });
@@ -336,7 +340,7 @@ describe('HITL run-segment park (§2.5)', () => {
   });
 
   it('TTL expiry becomes the timeout denial and the run continues (§2.5)', async () => {
-    const r = makeHitlRuntime({ hitlTtlMs: 30 });
+    const r = await makeHitlRuntime({ hitlTtlMs: 30 });
     const threadId = await park(r);
 
     // Backdate the INPUT_REQUIRED past the TTL — the answer key never existed
@@ -357,7 +361,7 @@ describe('HITL run-segment park (§2.5)', () => {
   });
 
   it('stop() while parked wins: the thread stays CANCELLED and respond is rejected', async () => {
-    const r = makeHitlRuntime();
+    const r = await makeHitlRuntime();
     const threadId = await park(r);
 
     const stopped = await r.chat.stop(threadId);
@@ -376,7 +380,7 @@ describe('HITL run-segment park (§2.5)', () => {
   // when something else woke the thread, so an approval nobody watched never
   // expired at all.
   it('the park schedules its own expiry, timed just past the TTL', async () => {
-    const r = makeHitlRuntime({ hitlTtlMs: 30_000, reclaimGraceMs: 5_000 });
+    const r = await makeHitlRuntime({ hitlTtlMs: 30_000, reclaimGraceMs: 5_000 });
     const ran = await r.chat.run({ prompt: 'hi' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
@@ -390,7 +394,7 @@ describe('HITL run-segment park (§2.5)', () => {
   });
 
   it('the scheduled expiry resolves an abandoned park with nobody watching', async () => {
-    const r = makeHitlRuntime({ hitlTtlMs: 30 });
+    const r = await makeHitlRuntime({ hitlTtlMs: 30 });
     const threadId = await park(r);
     const timer = r.queue.items.at(-1)!;
 
@@ -411,7 +415,7 @@ describe('HITL run-segment park (§2.5)', () => {
 
   it('an expiry job delivered early leaves the thread parked', async () => {
     // A queue adapter that ignores the delay must not cut the approval short.
-    const r = makeHitlRuntime({ hitlTtlMs: 60_000 });
+    const r = await makeHitlRuntime({ hitlTtlMs: 60_000 });
     const threadId = await park(r);
     const before = roles(r.storage, threadId);
 
@@ -425,7 +429,7 @@ describe('HITL run-segment park (§2.5)', () => {
   // runs. Mint a fresh id on respond and they can both run a segment — the
   // second one replying to a conversation that already ended.
   it('respond reuses the parked run id: the answer and the expiry are ONE run', async () => {
-    const r = makeHitlRuntime({ hitlTtlMs: 30 });
+    const r = await makeHitlRuntime({ hitlTtlMs: 30 });
     const ran = await r.chat.run({ prompt: 'hi' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
     const timer = r.queue.items.at(-1)!;
@@ -448,7 +452,7 @@ describe('HITL run-segment park (§2.5)', () => {
   });
 
   it('an expiry job that wins the race to an answered park honours the answer', async () => {
-    const r = makeHitlRuntime({ hitlTtlMs: 30 });
+    const r = await makeHitlRuntime({ hitlTtlMs: 30 });
     const threadId = await park(r);
     const timer = r.queue.items.at(-1)!;
 

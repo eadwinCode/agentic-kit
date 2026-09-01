@@ -3,10 +3,12 @@ import { simulateReadableStream } from 'ai';
 import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
 import { MockLanguageModelV1 } from 'ai/test';
 import { setupAgentCore } from '../src/runtime.js';
+import { MemoryAdminStore } from '../src/admin/memory.js';
+import { bindStorage } from '../src/core/state.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import { runIdKey } from '../src/core/keys.js';
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
-import type { RuntimePorts } from '../src/ports/runtime.js';
+import type { RuntimeOptions } from '../src/ports/runtime.js';
 
 /** Pull the newest user message out of the SDK-level prompt so the mock can
  *  answer the message it was actually given — that is how these tests tell
@@ -45,18 +47,20 @@ function slowModel(state: { aborted: boolean }, latencyMs = 300) {
   });
 }
 
-function makeRuntime(model: any, config: Partial<AgentConfig> = {}) {
+async function makeRuntime(model: any, config: Partial<AgentConfig> = {}) {
   const storage = new MemoryStorage();
   const bus = new MemoryBus();
   const queue = new MemoryQueue();
   const kv = new MemoryKv();
-  const deps: RuntimePorts = {
+  const deps: RuntimeOptions = {
     storage, bus, queue, kv,
+    // Isolated per test: the default store is a file on disk.
+    admin: new MemoryAdminStore(),
     resolveModel: () => ({ instance: () => model, contextWindow: 128_000 }),
     // A short poll keeps these tests fast; production keeps the 500ms default.
     config: resolveConfig({ stopPollMs: 20, ...config }),
   };
-  return { deps, runtime: setupAgentCore(deps), storage, bus, queue, kv };
+  return { deps, store: bindStorage(storage, { state: {} }), runtime: await setupAgentCore(deps), storage, bus, queue, kv };
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -73,7 +77,7 @@ const texts = (storage: MemoryStorage, threadId: string) =>
 describe('stop, then send another message right away (§2.1)', () => {
   it('stops the old run even though the new message overwrote CANCELLED', async () => {
     const state = { aborted: false };
-    const { runtime, storage, bus, queue, kv } = makeRuntime(slowModel(state));
+    const { runtime, storage, bus, queue, kv } = await makeRuntime(slowModel(state));
     const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 
     // 1. First message — worker A takes the lock and starts streaming.
@@ -116,7 +120,7 @@ describe('stop, then send another message right away (§2.1)', () => {
 
   it('a plain stop with no follow-up message still finalizes CANCELLED', async () => {
     const state = { aborted: false };
-    const { runtime, storage, bus, queue } = makeRuntime(slowModel(state));
+    const { runtime, storage, bus, queue } = await makeRuntime(slowModel(state));
     const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 
     const ran = await chat.run({ prompt: 'message A' });
@@ -133,7 +137,7 @@ describe('stop, then send another message right away (§2.1)', () => {
 
 describe('run identity (§2.1)', () => {
   it('a job whose run id has been replaced does nothing at all', async () => {
-    const { runtime, storage, kv } = makeRuntime(slowModel({ aborted: false }));
+    const { runtime, storage, kv } = await makeRuntime(slowModel({ aborted: false }));
     const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 
     const ran = await chat.run({ prompt: 'a' });
@@ -147,7 +151,7 @@ describe('run identity (§2.1)', () => {
   });
 
   it('a replaced run cannot write its state over the live one', async () => {
-    const { runtime, storage, kv, queue } = makeRuntime(slowModel({ aborted: false }));
+    const { runtime, storage, kv, queue } = await makeRuntime(slowModel({ aborted: false }));
     const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 
     const first = await chat.run({ prompt: 'a' });
@@ -173,7 +177,7 @@ describe('lock conflicts (§2.8)', () => {
     kv.set(`agent:lock:${threadId}`, holder, { onlyIfNotExists: true, exSeconds: 600 });
 
   it('re-dispatches a job blocked by an OLDER run instead of dropping it', async () => {
-    const { deps, runtime, queue, kv } = makeRuntime(slowModel({ aborted: false }));
+    const { deps, store, runtime, queue, kv } = await makeRuntime(slowModel({ aborted: false }));
     const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 
     const ran = await chat.run({ prompt: 'a' });
@@ -187,11 +191,11 @@ describe('lock conflicts (§2.8)', () => {
       runId: ran.runId,
       agent: 'chat',
     });
-    expect(queue.delays[1]).toBe(deps.config.runRedriveDelaySeconds);
+    expect(queue.delays[1]).toBe(deps.config!.runRedriveDelaySeconds);
   });
 
   it('still drops a duplicate delivery of the run already holding the lock', async () => {
-    const { runtime, queue, kv } = makeRuntime(slowModel({ aborted: false }));
+    const { runtime, queue, kv } = await makeRuntime(slowModel({ aborted: false }));
     const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 
     const ran = await chat.run({ prompt: 'a' });
@@ -203,7 +207,7 @@ describe('lock conflicts (§2.8)', () => {
   });
 
   it('drops a blocked job once a newer run has taken the thread', async () => {
-    const { runtime, queue, kv } = makeRuntime(slowModel({ aborted: false }));
+    const { runtime, queue, kv } = await makeRuntime(slowModel({ aborted: false }));
     const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 
     const ran = await chat.run({ prompt: 'a' });
@@ -216,7 +220,7 @@ describe('lock conflicts (§2.8)', () => {
   });
 
   it('gives up with FAILED when the lock never clears', async () => {
-    const { runtime, storage, queue, kv } = makeRuntime(
+    const { runtime, storage, queue, kv } = await makeRuntime(
       slowModel({ aborted: false }),
       { runMaxAttempts: 2 },
     );
@@ -248,7 +252,7 @@ describe('a failing provider call (§2.8)', () => {
     });
 
   it('surfaces the error instead of hanging the worker on an unsettled stream', async () => {
-    const { runtime, queue, kv } = makeRuntime(brokenModel());
+    const { runtime, queue, kv } = await makeRuntime(brokenModel());
     const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
     const ran = await chat.run({ prompt: 'a' });
 

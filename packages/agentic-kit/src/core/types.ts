@@ -1,4 +1,5 @@
 import type { LanguageModel, ToolSet } from 'ai';
+import type { AgentRunState } from './state.js';
 
 /** Lifecycle of a thread. Durable truth lives in Storage.threads; the kv copy
  *  (`agent:state:{threadId}`) is a hot cache the engine polls (§2.1, §3.4). */
@@ -178,6 +179,9 @@ export interface RunJob {
   /** Epoch ms at enqueue. The worker subtracts it on pickup to record how long
    *  the job waited — the number that says whether workers keep up (§2.9). */
   enqueuedAt?: number;
+  /** The run's state (§2.10), so a worker rehydrates exactly what the caller
+   *  attached — hours later, in another process, after an approval. */
+  state?: AgentRunState;
   tokenBudget?: number;
   providerOptions?: ProviderOptions;
 }
