@@ -1,105 +1,91 @@
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { RespondInput, RespondResult } from '../ports/runtime.js';
-import type { AgentEvent } from './types.js';
+import type { AgentEvent, ResumeInfo } from './types.js';
 import { publish } from './publish.js';
+import { claimRun } from './keys.js';
 import { reclaimIfOrphaned } from './reclaim.js';
 
 export const HITL_TTL_MS = 15 * 60_000;
 
-const hitlKey = (toolCallId: string) => `agent:hitl:${toolCallId}`;
+/** Result value a parked `requiresConfirmation` tool returns (§2.5). The
+ *  engine scans a step's tool results for this marker to end the run segment;
+ *  it is never persisted as a tool result — the resumed segment appends the
+ *  user's verdict (or the timeout denial) instead. */
+export const HITL_PARKED = '__hitl_parked__';
+
+export const hitlKey = (toolCallId: string) => `agent:hitl:${toolCallId}`;
 
 export interface HitlResponse {
   approved: boolean;
   payload?: unknown;
 }
 
-export interface TimeoutOutcome {
-  responded: false;
-  cancelled: true;
-  reason: 'timeout';
-}
-
-export interface SuspendInput {
+export interface ParkInput {
   threadId: string;
   toolCallId: string;
   toolName: string;
-  agentId?: string;
   args: unknown;
-  inputSchema?: unknown;
-  ttlMs: number;
-  signal: AbortSignal;
+  agentId?: string | null;
+  /** Dispatch ticket persisted in the INPUT_REQUIRED payload (§2.5) */
+  resume: ResumeInfo;
 }
 
-/** Parks the suspended tool call until the user responds, the TTL expires, or
- *  the run aborts. Returns null on abort; a TimeoutOutcome on TTL expiry (§2.5). */
-export async function waitForEvent(
-  deps: RuntimePorts,
-  toolCallId: string,
-  opts: { ttlMs: number; signal?: AbortSignal },
-): Promise<HitlResponse | null> {
-  const deadline = Date.now() + opts.ttlMs;
-
-  while (Date.now() < deadline) {
-    if (opts.signal?.aborted) return null; // stop teardown handled by the engine
-    const raw = await deps.kv.get(hitlKey(toolCallId));
-    if (raw) {
-      await deps.kv.del(hitlKey(toolCallId));
-      return JSON.parse(raw) as HitlResponse;
-    }
-    await sleep(1_000); // 1s poll — adapter-friendly, no blocking ops
-  }
-  return null; // TTL expired: the user had no response
-}
-
-/** Engine-side suspension around any `requiresConfirmation` tool (§2.5).
- *  A park flips durable + cached thread state to WAITING_FOR_INPUT, publishes
- *  the request, and blocks this tool call in place. Returns:
- *    - HitlResponse   → the user answered (approved / denied)
- *    - TimeoutOutcome → TTL expired; the timeout tool result is already appended
- *    - null           → aborted (stop) — the engine tears down */
-export async function suspendForApproval(
-  deps: RuntimePorts,
-  i: SuspendInput,
-): Promise<HitlResponse | TimeoutOutcome | null> {
-  const { threadId, toolCallId, toolName, ttlMs, signal } = i;
-
-  await deps.kv.set(`agent:state:${threadId}`, 'WAITING_FOR_INPUT');
-  await deps.storage.threads.setState(threadId, 'WAITING_FOR_INPUT');
-  await publish(deps, threadId, 'INPUT_REQUIRED', {
-    toolCallId,
-    toolName,
+/** The §2.5 suspension as a durable state transition — NO process waits.
+ *  Flips WAITING_FOR_INPUT on both homes and appends INPUT_REQUIRED to the
+ *  replayable event log (with the resume ticket). The engine then ends the
+ *  run segment; /api/agent/respond (or TTL expiry, §2.5) resumes it via the
+ *  queue. */
+export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise<void> {
+  await deps.kv.set(`agent:state:${i.threadId}`, 'WAITING_FOR_INPUT');
+  await deps.storage.threads.setState(i.threadId, 'WAITING_FOR_INPUT');
+  await publish(deps, i.threadId, 'INPUT_REQUIRED', {
+    toolCallId: i.toolCallId,
+    toolName: i.toolName,
     agentId: i.agentId ?? null,
     arguments: i.args,
-    inputSchema: i.inputSchema ?? null,
+    inputSchema: null,
+    resume: i.resume,
   });
-  await publish(deps, threadId, 'STATE_CHANGE', { state: 'WAITING_FOR_INPUT' });
-
-  const response = await waitForEvent(deps, toolCallId, { ttlMs, signal });
-
-  if (!response) {
-    if (signal.aborted) return null; // stop during the wait (§2.1) — engine tears down
-
-    // TTL expired: flip the thread back to RUNNING and publish; the timeout
-    // tool result itself is recorded by the SDK in response.messages and
-    // persisted at finish (§5.6) — no manual append here.
-    await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
-    await deps.storage.threads.setState(threadId, 'RUNNING');
-    await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
-    await publish(deps, threadId, 'INPUT_EXPIRED', { toolCallId });
-    return { responded: false, cancelled: true, reason: 'timeout' };
-  }
-
-  await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
-  await deps.storage.threads.setState(threadId, 'RUNNING');
-  await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
-  // The SDK records the tool result (approved payload / { denied: true }) in
-  // response.messages; the engine persists it at finish (§5.6).
-  return response;
+  await publish(deps, i.threadId, 'STATE_CHANGE', { state: 'WAITING_FOR_INPUT' });
 }
 
-/** The §5.4 behavior: heal orphans first (§2.5), then deliver the response to
- *  the parked waitForEvent via its handoff key. Answer-latest policy: only the
- *  most recent pending INPUT_REQUIRED is answerable (§2.7). */
+/** The pending request behind a WAITING_FOR_INPUT thread, hydrated from the
+ *  durable event log (§2.5). */
+export interface PendingHitl {
+  toolCallId: string;
+  toolName: string;
+  agentId: string | null;
+  arguments: unknown;
+  /** Epoch ms of the INPUT_REQUIRED event — the TTL clock (§2.5) */
+  requestedAt: number;
+}
+
+export async function loadPendingHitl(
+  deps: RuntimePorts,
+  threadId: string,
+): Promise<PendingHitl | null> {
+  const pending = await deps.storage.events.latest(threadId, 'INPUT_REQUIRED');
+  if (!pending) return null;
+  const p = pending.payload as {
+    toolCallId: string;
+    toolName: string;
+    agentId?: string | null;
+    arguments?: unknown;
+  };
+  return {
+    toolCallId: p.toolCallId,
+    toolName: p.toolName,
+    agentId: p.agentId ?? null,
+    arguments: p.arguments,
+    requestedAt: new Date(pending.createdAt).getTime(),
+  };
+}
+
+/** The §5.4 behavior: heal orphans first (§2.5), then record the answer in
+ *  the handoff key and resume the run segment via the queue (§2.8) — the
+ *  resumed worker appends the tool result and continues the loop.
+ *  Answer-latest policy: only the most recent pending INPUT_REQUIRED is
+ *  answerable (§2.7). */
 export async function respond(deps: RuntimePorts, input: RespondInput): Promise<RespondResult> {
   await reclaimIfOrphaned(deps, input.threadId);
 
@@ -113,7 +99,9 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
     return { delivered: false, error: 'No matching pending input request' };
   }
 
-  // Remaining-TTL expiry so a stale response can never leak into a later run
+  // Remaining-TTL expiry so a stale answer can never outlive its request: the
+  // key vanishing is what makes the resumed segment treat the request as
+  // unanswered (§2.5)
   const remainingSec = Math.max(
     60,
     Math.floor((deps.config.hitlTtlMs - (Date.now() - new Date(pending!.createdAt).getTime())) / 1000),
@@ -123,8 +111,7 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
     JSON.stringify({ approved: input.approved, payload: input.payload }),
     { exSeconds: remainingSec },
   );
-  // Bus-only fast-path notice (seq 0 = never persisted) — the parked waiter
-  // polls the key either way (§2.5)
+  // Bus-only fast-path notice (seq 0 = never persisted) for live UIs (§2.5)
   await deps.bus.publish(input.threadId, {
     threadId: input.threadId,
     seq: 0,
@@ -133,9 +120,23 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
     createdAt: new Date(),
   } as AgentEvent);
 
-  return { delivered: true };
-}
+  // Resume the run segment through the queue — same dispatch path as the
+  // original run, rebuilt from the ticket persisted in the event payload.
+  // A legacy park without a ticket falls back to the default handle.
+  const resume = (pending!.payload as any).resume as ResumeInfo | undefined;
+  const runId = await claimRun(deps, input.threadId);
+  await deps.queue.enqueue({
+    threadId: input.threadId,
+    runId,
+    model: resume?.model ?? thread.model,
+    ...(resume
+      ? {
+          agent: resume.agent,
+          ...(resume.tokenBudget !== undefined ? { tokenBudget: resume.tokenBudget } : {}),
+          ...(resume.providerOptions ? { providerOptions: resume.providerOptions } : {}),
+        }
+      : {}),
+  });
 
-export function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+  return { delivered: true };
 }

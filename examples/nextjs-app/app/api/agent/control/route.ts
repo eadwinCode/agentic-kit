@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { chat } from '@/lib/agents';
+import { chat } from '@/lib/runtime';
 
 // One stop button: the handle's stop is the single `state → CANCELLED` write (§2.1)
 export async function POST(req: NextRequest) {

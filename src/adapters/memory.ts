@@ -1,7 +1,7 @@
-import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewRun, NewUsage, RunDTO, RunJob, ThreadDTO } from '../core/types.js';
+import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewRun, NewUsage, RunDTO, RunJob, ThreadDTO, UsageTotals } from '../core/types.js';
 import type { Storage } from '../ports/storage.js';
 import type { EventBus } from '../ports/bus.js';
-import type { Queue } from '../ports/queue.js';
+import type { EnqueueOptions, Queue } from '../ports/queue.js';
 import type { Kv } from '../ports/kv.js';
 
 const id = () => Math.random().toString(36).slice(2, 12);
@@ -60,11 +60,17 @@ export class MemoryBus implements EventBus {
  *  worker would (`await queue.drain(job => runtime.engine.executeWithPolicy(job))`). */
 export class MemoryQueue implements Queue {
   readonly items: RunJob[] = [];
-  async enqueue(job: RunJob) { this.items.push(job); }
+  /** Delivery delay requested per enqueue, index-aligned with `items`. */
+  readonly delays: Array<number | undefined> = [];
+  async enqueue(job: RunJob, opts?: EnqueueOptions) {
+    this.items.push(job);
+    this.delays.push(opts?.delaySeconds);
+  }
   async drain(handler: (job: RunJob) => Promise<void>): Promise<number> {
     let n = 0;
     while (this.items.length) {
       const job = this.items.shift()!;
+      this.delays.shift();
       await handler(job);
       n++;
     }
@@ -90,6 +96,16 @@ export class MemoryStorage implements Storage {
       const thread = this.store.get(t);
       if (!thread) throw new Error(`Unknown thread ${t}`);
       thread.state = state; thread.updatedAt = new Date();
+    },
+    // Arrow-bound to the MemoryStorage instance: the cascade reaches the
+    // sibling sections (messages / events / usage / runs) — §3.2 contract
+    delete: async (t: string) => {
+      if (!this.threads.store.has(t)) throw new Error(`Unknown thread ${t}`);
+      this.threads.store.delete(t);
+      this.messages.store.delete(t);
+      this.events.store.delete(t);
+      this.usage.recorded = this.usage.recorded.filter((u) => u.threadId !== t);
+      for (const [runId, run] of this.runs.store) if (run.threadId === t) this.runs.store.delete(runId);
     },
     async claimState(t: string, from: ExecutionState, to: ExecutionState) {
       const thread = this.store.get(t);
@@ -135,6 +151,19 @@ export class MemoryStorage implements Storage {
   usage = {
     recorded: [] as (NewUsage & { threadId: string })[],
     async record(t: string, u: NewUsage) { this.recorded.push({ threadId: t, ...u }); },
+    async total(t: string): Promise<UsageTotals> {
+      return this.recorded
+        .filter((u) => u.threadId === t)
+        .reduce<UsageTotals>(
+          (sum, u) => ({
+            inputTokens: sum.inputTokens + u.inputTokens,
+            cachedInputTokens: sum.cachedInputTokens + u.cachedInputTokens,
+            outputTokens: sum.outputTokens + u.outputTokens,
+            totalTokens: sum.totalTokens + u.totalTokens,
+          }),
+          { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        );
+    },
   };
 
   runs = {

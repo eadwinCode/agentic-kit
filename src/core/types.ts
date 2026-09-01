@@ -74,6 +74,31 @@ export interface NewRun {
  *  downstream concern computed over the recorded counters. */
 /** Token attribution (§4): the platform records the counters; USD/credit
  *  pricing is a downstream concern computed over them. */
+/** Cumulative token attribution across every run on a thread (§4). */
+export interface UsageTotals {
+  /** Fresh (uncached) prompt tokens. */
+  inputTokens: number;
+  /** Prompt tokens served from the provider's prompt cache (§2.6). */
+  cachedInputTokens: number;
+  outputTokens: number;
+  /** input + cached + output. */
+  totalTokens: number;
+}
+
+/** How full the next run's prompt would be (§2.6). Token counts are the same
+ *  rough estimate the engine itself compacts on, so the number a user sees is
+ *  the number the platform acts on. */
+export interface ContextUsage {
+  /** Estimated tokens the stored history occupies right now. */
+  usedTokens: number;
+  /** What history may fill: the model's window minus the output reserve. */
+  budgetTokens: number;
+  /** Compaction runs above this — `budgetTokens × compactionTrigger`. */
+  compactAtTokens: number;
+  /** Messages currently in the thread, summaries included. */
+  messages: number;
+}
+
 export interface NewUsage {
   agentId?: string | null;
   /** Fresh (uncached) prompt tokens. */
@@ -108,6 +133,21 @@ export interface RunJob {
   threadId: string;
   model: string;
   agent?: string;
+  /** Identifies THIS dispatch (§2.1). A thread has one live run at a time and
+   *  `agent:run:{threadId}` holds its id; a job whose id no longer matches has
+   *  been replaced by a newer run and must not execute. Omitted on legacy
+   *  dispatches, which keep the old no-identity behavior. */
+  runId?: string;
+  tokenBudget?: number;
+  providerOptions?: ProviderOptions;
+}
+
+/** Everything needed to resume a parked HITL run segment (§2.5). Persisted
+ *  inside the INPUT_REQUIRED event payload so any late reader — /respond or
+ *  TTL reclamation — can rebuild the dispatch ticket without extra state. */
+export interface ResumeInfo {
+  agent: string;
+  model: string;
   tokenBudget?: number;
   providerOptions?: ProviderOptions;
 }
@@ -135,14 +175,24 @@ export interface SubagentsConfig {
 }
 
 export interface AgentConfig {
-  /** How long a parked HITL wait may last before timing out (§2.5) */
+  /** How long a parked HITL request stays answerable (§2.5) — expiry turns
+   *  it into the timeout denial ("user had no response") and the run continues. */
   hitlTtlMs: number;
   /** Grace beyond the HITL TTL before orphan reclamation may claim a thread (§2.5) */
   reclaimGraceMs: number;
-  /** AI-SDK step ceiling per run (§2.1 safety cap) */
+  /** AI-SDK round-trip ceiling per run (§2.1 safety cap) — the platform loop
+   *  runs one executeStep (maxSteps: 1) per iteration up to this count. */
   maxSteps: number;
   /** Queue redrive attempts before a run finalizes FAILED (§2.8) */
   runMaxAttempts: number;
+  /** How often a running worker re-reads the stop signal (§2.1). Also the
+   *  window in which it notices that a newer run has replaced it. */
+  stopPollMs: number;
+  /** Delay (seconds) before re-dispatching a job that found the run lock still
+   *  held by an OLDER run (§2.8). That job has not executed at all — dropping
+   *  it would strand the user's message — so it comes back once the previous
+   *  run has let go. */
+  runRedriveDelaySeconds: number;
   /** Default per-run token budget (input + output) when neither the execute
    *  input nor the agent spec declares one. `undefined` = unbounded apart
    *  from `maxSteps` (§2.1 safety cap). */
@@ -172,7 +222,7 @@ export interface AgentConfig {
    *  A `contextWindow` declared via `resolveModel` wins over this table. */
   nativeWindows?: Record<string, number>;
   /** Lease (seconds) for the per-thread run lock — must exceed the longest
-   *  possible run, including parked HITL waits (§2.8, §3.4). */
+   *  possible run segment; parked HITL waits hold NO lock (§2.8, §3.4). */
   runLockLeaseSeconds: number;
   /** Billing pre-execution check (§4). Return `{ ok: false, error }` to reject a run. */
   billingPreCheck?: (threadId: string) => Promise<{ ok: boolean; error?: string }>;
@@ -183,6 +233,8 @@ export const DEFAULT_CONFIG: AgentConfig = {
   reclaimGraceMs: 60_000,
   maxSteps: 25,
   runMaxAttempts: 3,
+  stopPollMs: 500,
+  runRedriveDelaySeconds: 2,
   subagentMaxDepth: 2,
   subagentMaxConcurrent: 3,
   subagentMaxSteps: 10,
@@ -201,6 +253,17 @@ export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
     // A subagent must never get a looser step ceiling than its parent run (§2.7)
     throw new Error(
       `Invalid config: subagentMaxSteps (${config.subagentMaxSteps}) must be between 1 and maxSteps (${config.maxSteps})`,
+    );
+  }
+  if (!Number.isInteger(config.stopPollMs) || config.stopPollMs < 1) {
+    // The poll is the only thing that delivers a stop to a running worker (§2.1)
+    throw new Error(
+      `Invalid config: stopPollMs (${config.stopPollMs}) must be an integer of at least 1`,
+    );
+  }
+  if (!Number.isInteger(config.runRedriveDelaySeconds) || config.runRedriveDelaySeconds < 0) {
+    throw new Error(
+      `Invalid config: runRedriveDelaySeconds (${config.runRedriveDelaySeconds}) must be a non-negative integer`,
     );
   }
   if (!Number.isInteger(config.runLockLeaseSeconds) || config.runLockLeaseSeconds < 1) {

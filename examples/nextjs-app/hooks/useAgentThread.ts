@@ -45,6 +45,26 @@ export interface SubagentView {
   text: string;
 }
 
+export interface UsageTotals {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+export interface ContextUsage {
+  usedTokens: number;
+  budgetTokens: number;
+  compactAtTokens: number;
+  messages: number;
+}
+
+export interface ThreadUsage {
+  tokens: UsageTotals;
+  context: ContextUsage;
+  model: string;
+}
+
 export interface PendingInput {
   toolCallId: string;
   toolName: string;
@@ -54,6 +74,7 @@ export interface PendingInput {
 
 export interface ThreadListItem {
   id: string;
+  title: string;
   state: AgentState;
   model: string;
   updatedAt: string;
@@ -156,18 +177,38 @@ export function useAgentThread(initialThreadId?: string) {
   const [pendingInput, setPendingInput] = useState<PendingInput | null>(null);
   const [subagents, setSubagents] = useState<SubagentView[]>([]);
   const [threads, setThreads] = useState<ThreadListItem[]>([]);
+  const [threadsLoading, setThreadsLoading] = useState(true);
+  const [usage, setUsage] = useState<ThreadUsage | null>(null);
   const threadRef = useRef<string | undefined>(threadId);
   threadRef.current = threadId;
+
+  /** Tokens spent (§4) and context load (§2.6). Read after hydration and
+   *  again whenever a run ends — both only change when a run writes. */
+  const loadUsage = useCallback(async (id?: string) => {
+    const target = id ?? threadRef.current;
+    if (!target) return;
+    try {
+      const res = await fetch(`/api/agent/usage?threadId=${encodeURIComponent(target)}`);
+      if (!res.ok) return;
+      const data = (await res.json()) as ThreadUsage;
+      if (threadRef.current === target) setUsage(data);
+    } catch {
+      // usage is a read-only extra — never break the conversation over it
+    }
+  }, []);
 
   /** Thread picker / sidebar: best-effort refresh, most recent first. */
   const loadThreads = useCallback(async () => {
     try {
+      setThreadsLoading(true);
       const res = await fetch('/api/threads');
       if (!res.ok) return;
       const data = await res.json();
       setThreads(data.threads ?? []);
     } catch {
       // sidebar is best-effort — ignore transport errors
+    } finally {
+      setThreadsLoading(false);
     }
   }, []);
 
@@ -188,6 +229,7 @@ export function useAgentThread(initialThreadId?: string) {
     setEntries([]);
     setSubagents([]);
     setPendingInput(null);
+    setUsage(null);
     setAgentState('IDLE');
     setActivity(stateActivity('IDLE'));
     window.localStorage.removeItem(LAST_THREAD_KEY);
@@ -201,6 +243,26 @@ export function useAgentThread(initialThreadId?: string) {
   const selectThread = useCallback((id: string) => {
     setThreadId(id);
   }, []);
+
+  /** Delete a thread (§3.2): the platform cascades messages, events, usage
+   *  and runs. If it's the open thread, reset the view; 404 counts as
+   *  success (someone in another tab beat us to it). */
+  const deleteThread = useCallback(
+    async (id: string) => {
+      try {
+        const res = await fetch(`/api/threads?threadId=${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+        });
+        if (!res.ok && res.status !== 404) return false;
+        if (threadRef.current === id) newThread();
+        void loadThreads();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [newThread, loadThreads],
+  );
 
   useEffect(() => {
     if (initialThreadId || threadRef.current) return;
@@ -231,6 +293,7 @@ export function useAgentThread(initialThreadId?: string) {
         // sidebar so it stops claiming a finished run is still RUNNING.
         if (nextState === 'COMPLETED' || nextState === 'FAILED' || nextState === 'CANCELLED') {
           void loadThreads();
+          void loadUsage();
         }
         break;
       }
@@ -354,7 +417,7 @@ export function useAgentThread(initialThreadId?: string) {
         );
         break;
     }
-  }, [loadThreads]);
+  }, [loadThreads, loadUsage]);
 
   useEffect(() => {
     if (!threadId) return;
@@ -379,6 +442,7 @@ export function useAgentThread(initialThreadId?: string) {
           window.history.replaceState({}, '', cleanUrl);
           setThreadId(undefined);
           setEntries([]);
+          setUsage(null);
           setAgentState('IDLE');
           setActivity(stateActivity('IDLE'));
           return;
@@ -393,6 +457,7 @@ export function useAgentThread(initialThreadId?: string) {
         setEntries(durableEntries);
         setSubagents([]);
         setPendingInput(null);
+        void loadUsage(threadId);
         setAgentState(snapshot.thread.state);
         setActivity(stateActivity(snapshot.thread.state));
 
@@ -423,7 +488,7 @@ export function useAgentThread(initialThreadId?: string) {
       cancelled = true;
       es?.close();
     };
-  }, [applyEvent, threadId]);
+  }, [applyEvent, loadUsage, threadId]);
 
   const run = useCallback(async (prompt: string, model = 'gpt-4o') => {
     setEntries((prev) => [
@@ -496,9 +561,12 @@ export function useAgentThread(initialThreadId?: string) {
     pendingInput,
     subagents,
     threads,
+    threadsLoading,
+    usage,
     loadThreads,
     newThread,
     selectThread,
+    deleteThread,
     run,
     stop,
     respondToInput,

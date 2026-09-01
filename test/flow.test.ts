@@ -197,12 +197,86 @@ describe('reclaimIfOrphaned (§2.5)', () => {
     expect(threadAfter!.state).toBe('RUNNING');
     const messages = await deps.storage.messages.list(thread.id);
     expect(messages).toHaveLength(1);
-    expect((messages[0]!.content as any).result).toEqual({
+    expect((messages[0]!.content as any)[0].result).toEqual({
       responded: false, cancelled: true, reason: 'timeout',
     });
     expect(queue.items).toHaveLength(1); // re-entered via the queue
     const last = bus.published.at(-1)!;
     expect(last.type).toBe('STATE_CHANGE');
+  });
+});
+
+describe('runtime.deleteThread (§3.2)', () => {
+  it('deletes the thread and everything that follows it', async () => {
+    const { deps, storage, runtime, bus, kv } = makeDeps();
+    const thread = await deps.storage.threads.create();
+    await deps.storage.messages.append(thread.id, { role: 'user', content: 'hi' });
+    await deps.storage.events.append(thread.id, {
+      threadId: thread.id, seq: 1, type: 'CHUNK', payload: {}, createdAt: new Date(),
+    });
+    await deps.storage.usage.record(thread.id, {
+      agentId: null, inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, totalTokens: 2,
+    });
+    await deps.storage.runs.create(thread.id, { name: 'sub', model: 'gpt-4o', depth: 1, state: 'COMPLETED' });
+    await deps.kv.set(`agent:state:${thread.id}`, 'COMPLETED');
+    await deps.kv.set(`agent:seq:${thread.id}`, '1');
+    await deps.kv.set(`agent:attempts:${thread.id}`, '2');
+
+    const res = await runtime.deleteThread(thread.id);
+    expect(res.accepted).toBe(true);
+
+    // Cascade: messages, events, usage, runs all follow the thread
+    expect(await deps.storage.threads.get(thread.id)).toBeNull();
+    expect(await deps.storage.messages.list(thread.id)).toEqual([]);
+    expect(await deps.storage.events.listSince(thread.id, -1)).toEqual([]);
+    expect(storage.usage.recorded.filter((u) => u.threadId === thread.id)).toEqual([]);
+    expect([...storage.runs.store.values()]).toEqual([]);
+
+    // Hot cache cleanup — no resurrection from kv
+    for (const key of ['state', 'seq', 'attempts', 'lock']) {
+      expect(await kv.get(`agent:${key}:${thread.id}`)).toBeNull();
+    }
+
+    // Live UIs are told via the bus-only notice
+    expect(bus.published.at(-1)!.type).toBe('THREAD_DELETED');
+  });
+
+  it('refuses an active run but deletes a parked HITL thread (no process held, §2.5)', async () => {
+    const { deps, runtime } = makeDeps();
+    const running = await deps.storage.threads.create();
+    await deps.storage.threads.setState(running.id, 'RUNNING');
+    const refused = await runtime.deleteThread(running.id);
+    expect(refused.accepted).toBe(false);
+    expect(refused.error).toMatch(/stop/i);
+    expect(await deps.storage.threads.get(running.id)).not.toBeNull();
+
+    const parked = await deps.storage.threads.create();
+    await deps.storage.threads.setState(parked.id, 'WAITING_FOR_INPUT');
+    expect((await runtime.deleteThread(parked.id)).accepted).toBe(true);
+  });
+
+  it('rejects an unknown thread', async () => {
+    const { runtime } = makeDeps();
+    const res = await runtime.deleteThread('nope');
+    expect(res.accepted).toBe(false);
+    expect(res.error).toMatch(/not found/i);
+  });
+
+  it('a late resume dispatch after deletion is a no-op — no resurrection', async () => {
+    const { deps, runtime } = makeDeps();
+    const thread = await deps.storage.threads.create();
+    await deps.storage.threads.setState(thread.id, 'WAITING_FOR_INPUT');
+    await deps.storage.events.append(thread.id, {
+      threadId: thread.id, seq: 1, type: 'INPUT_REQUIRED',
+      payload: { toolCallId: 'c1', toolName: 'sendEmail', resume: { agent: 'chat', model: 'gpt-4o' } },
+      createdAt: new Date(),
+    });
+
+    expect((await runtime.deleteThread(thread.id)).accepted).toBe(true);
+    // The §2.5 resume job arrives after the delete — nothing may come back
+    await runtime.worker.handleJob({ threadId: thread.id, model: 'gpt-4o', agent: 'chat' });
+    expect(await deps.storage.threads.get(thread.id)).toBeNull();
+    expect(await deps.storage.messages.list(thread.id)).toEqual([]);
   });
 });
 

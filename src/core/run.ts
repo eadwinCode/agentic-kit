@@ -1,6 +1,7 @@
 import type { RuntimePorts, RunInput, RunResult } from '../ports/runtime.js';
 import type { RegisteredAgent } from './agent.js';
 import { reclaimIfOrphaned } from './reclaim.js';
+import { claimRun } from './keys.js';
 import { publish } from './publish.js';
 
 /** The §5.1 behavior: heal orphans → billing pre-check (§4) → persist the user
@@ -38,13 +39,20 @@ export async function run(
   }
 
   await deps.storage.messages.append(threadId, { role: 'user', content: input.prompt });
+
+  // Claim the thread for THIS run before the state key is touched (§2.1). The
+  // next line overwrites whatever stop() may have just written, so the run id
+  // — not the state key — is what retires a worker still running the previous
+  // message.
+  const runId = await claimRun(deps, threadId);
+
   await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
   await deps.storage.threads.setState(threadId, 'RUNNING');
   // A durable run boundary lets reconnecting clients distinguish this turn's
   // in-flight chunks from earlier completed turns.
   await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
 
-  await deps.queue.enqueue({ threadId, model, agent: agent.name, tokenBudget: input.tokenBudget, providerOptions: input.providerOptions });
+  await deps.queue.enqueue({ threadId, runId, model, agent: agent.name, tokenBudget: input.tokenBudget, providerOptions: input.providerOptions });
 
-  return { accepted: true, threadId, state: 'RUNNING' };
+  return { accepted: true, threadId, runId, state: 'RUNNING' };
 }

@@ -40,6 +40,15 @@ export async function GET(req: NextRequest) {
       // Subscribe FIRST so events published between replay and tailing are
       // buffered instead of dropped (§2.2) …
       const unsubscribe = await runtime.events.subscribe(threadId, onEvent);
+      // §2.5 expiry is enforced at resolution time — no timer holds the run.
+      // While anyone watches, this connection doubles as the watchdog: heal
+      // on connect, then re-check periodically so an expired approval turns
+      // into the timeout denial (and the run continues) LIVE, in front of
+      // the user. Cheap no-op when there is nothing pending.
+      void runtime.hitl.reclaimIfOrphaned(threadId);
+      const watchdog = setInterval(() => {
+        void runtime.hitl.reclaimIfOrphaned(threadId).catch(() => {});
+      }, 30_000);
       try {
         // …then replay from the durable log, deduped against the buffer …
         for (const e of await runtime.events.since(threadId, since)) {
@@ -57,6 +66,7 @@ export async function GET(req: NextRequest) {
       req.signal.addEventListener('abort', () => {
         if (closed) return;
         closed = true;
+        clearInterval(watchdog);
         void (async () => {
           await unsubscribe();
           // The runtime may already have closed the controller when the

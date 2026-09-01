@@ -30,6 +30,15 @@ export interface AgentCore {
   /** One call for UIs / history routes: thread + messages + recent events. */
   getThreadSnapshot(threadId: string): Promise<ThreadSnapshot | null>;
 
+  /** Delete a thread and everything that follows it — messages, events,
+   *  usage rows, subagent runs, and the thread's hot kv keys (state cache,
+   *  run lock, event seq, retry counter). Refused while a run is active
+   *  (stop() first); a parked HITL thread deletes cleanly because a park
+   *  holds no process (§2.5). Live subscribers get a bus-only
+   *  THREAD_DELETED notice; a late resume dispatch for a deleted thread is
+   *  a no-op (the engine's missing/terminal-state guard, §2.8). */
+  deleteThread(threadId: string): Promise<{ accepted: boolean; error?: string }>;
+
   hitl: {
     respond(input: RespondInput): Promise<RespondResult>;
     reclaimIfOrphaned(threadId: string): Promise<boolean>;
@@ -100,9 +109,9 @@ export interface AgentHandle {
    *  (at-least-once duplicate delivery, §2.8) and nothing was executed.
    *
    *  tokenBudget: max cumulative tokens (input + output) for the whole run.
-   *  Tracked on every onStepFinish; the generation loop breaks BEFORE the
-   *  next step once spent, and the run finalizes COMPLETED with
-   *  stopReason 'token_budget' (§2.1 safety cap). */
+   *  Checked between the loop's steps; the step that crosses the line is
+   *  kept in full and the run finalizes COMPLETED with stopReason
+   *  'token_budget' (§2.1 safety cap). */
   execute(input: {
     threadId: string;
     model: string;
@@ -211,7 +220,7 @@ export interface SubagentsConfig {
 | `model` | **registry key on spec/run; resolved via `AgentCore.resolveModel`** → `{ instance, contextWindow }` — the instance executes, the context window feeds §2.6 |
 | `messages` / `prompt` | **platform** | built from thread history + compaction (§2.6); subagents get the brief only (§2.7) |
 | `abortSignal` | **platform** | wired to the stop poller (§2.1) |
-| `maxSteps` | **config** (`maxSteps`, §2.1 safety cap) | |
+| `maxSteps` | **config** (`maxSteps`, §2.1 safety cap) — the platform loop's iteration count; each step is an SDK call with `maxSteps: 1` | |
 | `tools` | **user + platform** | user-supplied set; platform wraps `requiresConfirmation` tools. `spawnSubagent` is **opt-in** (`subagents` config) — never injected silently |
 | `providerOptions` | **user (spec default + execute input)** | additional provider-specific options passed through to the provider from the AI SDK — per-provider namespace, execute input wins, platform never inspects them |
 | `onChunk` / `onFinish` | **platform + user** | platform persists, bills, and publishes first, **then chains the user's callback** — replacing it would silently drop user code |
@@ -223,126 +232,127 @@ Platform keys win: user args are spread first, platform assignments last. A user
 
 ## 4. What `execute()` Does With the Bound Args
 
+Execution is a **platform-owned loop of single-round-trip steps**. Each iteration calls `executeStep` — one SDK round-trip with `maxSteps: 1` — and every continuation decision (tool results ready, budget spent, step ceiling, HITL park, user stop) is made here, **between steps**, on a structured result. The SDK's internal multi-step loop is never used: after EVERY step the produced messages are persisted, so a worker that dies mid-run resumes from the last step, never from the whole run.
+
 ```typescript
+/** ONE SDK round-trip (maxSteps: 1). The SDK executes the step's tool calls
+ *  and reports a structured result; continuation is the loop's decision. */
+export interface StepResult {
+  text: string;
+  finishReason: string;
+  usage: Record<string, number> | undefined;
+  responseMessages: Array<{ role: string; content: unknown }>; // assistant + tool turns
+  toolResults: Array<{ toolCallId: string; toolName: string; result: unknown }>;
+}
+
 export async function execute(
   deps: RuntimePorts,
   agent: RegisteredAgent,                 // { name, kind, spec, args } resolved from the registry
-  input: { threadId: string; model: string; tokenBudget?: number },
+  input: { threadId: string; model: string; tokenBudget?: number; providerOptions?: ProviderOptions },
 ): Promise<'executed' | 'lock-conflict'> {
   const abort = new AbortController();
 
-  // 1. Per-thread run lock (§2.8, §3.4) — SET NX + lease
+  // 1. Per-thread run lock (§2.8, §3.4) — SET NX + lease. Parked HITL waits
+  //    hold NO lock (§2.5): a segment ends and the lock is released.
   const locked = await deps.kv.set(runLockKey(input.threadId), randomUUID(), {
     onlyIfNotExists: true,
     exSeconds: deps.config.runLockLeaseSeconds,
   });
   if (!locked) return 'lock-conflict';    // duplicate delivery: nothing executed
 
-  // 2. Token budget (§2.1 safety cap) — precedence: execute input → spec →
-  //    config. Tracked cumulatively on every onStepFinish; the loop breaks
-  //    BEFORE the next step once spent. This is NOT a user stop.
+  // 2. At-least-once idempotency (§2.8): a job whose run already ended —
+  //    or was stopped — is a no-op on redelivery.
+  const durable = await deps.storage.threads.get(input.threadId);
+  if (durable && ['CANCELLED', 'COMPLETED', 'FAILED'].includes(durable.state)) {
+    return 'executed';
+  }
+
+  // 3. Token budget (§2.1 safety cap) — precedence: execute input → spec →
+  //    config. Checked BETWEEN steps on the accumulated total; the step that
+  //    crossed the line is kept in full, nothing is aborted mid-generation.
   const tokenBudget = input.tokenBudget
     ?? agent.spec.tokenBudget
     ?? deps.config.tokenBudget;          // undefined = unbounded apart from maxSteps
-  let tokensUsed = 0;
-  let budgetExceeded = false;
-
-  // Delegation config (§3.2): false/undefined = off; true = defaults
-  const subCfg: SubagentsConfig =
-    agent.spec.subagents === true ? {} : (agent.spec.subagents ?? {});
 
   const controlPoll = setInterval(/* stop poller (§2.1) — aborts on CANCELLED */);
 
   try {
-    // 3. Durable history + compaction (§2.6) — the budget uses the resolved
-    //    model's contextWindow (resolveModel, §3.3) over config.nativeWindows
-    const history = await compactContext(deps, input.threadId, input.model);
-
-    // 4. Dispatch on the bound flavor — user args spread FIRST,
-    //    platform assignments LAST (ownership rule, §3.1)
-    if (agent.kind === 'stream-text') {
-      // Model resolution (§3.3): registry key → { instance, contextWindow }
-      const model = deps.resolveModel(input.model);
-
-      // Provider-specific options (§3.1): spec default <- execute input
-      const providerOptions = mergeProviderOptions(agent.spec.providerOptions, input.providerOptions);
-
-      const result = streamText({
-        ...agent.args,                                   // user: system, temperature, toolChoice…
-        model: model.instance(),                         // platform: resolved provider instance
-        messages: history.map(toCoreMessage),            // platform: durable history
-        ...(providerOptions ? { providerOptions } : {}), // passthrough - platform never inspects
-        tools: withHitl(deps, input.threadId, {          // platform: HITL wrap (§2.5) over the user's set.
-          ...(agent.args.tools ?? {}),                   // spawnSubagent is added ONLY when the
-          ...(agent.spec.subagents ? {                   // spec opts in (§2.7) — never silently
-            spawnSubagent: spawnSubagentTool({
-              threadId, depth: 0, sem, ports: deps,
-              kind: subCfg.kind ?? 'stream-text',        // streamText OR generateText nested loop
-              defaultModel: subCfg.model,                // used when delegation omits model
-              tools: subCfg.tools,                       // extra tools merged into children
-            }),
-          } : {}),
-        }),
-        abortSignal: abort.signal,                       // platform: stop signal
-        maxSteps: deps.config.maxSteps,                  // platform: safety cap
-        onStepFinish: (step) => {
-          agent.args.onStepFinish?.(step);               // user callback still fires
-          // 5. Budget tracking — break the loop BEFORE the next step
-          tokensUsed += countTokens(step.usage);         // NaN-guarded input + output (§finalize)
-          if (tokenBudget && tokensUsed >= tokenBudget) {
-            budgetExceeded = true;
-            abort.abort();                               // not a user stop — see finalize below
-          }
-        },
-        onChunk: async (para) => {
-          // One canonical path for every client: durable log + live Pub/Sub (§2.1, §2.2)
-          await publish(deps, input.threadId, 'CHUNK', para.chunk);
-          agent.args.onChunk?.(para);                    // user callback still fires
-        },
-        onFinish: async (finishParams) => {
-          await finalize(deps, agent, input, finishParams, abort, {
-            budgetExceeded, tokensUsed,
-          });
-          agent.args.onFinish?.(finishParams);           // user callback still fires
-        },
-      });
-      await result.text;
-    } else {
-      const result = await generateText({
-        ...agent.args,                                   // user: model instance, system, temperature, toolChoice…
-        messages: history.map(toCoreMessage),            // platform: durable history
-        tools: withHitl(deps, input.threadId, {          // platform: HITL wrap (§2.5) over the user's set.
-          ...(agent.args.tools ?? {}),                   // spawnSubagent only when spec opts in (§2.7)
-          ...(agent.spec.subagents ? {
-            spawnSubagent: spawnSubagentTool({
-              threadId, depth: 0, sem, ports: deps,
-              kind: subCfg.kind ?? 'stream-text',
-              defaultModel: subCfg.model,
-              tools: subCfg.tools,
-            }),
-          } : {}),
-        }),
-        abortSignal: abort.signal,                       // platform: stop signal
-        maxSteps: deps.config.maxSteps,                  // platform: safety cap
-        onStepFinish: (step) => {
-          agent.args.onStepFinish?.(step);               // user callback still fires
-          tokensUsed += countTokens(step.usage);         // budget tracking — break BEFORE next step
-          if (tokenBudget && tokensUsed >= tokenBudget) {
-            budgetExceeded = true;
-            abort.abort();
-          }
-        },
-        onFinish: async (finishParams) => {
-          await finalize(deps, agent, input, finishParams, abort, {
-            budgetExceeded, tokensUsed,
-          });
-          agent.args.onFinish?.(finishParams);           // user callback still fires
-        },
-      });
-
-      // One-shot flavor: no CHUNK stream — publish the final text as one event
-      await publish(deps, input.threadId, 'TEXT_RESULT', { text: result.text });
+    // 4. §2.5 resume: a WAITING thread at segment start is either the
+    //    /respond continuation or a redelivery of the parked job. Consumes
+    //    the answer (or the TTL denial), appends the tool result, flips
+    //    RUNNING; returns false → still parked → no-op.
+    if (durable?.state === 'WAITING_FOR_INPUT') {
+      const pending = await loadPendingHitl(deps, input.threadId);
+      if (!pending) throw new Error('WAITING_FOR_INPUT without a pending INPUT_REQUIRED');
+      const resumed = await resumePendingHitl(deps, input.threadId, pending, rawTools, abort.signal);
+      if (!resumed) return 'executed';
     }
+
+    // 5. Durable history + compaction (§2.6); prompt-cache stamping (§2.6) on
+    //    the stable prefix — appended step messages never invalidate it.
+    const history = await compactContext(deps, input.threadId, input.model);
+    let messages = history.map(toCoreMessage);
+    if (deps.config.promptCaching) messages = markPromptCaching(messages);
+
+    // 6. The loop (§2.1, §5.6)
+    const attribution = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 };
+    let tokensUsed = 0, lastText = '', lastFinishReason = '', parked = false;
+    let stepsLeft = deps.config.maxSteps;
+
+    while (stepsLeft > 0 && !abort.signal.aborted) {
+      stepsLeft--;
+      const step = await executeStep(agent, {
+        kind: agent.kind,                                // streamText OR generateText, maxSteps: 1
+        model: deps.resolveModel(input.model).instance(),// resolved per run (§3.3)
+        messages,                                        // grows by each step's turns
+        tools: withHitl(deps, input.threadId, rawTools), // HITL wrap (§2.5); spawnSubagent opt-in (§2.7)
+        providerOptions,                                 // spec default <- execute input (§3.1)
+        abortSignal: abort.signal,                       // stop signal
+        onChunk: agent.kind === 'stream-text'            // durable log + live Pub/Sub (§2.2),
+          ? async (chunk) => {                           // then the user's callback
+              await publish(deps, input.threadId, 'CHUNK', chunk);
+              agent.args.onChunk?.({ chunk });
+            }
+          : undefined,
+      });
+
+      // 7. Per-step durability (§5.6): append this step's turns BEFORE the
+      //    next step. A parked HITL result (the §2.5 sentinel) is skipped —
+      //    the resumed segment appends the user's verdict instead.
+      for (const m of step.responseMessages.filter(notParkSentinel)) {
+        await deps.storage.messages.append(input.threadId, m);
+      }
+      messages.push(...step.responseMessages);
+
+      // 8. Token attribution (§4), accumulated across the segment's steps
+      accumulate(attribution, attributeTokens(step.usage));
+      tokensUsed += countTokens(step.usage);
+      lastText = step.text; lastFinishReason = step.finishReason;
+
+      // 9. Continuation decisions — in order:
+      if (step.toolResults.some(isParkSentinel)) { parked = true; break; }      // §2.5 park
+      if (tokenBudget && tokensUsed >= tokenBudget) break;                      // §2.1 budget
+      if (step.finishReason !== 'tool-calls') break;                            // run is done
+      // 'tool-calls' → the loop feeds the tool results back as the next step
+    }
+
+    if (parked) {
+      // Segment ends holding the park: bill the steps up to the park (§4);
+      // NO state flip — WAITING_FOR_INPUT (or CANCELLED) stands.
+      await deps.storage.usage.record(input.threadId, { agentId: agent.name, ...attribution });
+      return 'executed';
+    }
+
+    await finalize(deps, agent, input.threadId, {
+      state: abort.signal.aborted ? 'CANCELLED' : 'COMPLETED',
+      stopReason: abort.signal.aborted ? 'cancelled'
+        : tokenBudget && tokensUsed >= tokenBudget ? 'token_budget'
+        : lastFinishReason === 'tool-calls' ? 'max_steps'   // step ceiling hit (§2.1)
+        : 'completed',
+      tokensUsed,
+      attribution,
+      oneShotText: agent.kind === 'generate-text' ? lastText : undefined,
+    });
 
     return 'executed';
   } finally {
@@ -352,81 +362,56 @@ export async function execute(
 }
 ```
 
-`finalize` (the shared `onFinish` body) is unchanged from §5.6 in structure, with three changes:
+`finalize` runs once per segment — after the loop ends (or at the park boundary, which records usage only and skips the state flip). It never touches messages: persistence already happened per step inside the loop.
 
-1. **Persist `response.messages` before the state transition** (assistant turns, tool calls, tool results) so redrives, HITL resumes, and replay always see a valid history (§2.2, §2.8).
+1. **Token attribution, not pricing.** A model may be any provider instance (`createOpenAI(…)`, `createAnthropic(…)`, `createDeepSeek(…)`), so the platform records **input / cached-input / output tokens** and leaves USD pricing to a downstream concern computed over the recorded counters (spec §4 migration item).
 2. **NaN-guard the usage counters.** Some OpenAI-compatible providers omit streaming usage; the AI SDK represents those as `NaN`. Clamp to `0` — optional metering must never keep a successfully completed run stuck in `RUNNING`.
-3. **Token attribution, not pricing.** A model may be any provider instance (`createOpenAI(…)`, `createAnthropic(…)`, `createDeepSeek(…)`), so the platform records **input / cached-input / output tokens** and leaves USD pricing to a downstream concern computed over the recorded counters (spec §4 migration item).
+3. **Stop classification.** A budget break is NOT a user stop — the run still completes with `stopReason: 'token_budget'` and the tokens it actually spent. The budget no longer touches the abort signal at all, so `aborted` unambiguously means the user pressed stop.
 
-**Prompt caching (§2.6):** when `config.promptCaching` is on (the default), `execute` stamps Anthropic-style ephemeral cache breakpoints on the prompt prefix (system message + last message) via the provider-metadata channel, so supported providers serve repeat runs from cache. OpenAI-family models cache automatically for prompts ≥1024 tokens and ignore the markers. Cached hits surface as `usage.cachedInputTokens` in the run's usage rows and the final `STATE_CHANGE` — the budget counts them once, inside input.
+**Prompt caching (§2.6):** when `config.promptCaching` is on (the default), `execute` stamps Anthropic-style ephemeral cache breakpoints on the prompt prefix (system message + last message of the compacted history) once per segment, before the loop. Appended step messages extend the prompt without invalidating the breakpoints, so multi-step runs keep serving the stable prefix from cache. OpenAI-family models cache automatically for prompts ≥1024 tokens and ignore the markers. Cached hits surface as `usage.cachedInputTokens` in the run's usage rows and the final `STATE_CHANGE` — the budget counts them once, inside input.
 
 ```typescript
+export interface FinalizeInput {
+  state: ExecutionState;
+  stopReason: 'completed' | 'token_budget' | 'max_steps' | 'cancelled';
+  tokensUsed: number;
+  attribution: TokenAttribution;
+  oneShotText?: string; // generate-text flavor: publish the final text as one TEXT_RESULT
+}
+
 export async function finalize(
   deps: RuntimePorts,
   agent: RegisteredAgent,
-  input: { threadId: string; model: string },
-  finishParams: { usage: LanguageModelUsage; finishReason: FinishReason; response: ... },
-  abort: AbortController,
-  budget: { budgetExceeded: boolean; tokensUsed: number },
+  threadId: string,
+  f: FinalizeInput,
 ): Promise<void> {
-  const { threadId } = input;
-  const u = finishParams.usage;
-
-  // Some providers omit streaming usage — the SDK reports NaN for those.
-  // Never let optional metering keep a completed run stuck in RUNNING.
-  // Token attribution is TOTAL TOKENS USED — input + cached + output.
-  const attribution = attributeTokens(u); // input + cached + output, NaN-guarded
-
-  // Persist the completed assistant turn(s) — including tool calls and tool
-  // results — BEFORE the state transition (§2.2, §2.8). On a budget-broken
-  // run the recorded usage is partial by definition: the budget was spent.
-  await deps.storage.messages.append(threadId, { /* response.messages, §5.6 */ });
+  if (f.oneShotText !== undefined) {
+    // One-shot flavor: no CHUNK stream — publish the final text as one event
+    await publish(deps, threadId, 'TEXT_RESULT', { text: f.oneShotText });
+  }
 
   // Token attribution: input / cached-input / output / total — that is all
   // (§4 pricing is downstream over these counters, if ever needed)
-  await deps.storage.usage.record(threadId, {
-    agentId: agent.name,
-    totalTokens,
-  });
+  await deps.storage.usage.record(threadId, { agentId: agent.name, ...f.attribution });
 
-  // Stop classification (§2.1). A budget break is NOT a user stop — the run
-  // still completes successfully with the tokens it managed to spend.
-  const finalState: ExecutionState = abort.signal.aborted && !budget.budgetExceeded
-    ? 'CANCELLED' : 'COMPLETED';
-  const stopReason = budget.budgetExceeded ? 'token_budget'
-    : abort.signal.aborted ? 'cancelled'
-    : finishParams.finishReason === 'tool-calls'
-      ? 'max_steps' // safety cap hit (§2.1)
-      : 'completed';
-
-  await deps.kv.set(`agent:state:${threadId}`, finalState);
-  await deps.storage.threads.setState(threadId, finalState);
+  await deps.kv.set(`agent:state:${threadId}`, f.state);
+  await deps.storage.threads.setState(threadId, f.state);
   await publish(deps, threadId, 'STATE_CHANGE', {
-    state: finalState, stopReason, tokensUsed: budget.tokensUsed,
+    state: f.state, stopReason: f.stopReason, tokensUsed: f.tokensUsed, usage: f.attribution,
   });
-}
-
-/** Total tokens used — input + cached + output, NaN-guarded. Providers that
- *  omit streaming usage report NaN; optional metering must never keep a
- *  completed run stuck in RUNNING. */
-function countTokens(usage: LanguageModelUsage): number {
-  const pick = (v: number | undefined) => (Number.isFinite(v) ? v : 0);
-  return pick(usage.inputTokens ?? usage.promptTokens)
-       + pick(usage.cachedInputTokens)
-       + pick(usage.outputTokens ?? usage.completionTokens);
 }
 ```
 
-**Callback chaining order:** platform work (persist → attribute tokens → publish) runs first, then the user's `onChunk`/`onFinish` fires with the same parameters. A user callback that throws is its own problem — it must not prevent the state transition, so `finalize` completes before `args.onFinish` is invoked.
+**Callback chaining order:** platform work (persist per step → attribute tokens → publish) runs first, then the user's `onChunk`/`onFinish` fires. `onChunk` chains per chunk inside `executeStep`; the user's `onFinish` fires after `finalize` completes — a user callback that throws must not prevent the state transition. The user's `onStepFinish` still fires once per step, passed through by `executeStep`.
 
 #### Token Budget Semantics
 
 - **Precedence:** `execute input.tokenBudget` → `spec.tokenBudget` → `config.tokenBudget` (default `undefined` = unbounded apart from `maxSteps`).
-- **Counted:** NaN-guarded `input + output` per step, accumulated across steps (`onStepFinish` fires once per step, including tool-call steps). `cachedInputTokens` are a subset of input on providers that report them — never double-counted.
-- **Break:** the shared abort signal fires at a step boundary, so generation stops *before* the next step — the in-flight step completes and its tokens count. The run finalizes `COMPLETED` with `stopReason: 'token_budget'`; `STATE_CHANGE.tokensUsed` reports the actual spend.
-- **Not a user stop:** the stop poller and the budget tracker are separate triggers of the same signal — `budgetExceeded` disambiguates them in `finalize`, so a budget break can never be misclassified as `cancelled` (or vice versa).
+- **Counted:** NaN-guarded `input + cached + output`, accumulated across steps — one sample per `executeStep`, including tool-call steps. `cachedInputTokens` are a subset of input on providers that report them — never double-counted.
+- **Break:** checked BETWEEN steps on the accumulated total, with **no abort at all** — the step that crossed the line completed fully and its tokens count; the next step simply never starts. The run finalizes `COMPLETED` with `stopReason: 'token_budget'`; `STATE_CHANGE.tokensUsed` reports the actual spend.
+- **Not a user stop:** the budget check and the stop poller are separate mechanisms — `abort.signal.aborted` means only one thing in `finalize`: the user pressed stop.
 - **Partial is correct:** on a budget break the recorded usage is partial by definition — the budget was spent.
-- **Queue path:** `run({ …, tokenBudget })` flows through `RunJob.tokenBudget` to the worker's `executeWithPolicy`.
+- **Queue path:** `run({ …, tokenBudget })` flows through `RunJob.tokenBudget` to the worker's `executeWithPolicy` — and through the §2.5 resume ticket to HITL continuations.
 
 `executeWithPolicy` wraps `execute` with the §2.8 policy exactly as today: redrive `< maxAttempts`, else finalize `FAILED` on both homes; a user stop is never retried; the attempt counter resets on success.
 
@@ -434,12 +419,12 @@ function countTokens(usage: LanguageModelUsage): number {
 
 | | `stream-text` | `generate-text` |
 | :--- | :--- | :--- |
-| SDK call | `streamText` | `generateText` |
-| Live events | `CHUNK` per delta (§2.2 fan-out) | single `TEXT_RESULT` on completion |
+| SDK call per step | `streamText` (maxSteps: 1) | `generateText` (maxSteps: 1) |
+| Live events | `CHUNK` per delta (§2.2 fan-out) | single `TEXT_RESULT` at finalize |
 | Typical UI | chat | summarization, extraction, batch |
 | Stop | aborts mid-generation | aborts the awaited call |
-| Token budget | tracked on `onStepFinish`, breaks before the next step | same |
-| Everything else | identical: lock, history, HITL, token attribution, finalize, redrive | |
+| Token budget | checked between steps, no mid-generation abort | same |
+| Everything else | identical: loop, lock, per-step persistence, HITL, token attribution, finalize, redrive | |
 
 ---
 

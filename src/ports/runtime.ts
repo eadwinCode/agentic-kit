@@ -3,6 +3,7 @@ import type {
   AgentEvent,
   AgentConfig,
   AgentKind,
+  ContextUsage,
   ExecutionState,
   MessageDTO,
   ProviderOptions,
@@ -10,11 +11,15 @@ import type {
   RunJob,
   SubagentsConfig,
   ThreadDTO,
+  UsageTotals,
 } from '../core/types.js';
 import type { Storage } from './storage.js';
 import type { EventBus } from './bus.js';
 import type { Queue } from './queue.js';
 import type { Kv } from './kv.js';
+import type { ExecuteInput, ExecuteOutcome } from '../core/engine.js';
+
+export type { ExecuteInput, ExecuteOutcome } from '../core/engine.js';
 
 // Re-exported for consumers: these flow through RuntimeOptions/RunJob/AgentCore.
 export type { AgentKind, ProviderOptions, ResolvedModel, RunJob, SubagentsConfig } from '../core/types.js';
@@ -62,11 +67,19 @@ export interface RunInput {
 export interface RunResult {
   accepted: boolean;
   threadId: string;
+  /** This run's id (§2.1) — the same one carried by the enqueued job. An
+   *  in-process worker must pass it back, or its dispatch has no identity. */
+  runId?: string;
   state?: ExecutionState;
   error?: string;
 }
 
 export interface StopResult {
+  accepted: boolean;
+  error?: string;
+}
+
+export interface DeleteThreadResult {
   accepted: boolean;
   error?: string;
 }
@@ -81,6 +94,16 @@ export interface RespondInput {
 export interface RespondResult {
   delivered: boolean;
   error?: string;
+}
+
+/** What a thread has spent, and how full its context is (§2.6, §4). */
+export interface ThreadUsage {
+  /** Every run segment's tokens, summed. */
+  tokens: UsageTotals;
+  /** What the next run's prompt would carry before compaction. */
+  context: ContextUsage;
+  /** The model the budget was measured against. */
+  model: string;
 }
 
 /** Durable state used to hydrate a client before it starts live event replay. */
@@ -140,17 +163,13 @@ export interface AgentHandle {
 
   /** Worker-side only (§5.6). Throws on failure — see executeWithPolicy.
    *  Returns 'lock-conflict' when another worker owns the thread's run lock
-   *  (at-least-once duplicate delivery, §2.8) and nothing was executed. */
-  execute(input: {
-    threadId: string;
-    model: string;
-    tokenBudget?: number;
-    providerOptions?: ProviderOptions;
-  }): Promise<'executed' | 'lock-conflict'>;
+   *  (nothing was executed) and 'stale' when a newer run has replaced this
+   *  one (§2.1, §2.8). */
+  execute(input: ExecuteInput): Promise<ExecuteOutcome>;
 
   /** execute + §2.8 failure policy: redrive < maxAttempts, else finalize FAILED */
   executeWithPolicy(
-    input: { threadId: string; model: string; tokenBudget?: number; providerOptions?: ProviderOptions },
+    input: ExecuteInput,
     policy?: { maxAttempts?: number },
   ): Promise<void>;
 
@@ -172,6 +191,15 @@ export interface AgentCore {
 
   /** One call for UIs / history routes: thread + messages + recent events. */
   getThreadSnapshot(threadId: string): Promise<ThreadSnapshot | null>;
+
+  /** Tokens spent so far and the §2.6 context load. Null when the thread is
+   *  gone. Kept out of the snapshot so hydration stays one cheap read. */
+  getThreadUsage(threadId: string): Promise<ThreadUsage | null>;
+
+  /** Delete a thread and everything that follows it — messages, events,
+   *  usage rows, subagent runs, and the thread's hot kv keys (§3.2).
+   *  Refused while a run is active; stop() first. */
+  deleteThread(threadId: string): Promise<DeleteThreadResult>;
 
   hitl: {
     respond(input: RespondInput): Promise<RespondResult>;

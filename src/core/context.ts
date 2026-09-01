@@ -1,6 +1,6 @@
 import { generateText } from 'ai';
 import type { RuntimePorts } from '../ports/runtime.js';
-import type { MessageDTO } from './types.js';
+import type { ContextUsage, MessageDTO } from './types.js';
 import { publish } from './publish.js';
 import { attributeTokens } from './usage.js';
 
@@ -33,6 +33,23 @@ export function contextBudget(deps: RuntimePorts, model: string): number {
 }
 
 const estimateTokens = (content: unknown) => Math.ceil(JSON.stringify(content).length / 4);
+
+/** Read-only view of the §2.6 budget math — what compactContext would see on
+ *  the next run, without summarizing anything. */
+export async function contextUsage(
+  deps: RuntimePorts,
+  threadId: string,
+  model: string,
+): Promise<ContextUsage> {
+  const budgetTokens = contextBudget(deps, model) - deps.config.contextOutputReserveTokens;
+  const history = await deps.storage.messages.list(threadId);
+  return {
+    usedTokens: history.reduce((sum, m) => sum + estimateTokens(m.content), 0),
+    budgetTokens,
+    compactAtTokens: Math.floor(budgetTokens * deps.config.compactionTrigger),
+    messages: history.length,
+  };
+}
 
 // Returns a history array guaranteed to fit the model's budget. Compaction is
 // durable: the summary is persisted as a Message, so every client and every

@@ -9,8 +9,14 @@ import { runtime } from '@/lib/runtime';
 // and finalizes FAILED when attempts are exhausted.
 async function handler(req: NextRequest) {
   const job = await req.json();
+  console.log('[agent-run] job received:', JSON.stringify(job));
 
-  waitUntil(runtime.worker.handleJob(job));
+  waitUntil(
+    runtime.worker
+      .handleJob(job)
+      .then((r) => console.log('[agent-run] handleJob result:', JSON.stringify(r)))
+      .catch((err) => console.error('[agent-run] handleJob FAILED:', err)),
+  );
 
   // Ack immediately. Delivery is at-least-once, so double dispatch is possible;
   // the per-thread run lock (§3.4) makes it a no-op.

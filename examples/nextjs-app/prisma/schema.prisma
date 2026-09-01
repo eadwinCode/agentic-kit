@@ -75,11 +75,14 @@ model SubagentRun {
 }
 
 model TokenUsage {
-  id          String   @id @default(cuid())
-  threadId    String
-  agentId     String?  // subagent attribution; null = main agent (§2.7)
-  totalTokens Int      // total tokens used (§4) — pricing is downstream
-  createdAt   DateTime @default(now())
+  id                String   @id @default(cuid())
+  threadId          String
+  agentId           String?  // subagent attribution; null = main agent (§2.7)
+  inputTokens       Int      @default(0) // fresh (uncached) prompt tokens (§4)
+  cachedInputTokens Int      @default(0) // prompt tokens served from provider cache (§2.6)
+  outputTokens      Int      @default(0)
+  totalTokens       Int      // input + cached + output — pricing is downstream
+  createdAt         DateTime @default(now())
 
   thread Thread @relation(fields: [threadId], references: [id], onDelete: Cascade)
 

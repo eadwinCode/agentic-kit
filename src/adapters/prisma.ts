@@ -1,4 +1,4 @@
-import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewRun, NewUsage, RunDTO, ThreadDTO } from '../core/types.js';
+import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewRun, NewUsage, RunDTO, ThreadDTO, UsageTotals } from '../core/types.js';
 import type { Storage } from '../ports/storage.js';
 
 /** Minimal structural type of the Prisma client surface we use. The real
@@ -10,6 +10,7 @@ export interface PrismaLike {
     create(a: { data: { model?: string } }): Promise<ThreadDTO>;
     update(a: { where: { id: string }; data: { state: ExecutionState } }): Promise<unknown>;
     updateMany(a: { where: { id: string; state: ExecutionState }; data: { state: ExecutionState } }): Promise<{ count: number }>;
+    delete(a: { where: { id: string } }): Promise<unknown>;
   };
   message: {
     create(a: { data: { threadId: string; agentId?: string | null; role: string; content: any } }): Promise<any>;
@@ -22,6 +23,15 @@ export interface PrismaLike {
   };
   tokenUsage: {
     create(a: { data: NewUsage & { threadId: string } }): Promise<unknown>;
+    aggregate(a: {
+      where: { threadId: string };
+      _sum: {
+        inputTokens: true;
+        cachedInputTokens: true;
+        outputTokens: true;
+        totalTokens: true;
+      };
+    }): Promise<{ _sum: Partial<Record<keyof UsageTotals, number | null>> }>;
   };
   subagentRun: {
     create(a: { data: { threadId: string } & NewRun }): Promise<RunDTO>;
@@ -50,6 +60,10 @@ export class PrismaStorage implements Storage {
       });
       return res.count > 0;
     },
+    delete: (threadId: string) =>
+      // One delete — the reference schema cascades to Message, AgentEvent,
+      // TokenUsage and SubagentRun via `onDelete: Cascade` (spec §2.4)
+      this.prisma.thread.delete({ where: { id: threadId } }).then(() => undefined),
   };
 
   messages = {
@@ -80,6 +94,25 @@ export class PrismaStorage implements Storage {
   };
 
   usage = {
+    total: async (threadId: string): Promise<UsageTotals> => {
+      // One aggregate rather than reading every row: a long thread can hold a
+      // usage row per run segment (§4).
+      const { _sum } = await this.prisma.tokenUsage.aggregate({
+        where: { threadId },
+        _sum: {
+          inputTokens: true,
+          cachedInputTokens: true,
+          outputTokens: true,
+          totalTokens: true,
+        },
+      });
+      return {
+        inputTokens: _sum.inputTokens ?? 0,
+        cachedInputTokens: _sum.cachedInputTokens ?? 0,
+        outputTokens: _sum.outputTokens ?? 0,
+        totalTokens: _sum.totalTokens ?? 0,
+      };
+    },
     record: async (threadId: string, usage: NewUsage) => {
       await this.prisma.tokenUsage.create({
         data: {

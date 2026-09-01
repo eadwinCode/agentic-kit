@@ -45,7 +45,8 @@ The platform ships as a **headless TypeScript library** (working name `@agent/co
 │   ┌─────────────────────────────────────────────────────────────────────┐   │
 │   │ Upstash Redis                                                       │   │
 │   │   - State: `agent:state:{threadId}`  (RUNNING/CANCELLED/...)        │   │
-│   │   - HITL Handoff: `agent:hitl:{toolCallId}`  (waitForEvent poll)    │   │
+│   │   - Run identity: `agent:run:{threadId}`  (current run; retires older) │   │
+│   │   - HITL Handoff: `agent:hitl:{toolCallId}`  (answer handoff, TTL-guarded)│   │
 │   │   - Pub/Sub: `thread:{threadId}:events`  (fan-out + death notices)  │   │
 │   └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
@@ -209,10 +210,10 @@ model TokenUsage {
 Destructive tool calls (e.g., sending an email, executing code) require explicit user approval before they run. HITL is a first-class run suspension handled server-side — not a client-side concern:
 
 1. **Declare:** tools that need approval are flagged in their definition (`requiresConfirmation: true`, optionally with an `inputSchema` for extra form fields).
-2. **Suspend:** when the model emits such a tool call, the engine does not execute it. It publishes `INPUT_REQUIRED` (tool call id, tool name, arguments, input schema), flips the thread to `WAITING_FOR_INPUT`, and then blocks the tool call **in place** on a **`waitForEvent`** primitive — the background invocation stays alive, parked until the user responds or the TTL expires.
+2. **Park:** when the model emits such a tool call, the engine does not execute it. It publishes `INPUT_REQUIRED` (tool call id, tool name, arguments, input schema, and a **resume ticket**), flips the thread to `WAITING_FOR_INPUT` on both homes, and **ends the run segment right there** — no process stays blocked or alive waiting. The suspension is a durable state transition, not an in-process wait.
 3. **Prompt:** all connected clients receive `INPUT_REQUIRED` over SSE and render an approval form.
-4. **Resolve:** any authorized viewer POSTs `/api/agent/respond` with `{ threadId, toolCallId, approved, payload? }`. The route writes the response to `agent:hitl:{toolCallId}` and publishes it on `thread:{threadId}:hitl`; the parked `waitForEvent` picks it up. Approved → the engine executes the tool with the payload. Denied → the tool result `{ denied: true }` is returned to the model and the run continues.
-5. **Timeout:** if the TTL elapses with no response, `waitForEvent` returns `null` and the engine hands the model a tool result of `{ responded: false, cancelled: true, reason: 'timeout' }` — the user had no response, the action is cancelled — then flips the state back to `RUNNING` and continues the run, letting the AI decide what to do next. Enforcement details in *Expiry Enforcement* below.
+4. **Resolve:** any authorized viewer POSTs `/api/agent/respond` with `{ threadId, toolCallId, approved, payload? }`. The route writes the answer to `agent:hitl:{toolCallId}` (with a remaining-TTL expiry) and **enqueues a resume job** — the same dispatch ticket persisted inside the `INPUT_REQUIRED` payload, so the identical worker path picks it up (§2.8). The resumed segment consumes the answer, executes the real tool on approval (or appends `{ denied: true }`), flips the thread back to `RUNNING`, and continues the loop with a fresh step.
+5. **Timeout:** if the TTL elapses with no response, the pending request is resolved as `{ responded: false, cancelled: true, reason: 'timeout' }` — the user had no response, the action is cancelled — the thread flips back to `RUNNING`, and the run continues, letting the AI decide what to do next. Enforcement details in *Expiry Enforcement* below.
 
 Example `INPUT_REQUIRED` event as delivered over SSE:
 
@@ -224,145 +225,150 @@ Example `INPUT_REQUIRED` event as delivered over SSE:
     "toolCallId": "call_9f2a",
     "toolName": "sendEmail",
     "arguments": { "to": "team@example.com", "subject": "Q3 report" },
-    "inputSchema": { "note": "string (optional)" }
+    "inputSchema": { "note": "string (optional)" },
+    "resume": { "agent": "chat", "model": "gpt-4o", "tokenBudget": 12000 }
   }
 }
 ```
 
-#### The `waitForEvent` Primitive
+The `resume` ticket is the key to durability: everything a worker needs to continue the parked run is persisted in the event log itself. `/respond` and TTL reclamation both rebuild the dispatch from it — there is no hidden in-memory state to lose.
 
-Suspension is an in-process wait rather than tearing the invocation down: the parked tool call blocks on `waitForEvent`, which polls a Redis handoff key until the user's response arrives, the TTL expires, or the run aborts.
+#### The Park: a Run-Segment State Transition
+
+Suspension does **not** keep an invocation alive. A `requiresConfirmation` tool's wrapper persists the request and returns a sentinel; the engine loop sees the sentinel in the step's tool results and ends the segment. The user's verdict is appended as the tool result by whichever segment resumes the run:
 
 ```typescript
 // src/core/hitl.ts — ships in the package; `deps` are the §3.2 ports
 import type { RuntimePorts } from '../ports/runtime';
+import type { ResumeInfo } from './types';
 
 export const HITL_TTL_MS = 15 * 60 * 1000;
-const hitlKey = (toolCallId: string) => `agent:hitl:${toolCallId}`;
+export const hitlKey = (toolCallId: string) => `agent:hitl:${toolCallId}`;
 
-export type HitlResponse = { approved: boolean; payload?: unknown };
+// Marker returned by a parked tool's wrapper — the engine scans a step's
+// tool results for it and ends the segment. Never persisted as a result.
+export const HITL_PARKED = '__hitl_parked__';
 
-// Parks the suspended tool call until the user responds, the TTL expires, or
-// the run aborts. Returns null on timeout / abort.
-export async function waitForEvent(
-  deps: RuntimePorts,
-  toolCallId: string,
-  opts: { ttlMs: number; signal?: AbortSignal },
-): Promise<HitlResponse | null> {
-  const deadline = Date.now() + opts.ttlMs;
-
-  while (Date.now() < deadline) {
-    if (opts.signal?.aborted) return null; // stop teardown handled by the engine
-    const raw = await deps.kv.get(hitlKey(toolCallId));
-    if (raw) {
-      await deps.kv.del(hitlKey(toolCallId));
-      return JSON.parse(raw) as HitlResponse;
-    }
-    await new Promise((r) => setTimeout(r, 1_000)); // 1s poll — adapter-friendly, no blocking ops
-  }
-  return null; // TTL expired: the user had no response
+// The §2.5 suspension as a durable state transition — NO process waits.
+export async function parkForApproval(deps: RuntimePorts, i: {
+  threadId: string; toolCallId: string; toolName: string; args: unknown;
+  resume: ResumeInfo;                       // dispatch ticket persisted in the payload
+}) {
+  await deps.kv.set(`agent:state:${i.threadId}`, 'WAITING_FOR_INPUT');
+  await deps.storage.threads.setState(i.threadId, 'WAITING_FOR_INPUT'); // durable truth (§3.4)
+  await publish(deps, i.threadId, 'INPUT_REQUIRED', {
+    toolCallId: i.toolCallId, toolName: i.toolName, agentId: i.agentId ?? null,
+    arguments: i.args, inputSchema: null, resume: i.resume,
+  });
+  await publish(deps, i.threadId, 'STATE_CHANGE', { state: 'WAITING_FOR_INPUT' });
 }
 ```
 
-Engine-side suspension around any `requiresConfirmation` tool (ships in the package):
+Resolution happens at the START of a resumed segment (`src/core/engine.ts`): the thread enters `execute` in `WAITING_FOR_INPUT`, the pending request is hydrated from the event log, and the outcome is appended as the tool result before the loop runs its next step:
 
 ```typescript
-export async function suspendForApproval(deps: RuntimePorts, i: {
-  threadId: string; toolCallId: string; toolName: string; agentId?: string;
-  args: unknown; inputSchema?: unknown; ttlMs: number; signal: AbortSignal;
-}) {
-  const { threadId, toolCallId, toolName, ttlMs, signal } = i;
+async function resumePendingHitl(deps: RuntimePorts, threadId: string, pending: PendingHitl,
+                                 tools: Record<string, any>, signal: AbortSignal) {
+  const raw = await deps.kv.get(hitlKey(pending.toolCallId));
+  const expired = Date.now() - pending.requestedAt >= deps.config.hitlTtlMs;
+  if (!raw && !expired) return false; // still parked — at-least-once redelivery is a no-op (§2.8)
 
-  await deps.kv.set(`agent:state:${threadId}`, 'WAITING_FOR_INPUT');
-  await deps.storage.threads.setState(threadId, 'WAITING_FOR_INPUT'); // durable truth (§3.4)
-  await publish(deps, threadId, 'INPUT_REQUIRED', {
-    toolCallId, toolName, agentId: i.agentId, arguments: i.args, inputSchema: i.inputSchema,
-  });
-  await publish(deps, threadId, 'STATE_CHANGE', { state: 'WAITING_FOR_INPUT' });
+  await deps.kv.del(hitlKey(pending.toolCallId));
 
-  const response = await waitForEvent(deps, toolCallId, { ttlMs, signal });
-
-  if (!response) {
-    if (signal.aborted) return null; // stop during the wait (§2.1) — engine tears down
-
-    // TTL expired: flip the thread back to RUNNING and publish; the timeout
-    // tool result itself is recorded by the SDK in response.messages and
-    // persisted at finish (§5.6) — no manual append here.
-    await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
-    await deps.storage.threads.setState(threadId, 'RUNNING');
-    await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
-    await publish(deps, threadId, 'INPUT_EXPIRED', { toolCallId });
-    return { responded: false, cancelled: true, reason: 'timeout' };
+  let result: unknown;
+  if (raw) {
+    const answer = JSON.parse(raw) as { approved: boolean; payload?: unknown };
+    if (answer.approved) {
+      try {
+        // The verdict arrives from a different process than the one that ran
+        // the model — a tool failure is surfaced TO THE MODEL as the tool
+        // result, so the conversation always stays executable
+        result = await tools[pending.toolName].execute(pending.arguments, {
+          toolCallId: pending.toolCallId, abortSignal: signal,
+        });
+      } catch (err) {
+        result = { error: err instanceof Error ? err.message : String(err) };
+      }
+    } else {
+      result = { denied: true };
+    }
+  } else {
+    result = { responded: false, cancelled: true, reason: 'timeout' }; // TTL expiry (§2.5)
   }
 
+  await deps.storage.messages.append(threadId, {
+    role: 'tool',
+    content: [{ type: 'tool-result', toolCallId: pending.toolCallId, toolName: pending.toolName, result }],
+  });
   await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
   await deps.storage.threads.setState(threadId, 'RUNNING');
   await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
-  // The SDK records the tool result (approved payload / { denied: true }) in
-  // response.messages; the engine persists it at finish (§5.6).
-  return response;
+  if (!raw) await publish(deps, threadId, 'INPUT_EXPIRED', { toolCallId: pending.toolCallId });
+  return true;
 }
 ```
 
-**Wall-clock constraint:** parking means the wait must fit the execution environment's timeout. TTLs of minutes (the 15-minute default) are fine because runs execute in the §2.8 queue-worker runtime — on Inngest, `waitForEvent` maps 1:1 to its native `step.waitForEvent`; with QStash, the loop runs in the long-lived worker. If the environment dies mid-wait, notification-driven reclamation heals the thread (*Expiry Enforcement* below).
+**Why a segment park instead of an in-process wait:** the execution environment's wall-clock limits stop mattering — there is no long-lived parked invocation to kill, no `maxDuration` to tune, and the run lock is released while parked (a parked thread holds no worker). The TTL becomes purely an *answer-validity* window instead of a timer a process must survive.
 
 #### Expiry Enforcement
 
-The primary expiry mechanism is the `waitForEvent` TTL itself: the parked tool call times out, and the engine returns `{ responded: false, cancelled: true, reason: 'timeout' }` to the model — the user had no response, the action is cancelled, and the AI decides how to proceed. The thread is never left suspended, and no tokens are burned while waiting. No external timer is involved.
+The TTL is enforced at **resolution time, not by a timer**: when a segment resumes a parked request, an unanswered request past `hitlTtlMs` becomes the timeout denial — `{ responded: false, cancelled: true, reason: 'timeout' }` — the user had no response, the action is cancelled, and the AI decides how to proceed. The answer handoff key carries a remaining-TTL expiry too, so a response can never outlive its request. No external timer, no cron.
 
-One enforcement gap remains: if the parked invocation dies before the TTL fires (deploy, crash, infra kill), the thread is stranded in `WAITING_FOR_INPUT` with nobody waiting. There is no cron — reclamation is driven purely by **notifications and the listeners that already exist**:
+One enforcement gap remains: if nobody responds and nothing touches the thread, it rests in `WAITING_FOR_INPUT` indefinitely. There is no cron — reclamation is driven purely by **notifications and the listeners that already exist**:
 
-1. **Death notice (fast path):** the parked invocation traps its own teardown (`SIGTERM` / `waitUntil` cancellation) and best-effort publishes `HITL_ORPHANED { threadId, toolCallId }` on `thread:{threadId}:events`. Whatever is subscribed acts on it immediately.
-2. **Self-healing listeners (the distributor doubles as watchdog):** every SSE connection in `/api/agent/stream` (§2.2) is already a subscriber of the thread channel. On connect, on receiving `HITL_ORPHANED`, and on a slow heartbeat while subscribed (pub/sub is at-most-once — a notice published while nobody was subscribed would be lost), the distributor runs `reclaimIfOrphaned(threadId)` (below).
-3. **Lazy checks (floor guarantee):** `/api/agent/respond` and the run route's active-run guard call the same `reclaimIfOrphaned(threadId)` before acting, so a thread heals on first touch even if it died while nobody was subscribed. A late response after reclamation gets `409`.
+1. **Self-healing listeners (the distributor doubles as watchdog):** every SSE connection in `/api/agent/stream` (§2.2) is already a subscriber of the thread channel. On connect (and on `HITL_ORPHANED` death notices, published best-effort by a torn-down worker), the distributor runs `reclaimIfOrphaned(threadId)` (below).
+2. **Lazy checks (floor guarantee):** `/api/agent/respond` and the run route's active-run guard call the same `reclaimIfOrphaned(threadId)` before acting, so a thread heals on first touch. A late response after reclamation gets `409` — an expired approval has already become a denial and the run continued.
 
-A plain Redis key with `EX 900` cannot serve as the wait timer — expiring keys fire no callbacks and Upstash's REST interface exposes no reliable keyspace notifications — which is why `waitForEvent` polls against a deadline. Redis keys are used only for the response handoff (§5.4), with a TTL expiry so a stale response can never leak into a later run.
+**Races are safe by construction:** the engine owns every state transition around the park; the respond route only delivers. Reclamation's conditional `UPDATE ... WHERE state = 'WAITING_FOR_INPUT'` claims each orphan exactly once, so a human response and any number of concurrent listeners can never double-append a tool result — the loser gets `409` or skips.
 
-**Races are safe by construction:** the engine owns every state transition around the wait; the respond route only delivers. A response landing just before the final poll is honored; one landing after the timeout is ignored and expires with its key. Reclamation's conditional `UPDATE ... WHERE state = 'WAITING_FOR_INPUT'` claims each orphan exactly once, so a human response and any number of concurrent listeners can never double-append a tool result — the loser gets `409` or skips.
+**Interplay with stop:** the user's stop flips the thread to `CANCELLED` instantly while a request is parked — nothing is running to abort. A late resume dispatch is a no-op (terminal-state guard, §2.8), `respond` on a cancelled thread is rejected, and cancelled threads never match reclamation's query.
 
-**Interplay with stop:** the user's stop aborts the engine's signal while a request is parked — `waitForEvent` returns immediately, the parked tool call is abandoned, and the run tears down as `CANCELLED`. A HITL wait never delays a stop, and cancelled threads never match reclamation's query.
-
-Reference implementation — the reclamation helper plus its wiring:
+Reference implementation — the reclamation helper:
 
 ```typescript
 // src/core/reclaim.ts — ships in the package; invoked by listeners, never a scheduler
 import type { RuntimePorts } from '../ports/runtime';
-import { HITL_TTL_MS } from './hitl';
-import { publish } from './engine';
 
-// Small grace so a live waiter always times out first — reclamation only ever
-// sees true orphans. Concurrent callers are safe: threads.claimState is a
-// compare-and-set (§3.4) — exactly one caller wins, everyone else skips.
-const RECLAIM_AFTER_MS = HITL_TTL_MS + 60 * 1000;
+// Small grace so an in-flight /respond delivery always lands first —
+// reclamation only ever sees true orphans. Concurrent callers are safe:
+// threads.claimState is a compare-and-set (§3.4) — exactly one caller wins.
+const graceAfterMs = (deps: RuntimePorts) => deps.config.hitlTtlMs + deps.config.reclaimGraceMs;
 
 export async function reclaimIfOrphaned(deps: RuntimePorts, threadId: string): Promise<boolean> {
   const stale = await deps.storage.events.latest(threadId, 'INPUT_REQUIRED');
   const age = stale ? Date.now() - stale.createdAt.getTime() : 0;
-  if (!stale || age < RECLAIM_AFTER_MS) return false;
+  if (!stale || age < graceAfterMs(deps)) return false;
 
   // Atomic claim — exactly one caller wins
   const claimed = await deps.storage.threads.claimState(threadId, 'WAITING_FOR_INPUT', 'RUNNING');
   if (!claimed) return false;
 
-  const { toolCallId } = stale.payload as { toolCallId: string };
+  const { toolCallId, toolName, resume } = stale.payload as { toolCallId: string; toolName?: string; resume?: ResumeInfo };
 
-  // The same tool result the engine would have produced on timeout (§2.5)
+  // The same tool result the resumed segment would have produced on timeout (§2.5)
   await deps.storage.messages.append(threadId, {
     role: 'tool',
-    content: { toolCallId, result: { responded: false, cancelled: true, reason: 'timeout' } },
+    content: [{ type: 'tool-result', toolCallId, toolName: toolName ?? 'unknown',
+                result: { responded: false, cancelled: true, reason: 'timeout' } }],
   });
   await publish(deps, threadId, 'INPUT_EXPIRED', { toolCallId });
   await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
+  await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
 
   const thread = await deps.storage.threads.get(threadId);
-  await deps.queue.enqueue({ threadId, model: thread!.model }); // re-enter via the queue (§2.8)
+  if (thread) {
+    // Re-enter via the queue (§2.8) — the ticket from the event payload
+    // rebuilds the original dispatch
+    await deps.queue.enqueue({ threadId, model: resume?.model ?? thread.model, ...(resume ? { agent: resume.agent } : {}) });
+  }
   return true;
 }
 ```
 
 ```typescript
-// Wiring point 1: the death notice, inside suspendForApproval (src/core/hitl.ts) —
-// a torn-down invocation notifies the channel itself, best-effort
+// Wiring point 1: the death notice — a worker torn down mid-segment (deploy,
+// crash, infra kill) notifies the channel itself, best-effort. A thread parked
+// on HITL outlives its worker by design; this notice just accelerates healing.
 process.once('SIGTERM', () => {
   void deps.bus.publish(threadId, {
     type: 'HITL_ORPHANED', threadId, toolCallId,
@@ -384,7 +390,7 @@ export async function GET(req: NextRequest) {
         controller.enqueue(encoder.encode(`id: ${e.seq}\ndata: ${JSON.stringify(e)}\n\n`));
       }
 
-      // 2. ...heal the thread if its parked wait died earlier ...
+      // 2. ...heal the thread if its parked request expired untouched ...
       void runtime.hitl.reclaimIfOrphaned(threadId);
 
       // 3. ...then tail live events; death notices trigger reclamation instantly
@@ -626,17 +632,17 @@ The concurrency cap uses a run-scoped semaphore: a subagent task acquires a slot
 
 #### HITL from a Subagent
 
-Subagents share the thread's HITL path (§2.5) — `suspendForApproval` works identically, with `agentId` added to the `INPUT_REQUIRED` payload so clients know which agent is asking:
+Subagents share the thread's HITL path (§2.5) — `parkForApproval` works identically, with `agentId` added to the `INPUT_REQUIRED` payload so clients know which agent is asking:
 
 ```typescript
-await publishEvent(threadId, 'INPUT_REQUIRED', { toolCallId, toolName, agentId, arguments: args });
+await publishEvent(threadId, 'INPUT_REQUIRED', { toolCallId, toolName, agentId, arguments: args, resume });
 ```
 
-Because a subagent runs in-process inside the parent's `spawnSubagent` tool call, a subagent park suspends the **whole run**: the parent is blocked mid-tool-call, so `WAITING_FOR_INPUT` is truthful for the entire thread, and no extra machinery is needed — the state key, the event channel, and the handoff keys are all per-thread. Resolution is the identical §2.5 flow: respond → `agent:hitl:{toolCallId}` → the parked `waitForEvent` resolves → the subagent executes or records the denial → finishes → its result returns to the parent as the `spawnSubagent` tool result.
+Because a subagent runs inside the parent's `spawnSubagent` tool call, a subagent park suspends the **whole run segment**: the parent's step cannot complete without the subagent's result, so `WAITING_FOR_INPUT` is truthful for the entire thread, and no extra machinery is needed — the state key, the event channel, and the handoff keys are all per-thread. Resolution is the identical §2.5 flow: respond → `agent:hitl:{toolCallId}` + resume job → the resumed segment resolves the pending request → the subagent executes or records the denial → finishes → its result returns to the parent as the `spawnSubagent` tool result.
 
-With no subagent timeout, **the HITL TTL is the only bound on a parked wait**: the subagent sits for as long as the TTL allows (15 min default), and on expiry its own model receives `{ responded: false, cancelled: true, reason: 'timeout' }` and decides what to do — there is no outer timer that could kill it mid-wait. Stop and orphan reclamation are unchanged: both are thread-keyed and cascade through the nested abort chain regardless of which agent parked.
+With no subagent timeout, **the HITL TTL is the only bound on a parked request**: the thread waits for as long as the TTL allows (15 min default), and on expiry the model receives `{ responded: false, cancelled: true, reason: 'timeout' }` and decides what to do — there is no outer timer killing anything mid-wait, because no process is held waiting at all (§2.5). Stop and orphan reclamation are unchanged: both are thread-keyed and operate on the durable state regardless of which agent parked.
 
-One deliberate policy: **concurrent parks are answer-latest**. Up to 3 subagents may park at once, and each `waitForEvent` polls its own `agent:hitl:{toolCallId}` key, but respond answers only the *latest* pending request — earlier ones time out. One prompt at a time is the intended UX; answering any pending request would be a small change to the respond validation.
+One deliberate policy: **concurrent parks are answer-latest**. Up to 3 subagents may park at once, but respond answers only the *latest* pending `INPUT_REQUIRED` — earlier ones time out. One prompt at a time is the intended UX; answering any pending request would be a small change to the respond validation.
 
 By default subagents carry no destructive tools at all; grant them (and thereby HITL prompts) only when a workflow genuinely needs an approved side effect.
 
@@ -678,7 +684,7 @@ The platform ships as a headless TypeScript library (working name `@agent/core`)
 ├── src/
 │   ├── core/                  # pure business logic — imports ports, never vendors
 │   │   ├── engine.ts          # execute / executeWithPolicy / publish (§5.6)
-│   │   ├── hitl.ts            # waitForEvent, suspendForApproval, respond (§2.5)
+│   │   ├── hitl.ts            # parkForApproval, respond, TTL keys (§2.5)
 │   │   ├── reclaim.ts         # reclaimIfOrphaned (§2.5)
 │   │   ├── subagent.ts        # spawnSubagentTool, Semaphore (§2.7)
 │   │   ├── context.ts         # contextBudget, compactContext (§2.6)
@@ -799,9 +805,11 @@ The engine's correctness depends on adapters honoring these contracts:
 2. **`claimState` must be atomic** (a single conditional `UPDATE` or equivalent). HITL reclamation and double-dispatch protection rely on exactly one caller winning.
 3. **`queue.enqueue` is at-least-once; the engine is idempotent.** The state guard + `claimState` make double dispatch a no-op — adapters must not drop jobs to "help".
 4. **`bus` is at-most-once.** The §2.5 death-notice/heartbeat/watchdog pattern exists because pub/sub drops; stronger buses may simplify the heartbeat, but reclamation stays.
-5. **Two state homes, one truth:** durable thread state lives in `storage.threads`; the kv copy (`agent:state:{threadId}`) is a hot cache the engine polls (500 ms). Behavior functions write both — including terminal transitions like `FAILED` — and the durable copy decides recovery.
+5. **Two state homes, one truth:** durable thread state lives in `storage.threads`; the kv copy (`agent:state:{threadId}`) is a hot cache the engine polls (`stopPollMs`, 500 ms by default). Behavior functions write both — including terminal transitions like `FAILED` — and the durable copy decides recovery.
 6. **No vendor on the core path:** `core/` imports nothing from `adapters/`; adapters never import each other's clients.
-7. **Run lock:** `engine.execute` begins by acquiring `agent:lock:{threadId}` via `kv.set` with `onlyIfNotExists` (SET NX) and a lease (`runLockLeaseSeconds`) — queued→running is thus atomic, double dispatch is a no-op, and a crashed worker's lock self-expires. The lock is released in a `finally`.
+7. **Run lock:** `engine.execute` begins by acquiring `agent:lock:{threadId}` via `kv.set` with `onlyIfNotExists` (SET NX) and a lease (`runLockLeaseSeconds`) — queued→running is thus atomic, double dispatch is a no-op, and a crashed worker's lock self-expires. The lock is released in a `finally`. Its value is the holder's **run id**, which is what lets a blocked job tell a duplicate of itself apart from an older run still finishing (invariant 8).
+8. **Run identity:** `run()` (and the HITL resume paths) mint a run id into `agent:run:{threadId}` **before** writing the state key, and every dispatch carries it. The state key alone cannot signal a stop — a user who stops and immediately sends another message puts `RUNNING` back over `CANCELLED` inside the poll window — so a worker also aborts when its run id is no longer current, and `finalize` writes state only while it still is. A job blocked by an older run's lock is re-dispatched (`runRedriveDelaySeconds`), never dropped: dropping it would strand the message the user just sent.
+9. **A stream's error part is fatal:** `streamText` reports a provider failure (an aborted call included) as an `error` part and then ends the stream normally, while its `text`/`usage`/`response` promises never settle. `executeStep` carries that error out of the drain and throws it. Awaiting those promises instead hangs the worker forever holding the run lock.
 
 ---
 
@@ -961,7 +969,8 @@ export async function POST(req: NextRequest) {
   const result = await runtime.hitl.respond(body);
   // runtime.hitl.respond: heal orphans (§2.5) → validate thread WAITING_FOR_INPUT
   // + latest pending INPUT_REQUIRED → write `agent:hitl:{toolCallId}` handoff key
-  // (remaining-TTL) → notify the parked waitForEvent via the bus
+  // (remaining-TTL) → enqueue the resume job (§2.8) so a worker appends the
+  // tool result and continues the run
   return NextResponse.json(result, { status: result.delivered ? 200 : 409 });
 }
 ```

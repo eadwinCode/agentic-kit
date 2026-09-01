@@ -20,67 +20,110 @@ body {
   font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, sans-serif;
 }
 
-.shell {
-  max-width: 980px;
-  margin: 0 auto;
-  padding: 24px 16px 96px;
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+}
+
+.thread-sidebar {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  padding: 16px 12px;
+  overflow-y: auto;
+  border-right: 1px solid var(--border);
+  background: #0b0f14;
+}
+.thread-sidebar-head {
   display: flex;
-  gap: 20px;
-  align-items: flex-start;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 0 4px;
 }
-
-main {
-  flex: 1;
-  min-width: 0;
-}
-
-.sidebar {
-  flex: 0 0 220px;
+.new-thread { padding: 5px 10px; color: var(--accent); }
+.thread-list { display: flex; flex-direction: column; gap: 6px; }
+.thread-list-empty { color: var(--muted); padding: 10px 6px; }
+.thread-option {
+  width: 100%;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  position: sticky;
-  top: 24px;
-}
-.sidebar h2 {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--muted);
-  margin: 10px 2px 2px;
-}
-.thread-item {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 9px 10px;
   text-align: left;
-  font-size: 12px;
-  padding: 7px 10px;
 }
-.thread-item.active { border-color: var(--accent); }
-.thread-item .thread-name {
+.thread-option-title {
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.thread-option-meta {
+  width: 100%;
   display: flex;
   align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-.thread-item code {
-  color: var(--text);
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted);
   font-size: 11px;
 }
-.thread-item .thread-state { color: var(--muted); font-size: 11px; }
-.new-thread { width: 100%; }
+.thread-status {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 5px;
+  font-weight: 600;
+}
+.thread-status-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.thread-status.running .thread-status-dot {
+  background: var(--accent);
+  animation: pulse 1.2s infinite;
+}
+.thread-status.waiting_for_input .thread-status-dot { background: var(--yellow); }
+.thread-status.completed .thread-status-dot { background: var(--green); }
+.thread-status.failed .thread-status-dot,
+.thread-status.cancelled .thread-status-dot { background: var(--red); }
+.thread-option.active {
+  border-color: var(--accent);
+  background: rgba(88, 166, 255, 0.12);
+}
 
-@media (max-width: 720px) {
-  .shell { flex-direction: column; }
-  .sidebar { position: static; flex: none; width: 100%; }
+/* Delete affordance beside each thread option (§3.2) — the option itself
+   stays a single button, so the row is a flex wrapper. */
+.thread-option-row { display: flex; align-items: stretch; gap: 4px; }
+.thread-option-row .thread-option { flex: 1; min-width: 0; }
+.thread-delete {
+  flex: none;
+  width: 30px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+}
+.thread-delete:hover:not(:disabled) {
+  color: var(--red);
+  border-color: var(--red);
+  background: rgba(248, 81, 73, 0.12);
 }
 
 main {
-  flex: 1;
-  min-width: 0;
+  width: 100%;
+  min-height: 100vh;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 24px 16px 24px;
+  display: flex;
+  flex-direction: column;
 }
 
 header h1 {
@@ -150,7 +193,7 @@ header h1 {
 
 @keyframes pulse { 50% { opacity: 0.35; } }
 
-.thread { display: flex; flex-direction: column; gap: 12px; }
+.thread { flex: 1; display: flex; flex-direction: column; gap: 12px; }
 .empty { color: var(--muted); }
 
 .message {
@@ -241,12 +284,12 @@ button.deny { border-color: var(--red); }
 button.stop { border-color: var(--red); }
 
 .composer {
-  position: fixed;
+  position: sticky;
   bottom: 0;
-  left: 0;
-  right: 0;
+  z-index: 2;
   display: flex;
   gap: 8px;
+  margin: 24px -16px -24px;
   padding: 12px 16px;
   background: var(--bg);
   border-top: 1px solid var(--border);
@@ -261,3 +304,99 @@ button.stop { border-color: var(--red); }
   font: inherit;
 }
 .composer input:focus { outline: 1px solid var(--accent); }
+
+@media (max-width: 720px) {
+  .app-shell { grid-template-columns: 1fr; }
+  .thread-sidebar {
+    position: static;
+    width: 100%;
+    height: auto;
+    max-height: 220px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .thread-list {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(180px, 72vw);
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+}
+
+/* Token + context usage (§2.6, §4) */
+.usage {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+  margin: 0 0 20px;
+}
+.usage-item {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: baseline;
+  gap: 2px 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.usage-label {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.usage-item strong {
+  justify-self: start;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+/* Its own row, so the breakdown wraps instead of truncating */
+.usage-detail {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 11px;
+}
+.usage-bar {
+  grid-column: 1 / -1;
+  position: relative;
+  height: 4px;
+  margin-top: 2px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+}
+.usage-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 240ms ease;
+}
+/* Where compaction takes over (§2.6) */
+.usage-bar-mark {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 100%;
+  background: var(--muted);
+}
+.usage-item.near .usage-bar-fill { background: var(--yellow); }
+.usage-item.near strong { color: var(--yellow); }
+
+/* One composer button: send, or stop while a run is live */
+.composer-action {
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  line-height: 1;
+}
+.composer-action.send { border-color: var(--accent); color: var(--accent); }
+.composer-action.stop { border-color: var(--red); color: var(--red); }
+.composer-action:disabled { border-color: var(--border); color: var(--muted); }

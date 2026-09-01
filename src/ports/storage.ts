@@ -5,6 +5,7 @@ import type {
   NewMessage,
   NewRun,
   NewUsage,
+  UsageTotals,
   RunDTO,
   ThreadDTO,
 } from '../core/types.js';
@@ -19,6 +20,10 @@ export interface Storage {
     /** Most recent first — thread pickers / sidebars. */
     list(): Promise<ThreadDTO[]>;
     setState(threadId: string, state: ExecutionState): Promise<void>;
+    /** Delete the thread AND everything that follows it: messages, events,
+     *  usage rows, and subagent runs. Throws if the thread does not exist.
+     *  The reference Prisma schema cascades via `onDelete: Cascade`. */
+    delete(threadId: string): Promise<void>;
     /** Compare-and-set: returns true iff THIS caller performed the transition.
      *  Backs HITL reclamation + double-dispatch protection (§2.5, §2.8).
      *  Must be atomic — a single conditional UPDATE or equivalent. */
@@ -37,6 +42,9 @@ export interface Storage {
   };
   usage: {
     record(threadId: string, usage: NewUsage): Promise<void>;
+    /** Every recorded segment for the thread, summed (§4). A thread with no
+     *  usage rows yet returns zeroes, never null. */
+    total(threadId: string): Promise<UsageTotals>;
   };
   runs: {
     create(threadId: string, run: NewRun): Promise<RunDTO>;

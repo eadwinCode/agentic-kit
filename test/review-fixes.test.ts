@@ -180,13 +180,23 @@ describe('runtime.worker.handleJob (§2.8)', () => {
   });
 
   it('dispatches to the default handle when agent is omitted', async () => {
-    const { runtime, queue } = makeDeps();
+    const { deps, runtime, queue } = makeDeps();
     runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
+    const thread = await deps.storage.threads.create();
 
-    const res = await runtime.worker.handleJob({ threadId: 't1', model: 'gpt-4o' });
+    const res = await runtime.worker.handleJob({ threadId: thread.id, model: 'gpt-4o' });
     expect(res.accepted).toBe(true);
     // execute threw (no-llm) → §2.8 redrive enqueued one job
     expect(queue.items.length).toBe(1);
     expect(queue.items[0]!.agent).toBe('chat');
+  });
+
+  it('a job for a missing (deleted) thread is a no-op', async () => {
+    const { runtime, queue } = makeDeps();
+    runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
+
+    const res = await runtime.worker.handleJob({ threadId: 'deleted-thread', model: 'gpt-4o' });
+    expect(res.accepted).toBe(true);
+    expect(queue.items.length).toBe(0); // nothing executed, nothing redriven
   });
 });

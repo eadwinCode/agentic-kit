@@ -1,4 +1,5 @@
 import type { RuntimePorts } from '../ports/runtime.js';
+import type { ExecuteInput } from './engine.js';
 import type {
   AgentHandle,
   AgentKind,
@@ -44,12 +45,9 @@ function createHandle(deps: RuntimePorts, agent: RegisteredAgent): AgentHandle {
   return {
     name: agent.name,
     kind: agent.kind,
-    execute: (input: { threadId: string; model: string; tokenBudget?: number }) =>
-      execute(deps, agent, input),
-    executeWithPolicy: (
-      input: { threadId: string; model: string; tokenBudget?: number },
-      policy?: { maxAttempts?: number },
-    ) => executeWithPolicy(deps, agent, input, policy),
+    execute: (input: ExecuteInput) => execute(deps, agent, input),
+    executeWithPolicy: (input: ExecuteInput, policy?: { maxAttempts?: number }) =>
+      executeWithPolicy(deps, agent, input, policy),
     run: (input: RunInput) => run(deps, agent, input),
     stop: (threadId: string) => stop(deps, threadId),
   };

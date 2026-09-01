@@ -11,9 +11,12 @@ import type {
   RuntimePorts,
   ThreadSnapshot,
 } from './ports/runtime.js';
+import type { ThreadUsage } from './ports/runtime.js';
+import { contextUsage } from './core/context.js';
 import { createGenerateTextAgent, createStreamTextAgent } from './core/agent.js';
 import { reclaimIfOrphaned } from './core/reclaim.js';
 import { respond } from './core/hitl.js';
+import { deleteThread } from './core/deleteThread.js';
 
 /** Bind the ports to the core behaviors (§3.3). This is the package's public
  *  entry point — the only place where anything is wired together. */
@@ -51,6 +54,8 @@ export function setupAgentCore(opts: RuntimeOptions): AgentCore {
 
     listThreads: () => deps.storage.threads.list(),
 
+    deleteThread: (threadId: string) => deleteThread(deps, threadId),
+
     getThreadSnapshot: async (threadId: string): Promise<ThreadSnapshot | null> => {
       const thread = await deps.storage.threads.get(threadId);
       if (!thread) return null;
@@ -76,6 +81,16 @@ export function setupAgentCore(opts: RuntimeOptions): AgentCore {
       }
 
       return { thread, messages, lastEventSeq, activeEvents };
+    },
+
+    getThreadUsage: async (threadId: string): Promise<ThreadUsage | null> => {
+      const thread = await deps.storage.threads.get(threadId);
+      if (!thread) return null;
+      const [tokens, context] = await Promise.all([
+        deps.storage.usage.total(threadId),
+        contextUsage(deps, threadId, thread.model),
+      ]);
+      return { tokens, context, model: thread.model };
     },
 
     hitl: {
@@ -120,6 +135,9 @@ export function setupAgentCore(opts: RuntimeOptions): AgentCore {
         // else finalize FAILED; a user stop is never retried.
         await agent.executeWithPolicy({
           threadId: job.threadId,
+          // The dispatch's identity (§2.1) — without it the worker cannot tell
+          // it has been replaced by a newer run, and a blocked job is dropped.
+          runId: job.runId,
           model: job.model,
           tokenBudget: job.tokenBudget,
           providerOptions: job.providerOptions,
