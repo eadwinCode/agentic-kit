@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 import { runtime } from '@/lib/runtime';
-import type { AgentEvent } from '@agent/core';
+import type { AgentEvent } from '@agentic-kit/core';
 
 // SSE distributor (§2.2): replay after the client's cursor, then tail live.
 // A parked HITL request carries its own expiry on the queue (§2.5), so this

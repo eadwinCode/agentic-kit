@@ -114,7 +114,7 @@ export default function Page() {
       <main>
       <header>
         <h1>
-          <span className={`dot ${agentState.toLowerCase()}`} /> @agent/core example
+          <span className={`dot ${agentState.toLowerCase()}`} /> @agentic-kit/core example
         </h1>
         <p className="hint">
           {threadId ? (

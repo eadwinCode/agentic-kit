@@ -11,7 +11,7 @@
     "start": "next start -p 5000"
   },
   "dependencies": {
-    "@agent/core": "file:../..",
+    "@agentic-kit/core": "workspace:*",
     "@ai-sdk/openai": "^1.3.24",
     "@prisma/client": "^5.22.0",
     "@upstash/qstash": "^2.7.0",

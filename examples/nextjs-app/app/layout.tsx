@@ -3,7 +3,7 @@ import Script from 'next/script';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: '@agent/core — example',
+  title: '@agentic-kit/core — example',
   description: 'Queue-dispatched agent runs with SSE sync, HITL approval, and subagents',
 };
 

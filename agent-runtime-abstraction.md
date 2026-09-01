@@ -1,6 +1,6 @@
 # Design Doc: `setupAgentCore` — Splitting Agent Flavors from Platform Services
 
-**Status:** Implemented (v1) — target surface for the next minor release of `@agent/core`.
+**Status:** Implemented (v1) — target surface for the next minor release of `@agentic-kit/core`.
 **Builds on:** the [technical specification](./agent-platform-technical-spec.md) (§ references below point there).
 
 > **Implementation status:** `setupAgentCore` and the registered-handle execution path live in `src/core/agent.ts` and `src/runtime.ts`. `spawnSubagent` is constructed by the platform **only when the spec enables subagents**, and model precedence is **run `input.model` → `spec.model` → `'gpt-4o'`**. The deprecated compatibility engine remains available through `createAgentRuntime` for the one-minor migration window.

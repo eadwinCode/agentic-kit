@@ -16,8 +16,8 @@
     "plugins": [{ "name": "next" }],
     "paths": {
       "@/*": ["./*"],
-      "@agent/core": ["../../src/index.ts"],
-      "@agent/core/adapters/*": ["../../src/adapters/*"]
+      "@agentic-kit/core": ["../../packages/agentic-kit/src/index.ts"],
+      "@agentic-kit/core/adapters/*": ["../../packages/agentic-kit/src/adapters/*"]
     }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],

@@ -6,7 +6,7 @@ This specification outlines the architecture for a real-time, multi-model AI Age
 
 The core requirements—an immediate stop button, disconnect-safe multi-user synchronous viewing, human-in-the-loop (HITL) confirmation, subagent delegation, bounded context windows with automatic compaction (265k ceiling), LLM model abstraction, thread persistence, and granular token-based billing—are resolved using an event-driven control plane coupled with queue-dispatched background execution and standard stream handlers.
 
-The platform ships as a **headless TypeScript library** (working name `@agent/core`): the engine depends only on a small set of **ports** — storage, event bus, queue, key-value (§3) — with reference adapters for PostgreSQL/Prisma, Upstash Redis, and QStash. Users with different databases or team architectures implement the same ports against their own stack. The Next.js routes in §5 are an example integration, not the product.
+The platform ships as a **headless TypeScript library** (`@agentic-kit/core`, in `packages/agentic-kit`): the engine depends only on a small set of **ports** — storage, event bus, queue, key-value (§3) — with reference adapters for PostgreSQL/Prisma, Upstash Redis, and QStash. Users with different databases or team architectures implement the same ports against their own stack. The Next.js routes in §5 are an example integration, not the product.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -719,12 +719,12 @@ Every top-level run is dispatched through a durable message queue (QStash-style 
 
 ## 3. Package Architecture: Ports & Adapters
 
-The platform ships as a headless TypeScript library (working name `@agent/core`). Everything in §2 — engine, HITL, subagents, compaction, reclamation — lives in the package's `core/` and depends **only on ports** (interfaces). Vendor code exists exclusively in **adapters**: the package ships reference adapters for PostgreSQL (Prisma), Upstash Redis, and QStash, while users with MongoDB, MySQL, DynamoDB, SQS, Kafka, Ably — or in-house services shaped around their own team architecture — implement the same small interfaces and the entire platform works unchanged.
+The platform ships as a headless TypeScript library (working name `@agentic-kit/core`). Everything in §2 — engine, HITL, subagents, compaction, reclamation — lives in the package's `core/` and depends **only on ports** (interfaces). Vendor code exists exclusively in **adapters**: the package ships reference adapters for PostgreSQL (Prisma), Upstash Redis, and QStash, while users with MongoDB, MySQL, DynamoDB, SQS, Kafka, Ably — or in-house services shaped around their own team architecture — implement the same small interfaces and the entire platform works unchanged.
 
 ### 3.1 Package Layout
 
 ```
-@agent/core
+@agentic-kit/core
 ├── src/
 │   ├── core/                  # pure business logic — imports ports, never vendors
 │   │   ├── engine.ts          # execute / executeWithPolicy / publish (§5.6)
@@ -881,14 +881,14 @@ $$\text{Credits Used} = (\text{Prompt Tokens} \times \text{Multiplier}_{\text{pr
 
 ## 5. Reference Integration (Next.js App Router)
 
-The package is headless — everything in §2 ships inside `@agent/core`. This section is the **example integration**: thin Next.js route handlers wiring the runtime to HTTP, demonstrating how the flows execute. Each handler is a few lines; all behavior lives in the runtime (§3.3). The only vendor-wiring file in the example is the runtime instantiation:
+The package is headless — everything in §2 ships inside `@agentic-kit/core`. This section is the **example integration**: thin Next.js route handlers wiring the runtime to HTTP, demonstrating how the flows execute. Each handler is a few lines; all behavior lives in the runtime (§3.3). The only vendor-wiring file in the example is the runtime instantiation:
 
 ```typescript
 // examples/nextjs-app/lib/runtime.ts
 import { Client } from '@upstash/qstash';
 import { Redis } from '@upstash/redis';
 import { PrismaClient } from '@prisma/client';
-import { createAgentRuntime } from '@agent/core';
+import { createAgentRuntime } from '@agentic-kit/core';
 import { PrismaStorage } from '@agent/adapters/prisma';
 import { UpstashBus, UpstashKv } from '@agent/adapters/upstash';
 import { QStashQueue } from '@agent/adapters/qstash';

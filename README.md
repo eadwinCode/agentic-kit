@@ -1,91 +1,39 @@
-# @agent/core
+# agentic-kit
 
-Headless multi-tenant real-time AI agent platform: durable queue-dispatched runs, coordinated multi-user streaming, HITL (human-in-the-loop) suspension, subagent delegation, and context-window compaction — as a **library**. Bring your own storage, queue, and pub/sub by implementing four small ports.
+A durable runtime for AI agent runs.
 
-The [technical specification](./agent-platform-technical-spec.md) (§ numbers below refer to it) is the behavioral source of truth.
+Not an agent framework — it does not own your prompts, models, or tools; the
+[AI SDK](https://sdk.vercel.ai) does. It owns the **lifecycle of a run**: that a run
+outlives the request that started it, survives a worker dying mid-step, can be stopped,
+parked for a human, resumed exactly where it stopped, nested, metered, and watched by
+several people at once.
 
-## Install
+Everything vendor-specific lives behind four small ports — storage, queue, event bus,
+key-value — so the engine never imports a database driver.
 
-```bash
-bun add @agent/core ai zod
-# optional reference adapters:
-bun add @prisma/client @upstash/redis @upstash/qstash
+```
+packages/
+  agentic-kit/        @agentic-kit/core — the library
+    src/core/         the engine: loop, HITL, subagents, compaction, run identity
+    src/ports/        the four interfaces you implement
+    src/adapters/     reference adapters (Prisma, Redis, QStash, Upstash, memory)
+    test/
+examples/
+  nextjs-app/         a full integration — an example, not the product
 ```
 
-## Quick start
-
-```typescript
-import { Client } from '@upstash/qstash';
-import { Redis } from '@upstash/redis';
-import { PrismaClient } from '@prisma/client';
-import { createAgentRuntime, PrismaStorage, UpstashBus, UpstashKv, QStashQueue } from '@agent/core';
-
-const redis = new Redis({ url: ..., token: ... });
-
-export const runtime = createAgentRuntime({
-  storage: new PrismaStorage(new PrismaClient()),  // ← swap for Mongo/Dynamo/your DB
-  bus: new UpstashBus(redis),                      // ← Ably / Kafka / Postgres LISTEN…
-  queue: new QStashQueue(
-    new Client({ token: process.env.QSTASH_TOKEN! }),
-    { url: 'https://app.example.com/api/queue/agent-run' },
-  ),
-  kv: new UpstashKv(redis),
-  models: modelRegistry,                           // any `ai`-SDK models (§2.3)
-});
-```
-
-### Framework-agnostic operations
-
-```typescript
-await runtime.run({ prompt: 'hi', model: 'gpt-4o' });      // persist + enqueue → 202 (§5.1)
-await runtime.stop(threadId);                              // one write: state → CANCELLED (§2.1)
-await runtime.hitl.respond({ threadId, toolCallId, approved, payload });  // §2.5
-await runtime.hitl.reclaimIfOrphaned(threadId);            // §2.5 (listeners call this)
-const missed = await runtime.events.since(threadId, lastSeq);             // SSE replay (§2.2)
-const unsub = await runtime.events.subscribe(threadId, handler);          // live tail
-await runtime.engine.executeWithPolicy({ threadId, model });// worker-side only (§2.8)
-```
-
-The Next.js routes in [`examples/nextjs-app`](./examples/nextjs-app) show the HTTP wiring — each handler is a few lines over the runtime.
-
-## Ports (§3.2)
-
-| Port | Role | Reference adapter |
-| :--- | :--- | :--- |
-| `Storage` | threads / messages / events / usage / runs — incl. atomic `claimState` | `PrismaStorage` |
-| `EventBus` | live fan-out + HITL death notices (at-most-once) | `UpstashBus` |
-| `Queue` | durable run dispatch (at-least-once) | `QStashQueue` |
-| `Kv` | hot state cache, HITL handoff keys, seq/attempt counters | `UpstashKv` |
-
-Implement any of them for your own stack — `core/` imports nothing else. The [`Memory*` adapters](./src/adapters/memory.ts) are a complete in-memory implementation used by the test suite; they double as a template.
-
-### Adapter invariants (§3.4)
-
-1. `events.append` receives `seq` from `kv.incr('agent:seq:{threadId}')` — monotonic per thread.
-2. `threads.claimState` must be atomic (one conditional UPDATE) — exactly one caller wins.
-3. `queue.enqueue` is at-least-once; the engine is idempotent via the state guard.
-4. `bus` is at-most-once; the §2.5 watchdog pattern compensates.
-5. Durable thread state lives in `storage.threads`; the kv copy is a hot cache. Writes go to both.
-
-## Behavior map
-
-| Spec | Where in the package |
-| :--- | :--- |
-| §2.1 Detached execution & stop | `core/run.ts`, `core/stop.ts`, `core/engine.ts` |
-| §2.2 Multi-user stream | `ports/bus.ts` + `runtime.events` |
-| §2.5 HITL (waitForEvent / respond / orphan reclaim) | `core/hitl.ts`, `core/reclaim.ts` |
-| §2.6 Context ceiling & compaction | `core/context.ts` |
-| §2.7 Subagents (depth, semaphore, no timeout) | `core/subagent.ts` |
-| §2.8 Queue dispatch + redrive/FAIL policy | `ports/queue.ts`, `core/engine.ts` (`executeWithPolicy`) |
-| §5 Reference HTTP integration | `examples/nextjs-app` |
+- [`packages/agentic-kit/README.md`](./packages/agentic-kit/README.md) — install and usage
+- [`agent-platform-technical-spec.md`](./agent-platform-technical-spec.md) — the behavioral
+  source of truth; the `§` references throughout the code point here
+- [`agent-runtime-abstraction.md`](./agent-runtime-abstraction.md) — the ports rationale
 
 ## Development
 
-Requires [Bun](https://bun.sh) ≥ 1.1.
-
 ```bash
 bun install
-bun test          # runs test/*.test.ts directly on Bun (no build step)
-bun run typecheck # tsc --noEmit over src + tests
-bun run build     # tsc emit → dist/ (published artifact)
+bun test         # the package's suite
+bun run typecheck
 ```
+
+The example app expects Postgres, Redis and a local QStash; see
+[`examples/nextjs-app/README.md`](./examples/nextjs-app/README.md).
