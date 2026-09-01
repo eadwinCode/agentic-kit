@@ -2,7 +2,7 @@ import { generateText } from 'ai';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { MessageDTO } from './types.js';
 import { publish } from './publish.js';
-import { countTokens } from './usage.js';
+import { attributeTokens } from './usage.js';
 
 /** Universal context ceiling across all models (§2.6) */
 export const CONTEXT_TOKEN_CEILING = 265_000;
@@ -73,10 +73,10 @@ export async function compactContext(
     content: { type: 'CONTEXT_SUMMARY', text },
   });
 
-  // Token attribution: total tokens used (§4)
+  // Token attribution (§4): input + cached + output
   await deps.storage.usage.record(threadId, {
     agentId: null,
-    totalTokens: countTokens(usage),
+    ...attributeTokens(usage),
   });
   await publish(deps, threadId, 'CONTEXT_COMPACTED', { summarizedMessages: older.length });
 

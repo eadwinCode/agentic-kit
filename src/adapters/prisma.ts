@@ -85,6 +85,9 @@ export class PrismaStorage implements Storage {
         data: {
           threadId,
           agentId: usage.agentId ?? null,
+          inputTokens: usage.inputTokens,
+          cachedInputTokens: usage.cachedInputTokens,
+          outputTokens: usage.outputTokens,
           totalTokens: usage.totalTokens,
         },
       });

@@ -72,8 +72,16 @@ export interface NewRun {
 
 /** Token attribution only (§4): total tokens used. USD/credit pricing is a
  *  downstream concern computed over the recorded counters. */
+/** Token attribution (§4): the platform records the counters; USD/credit
+ *  pricing is a downstream concern computed over them. */
 export interface NewUsage {
   agentId?: string | null;
+  /** Fresh (uncached) prompt tokens. */
+  inputTokens: number;
+  /** Prompt tokens served from the provider's prompt cache (§2.6 caching). */
+  cachedInputTokens: number;
+  outputTokens: number;
+  /** input + cached + output. */
   totalTokens: number;
 }
 
@@ -138,6 +146,11 @@ export interface AgentConfig {
   compactionTrigger: number;
   /** Share of budget kept verbatim as the recent tail (§2.6) */
   contextTailShare: number;
+  /** Prompt caching (§2.6): when true, the engine stamps Anthropic-style
+   *  ephemeral cache breakpoints on the prompt prefix so providers that
+   *  support marking cache it. OpenAI models cache automatically (≥1024
+   *  tokens) and ignore the flag. Default: true. */
+  promptCaching: boolean;
   /** Per-model native windows below the ceiling (§2.6) — merged over defaults.
    *  A `contextWindow` declared via `resolveModel` wins over this table. */
   nativeWindows?: Record<string, number>;
@@ -161,6 +174,7 @@ export const DEFAULT_CONFIG: AgentConfig = {
   contextOutputReserveTokens: 16_000,
   compactionTrigger: 0.8,
   contextTailShare: 0.25,
+  promptCaching: true,
   runLockLeaseSeconds: 30 * 60,
 };
 

@@ -353,6 +353,8 @@ export async function execute(
 2. **NaN-guard the usage counters.** Some OpenAI-compatible providers omit streaming usage; the AI SDK represents those as `NaN`. Clamp to `0` — optional metering must never keep a successfully completed run stuck in `RUNNING`.
 3. **Token attribution, not pricing.** A model may be any provider instance (`createOpenAI(…)`, `createAnthropic(…)`, `createDeepSeek(…)`), so the platform records **input / cached-input / output tokens** and leaves USD pricing to a downstream concern computed over the recorded counters (spec §4 migration item).
 
+**Prompt caching (§2.6):** when `config.promptCaching` is on (the default), `execute` stamps Anthropic-style ephemeral cache breakpoints on the prompt prefix (system message + last message) via the provider-metadata channel, so supported providers serve repeat runs from cache. OpenAI-family models cache automatically for prompts ≥1024 tokens and ignore the markers. Cached hits surface as `usage.cachedInputTokens` in the run's usage rows and the final `STATE_CHANGE` — the budget counts them once, inside input.
+
 ```typescript
 export async function finalize(
   deps: RuntimePorts,
@@ -368,15 +370,15 @@ export async function finalize(
   // Some providers omit streaming usage — the SDK reports NaN for those.
   // Never let optional metering keep a completed run stuck in RUNNING.
   // Token attribution is TOTAL TOKENS USED — input + cached + output.
-  const totalTokens = countTokens(u);
+  const attribution = attributeTokens(u); // input + cached + output, NaN-guarded
 
   // Persist the completed assistant turn(s) — including tool calls and tool
   // results — BEFORE the state transition (§2.2, §2.8). On a budget-broken
   // run the recorded usage is partial by definition: the budget was spent.
   await deps.storage.messages.append(threadId, { /* response.messages, §5.6 */ });
 
-  // Token attribution: total tokens used — that is all (§4 pricing is
-  // downstream over these counters, if ever needed)
+  // Token attribution: input / cached-input / output / total — that is all
+  // (§4 pricing is downstream over these counters, if ever needed)
   await deps.storage.usage.record(threadId, {
     agentId: agent.name,
     totalTokens,
@@ -659,7 +661,7 @@ await chat.stop(threadId);
 | — new — | `runtime.createStreamTextAgent` / `createGenerateTextAgent` / `getAgent` |
 | `RunJob { threadId, model }` | `RunJob { threadId, model, agent, tokenBudget }` (missing `agent` → default handle) |
 | worker route body (resolve handle → policy) | `runtime.worker.handleJob(job)` — the route becomes a transport shell (verify + parse + call) |
-| `TokenUsage { model, promptTokens, completionTokens, costUSD }` | `{ agentId, totalTokens }` — total tokens used; USD/credit pricing (spec §4) becomes a downstream concern computed over the recorded counters |
+| `TokenUsage { model, promptTokens, completionTokens, costUSD }` | `{ agentId, inputTokens, cachedInputTokens, outputTokens, totalTokens }` — token attribution only; USD/credit pricing (spec §4) becomes a downstream concern computed over the recorded counters |
 
 Non-breaking rollout: ship `setupAgentCore` alongside `createAgentRuntime` (alias) for one minor, migrate the example app, then drop the old factory.
 

@@ -3,10 +3,11 @@ import { randomUUID } from 'node:crypto';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { ExecutionState } from './types.js';
 import { compactContext } from './context.js';
+import { attributeTokens, countTokens } from './usage.js';
+import { markPromptCaching } from './cache.js';
 import type { RegisteredAgent } from './agent.js';
 import { suspendForApproval, type SuspendInput } from './hitl.js';
 import { publish } from './publish.js';
-import { countTokens } from './usage.js';
 import { spawnSubagentTool } from './subagent.js';
 
 export { countTokens } from './usage.js';
@@ -118,10 +119,17 @@ export async function execute(
     // Ownership rule (§3.1): user args spread FIRST, platform keys LAST —
     // persistence, billing, the stop signal, and the safety cap cannot be
     // opted out of.
+    let messages = history.map((m) => ({ role: m.role, content: m.content }) as any);
+    if (deps.config.promptCaching) {
+      // Stamp ephemeral cache breakpoints on the stable prefix (§2.6) so
+      // providers with prompt caching serve repeat runs from cache.
+      messages = markPromptCaching(messages);
+    }
+
     const shared = {
       ...agent.args,
       model: model.instance(),
-      messages: history.map((m) => ({ role: m.role, content: m.content }) as any),
+      messages,
       tools,
       abortSignal: abort.signal,
       maxSteps: deps.config.maxSteps,
@@ -202,12 +210,11 @@ export async function finalize(
     });
   }
 
-  const totalTokens = countTokens(finishParams.usage);
-
-  // Token attribution only (§4): total tokens used. Pricing is downstream.
+  // Token attribution (§4): input + cached + output. Pricing is downstream.
+  const attribution = attributeTokens(finishParams.usage);
   await deps.storage.usage.record(threadId, {
     agentId: agent.name,
-    totalTokens,
+    ...attribution,
   });
 
   const finalState: ExecutionState =
@@ -226,6 +233,7 @@ export async function finalize(
     state: finalState,
     stopReason,
     tokensUsed: budget.tokensUsed,
+    usage: attribution,
   });
 }
 

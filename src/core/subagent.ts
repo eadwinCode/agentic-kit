@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { SubagentsConfig } from './types.js';
 import type { RuntimePorts } from '../ports/runtime.js';
 import { publish } from './publish.js';
-import { countTokens } from './usage.js';
+import { attributeTokens } from './usage.js';
 
 export interface SubagentCtx {
   threadId: string;
@@ -154,7 +154,7 @@ async function runStreamSubagent(
       // Billing attribution per subagent (§4): total tokens used
       await ports.storage.usage.record(threadId, {
         agentId,
-        totalTokens: countTokens(usage),
+        ...attributeTokens(usage),
       });
     },
   });
@@ -193,7 +193,7 @@ async function runGenerateSubagent(
   // Billing attribution per subagent (§4): total tokens used
   await ports.storage.usage.record(threadId, {
     agentId,
-    totalTokens: countTokens(result.usage),
+    ...attributeTokens(result.usage),
   });
 
   return result.text;
