@@ -455,3 +455,10 @@ button.stop { border-color: var(--red); }
 }
 .edit-actions button { padding: 4px 10px; font-size: 12px; }
 .edit-actions .send { border-color: var(--accent); color: var(--accent); }
+
+/* Several approvals can be open at once (§2.7) */
+.hitl-count {
+  margin: 12px 0 4px;
+  color: var(--yellow);
+  font-size: 12px;
+}

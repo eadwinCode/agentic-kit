@@ -515,7 +515,7 @@ export async function compactContext(deps: RuntimePorts, threadId: string, model
 
 The main agent can delegate self-contained sub-tasks to subagents. A subagent is a full agent run with its own isolated context, executed through the same detached pipeline as §2.1. The full reference implementation lives in `src/core/subagent.ts` (§5.5); this section walks through each concern.
 
-> **Status.** The delegation tool, context isolation, namespaced observability, billing attribution, the depth/concurrency limits and the stop cascade all ship today. **Nested runs do not.** The child's own platform loop, its persisted `agentId` message stream, and everything that follows from them — subagent HITL, the frame stack, the pending set, children counting against the run budget — are designed here and not yet built. Today `SubagentsConfig.tools` is never merged into a child's toolset, so a child has only `spawnSubagent`, holds no destructive tools, and therefore cannot park at all. Read this section as the target; read §5.5 for what runs now.
+> **Status.** Implemented. A subagent runs the same platform loop as the main agent (`src/core/loop.ts`), persists its turns under its own `agentId`, receives `SubagentsConfig.tools` HITL-wrapped, can park and be re-entered where it stopped, and spends against the run-wide token ledger. `Storage.messages.list` takes an `agentId` scope and `Storage.events.listByType` backs the open-approval set; both are breaking changes for custom adapters. Orphan reclamation no longer heals inline — it re-dispatches and lets the engine own the single definition of an expired approval.
 
 #### Delegation Tool & Contract
 

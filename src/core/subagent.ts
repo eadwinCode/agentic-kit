@@ -1,11 +1,15 @@
-import { generateText, streamText, tool } from 'ai';
+import { tool } from 'ai';
 import { z } from 'zod';
-import type { SubagentsConfig } from './types.js';
+import type { NestedDescriptor, ProviderOptions, ResumeInfo, SubagentsConfig } from './types.js';
 import type { RuntimePorts } from '../ports/runtime.js';
+import type { RegisteredAgent } from './agent.js';
 import { publish } from './publish.js';
-import { drainOrThrow } from './stream.js';
-import { attributeTokens } from './usage.js';
+import { HITL_PARKED, withHitl, type HitlFrame } from './hitl.js';
+import { runLoop, type LoopOutcome, type RunLedger } from './loop.js';
 
+/** Everything a nested run needs from the run that spawned it (§2.7). The
+ *  thread, lock, run id, abort signal and token ledger are the parent's; the
+ *  message stream, step ceiling and toolset are the child's own. */
 export interface SubagentCtx {
   threadId: string;
   depth: number; // 0 = called from the main agent
@@ -14,6 +18,24 @@ export interface SubagentCtx {
   /** Delegation config carried from the parent's spec (§2.7): flavor,
    *  default model, and extra tools for every spawned child. */
   sub: SubagentsConfig;
+  /** The registered agent whose generation args every nested run inherits
+   *  (§3.1) — its `system` and `tools` are overridden per child. */
+  agent: RegisteredAgent;
+  /** The run-wide token ledger (§2.7): a child's spend counts against the
+   *  same safety cap the main agent is checked against. */
+  ledger: RunLedger;
+  /** Dispatch ticket persisted with any park raised beneath here (§2.5). */
+  resume: ResumeInfo;
+  /** The stream this spawner writes to — `null` when it is the main agent. */
+  agentId: string | null;
+  /** Calls already waiting on an approval above this level, innermost first. */
+  frames: HitlFrame[];
+  /** This spawner's own descriptor — absent when it is the main agent. Goes
+   *  onto the frame it pushes, so an unwind can re-enter it (§2.7). */
+  descriptor?: NestedDescriptor;
+  tokenBudget?: number;
+  providerOptions?: ProviderOptions;
+  abortSignal?: AbortSignal;
 }
 
 /** Run-scoped semaphore: sibling subagents queue instead of running away (§2.7) */
@@ -76,31 +98,49 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
           agentId: run.id, name, depth,
         });
 
-        try {
-          const job = {
-            agentId: run.id,
-            name,
-            instructions,
-            model: model ?? ctx.sub.model ?? 'gpt-4o',
-            depth,
-            abortSignal: opts.abortSignal, // cancellation propagates from the parent (§2.7)
-          };
+        const descriptor: NestedDescriptor = {
+          agentId: run.id,
+          name,
+          model: model ?? ctx.sub.model ?? 'gpt-4o',
+          depth,
+        };
 
-          const result =
-            ctx.sub.kind === 'generate-text'
-              ? await runGenerateSubagent(ctx, job) // single completion, lifecycle events only
-              : await runStreamSubagent(ctx, job); // live SUBAGENT_CHUNK fan-out (§2.2)
+        try {
+          const outcome = await runNestedAgent(
+            ctx,
+            descriptor,
+            instructions,
+            opts.abortSignal ?? ctx.abortSignal,
+            // This call is now the innermost thing waiting on any approval the
+            // child raises (§2.7).
+            [
+              {
+                agentId: ctx.agentId,
+                toolCallId: opts.toolCallId ?? run.id,
+                ...(ctx.descriptor ? { nested: ctx.descriptor } : {}),
+              },
+              ...ctx.frames,
+            ],
+          );
+
+          if (outcome.parked) {
+            // The child is suspended, not finished: leave its SubagentRun
+            // RUNNING and hand the parent the sentinel so its segment ends
+            // too (§2.5). The child is re-entered on approval, from its own
+            // persisted turns — it never restarts.
+            return { [HITL_PARKED]: opts.toolCallId ?? run.id };
+          }
 
           await ctx.ports.storage.runs.update(run.id, {
             state: 'COMPLETED',
-            result: { text: result },
+            result: { text: outcome.text },
           });
           await publish(ctx.ports, ctx.threadId, 'SUBAGENT_COMPLETED', { agentId: run.id });
 
           // The parent receives a capped result, keeping its own context small (§2.6)
           return {
             agentId: run.id,
-            result: result.slice(0, ctx.ports.config.subagentResultCapChars),
+            result: outcome.text.slice(0, ctx.ports.config.subagentResultCapChars),
           };
         } catch (err) {
           const state =
@@ -108,7 +148,13 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
               ? 'CANCELLED'
               : 'FAILED';
           await ctx.ports.storage.runs.update(run.id, { state });
-          await publish(ctx.ports, ctx.threadId, 'SUBAGENT_FAILED', { agentId: run.id, state });
+          // Carry the reason: a bare state tells an operator a child died but
+          // not why, and a nested run's failure is otherwise invisible.
+          await publish(ctx.ports, ctx.threadId, 'SUBAGENT_FAILED', {
+            agentId: run.id,
+            state,
+            error: err instanceof Error ? err.message : String(err),
+          });
           throw err; // propagate: the parent step sees the failure / abort
         }
       } finally {
@@ -118,88 +164,107 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
   });
 }
 
-/** stream-text child: live SUBAGENT_CHUNK fan-out (§2.2) */
-async function runStreamSubagent(
+/** The toolset a nested run sees (§2.7): the delegation config's extra tools,
+ *  HITL-wrapped exactly like the parent's, plus nesting while depth allows.
+ *  Default is `spawnSubagent` alone — destructive tools reach a child only
+ *  when a workflow grants them. */
+function nestedTools(
   ctx: SubagentCtx,
-  job: {
-    agentId: string;
-    name: string;
-    instructions: string;
-    model: string;
-    depth: number;
-    abortSignal?: AbortSignal;
-  },
-): Promise<string> {
-  const { threadId, depth, sem, ports, sub, agentId, name, instructions, model, abortSignal } = {
-    ...ctx,
-    ...job,
+  d: NestedDescriptor,
+  frames: HitlFrame[],
+  abortSignal?: AbortSignal,
+): Record<string, any> {
+  const raw: Record<string, any> = {
+    ...(ctx.sub.tools ?? {}),
+    spawnSubagent: spawnSubagentTool({
+      ...ctx,
+      depth: d.depth,
+      agentId: d.agentId,
+      frames,
+      descriptor: d,
+      abortSignal,
+    }),
   };
-
-  const result = streamText({
-    model: (ports.resolveModel(model) || ports.resolveModel('gpt-4o')).instance(),
-    // Isolated context: seeded with the brief only — never the parent history
-    system: `You are the "${name}" subagent. Complete the task, then stop.`,
-    prompt: instructions,
-    abortSignal, // stop tears this down immediately (§2.7)
-    maxSteps: ports.config.subagentMaxSteps,
-    tools: {
-      // Nesting up to subagentMaxDepth, inheriting the delegation config.
-      // Default toolset is restricted: destructive tools are not included (§2.5, §2.7)
-      spawnSubagent: spawnSubagentTool({ threadId, depth: depth + 1, sem, ports, sub }),
-    },
-    onChunk: async ({ chunk }) => {
-      // Namespaced into the shared thread event log → same multi-user pipeline (§2.2)
-      await publish(ports, threadId, 'SUBAGENT_CHUNK', { agentId, chunk });
-    },
-    onFinish: async ({ usage }) => {
-      // Billing attribution per subagent (§4): total tokens used
-      await ports.storage.usage.record(threadId, {
-        agentId,
-        ...attributeTokens(usage),
-      });
-    },
+  return withHitl(ctx.ports, ctx.threadId, raw, {
+    resume: ctx.resume,
+    agentId: d.agentId,
+    frames,
+    nested: d,
   });
-
-  // Without this the child hangs on a provider failure — and its parent's step
-  // hangs with it, holding the thread's run lock (see drainOrThrow).
-  await drainOrThrow(result.fullStream);
-
-  return result.text;
 }
 
-/** generate-text child: single completion, lifecycle events only (§2.7) */
-async function runGenerateSubagent(
+/** The delegation tool lets the MODEL name the child's model, so an unknown
+ *  registry key is ordinary bad input rather than a failure. `resolveModel`
+ *  throws on one (§3.3) — a `||` fallback can never catch that — so the child
+ *  falls back to the model its parent is already running on, which is
+ *  resolvable by construction. */
+function resolveNestedModel(ctx: SubagentCtx, name: string) {
+  try {
+    return ctx.ports.resolveModel(name);
+  } catch {
+    return ctx.ports.resolveModel(ctx.resume.model);
+  }
+}
+
+/** Run — or RE-ENTER — a nested agent (§2.7).
+ *
+ *  Its turns live in the thread's message log under its own `agentId`, so a
+ *  child that parked is resumed from exactly where it stopped rather than
+ *  replayed from its brief. Replaying an LLM call is not a safe substitute:
+ *  the model can take a different path and never make the call the human
+ *  approved, and it re-pays for everything before the park. */
+export async function runNestedAgent(
   ctx: SubagentCtx,
-  job: {
-    agentId: string;
-    name: string;
-    instructions: string;
-    model: string;
-    depth: number;
-    abortSignal?: AbortSignal;
-  },
-): Promise<string> {
-  const { threadId, depth, sem, ports, sub, agentId, name, instructions, model, abortSignal } = {
-    ...ctx,
-    ...job,
-  };
+  d: NestedDescriptor,
+  /** Seeds the stream on first entry; ignored once the child has turns. */
+  instructions: string | null,
+  abortSignal: AbortSignal | undefined,
+  frames: HitlFrame[],
+): Promise<LoopOutcome> {
+  const { ports, threadId } = ctx;
 
-  const result = await generateText({
-    model: (ports.resolveModel(model) || ports.resolveModel('gpt-4o')).instance(),
-    system: `You are the "${name}" subagent. Complete the task, then stop.`,
-    prompt: instructions,
-    abortSignal,
-    maxSteps: ports.config.subagentMaxSteps,
-    tools: {
-      spawnSubagent: spawnSubagentTool({ threadId, depth: depth + 1, sem, ports, sub }),
+  const persisted = await ports.storage.messages.list(threadId, { agentId: d.agentId });
+  if (persisted.length === 0) {
+    if (instructions === null) {
+      throw new Error(`Nested run ${d.agentId} has no turns and no brief to seed from`);
+    }
+    // Isolated context (§2.7): the brief is the only input — parent history
+    // is never forwarded.
+    persisted.push(
+      await ports.storage.messages.append(threadId, {
+        role: 'user',
+        content: instructions,
+        agentId: d.agentId,
+      }),
+    );
+  }
+
+  const outcome = await runLoop(
+    ports,
+    ctx.agent,
+    threadId,
+    {
+      agentId: d.agentId,
+      kind: ctx.sub.kind ?? 'stream-text',
+      model: resolveNestedModel(ctx, d.model).instance(),
+      messages: persisted.map((m) => ({ role: m.role, content: m.content }) as any),
+      tools: nestedTools(ctx, d, frames, abortSignal),
+      maxSteps: ports.config.subagentMaxSteps,
+      abortSignal: abortSignal ?? new AbortController().signal,
+      providerOptions: ctx.providerOptions,
+      tokenBudget: ctx.tokenBudget,
+      system: `You are the "${d.name}" subagent. Complete the task, then stop.`,
+      onChunk: async (chunk) => {
+        // Namespaced into the shared thread event log → same multi-user pipeline (§2.2)
+        await publish(ports, threadId, 'SUBAGENT_CHUNK', { agentId: d.agentId, chunk });
+      },
     },
-  });
+    ctx.ledger,
+  );
 
-  // Billing attribution per subagent (§4): total tokens used
-  await ports.storage.usage.record(threadId, {
-    agentId,
-    ...attributeTokens(result.usage),
-  });
+  // Billing attribution per subagent (§4); the run-wide ledger was already
+  // advanced inside the loop.
+  await ports.storage.usage.record(threadId, { agentId: d.agentId, ...outcome.attribution });
 
-  return result.text;
+  return outcome;
 }

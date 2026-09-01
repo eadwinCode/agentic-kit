@@ -14,12 +14,20 @@ export interface PrismaLike {
   };
   message: {
     create(a: { data: { threadId: string; agentId?: string | null; role: string; content: any } }): Promise<any>;
-    findMany(a: { where: { threadId: string }; orderBy: { createdAt: 'asc' } }): Promise<any[]>;
+    findMany(a: {
+      where: { threadId: string; agentId?: string | null };
+      orderBy: { createdAt: 'asc' };
+    }): Promise<any[]>;
     deleteMany(a: { where: { id: { in: string[] } } }): Promise<{ count: number }>;
   };
   agentEvent: {
     create(a: { data: { threadId: string; seq: number; type: string; payload: any } }): Promise<unknown>;
-    findMany(a: { where: { threadId: string; seq?: { gt: number } }; orderBy: { seq: 'asc' } }): Promise<AgentEvent[]>;
+    findMany(a: {
+      // One signature covering both reads — listSince (by seq) and listByType.
+      // Two overloads here would be a shape the real PrismaClient cannot satisfy.
+      where: { threadId: string; seq?: { gt: number }; type?: string };
+      orderBy: { seq: 'asc' };
+    }): Promise<AgentEvent[]>;
     findFirst(a: { where: { threadId: string; type: string }; orderBy: { seq: 'desc' } }): Promise<AgentEvent | null>;
   };
   tokenUsage: {
@@ -72,8 +80,16 @@ export class PrismaStorage implements Storage {
       this.prisma.message.create({
         data: { threadId, agentId: m.agentId ?? null, role: m.role, content: m.content },
       }),
-    list: (threadId: string) =>
-      this.prisma.message.findMany({ where: { threadId }, orderBy: { createdAt: 'asc' } }),
+    list: (threadId: string, opts?: { agentId?: string | null }) =>
+      this.prisma.message.findMany({
+        // `agentId: null` is a real filter (IS NULL), not an absent one — the
+        // scope is only dropped when the caller omits it entirely.
+        where: {
+          threadId,
+          ...(opts && 'agentId' in opts ? { agentId: opts.agentId } : {}),
+        },
+        orderBy: { createdAt: 'asc' },
+      }),
     deleteFrom: async (threadId: string, messageId: string) => {
       // Delete by id over the same ordering `list` uses, rather than a
       // `createdAt >=` range: a run appends several messages inside one
@@ -107,6 +123,8 @@ export class PrismaStorage implements Storage {
         where: { threadId, type },
         orderBy: { seq: 'desc' },
       }),
+    listByType: (threadId: string, type: string) =>
+      this.prisma.agentEvent.findMany({ where: { threadId, type }, orderBy: { seq: 'asc' } }),
   };
 
   usage = {

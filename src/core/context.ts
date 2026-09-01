@@ -42,7 +42,8 @@ export async function contextUsage(
   model: string,
 ): Promise<ContextUsage> {
   const budgetTokens = contextBudget(deps, model) - deps.config.contextOutputReserveTokens;
-  const history = await deps.storage.messages.list(threadId);
+  // The main agent's stream only — a nested run's turns are its own (§2.7)
+  const history = await deps.storage.messages.list(threadId, { agentId: null });
   return {
     usedTokens: history.reduce((sum, m) => sum + estimateTokens(m.content), 0),
     budgetTokens,
@@ -60,7 +61,9 @@ export async function compactContext(
   model: string,
 ): Promise<MessageDTO[]> {
   const budget = contextBudget(deps, model) - deps.config.contextOutputReserveTokens;
-  const history = await deps.storage.messages.list(threadId);
+  // Scoped to the main agent: unscoped, delegated turns would be compacted
+  // into — and then fed back through — the parent's prompt (§2.7)
+  const history = await deps.storage.messages.list(threadId, { agentId: null });
 
   const total = history.reduce((sum, m) => sum + estimateTokens(m.content), 0);
   if (total <= budget * deps.config.compactionTrigger) return history;

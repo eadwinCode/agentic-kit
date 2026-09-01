@@ -31,7 +31,13 @@ export interface Storage {
   };
   messages: {
     append(threadId: string, message: NewMessage): Promise<MessageDTO>;
-    list(threadId: string): Promise<MessageDTO[]>;
+    /** Oldest first. The scope decides WHOSE turns come back (§2.7):
+     *  - `{ agentId: null }` — the main agent's stream. Compaction (§2.6) and
+     *    the edit lookup (§5.1) must use this; unscoped, a subagent's turns
+     *    leak into the parent's prompt and context isolation is gone.
+     *  - `{ agentId: 'sub_1' }` — that nested run's own stream.
+     *  - omitted — every row on the thread, for UI hydration (§2.2). */
+    list(threadId: string, opts?: { agentId?: string | null }): Promise<MessageDTO[]>;
     /** Delete `messageId` and every message after it, in the same order
      *  `list` returns (§5.1 edit + resend). Returns how many rows went; 0 when
      *  the id is not in this thread.
@@ -48,6 +54,10 @@ export interface Storage {
     listSince(threadId: string, sinceSeq: number): Promise<AgentEvent[]>;
     /** Most recent event of a type — the HITL pending check (§2.5) */
     latest(threadId: string, type: string): Promise<AgentEvent | null>;
+    /** Every event of a type, ascending by seq. The open-approval set (§2.7)
+     *  is derived from these; scanning `listSince` instead would drag every
+     *  CHUNK on the thread through memory. */
+    listByType(threadId: string, type: string): Promise<AgentEvent[]>;
   };
   usage: {
     record(threadId: string, usage: NewUsage): Promise<void>;

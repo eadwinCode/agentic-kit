@@ -127,7 +127,11 @@ export class MemoryStorage implements Storage {
       list.push(dto);
       return dto;
     },
-    async list(t: string) { return [...(this.store.get(t) ?? [])]; },
+    async list(t: string, opts?: { agentId?: string | null }) {
+      const rows = this.store.get(t) ?? [];
+      if (!opts || !('agentId' in opts)) return [...rows];
+      return rows.filter((m) => (m.agentId ?? null) === (opts.agentId ?? null));
+    },
     async deleteFrom(t: string, messageId: string) {
       const rows = this.store.get(t) ?? [];
       const from = rows.findIndex((m) => m.id === messageId);
@@ -151,6 +155,10 @@ export class MemoryStorage implements Storage {
       const list = this.store.get(t) ?? [];
       for (let i = list.length - 1; i >= 0; i--) if (list[i].type === type) return list[i];
       return null;
+    },
+    async listByType(t: string, type: string) {
+      return (this.store.get(t) ?? []).filter((e) => e.type === type)
+        .sort((a, b) => a.seq - b.seq);
     },
   };
 

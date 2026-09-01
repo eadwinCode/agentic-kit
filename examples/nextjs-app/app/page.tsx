@@ -19,7 +19,7 @@ export default function Page() {
     agentState,
     activity,
     historyLoading,
-    pendingInput,
+    pendingInputs,
     subagents,
     threads,
     threadsLoading,
@@ -197,28 +197,41 @@ export default function Page() {
           </div>
         ))}
 
-        {agentState === 'WAITING_FOR_INPUT' && pendingInput && (
-          <div className="hitl">
-            <p>
-              ⏸ approval required — <code>{pendingInput.toolName}</code>
-              {pendingInput.agentId && (
-                <>
-                  {' '}
-                  requested by subagent <code>{pendingInput.agentId}</code>
-                </>
-              )}
-            </p>
-            <pre>{truncate(JSON.stringify(pendingInput.arguments, null, 2), 400)}</pre>
-            <div className="row">
-              <button className="approve" onClick={() => void respondToInput(true)}>
-                Approve
-              </button>
-              <button className="deny" onClick={() => void respondToInput(false)}>
-                Deny
-              </button>
-            </div>
-          </div>
+        {agentState === 'WAITING_FOR_INPUT' && pendingInputs.length > 1 && (
+          <p className="hitl-count">
+            {pendingInputs.length} approvals open — the run continues once every one is
+            answered (§2.7)
+          </p>
         )}
+        {agentState === 'WAITING_FOR_INPUT' &&
+          pendingInputs.map((req) => (
+            <div key={req.toolCallId} className="hitl">
+              <p>
+                ⏸ approval required — <code>{req.toolName}</code>
+                {req.agentId && (
+                  <>
+                    {' '}
+                    requested by subagent <code>{req.agentId}</code>
+                  </>
+                )}
+              </p>
+              <pre>{truncate(JSON.stringify(req.arguments, null, 2), 400)}</pre>
+              <div className="row">
+                <button
+                  className="approve"
+                  onClick={() => void respondToInput(req.toolCallId, true)}
+                >
+                  Approve
+                </button>
+                <button
+                  className="deny"
+                  onClick={() => void respondToInput(req.toolCallId, false)}
+                >
+                  Deny
+                </button>
+              </div>
+            </div>
+          ))}
       </section>
 
       <form className="composer" onSubmit={submit}>

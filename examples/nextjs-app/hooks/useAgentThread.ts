@@ -174,7 +174,9 @@ export function useAgentThread(initialThreadId?: string) {
   const [agentState, setAgentState] = useState<AgentState>('IDLE');
   const [activity, setActivity] = useState<AgentActivity>(stateActivity('IDLE'));
   const [historyLoading, setHistoryLoading] = useState(false);
-  const [pendingInput, setPendingInput] = useState<PendingInput | null>(null);
+  // A parent step can park several nested runs at once (§2.7), so the run
+  // waits on a SET of approvals — the thread resumes when the last is answered.
+  const [pendingInputs, setPendingInputs] = useState<PendingInput[]>([]);
   const [subagents, setSubagents] = useState<SubagentView[]>([]);
   const [threads, setThreads] = useState<ThreadListItem[]>([]);
   const [threadsLoading, setThreadsLoading] = useState(true);
@@ -228,7 +230,7 @@ export function useAgentThread(initialThreadId?: string) {
     setThreadId(undefined);
     setEntries([]);
     setSubagents([]);
-    setPendingInput(null);
+    setPendingInputs([]);
     setUsage(null);
     setAgentState('IDLE');
     setActivity(stateActivity('IDLE'));
@@ -288,7 +290,7 @@ export function useAgentThread(initialThreadId?: string) {
           }
           return stateActivity(nextState);
         });
-        if (nextState !== 'WAITING_FOR_INPUT') setPendingInput(null);
+        if (nextState !== 'WAITING_FOR_INPUT') setPendingInputs([]);
         // Terminal states land in the durable thread row — refresh the
         // sidebar so it stops claiming a finished run is still RUNNING.
         if (nextState === 'COMPLETED' || nextState === 'FAILED' || nextState === 'CANCELLED') {
@@ -359,16 +361,24 @@ export function useAgentThread(initialThreadId?: string) {
       case 'INPUT_REQUIRED':
         setAgentState('WAITING_FOR_INPUT');
         setActivity({ phase: 'waiting-input', label: 'Waiting for approval', detail: p.toolName });
-        setPendingInput({
-          toolCallId: p.toolCallId,
-          toolName: p.toolName,
-          agentId: p.agentId ?? null,
-          arguments: p.arguments,
-        });
+        setPendingInputs((prev) =>
+          prev.some((r) => r.toolCallId === p.toolCallId)
+            ? prev // replayed on reconnect (§2.2)
+            : [
+                ...prev,
+                {
+                  toolCallId: p.toolCallId,
+                  toolName: p.toolName,
+                  agentId: p.agentId ?? null,
+                  arguments: p.arguments,
+                },
+              ],
+        );
         break;
 
       case 'INPUT_EXPIRED':
-        setPendingInput(null);
+        // Only this request expired; any sibling approval is still open.
+        setPendingInputs((prev) => prev.filter((r) => r.toolCallId !== p.toolCallId));
         setActivity({ phase: 'failed', label: 'Approval expired' });
         break;
 
@@ -456,7 +466,7 @@ export function useAgentThread(initialThreadId?: string) {
           .filter((entry): entry is ChatEntry => entry !== null);
         setEntries(durableEntries);
         setSubagents([]);
-        setPendingInput(null);
+        setPendingInputs([]);
         void loadUsage(threadId);
         setAgentState(snapshot.thread.state);
         setActivity(stateActivity(snapshot.thread.state));
@@ -506,7 +516,7 @@ export function useAgentThread(initialThreadId?: string) {
       ];
     });
     setSubagents([]);
-    setPendingInput(null);
+    setPendingInputs([]);
     setAgentState('RUNNING');
     setActivity({ phase: 'thinking', label: 'Thinking' });
 
@@ -544,22 +554,19 @@ export function useAgentThread(initialThreadId?: string) {
   }, []);
 
   const respondToInput = useCallback(
-    async (approved: boolean, payload?: unknown) => {
-      if (!threadRef.current || !pendingInput) return;
+    async (toolCallId: string, approved: boolean, payload?: unknown) => {
+      if (!threadRef.current) return;
+      // Drop this card straight away; the run only moves once the LAST open
+      // approval is answered, so the others stay on screen (§2.7).
+      setPendingInputs((prev) => prev.filter((r) => r.toolCallId !== toolCallId));
       setActivity({ phase: 'thinking', label: approved ? 'Approval sent' : 'Request denied' });
       await fetch('/api/agent/respond', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          threadId: threadRef.current,
-          toolCallId: pendingInput.toolCallId,
-          approved,
-          payload,
-        }),
+        body: JSON.stringify({ threadId: threadRef.current, toolCallId, approved, payload }),
       });
-      setPendingInput(null);
     },
-    [pendingInput],
+    [],
   );
 
   return {
@@ -568,7 +575,7 @@ export function useAgentThread(initialThreadId?: string) {
     agentState,
     activity,
     historyLoading,
-    pendingInput,
+    pendingInputs,
     subagents,
     threads,
     threadsLoading,

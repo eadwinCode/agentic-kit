@@ -1,6 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { RespondInput, RespondResult } from '../ports/runtime.js';
-import type { AgentEvent, ResumeInfo } from './types.js';
+import type { AgentEvent, NestedDescriptor, ResumeInfo } from './types.js';
 import { publish } from './publish.js';
 import { currentRunId } from './keys.js';
 import { reclaimGraceAfterMs, reclaimIfOrphaned } from './reclaim.js';
@@ -20,14 +21,76 @@ export interface HitlResponse {
   payload?: unknown;
 }
 
+/** One tool call left waiting on an approval further down (§2.7). A park by
+ *  the main agent has none; a park inside a nested run has one per level, the
+ *  innermost waiter first. `agentId` names the stream the waiting call lives
+ *  in — `null` for the main agent. */
+export interface HitlFrame {
+  agentId: string | null;
+  toolCallId: string;
+  /** How to re-enter the owner's loop when this frame unwinds. Absent for the
+   *  main agent, whose loop the engine re-enters itself. */
+  nested?: NestedDescriptor;
+}
+
 export interface ParkInput {
   threadId: string;
   toolCallId: string;
   toolName: string;
   args: unknown;
   agentId?: string | null;
+  /** The calls waiting on this answer, innermost first (§2.7). Empty for a
+   *  main-agent park, which reduces this to the plain §2.5 flow. */
+  frames?: HitlFrame[];
+  /** The nested run that raised this park; absent when the main agent did. */
+  nested?: NestedDescriptor;
   /** Dispatch ticket persisted in the INPUT_REQUIRED payload (§2.5) */
   resume: ResumeInfo;
+}
+
+/** Wrap every marked tool so a call parks (§2.5) instead of executing: the
+ *  request is persisted as INPUT_REQUIRED and the wrapper returns the park
+ *  sentinel — nothing blocks. The real tool runs when the park is resolved
+ *  (see resumePendingHitl), in whichever stream owns it.
+ *
+ *  Shared by the main agent and every nested run (§2.7): the only difference
+ *  is the `agentId` asking and the `frames` waiting on the answer. */
+export function withHitl(
+  deps: RuntimePorts,
+  threadId: string,
+  tools: Record<string, any>,
+  ctx: {
+    resume: ResumeInfo;
+    agentId?: string | null;
+    frames?: HitlFrame[];
+    nested?: NestedDescriptor;
+  },
+): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const [name, t] of Object.entries(tools)) {
+    if (!(t as any)?.requiresConfirmation) {
+      out[name] = t;
+      continue;
+    }
+    out[name] = {
+      ...t,
+      execute: async (args: unknown, opts: { toolCallId?: string }) => {
+        const toolCallId = opts?.toolCallId ?? randomUUID();
+        await parkForApproval(deps, {
+          threadId,
+          toolCallId,
+          toolName: name,
+          args,
+          agentId: ctx.agentId ?? null,
+          frames: ctx.frames ?? [],
+          ...(ctx.nested ? { nested: ctx.nested } : {}),
+          resume: ctx.resume,
+        });
+        return { [HITL_PARKED]: toolCallId };
+      },
+    };
+  }
+  return out;
 }
 
 /** The §2.5 suspension as a durable state transition — NO process waits.
@@ -54,6 +117,9 @@ export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise
     agentId: i.agentId ?? null,
     arguments: i.args,
     inputSchema: null,
+    // The unwind chain (§2.7) — empty for a main-agent park.
+    frames: i.frames ?? [],
+    ...(i.nested ? { nested: i.nested } : {}),
     resume: i.resume,
   });
   await publish(deps, i.threadId, 'STATE_CHANGE', { state: 'WAITING_FOR_INPUT' });
@@ -89,6 +155,10 @@ export interface PendingHitl {
   toolName: string;
   agentId: string | null;
   arguments: unknown;
+  /** Calls waiting on this answer, innermost first (§2.7). */
+  frames: HitlFrame[];
+  /** The nested run that raised it; absent for a main-agent park. */
+  nested?: NestedDescriptor;
   /** Epoch ms of the INPUT_REQUIRED event — the TTL clock (§2.5) */
   requestedAt: number;
 }
@@ -99,19 +169,61 @@ export async function loadPendingHitl(
 ): Promise<PendingHitl | null> {
   const pending = await deps.storage.events.latest(threadId, 'INPUT_REQUIRED');
   if (!pending) return null;
+  return fromInputRequired(pending);
+}
+
+function fromInputRequired(pending: AgentEvent): PendingHitl {
   const p = pending.payload as {
     toolCallId: string;
     toolName: string;
     agentId?: string | null;
     arguments?: unknown;
+    frames?: HitlFrame[];
+    nested?: NestedDescriptor;
   };
   return {
     toolCallId: p.toolCallId,
     toolName: p.toolName,
     agentId: p.agentId ?? null,
     arguments: p.arguments,
+    // A park recorded before frames existed unwinds as a main-agent park.
+    frames: p.frames ?? [],
+    ...(p.nested ? { nested: p.nested } : {}),
     requestedAt: new Date(pending.createdAt).getTime(),
   };
+}
+
+/** Every approval on the thread that is still open (§2.7).
+ *
+ *  Derived from durable state, never cached: a request is settled once a tool
+ *  result carries its `toolCallId` — in whichever stream owns it — or an
+ *  INPUT_EXPIRED event names it. Both are already written on the settling
+ *  path. A cached set would be a read-modify-write race between exactly the
+ *  concurrent siblings this exists to serve, since Kv has no set operations. */
+export async function loadOpenHitls(
+  deps: RuntimePorts,
+  threadId: string,
+): Promise<PendingHitl[]> {
+  const requested = await deps.storage.events.listByType(threadId, 'INPUT_REQUIRED');
+  if (requested.length === 0) return [];
+
+  const expired = new Set(
+    (await deps.storage.events.listByType(threadId, 'INPUT_EXPIRED')).map(
+      (e) => (e.payload as { toolCallId?: string } | null)?.toolCallId,
+    ),
+  );
+  const answered = new Set<string>();
+  for (const m of await deps.storage.messages.list(threadId)) {
+    if (m.role !== 'tool') continue;
+    for (const part of Array.isArray(m.content) ? m.content : []) {
+      const id = (part as { toolCallId?: string } | null)?.toolCallId;
+      if (id) answered.add(id);
+    }
+  }
+
+  return requested
+    .map((e) => fromInputRequired(e))
+    .filter((p) => !answered.has(p.toolCallId) && !expired.has(p.toolCallId));
 }
 
 /** The §5.4 behavior: heal orphans first (§2.5), then record the answer in
@@ -123,12 +235,13 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
   await reclaimIfOrphaned(deps, input.threadId);
 
   const thread = await deps.storage.threads.get(input.threadId);
-  const pending = await deps.storage.events.latest(input.threadId, 'INPUT_REQUIRED');
+  // ANY open request is answerable, not just the newest (§2.7): one parent
+  // step can park several nested runs at once, and each is answered on its
+  // own. The run resumes when the last of them is settled.
+  const open = await loadOpenHitls(deps, input.threadId);
+  const match = open.find((p) => p.toolCallId === input.toolCallId);
 
-  if (
-    thread?.state !== 'WAITING_FOR_INPUT' ||
-    (pending?.payload as any)?.toolCallId !== input.toolCallId
-  ) {
+  if (thread?.state !== 'WAITING_FOR_INPUT' || !match) {
     return { delivered: false, error: 'No matching pending input request' };
   }
 
@@ -137,7 +250,7 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
   // unanswered (§2.5)
   const remainingSec = Math.max(
     60,
-    Math.floor((deps.config.hitlTtlMs - (Date.now() - new Date(pending!.createdAt).getTime())) / 1000),
+    Math.floor((deps.config.hitlTtlMs - (Date.now() - match.requestedAt)) / 1000),
   );
   await deps.kv.set(
     hitlKey(input.toolCallId),
@@ -156,7 +269,11 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
   // Resume the run segment through the queue — same dispatch path as the
   // original run, rebuilt from the ticket persisted in the event payload.
   // A legacy park without a ticket falls back to the default handle.
-  const resume = (pending!.payload as any).resume as ResumeInfo | undefined;
+  const requested = await deps.storage.events.listByType(input.threadId, 'INPUT_REQUIRED');
+  const event = requested.find(
+    (e) => (e.payload as { toolCallId?: string } | null)?.toolCallId === input.toolCallId,
+  );
+  const resume = (event?.payload as any)?.resume as ResumeInfo | undefined;
   // REUSE the parked run's id, never mint a new one: this dispatch and the
   // park's expiry job are the same run, and the lock must be able to tell
   // that. Bumping here would let both run and reply twice (§2.5).

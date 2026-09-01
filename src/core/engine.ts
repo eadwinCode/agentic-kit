@@ -1,5 +1,3 @@
-import { generateText, streamText } from 'ai';
-import type { LanguageModel } from 'ai';
 import { randomUUID } from 'node:crypto';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { AgentKind, ExecutionState, ProviderOptions, ResumeInfo } from './types.js';
@@ -9,18 +7,20 @@ import { markPromptCaching } from './cache.js';
 import { mergeProviderOptions } from './types.js';
 import type { RegisteredAgent } from './agent.js';
 import {
-  HITL_PARKED,
   hitlKey,
-  loadPendingHitl,
-  parkForApproval,
+  loadOpenHitls,
+  withHitl,
   type PendingHitl,
 } from './hitl.js';
 import { publish } from './publish.js';
-import { spawnSubagentTool } from './subagent.js';
+import { runNestedAgent, spawnSubagentTool, type SubagentCtx } from './subagent.js';
 import { redriveKey, runIdKey } from './keys.js';
-import { drainOrThrow } from './stream.js';
+import { isParked, runLoop, type RunLedger } from './loop.js';
 
 export { countTokens } from './usage.js';
+// executeStep and the loop live in ./loop.js so a nested run can share them
+// without engine ↔ subagent becoming a cycle (§2.7).
+export { executeStep, isParked, runLoop, type LoopInput, type LoopOutcome, type RunLedger, type StepResult } from './loop.js';
 
 const runLockKey = (threadId: string) => `agent:lock:${threadId}`;
 
@@ -39,194 +39,153 @@ export function markRequiresConfirmation<T extends object>(t: T): T {
   return Object.assign(t, { requiresConfirmation: true });
 }
 
-const isParked = (result: unknown): boolean =>
-  typeof result === 'object' &&
-  result !== null &&
-  (result as Record<string, unknown>)[HITL_PARKED] !== undefined;
-
-/** Wrap every marked tool so a call parks (§2.5) instead of executing: the
- *  request is persisted as INPUT_REQUIRED and the wrapper returns the park
- *  sentinel — nothing blocks. The real tool runs in the RESUMED segment on
- *  approval (see resumePendingHitl). */
-function withHitl(
+/** Is this approval settled yet (§2.7)? Read-only on purpose: with several
+ *  open at once, nothing may be executed until EVERY one is ready, or a
+ *  redelivery would run half of them and then leave the thread parked with
+ *  those verdicts already consumed. */
+async function verdictReady(
   deps: RuntimePorts,
-  threadId: string,
-  tools: Record<string, any>,
-  resume: ResumeInfo,
-) {
-  const out: Record<string, any> = {};
-  for (const [name, t] of Object.entries(tools)) {
-    if (!(t as any)?.requiresConfirmation) {
-      out[name] = t;
-      continue;
-    }
-    out[name] = {
-      ...t,
-      execute: async (args: unknown, opts: { toolCallId?: string }) => {
-        const toolCallId = opts?.toolCallId ?? randomUUID();
-        await parkForApproval(deps, {
-          threadId,
-          toolCallId,
-          toolName: name,
-          args,
-          resume,
-        });
-        return { [HITL_PARKED]: toolCallId };
-      },
-    };
-  }
-  return out;
+  pending: PendingHitl,
+): Promise<'answered' | 'expired' | 'open'> {
+  if (await deps.kv.get(hitlKey(pending.toolCallId))) return 'answered';
+  return Date.now() - pending.requestedAt >= deps.config.hitlTtlMs ? 'expired' : 'open';
 }
 
-/** One platform-owned step (§2.1, §5.6): a single SDK round-trip with
- *  maxSteps: 1. The SDK executes the step's tool calls and reports a
- *  structured result; whether to continue is the engine loop's decision,
- *  never the SDK's. */
-export interface StepResult {
-  text: string;
-  finishReason: string;
-  usage: Record<string, number> | undefined;
-  /** Assistant + tool messages this step produced — appended to the
-   *  conversation (in memory AND storage) before the next step. */
-  responseMessages: Array<{ role: string; content: unknown }>;
-  /** The step's executed tool calls and their results. */
-  toolResults: Array<{ toolCallId: string; toolName: string; result: unknown }>;
-}
-
-export async function executeStep(
-  agent: RegisteredAgent,
-  call: {
-    kind: AgentKind;
-    model: LanguageModel;
-    messages: Array<any>;
-    tools: Record<string, any>;
-    providerOptions?: ProviderOptions;
-    abortSignal: AbortSignal;
-    onChunk?: (chunk: unknown) => Promise<void>;
-  },
-): Promise<StepResult> {
-  // Ownership rule (§3.1): user args spread FIRST, platform keys LAST. The
-  // user's stream callbacks are stripped here and re-chained by the platform
-  // (onChunk below, onFinish at finalize) so the SDK can never own them.
-  const {
-    onChunk: _userOnChunk,
-    onFinish: _userOnFinish,
-    onStepFinish: userOnStepFinish,
-    ...userArgs
-  } = agent.args as Record<string, any>;
-
-  const shared = {
-    ...userArgs,
-    model: call.model,
-    messages: call.messages,
-    tools: call.tools,
-    abortSignal: call.abortSignal,
-    maxSteps: 1, // the loop owns continuation
-    // Provider-specific options (§3.1): forwarded under both the v5-native
-    // key and the v4 alias.
-    ...(call.providerOptions
-      ? {
-          providerOptions: call.providerOptions,
-          experimental_providerMetadata: call.providerOptions as any,
-        }
-      : {}),
-    ...(call.onChunk
-      ? { onChunk: async ({ chunk }: any) => { await call.onChunk!(chunk); } }
-      : {}),
-    ...(userOnStepFinish
-      ? { onStepFinish: (step: any) => userOnStepFinish?.(step) } // user callback still fires
-      : {}),
-  };
-
-  if (call.kind === 'stream-text') {
-    const result = streamText(shared as any);
-    // streamText is lazy: drain the full stream so onChunk fires per part, and
-    // let a provider failure throw here rather than hanging on promises that
-    // never settle (see drainOrThrow). The loop turns it into a stop or a
-    // redrive (§2.8).
-    await drainOrThrow(result.fullStream);
-
-    const [text, usage, finishReason, response, steps] = await Promise.all([
-      result.text,
-      result.usage,
-      result.finishReason,
-      result.response,
-      result.steps,
-    ]);
-    return {
-      text,
-      finishReason,
-      usage: usage as any,
-      responseMessages: (response?.messages ?? []) as any,
-      toolResults: (steps?.at(-1)?.toolResults ?? []) as any,
-    };
-  }
-
-  const result = await generateText(shared as any);
-  return {
-    text: result.text,
-    finishReason: result.finishReason,
-    usage: result.usage as any,
-    responseMessages: (result.response?.messages ?? []) as any,
-    toolResults: (result.steps?.at(-1)?.toolResults ?? []) as any,
-  };
-}
-
-/** Resolve a parked HITL request at segment start (§2.5): consume the answer
- *  from the handoff key — or convert an expired request into the timeout
- *  denial ("user had no response", §2.5) — append the tool result, and flip
- *  the thread back to RUNNING. Returns false when the request is still within
- *  its TTL and unanswered: the dispatch is an at-least-once redelivery and
- *  the thread stays parked. `tools` must be the UNWRAPPED toolset. */
-async function resumePendingHitl(
+/** Turn a settled approval into the tool result the conversation will carry
+ *  (§2.5): run the approved tool, record the denial, or convert an expired
+ *  request into the timeout denial ("user had no response").
+ *
+ *  The tool failure is surfaced TO THE MODEL as the tool result — the verdict
+ *  arrives from a different process than the one that ran the model, so the
+ *  conversation always stays executable. */
+async function settleVerdict(
   deps: RuntimePorts,
   threadId: string,
   pending: PendingHitl,
-  tools: Record<string, any>,
+  target: { execute?: (args: unknown, opts: unknown) => Promise<unknown> } | undefined,
   signal: AbortSignal,
-): Promise<boolean> {
+): Promise<unknown> {
   const raw = await deps.kv.get(hitlKey(pending.toolCallId));
-  const expired = Date.now() - pending.requestedAt >= deps.config.hitlTtlMs;
-  if (!raw && !expired) return false; // still parked — redelivery no-op (§2.8)
-
   await deps.kv.del(hitlKey(pending.toolCallId));
 
-  let result: unknown;
-  if (raw) {
-    const answer = JSON.parse(raw) as HitlAnswer;
-    if (answer.approved) {
-      // The verdict arrives from a different process than the one that ran
-      // the model — the tool failure is surfaced TO THE MODEL as the tool
-      // result, so the conversation always stays executable (§2.5)
-      const target = tools[pending.toolName];
-      try {
-        result = target
-          ? await target.execute(pending.arguments, {
-              toolCallId: pending.toolCallId,
-              abortSignal: signal,
-            })
-          : { error: `Unknown tool: ${pending.toolName}` };
-      } catch (err) {
-        result = { error: err instanceof Error ? err.message : String(err) };
-      }
-    } else {
-      result = { denied: true };
-    }
-  } else {
-    result = { responded: false, cancelled: true, reason: 'timeout' };
+  if (!raw) {
+    await publish(deps, threadId, 'INPUT_EXPIRED', { toolCallId: pending.toolCallId });
+    return { responded: false, cancelled: true, reason: 'timeout' };
   }
 
+  const answer = JSON.parse(raw) as HitlAnswer;
+  if (!answer.approved) return { denied: true };
+
+  try {
+    return target?.execute
+      ? await target.execute(pending.arguments, {
+          toolCallId: pending.toolCallId,
+          abortSignal: signal,
+        })
+      : { error: `Unknown tool: ${pending.toolName}` };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Land a settled verdict and unwind whatever was waiting on it (§2.7).
+ *
+ *  The verdict belongs to the stream that asked — the main agent's, or a
+ *  nested run's. When a nested run asked, its own loop is re-entered from its
+ *  persisted turns and its result is handed to the call waiting one level up,
+ *  repeating until the main agent's `spawnSubagent` call is answered.
+ *
+ *  Returns false when the unwind parked again: the thread stays
+ *  WAITING_FOR_INPUT and a later dispatch picks up from the new request. */
+async function unwindVerdict(
+  deps: RuntimePorts,
+  threadId: string,
+  pending: PendingHitl,
+  result: unknown,
+  subCtx: SubagentCtx | null,
+  signal: AbortSignal,
+): Promise<boolean> {
   await deps.storage.messages.append(threadId, {
     role: 'tool',
+    agentId: pending.agentId,
     content: [
       { type: 'tool-result', toolCallId: pending.toolCallId, toolName: pending.toolName, result },
     ],
   });
 
+  // `producer` is whoever must now run to produce the next result. Undefined
+  // means the main agent, whose loop the caller re-enters itself.
+  let producer = pending.nested;
+  for (let i = 0; i < pending.frames.length; i += 1) {
+    const frame = pending.frames[i]!;
+    if (!producer || !subCtx) break;
+
+    const outcome = await runNestedAgent(subCtx, producer, null, signal, pending.frames.slice(i));
+    if (outcome.parked) return false; // parked again, one level down
+    if (outcome.aborted) return false; // user stop mid-unwind (§2.1)
+
+    await deps.storage.runs.update(producer.agentId, {
+      state: 'COMPLETED',
+      result: { text: outcome.text },
+    });
+    await publish(deps, threadId, 'SUBAGENT_COMPLETED', { agentId: producer.agentId });
+
+    // Hand the capped result to the call one level up (§2.6)
+    await deps.storage.messages.append(threadId, {
+      role: 'tool',
+      agentId: frame.agentId,
+      content: [
+        {
+          type: 'tool-result',
+          toolCallId: frame.toolCallId,
+          toolName: 'spawnSubagent',
+          result: {
+            agentId: producer.agentId,
+            result: outcome.text.slice(0, deps.config.subagentResultCapChars),
+          },
+        },
+      ],
+    });
+    producer = frame.nested;
+  }
+  return true;
+}
+
+/** Resolve every parked request at segment start (§2.5, §2.7) and flip the
+ *  thread back to RUNNING. Returns false when at least one approval is still
+ *  open within its TTL: the dispatch is an at-least-once redelivery and the
+ *  thread stays parked. `rawTools` must be the UNWRAPPED main toolset. */
+async function resumePendingHitl(
+  deps: RuntimePorts,
+  threadId: string,
+  open: PendingHitl[],
+  rawTools: Record<string, any>,
+  subCtx: SubagentCtx | null,
+  signal: AbortSignal,
+): Promise<boolean> {
+  // Readiness first, side effects second: the thread resumes only when EVERY
+  // open approval has been answered or has expired (§2.7).
+  const states = await Promise.all(open.map((p) => verdictReady(deps, p)));
+  if (states.includes('open')) return false; // redelivery no-op (§2.8)
+
+  let expiredAny = false;
+  for (const pending of open) {
+    // A nested run's tools come from the delegation config, not the main
+    // agent's set — the approved tool has to be resolved where it lives.
+    const target =
+      pending.agentId === null
+        ? rawTools[pending.toolName]
+        : (subCtx?.sub.tools as Record<string, any> | undefined)?.[pending.toolName];
+
+    const result = await settleVerdict(deps, threadId, pending, target, signal);
+    if ((result as { reason?: string })?.reason === 'timeout') expiredAny = true;
+    if (!(await unwindVerdict(deps, threadId, pending, result, subCtx, signal))) return false;
+  }
+
   await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
   await deps.storage.threads.setState(threadId, 'RUNNING');
   await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
-  if (!raw) await publish(deps, threadId, 'INPUT_EXPIRED', { toolCallId: pending.toolCallId });
+  void expiredAny;
   return true;
 }
 
@@ -329,46 +288,63 @@ export async function execute(
       return 'executed';
     }
 
-    // Platform-owned toolset: HITL (§2.5) over the user's set; spawnSubagent
-    // added ONLY when the spec opts in (§2.7). rawTools keeps the real
-    // implementations — the resumed segment executes the approved tool.
-    const sub = agent.spec.subagents
-      ? agent.spec.subagents === true
-        ? {}
-        : agent.spec.subagents
-      : null;
-    const rawTools: Record<string, any> = {
-      ...(agent.args.tools ?? {}),
-      ...(sub
-        ? {
-            spawnSubagent: spawnSubagentTool({
-              threadId,
-              depth: 0,
-              sem: agent.sem,
-              ports: deps,
-              sub,
-            }),
-          }
-        : {}),
-    };
     const resume: ResumeInfo = {
       agent: agent.name,
       model: input.model,
       ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
       ...(providerOptions ? { providerOptions } : {}),
     };
-    const tools = withHitl(deps, threadId, rawTools, resume);
+
+    // One ledger for the whole run: a nested run's spend counts against the
+    // same safety cap the main agent is checked against (§2.7).
+    const ledger: RunLedger = { tokensUsed: 0 };
+
+    // Platform-owned toolset: HITL (§2.5) over the user's set; spawnSubagent
+    // added ONLY when the spec opts in (§2.7). rawTools keeps the real
+    // implementations — the resolved park executes the approved tool.
+    const sub = agent.spec.subagents
+      ? agent.spec.subagents === true
+        ? {}
+        : agent.spec.subagents
+      : null;
+    const subCtx: SubagentCtx | null = sub
+      ? {
+          threadId,
+          depth: 0,
+          sem: agent.sem,
+          ports: deps,
+          sub,
+          agent,
+          ledger,
+          resume,
+          agentId: null, // spawned by the main agent
+          frames: [],
+          tokenBudget,
+          providerOptions,
+          abortSignal: abort.signal,
+        }
+      : null;
+    const rawTools: Record<string, any> = {
+      ...(agent.args.tools ?? {}),
+      ...(subCtx ? { spawnSubagent: spawnSubagentTool(subCtx) } : {}),
+    };
+    // The main agent's own toolset: nothing is waiting on its parks (§2.7).
+    const tools = withHitl(deps, threadId, rawTools, { resume, agentId: null, frames: [] });
 
     // §2.5 resume: a WAITING thread at segment start is either the /respond
     // continuation or a redelivery of the original job while still parked.
     if (durable?.state === 'WAITING_FOR_INPUT') {
-      const pending = await loadPendingHitl(deps, threadId);
-      if (!pending) {
+      // Every approval still open, not just the latest: one parent step can
+      // park several nested runs at once (§2.7).
+      const open = await loadOpenHitls(deps, threadId);
+      if (open.length === 0) {
         // WAITING without a pending request cannot be continued — fail into
         // the §2.8 policy rather than corrupting the conversation.
         throw new Error(`Thread ${threadId} is WAITING_FOR_INPUT without a pending INPUT_REQUIRED`);
       }
-      const resumed = await resumePendingHitl(deps, threadId, pending, rawTools, abort.signal);
+      const resumed = await resumePendingHitl(
+        deps, threadId, open, rawTools, subCtx, abort.signal,
+      );
       if (!resumed) return 'executed'; // still parked — nothing to do yet
     }
 
@@ -385,82 +361,34 @@ export async function execute(
     }
 
     const userArgs = agent.args as Record<string, any>;
-    const attribution: TokenAttribution = {
-      inputTokens: 0,
-      cachedInputTokens: 0,
-      outputTokens: 0,
-      totalTokens: 0,
-    };
-    let tokensUsed = 0;
-    let lastText = '';
-    let lastFinishReason = '';
-    let parked = false;
-    let stepsLeft = deps.config.maxSteps;
 
-    while (stepsLeft > 0 && !abort.signal.aborted) {
-      stepsLeft--;
-      let step: StepResult;
-      try {
-        step = await executeStep(agent, {
-          kind: agent.kind,
-          model: model.instance(),
-          messages,
-          tools,
-          providerOptions,
-          abortSignal: abort.signal,
-          onChunk:
-            agent.kind === 'stream-text'
-              ? async (chunk) => {
-                  // One canonical path for every client: durable log + live Pub/Sub (§2.1, §2.2)
-                  await publish(deps, threadId, 'CHUNK', chunk);
-                  userArgs.onChunk?.({ chunk }); // user callback still fires
-                }
-              : undefined,
-        });
-      } catch (err) {
-        if (abort.signal.aborted) break; // user stop mid-step — finalize below
-        throw err; // real failure → §2.8 redrive policy
-      }
+    const loop = await runLoop(
+      deps,
+      agent,
+      threadId,
+      {
+        agentId: null, // the main agent's stream (§2.7)
+        kind: agent.kind,
+        model: model.instance(),
+        messages,
+        tools,
+        maxSteps: deps.config.maxSteps,
+        abortSignal: abort.signal,
+        providerOptions,
+        tokenBudget,
+        onChunk: async (chunk) => {
+          // One canonical path for every client: durable log + live Pub/Sub (§2.1, §2.2)
+          await publish(deps, threadId, 'CHUNK', chunk);
+          userArgs.onChunk?.({ chunk }); // user callback still fires
+        },
+      },
+      ledger,
+    );
 
-      // Per-step durability (§5.6): append this step's turns BEFORE the next
-      // step. A parked HITL tool result (the sentinel) is NOT a real result —
-      // it is skipped here; the resumed segment appends the user's verdict.
-      const persisted = step.responseMessages.filter((m) => {
-        if (m.role !== 'tool') return true;
-        const parts = Array.isArray(m.content) ? m.content : [];
-        return !parts.some((p: any) => isParked(p?.result));
-      });
-      for (const m of persisted) {
-        await deps.storage.messages.append(threadId, { role: m.role as any, content: m.content });
-      }
-      messages.push(...step.responseMessages);
-
-      // Token attribution (§4), accumulated across the segment's steps
-      const a = attributeTokens(step.usage as any);
-      attribution.inputTokens += a.inputTokens;
-      attribution.cachedInputTokens += a.cachedInputTokens;
-      attribution.outputTokens += a.outputTokens;
-      attribution.totalTokens += a.totalTokens;
-      tokensUsed += a.totalTokens;
-      lastText = step.text ?? '';
-      lastFinishReason = step.finishReason;
-
-      // §2.5 park: a requiresConfirmation tool returned the sentinel — the
-      // segment ends here on WAITING_FOR_INPUT (set by parkForApproval); the
-      // /respond continuation (or TTL expiry) runs a fresh segment.
-      if ((step.toolResults ?? []).some((r: any) => isParked(r?.result))) {
-        parked = true;
-        break;
-      }
-
-      // Budget check BETWEEN steps (§2.1) — the step that crossed the line
-      // is kept in full; the next one never starts.
-      if (tokenBudget && tokensUsed >= tokenBudget) break;
-
-      // 'tool-calls' → the SDK executed the step's tools; the loop feeds the
-      // results back. Anything else ('stop', 'length', …) ends the run.
-      if (step.finishReason !== 'tool-calls') break;
-    }
+    const { attribution, parked } = loop;
+    const tokensUsed = ledger.tokensUsed;
+    const lastText = loop.text;
+    const lastFinishReason = loop.finishReason;
 
     if (parked) {
       // The segment ends holding the park: bill the steps up to the park

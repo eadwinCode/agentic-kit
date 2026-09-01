@@ -94,7 +94,11 @@ const sendEmail = markRequiresConfirmation(
 export const chat = runtime.createStreamTextAgent({
   name: 'chat',
   model: 'gpt-4o',
-  subagents: true, // opt-in: platform injects the scoped spawnSubagent tool (§2.7)
+  // Opt-in delegation (§2.7): the platform injects the scoped spawnSubagent
+  // tool, and `tools` here are merged into every child and HITL-wrapped just
+  // like the parent's — so a subagent parks for approval too, and is resumed
+  // where it stopped rather than restarted.
+  subagents: { tools: { sendEmail } },
   tools: { sendEmail },
 });
 

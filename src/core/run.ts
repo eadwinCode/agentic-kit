@@ -44,7 +44,9 @@ export async function run(
   // strip a tool result off the assistant tool-call that produced it, and a
   // dangling call is a conversation no provider accepts.
   if (input.editMessageId) {
-    const history = await deps.storage.messages.list(threadId);
+    // Only the main agent's turns are editable — a nested run's stream is
+    // never addressed from the outside (§2.7)
+    const history = await deps.storage.messages.list(threadId, { agentId: null });
     const target = history.find((m) => m.id === input.editMessageId);
     if (!target) return { accepted: false, threadId, error: 'Message not found' };
     if (target.role !== 'user') {

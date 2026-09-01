@@ -44,16 +44,19 @@ export {
   respond,
   parkForApproval,
   loadPendingHitl,
+  loadOpenHitls,
+  withHitl,
   HITL_PARKED,
   HITL_TTL_MS,
   hitlKey,
+  type HitlFrame,
   type HitlResponse,
   type ParkInput,
   type PendingHitl,
 } from './core/hitl.js';
 export { reclaimIfOrphaned } from './core/reclaim.js';
 export { contextBudget, contextUsage, compactContext, CONTEXT_TOKEN_CEILING } from './core/context.js';
-export { Semaphore, spawnSubagentTool, type SubagentCtx } from './core/subagent.js';
+export { Semaphore, runNestedAgent, spawnSubagentTool, type SubagentCtx } from './core/subagent.js';
 export { run } from './core/run.js';
 export { stop } from './core/stop.js';
 
@@ -74,6 +77,7 @@ export {
   type RunJob,
   type ResumeInfo,
   type ContextUsage,
+  type NestedDescriptor,
   type ThreadDTO,
   type UsageTotals,
 } from './core/types.js';

@@ -178,31 +178,51 @@ describe('reclaimIfOrphaned (§2.5)', () => {
     expect(await runtime.hitl.reclaimIfOrphaned(thread.id)).toBe(false);
   });
 
-  it('claims a true orphan exactly once: appends timeout result, re-enqueues (§2.8)', async () => {
-    const { deps, runtime, queue, bus } = makeDeps({ hitlTtlMs: 5, reclaimGraceMs: 1 });
+  it('re-dispatches a true orphan instead of healing it inline (§2.7)', async () => {
+    const { deps, runtime, queue } = makeDeps({ hitlTtlMs: 5, reclaimGraceMs: 1 });
     const thread = await deps.storage.threads.create();
     const seq = await deps.kv.incr(`agent:seq:${thread.id}`);
     await deps.storage.threads.setState(thread.id, 'WAITING_FOR_INPUT');
     await deps.kv.set(`agent:state:${thread.id}`, 'WAITING_FOR_INPUT');
+    await deps.kv.set(`agent:run:${thread.id}`, 'run-1');
     await deps.storage.events.append(thread.id, {
       threadId: thread.id, seq, type: 'INPUT_REQUIRED', payload: { toolCallId: 'c1' },
       createdAt: new Date(Date.now() - 60_000), // far older than TTL + grace
     });
 
     expect(await runtime.hitl.reclaimIfOrphaned(thread.id)).toBe(true);
-    // Second caller loses the CAS race (§3.4)
-    expect(await runtime.hitl.reclaimIfOrphaned(thread.id)).toBe(false);
 
-    const threadAfter = await deps.storage.threads.get(thread.id);
-    expect(threadAfter!.state).toBe('RUNNING');
-    const messages = await deps.storage.messages.list(thread.id);
-    expect(messages).toHaveLength(1);
-    expect((messages[0]!.content as any)[0].result).toEqual({
-      responded: false, cancelled: true, reason: 'timeout',
-    });
-    expect(queue.items).toHaveLength(1); // re-entered via the queue
-    const last = bus.published.at(-1)!;
-    expect(last.type).toBe('STATE_CHANGE');
+    // It kicks the engine and touches nothing else: the engine owns the single
+    // definition of what an expired approval becomes, and resolves a thread's
+    // open approvals as a set rather than one at a time (§2.7).
+    expect(await deps.storage.messages.list(thread.id)).toHaveLength(0);
+    expect((await deps.storage.threads.get(thread.id))!.state).toBe('WAITING_FOR_INPUT');
+    expect(queue.items).toHaveLength(1);
+    // Resuming reuses the parked run's id (§2.1)
+    expect(queue.items[0]).toMatchObject({ threadId: thread.id, runId: 'run-1' });
+
+    // A duplicate re-dispatch is safe — the run lock and the engine's
+    // readiness check make it a no-op, so it is not suppressed here.
+    expect(await runtime.hitl.reclaimIfOrphaned(thread.id)).toBe(true);
+    expect(queue.items).toHaveLength(2);
+  });
+
+  it('waits while ANY open approval is still answerable (§2.7)', async () => {
+    const { deps, runtime, queue } = makeDeps({ hitlTtlMs: 5, reclaimGraceMs: 1 });
+    const thread = await deps.storage.threads.create();
+    await deps.storage.threads.setState(thread.id, 'WAITING_FOR_INPUT');
+    for (const [id, ageMs] of [['old', 60_000], ['fresh', 0]] as const) {
+      await deps.storage.events.append(thread.id, {
+        threadId: thread.id,
+        seq: await deps.kv.incr(`agent:seq:${thread.id}`),
+        type: 'INPUT_REQUIRED',
+        payload: { toolCallId: id },
+        createdAt: new Date(Date.now() - ageMs),
+      });
+    }
+
+    expect(await runtime.hitl.reclaimIfOrphaned(thread.id)).toBe(false);
+    expect(queue.items).toHaveLength(0);
   });
 });
 

@@ -142,6 +142,15 @@ export interface RunJob {
   providerOptions?: ProviderOptions;
 }
 
+/** Identifies a nested run well enough to re-enter its loop (§2.7). Persisted
+ *  in the INPUT_REQUIRED payload so a resume never has to read it back. */
+export interface NestedDescriptor {
+  agentId: string;
+  name: string;
+  model: string;
+  depth: number;
+}
+
 /** Everything needed to resume a parked HITL run segment (§2.5). Persisted
  *  inside the INPUT_REQUIRED event payload so any late reader — /respond or
  *  TTL reclamation — can rebuild the dispatch ticket without extra state. */
