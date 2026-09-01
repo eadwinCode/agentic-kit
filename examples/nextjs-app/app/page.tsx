@@ -40,6 +40,9 @@ export default function Page() {
   // The message being edited, and its working text. Editing is a resend: the
   // turn and everything after it is replaced (§5.1).
   const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
+  // Subagent cards a user has toggled by hand; anything absent falls back to
+  // the default for its state.
+  const [openAgents, setOpenAgents] = useState<Record<string, boolean>>({});
   // One button, two jobs: while a run is live it stops; otherwise it sends.
   const running = agentState === 'RUNNING' || agentState === 'WAITING_FOR_INPUT';
   const waiting = agentState === 'WAITING_FOR_INPUT';
@@ -202,24 +205,45 @@ export default function Page() {
         )}
 
         {/* A nested run's approval belongs to the agent that raised it, so it
-            renders inside that agent's card rather than floating free (§2.7). */}
-        {subagents.map((s) => (
-          <div key={s.agentId} className={`subagent ${s.status.toLowerCase()}`}>
-            <p className="subagent-head">
-              ▸ {s.name}
-              {s.depth > 1 && <span className="subagent-depth">depth {s.depth}</span>}
-              <span className={`dot ${s.status.toLowerCase()}`} /> {subagentLabel[s.status]}
-            </p>
-            {s.text && <pre>{s.text}</pre>}
-            {s.error && <p className="subagent-error">✕ {s.error}</p>}
-            {waiting &&
-              pendingInputs
-                .filter((req) => req.agentId === s.agentId)
-                .map((req) => (
+            renders inside that agent's card rather than floating free (§2.7).
+            A child that finished is dropped entirely: its result is already in
+            the transcript as the spawnSubagent result, so the card would only
+            repeat it. A failure stays — nothing else says why it died. */}
+        {subagents
+          .filter((s) => s.status !== 'COMPLETED')
+          .map((s) => {
+            // Working children stay folded; anything needing attention opens.
+            const open = openAgents[s.agentId] ?? s.status !== 'RUNNING';
+            const asks = waiting
+              ? pendingInputs.filter((req) => req.agentId === s.agentId)
+              : [];
+            return (
+              <div key={s.agentId} className={`subagent ${s.status.toLowerCase()}`}>
+                <button
+                  type="button"
+                  className="subagent-head"
+                  aria-expanded={open}
+                  onClick={() =>
+                    setOpenAgents((prev) => ({ ...prev, [s.agentId]: !open }))
+                  }
+                >
+                  <span className="subagent-caret" aria-hidden="true">
+                    {open ? '▾' : '▸'}
+                  </span>
+                  {s.name}
+                  {s.depth > 1 && <span className="subagent-depth">depth {s.depth}</span>}
+                  <span className={`dot ${s.status.toLowerCase()}`} />
+                  {subagentLabel[s.status]}
+                </button>
+                {open && s.text && <pre>{s.text}</pre>}
+                {open && s.error && <p className="subagent-error">✕ {s.error}</p>}
+                {/* Always shown: a decision you cannot see is one you cannot make. */}
+                {asks.map((req) => (
                   <Approval key={req.toolCallId} req={req} onRespond={respondToInput} />
                 ))}
-          </div>
-        ))}
+              </div>
+            );
+          })}
 
         {/* Approvals the MAIN agent raised have no subagent to sit under. */}
         {waiting &&

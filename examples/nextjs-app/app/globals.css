@@ -241,7 +241,25 @@ header h1 {
   padding: 10px 14px;
   background: var(--panel);
 }
-.subagent-head { margin: 0 0 6px; font-weight: 600; }
+/* The header is the fold control — reset the global button chrome */
+.subagent-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+.subagent-head:hover:not(:disabled) { border-color: transparent; }
+.subagent-caret { color: var(--muted); font-size: 10px; }
+.subagent pre + .hitl, .subagent-head + .hitl { margin-top: 10px; }
 .subagent pre {
   margin: 0;
   white-space: pre-wrap;
