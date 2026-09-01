@@ -515,6 +515,8 @@ export async function compactContext(deps: RuntimePorts, threadId: string, model
 
 The main agent can delegate self-contained sub-tasks to subagents. A subagent is a full agent run with its own isolated context, executed through the same detached pipeline as §2.1. The full reference implementation lives in `src/core/subagent.ts` (§5.5); this section walks through each concern.
 
+> **Status.** The delegation tool, context isolation, namespaced observability, billing attribution, the depth/concurrency limits and the stop cascade all ship today. **Nested runs do not.** The child's own platform loop, its persisted `agentId` message stream, and everything that follows from them — subagent HITL, the frame stack, the pending set, children counting against the run budget — are designed here and not yet built. Today `SubagentsConfig.tools` is never merged into a child's toolset, so a child has only `spawnSubagent`, holds no destructive tools, and therefore cannot park at all. Read this section as the target; read §5.5 for what runs now.
+
 #### Delegation Tool & Contract
 
 The parent model sees exactly one tool. Its `instructions` parameter is the entire contract: the subagent never sees the parent's history, so the brief must be self-contained (goal, relevant facts, expected output shape).
@@ -562,25 +564,35 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
 }
 ```
 
-#### Context Isolation
+#### A Subagent is a Nested Run
 
-The subagent's prompt is the brief — nothing else is forwarded, which is what bounds the parent's context growth (§2.6) and lets cheap models handle narrow tasks:
+A subagent is **not** an SDK `streamText({ maxSteps })` call hidden inside a tool. It is the same platform-owned loop the main agent runs (§2.1, §5.6), parameterised by three things: the `agentId` that scopes its message stream, its own step ceiling (`subagentMaxSteps`), and its own toolset.
+
+| | |
+| :--- | :--- |
+| **Shares with the parent** | thread, run lock, run id, abort signal, token ledger |
+| **Owns** | its message stream (`agentId`), its step ceiling, its toolset |
+
+The reason is durability, not tidiness. A park is a **durable suspension** (§2.5), and its correctness rests on the run resuming from persisted history. A child running the SDK's own loop has no persisted history — its context lives only in memory — so it can be interrupted but never resumed. Every awkwardness in delegated execution traces back to that one thing: a non-durable execution model nested inside a durable one.
+
+This is also where the field has converged. The OpenAI Agents SDK exposes nested agents through `agent.asTool()` over a serialized run state that spans the whole agent graph, with an approval surface that is explicitly **run-wide** rather than limited to the top-level agent; LangGraph checkpoints subgraphs and bubbles a subgraph interrupt up to the parent, whose snapshot points at the subgraph's own checkpoint namespace. Same idea twice: nesting is durable, and identity is stable across it.
+
+**Context isolation is unchanged.** The child's prompt is the brief — parent history is never forwarded, which is what bounds the parent's context growth (§2.6) and lets cheap models handle narrow tasks. What changes is that the child's own turns become durable rows, so it can be resumed rather than restarted.
+
+**Message scoping.** Child turns persist as `Message` rows carrying `agentId` (§2.4 — the column exists for exactly this). `Storage.messages.list` therefore takes a scope:
 
 ```typescript
-const result = streamText({
-  model: modelRegistry[model] || modelRegistry['gpt-4o'],
-  system: `You are the "${name}" subagent. Complete the task, then stop.`,
-  prompt: instructions, // ← the only input; parent history is never passed
-  abortSignal,          // cancellation propagates from the parent (below)
-  maxSteps: 10,
-  tools: {
-    // Nesting allowed up to MAX_SUBAGENT_DEPTH. The default toolset is
-    // restricted: destructive tools (sendEmail & co) are NOT included (§2.5).
-    spawnSubagent: spawnSubagentTool({ ...ctx, depth: depth + 1 }),
-  },
-  ...
-});
+list(threadId: string, opts?: { agentId?: string | null }): Promise<MessageDTO[]>;
+// agentId: null    → the main agent's stream (compaction §2.6, edit lookup §5.1)
+// agentId: 'sub_1' → that child's stream (its own loop)
+// omitted          → every row (UI hydration, §2.2)
+```
 
+That scope is load-bearing, not cosmetic. `compactContext` must see `agentId: null` only — unscoped, delegated turns leak straight into the parent's prompt and the isolation above is gone.
+
+**Tools.** `SubagentsConfig.tools` is merged into every child's toolset and HITL-wrapped identically to the parent's (§2.5). The default is still nothing but `spawnSubagent`: destructive tools reach a child only when a workflow explicitly grants them.
+
+```typescript
 // The parent receives a capped result, keeping its own context small (§2.6)
 return { agentId: run.id, result: result.slice(0, PARENT_RESULT_CAP) }; // 8k chars
 ```
@@ -632,23 +644,51 @@ export const MAX_CONCURRENT_SUBAGENTS = 3;  // per run, enforced by the Semaphor
 const PARENT_RESULT_CAP = 8_000;            // chars handed back to the parent (§2.6)
 ```
 
-The concurrency cap uses a run-scoped semaphore: a subagent task acquires a slot before doing work and releases it in a `finally`, so a fourth concurrent delegation waits instead of starting. There is **no wall-clock timeout** on subagents — they are bounded by `maxSteps` (10) at the AI level, by the HITL TTL while parked (§2.5), and by the user's stop button. That is deliberate: a subagent may sit in a HITL wait for as long as the TTL allows without an outer timer killing it mid-wait. A failed subagent (provider error, nested failure) is recorded `FAILED` in `SubagentRun` and the error propagates to the parent step (§5.5).
+The concurrency cap uses a run-scoped semaphore: a subagent task acquires a slot before doing work and releases it in a `finally`, so a fourth concurrent delegation waits instead of starting. There is **no wall-clock timeout** on subagents — they are bounded by `subagentMaxSteps` (10), enforced between steps by the child's own platform loop rather than handed to the SDK, by the HITL TTL while parked (§2.5), and by the user's stop button. That is deliberate: a subagent may sit in a HITL wait for as long as the TTL allows without an outer timer killing it mid-wait. A failed subagent (provider error, nested failure) is recorded `FAILED` in `SubagentRun` and the error propagates to the parent step (§5.5).
 
 #### HITL from a Subagent
 
-Subagents share the thread's HITL path (§2.5) — `parkForApproval` works identically, with `agentId` added to the `INPUT_REQUIRED` payload so clients know which agent is asking:
+A park inside a child suspends the **whole thread**, and that much needs no new machinery: the parent's step cannot complete without the child's result, so `WAITING_FOR_INPUT` is truthful for the entire thread, and the state key, event channel and handoff keys are all per-thread already. Siblings still finish — the engine ends a segment by inspecting a completed step's tool results (§5.6), so a park is simply one result among several.
+
+What a subagent park does add is that **the approval and the waiting call are different tool calls**. The human approves the child's `sendEmail`; the call left dangling in the parent's history is `spawnSubagent`. So `INPUT_REQUIRED` carries the chain of calls waiting on the answer:
 
 ```typescript
-await publishEvent(threadId, 'INPUT_REQUIRED', { toolCallId, toolName, agentId, arguments: args, resume });
+await publishEvent(threadId, 'INPUT_REQUIRED', {
+  toolCallId,   // the CHILD's call — what the human sees and approves
+  toolName,
+  agentId,      // which child asked
+  arguments: args,
+  frames: [     // calls waiting on it, innermost first
+    { agentId: 'sub_1', toolCallId: 'call_spawn_1' },  // the parent's spawnSubagent
+  ],
+  resume,
+});
 ```
 
-Because a subagent runs inside the parent's `spawnSubagent` tool call, a subagent park suspends the **whole run segment**: the parent's step cannot complete without the subagent's result, so `WAITING_FOR_INPUT` is truthful for the entire thread, and no extra machinery is needed — the state key, the event channel, and the handoff keys are all per-thread. Resolution is the identical §2.5 flow: respond → `agent:hitl:{toolCallId}` + resume job → the resumed segment resolves the pending request → the subagent executes or records the denial → finishes → its result returns to the parent as the `spawnSubagent` tool result.
+Resume unwinds that stack:
+
+1. consume the verdict → append the tool result to the **child's** stream under the child's `toolCallId`;
+2. re-enter the child's loop from its persisted messages;
+3. the child finishes → append the **parent's** tool result under `frames[0].toolCallId`, carrying the capped child result;
+4. continue the parent's loop.
+
+Nesting to `subagentMaxDepth` makes `frames` deeper and runs the unwind once per frame. A park by the main agent has empty `frames` and reduces to the §2.5 flow exactly — one code path, not two.
 
 With no subagent timeout, **the HITL TTL is the only bound on a parked request**: the thread waits for as long as the TTL allows (15 min default), and on expiry the model receives `{ responded: false, cancelled: true, reason: 'timeout' }` and decides what to do — there is no outer timer killing anything mid-wait, because no process is held waiting at all (§2.5). Stop and orphan reclamation are unchanged: both are thread-keyed and operate on the durable state regardless of which agent parked.
 
-One deliberate policy: **concurrent parks are answer-latest**. Up to 3 subagents may park at once, but respond answers only the *latest* pending `INPUT_REQUIRED` — earlier ones time out. One prompt at a time is the intended UX; answering any pending request would be a small change to the respond validation.
+#### Concurrent Parks: a Pending Set
 
-By default subagents carry no destructive tools at all; grant them (and thereby HITL prompts) only when a workflow genuinely needs an approved side effect.
+Up to `subagentMaxConcurrent` children can park inside one parent step, leaving several open requests and several dangling calls. The thread stays `WAITING_FOR_INPUT` until **every** open request is settled — answered or expired — and then a single resume unwinds all the frames. (LangGraph resolves the same situation by matching several interrupts within one node to resume values positionally; this is that, keyed by `toolCallId` instead of by order.)
+
+"Open" is **derived from durable state, never cached**: a request is settled if and only if a tool-result message carries its `toolCallId`, or an `INPUT_EXPIRED` event names it. Both are already written on the settling path, so nothing new has to be maintained. This is not a stylistic preference — `Kv` exposes only get/set/del/incr (§3.2), so a cached pending list would be a read-modify-write race between exactly the concurrent siblings it exists to serve.
+
+Each park schedules its own expiry (§2.5). They fire independently, each settling its own request, and the thread resumes when the last one settles.
+
+#### Budget
+
+Delegated work is the expensive kind — a multi-agent run costs roughly an order of magnitude more tokens than a single agent on the same problem, because that is the whole point of spreading it across independent context windows. A run budget that ignores children is therefore not a budget: a child's usage accumulates into the run's `tokensUsed` as well as being attributed per `agentId` (§4). The check stays between steps (§2.1) — the step that crossed the line is kept in full, and nothing is aborted mid-generation.
+
+Persisting a child rather than replaying it matters here too. A resumed child bills once; a replayed one re-pays for everything before the park, every attempt.
 
 #### Stop Cascade
 
