@@ -18,6 +18,7 @@ import {
 import { publish } from './publish.js';
 import { spawnSubagentTool } from './subagent.js';
 import { redriveKey, runIdKey } from './keys.js';
+import { drainOrThrow } from './stream.js';
 
 export { countTokens } from './usage.js';
 
@@ -139,20 +140,11 @@ export async function executeStep(
 
   if (call.kind === 'stream-text') {
     const result = streamText(shared as any);
-    // streamText is lazy: drain the full stream so onChunk fires per part.
-    //
-    // A provider failure — an aborted call included — arrives as an `error`
-    // part and the stream then ends NORMALLY, while result.text/usage/... never
-    // settle. Awaiting them without rethrowing here hangs the worker forever,
-    // holding the thread's run lock, so the error is carried out of the drain
-    // and thrown: the engine loop turns it into a stop or a redrive (§2.8).
-    let streamError: unknown;
-    for await (const part of result.fullStream) {
-      if ((part as any)?.type === 'error' && streamError === undefined) {
-        streamError = (part as any).error;
-      }
-    }
-    if (streamError !== undefined) throw streamError;
+    // streamText is lazy: drain the full stream so onChunk fires per part, and
+    // let a provider failure throw here rather than hanging on promises that
+    // never settle (see drainOrThrow). The loop turns it into a stop or a
+    // redrive (§2.8).
+    await drainOrThrow(result.fullStream);
 
     const [text, usage, finishReason, response, steps] = await Promise.all([
       result.text,
@@ -628,6 +620,10 @@ export async function executeWithPolicy(
     if (attempts < maxAttempts) {
       return deps.queue.enqueue({
         threadId: input.threadId,
+        // A retry is the SAME run trying again (§2.1). Dropping the id here
+        // left the retried job unable to notice it had been replaced, and
+        // unable to redrive if it found the lock held.
+        runId: input.runId,
         model: input.model,
         agent: agent.name,
         tokenBudget: input.tokenBudget,

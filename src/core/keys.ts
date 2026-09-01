@@ -17,6 +17,16 @@ export const runIdKey = (threadId: string) => `agent:run:${threadId}`;
  *  failed, it simply has not started yet. */
 export const redriveKey = (threadId: string) => `agent:redrive:${threadId}`;
 
+/** The run that owns the thread right now, or null on a thread that predates
+ *  run ids. Resuming a parked run (§2.5) REUSES this — a resume is the same
+ *  run continuing, not a new one, so it must never bump the id. */
+export async function currentRunId(
+  deps: RuntimePorts,
+  threadId: string,
+): Promise<string | undefined> {
+  return (await deps.kv.get(runIdKey(threadId))) ?? undefined;
+}
+
 /** Claim the thread for a brand new run and return its id (§2.1).
  *
  *  Always called BEFORE the state key is written: bumping this id is what

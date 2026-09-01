@@ -2,8 +2,8 @@ import type { RuntimePorts } from '../ports/runtime.js';
 import type { RespondInput, RespondResult } from '../ports/runtime.js';
 import type { AgentEvent, ResumeInfo } from './types.js';
 import { publish } from './publish.js';
-import { claimRun } from './keys.js';
-import { reclaimIfOrphaned } from './reclaim.js';
+import { currentRunId } from './keys.js';
+import { reclaimGraceAfterMs, reclaimIfOrphaned } from './reclaim.js';
 
 export const HITL_TTL_MS = 15 * 60_000;
 
@@ -33,8 +33,18 @@ export interface ParkInput {
 /** The §2.5 suspension as a durable state transition — NO process waits.
  *  Flips WAITING_FOR_INPUT on both homes and appends INPUT_REQUIRED to the
  *  replayable event log (with the resume ticket). The engine then ends the
- *  run segment; /api/agent/respond (or TTL expiry, §2.5) resumes it via the
- *  queue. */
+ *  run segment; /api/agent/respond (or the expiry job below) resumes it via
+ *  the queue.
+ *
+ *  The park also schedules its OWN expiry: one delayed dispatch of the same
+ *  run, timed for just after the TTL. Without it the deadline only exists
+ *  while somebody happens to be watching the thread — close the tab and the
+ *  approval never times out at all. The delayed job holds no process; the
+ *  queue holds it, exactly like the original dispatch (§2.8).
+ *
+ *  It carries the PARKED run's id, so the answer and the expiry are two
+ *  deliveries of one run: whichever resolves the park first wins, and the
+ *  run lock makes the other a no-op. */
 export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise<void> {
   await deps.kv.set(`agent:state:${i.threadId}`, 'WAITING_FOR_INPUT');
   await deps.storage.threads.setState(i.threadId, 'WAITING_FOR_INPUT');
@@ -47,6 +57,29 @@ export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise
     resume: i.resume,
   });
   await publish(deps, i.threadId, 'STATE_CHANGE', { state: 'WAITING_FOR_INPUT' });
+
+  // Best-effort, and deliberately last. The park is ALREADY durable by this
+  // point — state flipped on both homes, INPUT_REQUIRED on the event log — so
+  // a queue that cannot schedule must not be allowed to throw back through the
+  // tool call and fail the run. Reclamation (§2.5) covers the thread instead.
+  //
+  // Arriving early is equally harmless: an unexpired, unanswered request
+  // resolves to nothing and the job is a no-op (see resumePendingHitl).
+  try {
+    await deps.queue.enqueue(
+      {
+        threadId: i.threadId,
+        runId: await currentRunId(deps, i.threadId),
+        model: i.resume.model,
+        agent: i.resume.agent,
+        ...(i.resume.tokenBudget !== undefined ? { tokenBudget: i.resume.tokenBudget } : {}),
+        ...(i.resume.providerOptions ? { providerOptions: i.resume.providerOptions } : {}),
+      },
+      { delaySeconds: Math.ceil(reclaimGraceAfterMs(deps) / 1000) },
+    );
+  } catch {
+    // No expiry scheduled — the thread still heals on first touch (§2.5).
+  }
 }
 
 /** The pending request behind a WAITING_FOR_INPUT thread, hydrated from the
@@ -124,7 +157,10 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
   // original run, rebuilt from the ticket persisted in the event payload.
   // A legacy park without a ticket falls back to the default handle.
   const resume = (pending!.payload as any).resume as ResumeInfo | undefined;
-  const runId = await claimRun(deps, input.threadId);
+  // REUSE the parked run's id, never mint a new one: this dispatch and the
+  // park's expiry job are the same run, and the lock must be able to tell
+  // that. Bumping here would let both run and reply twice (§2.5).
+  const runId = await currentRunId(deps, input.threadId);
   await deps.queue.enqueue({
     threadId: input.threadId,
     runId,

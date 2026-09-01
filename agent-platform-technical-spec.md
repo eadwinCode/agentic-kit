@@ -91,7 +91,7 @@ To ensure all users watching a thread see the exact same output at the same time
 2. Client connections subscribe to the SSE endpoint (`/api/agent/stream?threadId=XYZ`). Each SSE message carries `id: seq`, and `EventSource` reconnects automatically.
 3. On (re)connect, the route first replays from PostgreSQL every event after the client's `Last-Event-ID` (or `?since=` cursor), then tails Redis Pub/Sub for live events. A reconnecting client resumes exactly where it left off, and a client that never comes back has zero effect on the run.
 
-While subscribed, the distributor also doubles as the HITL orphan watchdog: it listens for `HITL_ORPHANED` death notices and runs periodic reclamation checks (§2.5).
+While subscribed, the distributor also heals HITL orphans once on connect (§2.5) — a fallback beside the park's own scheduled expiry, not a poll.
 
 ### 2.3 Model Abstraction Layer
 
@@ -314,9 +314,13 @@ async function resumePendingHitl(deps: RuntimePorts, threadId: string, pending: 
 
 The TTL is enforced at **resolution time, not by a timer**: when a segment resumes a parked request, an unanswered request past `hitlTtlMs` becomes the timeout denial — `{ responded: false, cancelled: true, reason: 'timeout' }` — the user had no response, the action is cancelled, and the AI decides how to proceed. The answer handoff key carries a remaining-TTL expiry too, so a response can never outlive its request. No external timer, no cron.
 
-One enforcement gap remains: if nobody responds and nothing touches the thread, it rests in `WAITING_FOR_INPUT` indefinitely. There is no cron — reclamation is driven purely by **notifications and the listeners that already exist**:
+**The park schedules its own expiry.** `parkForApproval` enqueues one delayed dispatch of the same run, timed for `hitlTtlMs + reclaimGraceMs`. When it lands, the ordinary resume path runs: `resumePendingHitl` finds no answer past the TTL, writes the timeout denial, and the loop continues. This is still not a timer holding a run — nothing is pinned, no process waits, no cron sweeps. The queue holds the deadline exactly as it holds the original dispatch (§2.8), so the TTL means the same thing whether or not anyone is watching.
 
-1. **Self-healing listeners (the distributor doubles as watchdog):** every SSE connection in `/api/agent/stream` (§2.2) is already a subscriber of the thread channel. On connect (and on `HITL_ORPHANED` death notices, published best-effort by a torn-down worker), the distributor runs `reclaimIfOrphaned(threadId)` (below).
+The delayed job carries the **parked run's id**, never a fresh one. The answer dispatch from `/api/agent/respond` reuses that id too, so the two are deliveries of one run rather than rival runs: whichever reaches the run lock first resolves the park, and the other is a no-op (§2.1). Minting a new id on respond would let both run a segment, the second replying to a conversation that already ended.
+
+Two fallbacks remain, for what a delayed dispatch cannot cover — threads parked before the timer existed, and queue adapters that deliver without honoring a delay:
+
+1. **Heal on connect:** every SSE connection in `/api/agent/stream` (§2.2) runs `reclaimIfOrphaned(threadId)` once when it opens, which also makes an already-expired approval resolve live in front of the user. It no longer polls: the deadline is the queue's job, not the viewer's.
 2. **Lazy checks (floor guarantee):** `/api/agent/respond` and the run route's active-run guard call the same `reclaimIfOrphaned(threadId)` before acting, so a thread heals on first touch. A late response after reclamation gets `409` — an expired approval has already become a denial and the run continued.
 
 **Races are safe by construction:** the engine owns every state transition around the park; the respond route only delivers. Reclamation's conditional `UPDATE ... WHERE state = 'WAITING_FOR_INPUT'` claims each orphan exactly once, so a human response and any number of concurrent listeners can never double-append a tool result — the loser gets `409` or skips.
@@ -803,7 +807,7 @@ The engine's correctness depends on adapters honoring these contracts:
 
 1. **Sequence numbers:** `events.append` receives `seq` from `kv.incr(\`agent:seq:{threadId}\`)` — monotonic per thread. SSE resume (§2.2) depends on ordering, not gaplessness.
 2. **`claimState` must be atomic** (a single conditional `UPDATE` or equivalent). HITL reclamation and double-dispatch protection rely on exactly one caller winning.
-3. **`queue.enqueue` is at-least-once; the engine is idempotent.** The state guard + `claimState` make double dispatch a no-op — adapters must not drop jobs to "help".
+3. **`queue.enqueue` is at-least-once; the engine is idempotent.** The state guard + `claimState` make double dispatch a no-op — adapters must not drop jobs to "help". An adapter that cannot honor `delaySeconds` may deliver immediately (both callers treat an early arrival as a no-op) but must never throw for it: the HITL expiry is scheduled from inside a parked tool call, and a throw there would fail the run the park belongs to. The reference adapter shows the shape — QStash accepts delays on publish and rejects them on queue enqueue, so `QStashQueue` publishes delayed jobs and queues everything else.
 4. **`bus` is at-most-once.** The §2.5 death-notice/heartbeat/watchdog pattern exists because pub/sub drops; stronger buses may simplify the heartbeat, but reclamation stays.
 5. **Two state homes, one truth:** durable thread state lives in `storage.threads`; the kv copy (`agent:state:{threadId}`) is a hot cache the engine polls (`stopPollMs`, 500 ms by default). Behavior functions write both — including terminal transitions like `FAILED` — and the durable copy decides recovery.
 6. **No vendor on the core path:** `core/` imports nothing from `adapters/`; adapters never import each other's clients.

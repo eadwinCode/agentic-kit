@@ -3,9 +3,9 @@ import { runtime } from '@/lib/runtime';
 import type { AgentEvent } from '@agent/core';
 
 // SSE distributor (§2.2): replay after the client's cursor, then tail live.
-// The subscription doubles as the §2.5 HITL orphan watchdog — death notices
-// trigger reclamation instantly, and RedisBus HEARTBEAT notices (every 60s)
-// re-check orphans in case a death notice was published to zero subscribers.
+// A parked HITL request carries its own expiry on the queue (§2.5), so this
+// connection no longer has to poll for one — it just heals on connect, which
+// makes an already-expired approval resolve live in front of the user.
 export async function GET(req: NextRequest) {
   const threadId = req.nextUrl.searchParams.get('threadId')!;
   // EventSource sends Last-Event-ID automatically on auto-reconnect — honor it
@@ -40,15 +40,13 @@ export async function GET(req: NextRequest) {
       // Subscribe FIRST so events published between replay and tailing are
       // buffered instead of dropped (§2.2) …
       const unsubscribe = await runtime.events.subscribe(threadId, onEvent);
-      // §2.5 expiry is enforced at resolution time — no timer holds the run.
-      // While anyone watches, this connection doubles as the watchdog: heal
-      // on connect, then re-check periodically so an expired approval turns
-      // into the timeout denial (and the run continues) LIVE, in front of
-      // the user. Cheap no-op when there is nothing pending.
+      // §2.5 expiry rides the queue now — parkForApproval schedules it, so it
+      // fires with nobody watching. This one heal-on-connect stays as the
+      // fallback: it catches threads parked before the timer existed, and any
+      // queue adapter that ignores the delay. Cheap no-op when there is
+      // nothing pending, and it costs one call per connection rather than a
+      // poll per viewer.
       void runtime.hitl.reclaimIfOrphaned(threadId);
-      const watchdog = setInterval(() => {
-        void runtime.hitl.reclaimIfOrphaned(threadId).catch(() => {});
-      }, 30_000);
       try {
         // …then replay from the durable log, deduped against the buffer …
         for (const e of await runtime.events.since(threadId, since)) {
@@ -66,7 +64,6 @@ export async function GET(req: NextRequest) {
       req.signal.addEventListener('abort', () => {
         if (closed) return;
         closed = true;
-        clearInterval(watchdog);
         void (async () => {
           await unsubscribe();
           // The runtime may already have closed the controller when the

@@ -371,4 +371,93 @@ describe('HITL run-segment park (§2.5)', () => {
     expect(await r.kv.get(`agent:state:${threadId}`)).toBe('CANCELLED');
     expect(r.sent).toEqual([]);
   });
+
+  // The park used to have no deadline of its own: hitlTtlMs was only ever read
+  // when something else woke the thread, so an approval nobody watched never
+  // expired at all.
+  it('the park schedules its own expiry, timed just past the TTL', async () => {
+    const r = makeHitlRuntime({ hitlTtlMs: 30_000, reclaimGraceMs: 5_000 });
+    const ran = await r.chat.run({ prompt: 'hi' });
+    await r.runtime.worker.handleJob(r.queue.items[0]!);
+
+    expect(r.queue.items.at(-1)).toMatchObject({
+      threadId: ran.threadId,
+      runId: ran.runId,   // the PARKED run, not a new one
+      model: 'gpt-4o',
+      agent: 'chat',
+    });
+    expect(r.queue.delays.at(-1)).toBe(35); // (hitlTtlMs + reclaimGraceMs) / 1000
+  });
+
+  it('the scheduled expiry resolves an abandoned park with nobody watching', async () => {
+    const r = makeHitlRuntime({ hitlTtlMs: 30 });
+    const threadId = await park(r);
+    const timer = r.queue.items.at(-1)!;
+
+    // The TTL passes with no client connected and no reclaim call.
+    const req = r.storage.events.store
+      .get(threadId)!
+      .find((e) => e.type === 'INPUT_REQUIRED')!;
+    (req as any).createdAt = new Date(Date.now() - 60_000);
+
+    await r.runtime.worker.handleJob(timer);
+
+    expect(r.sent).toEqual([]); // never answered → never executed
+    expect((r.storage.messages.store.get(threadId)![2]!.content as any)[0].result).toEqual({
+      responded: false, cancelled: true, reason: 'timeout',
+    });
+    expect(lastTerminal(r.bus).payload).toMatchObject({ state: 'COMPLETED' });
+  });
+
+  it('an expiry job delivered early leaves the thread parked', async () => {
+    // A queue adapter that ignores the delay must not cut the approval short.
+    const r = makeHitlRuntime({ hitlTtlMs: 60_000 });
+    const threadId = await park(r);
+    const before = roles(r.storage, threadId);
+
+    await r.runtime.worker.handleJob(r.queue.items.at(-1)!);
+
+    expect(roles(r.storage, threadId)).toEqual(before);
+    expect(await r.kv.get(`agent:state:${threadId}`)).toBe('WAITING_FOR_INPUT');
+  });
+
+  // The invariant that keeps the answer and the expiry from becoming rival
+  // runs. Mint a fresh id on respond and they can both run a segment — the
+  // second one replying to a conversation that already ended.
+  it('respond reuses the parked run id: the answer and the expiry are ONE run', async () => {
+    const r = makeHitlRuntime({ hitlTtlMs: 30 });
+    const ran = await r.chat.run({ prompt: 'hi' });
+    await r.runtime.worker.handleJob(r.queue.items[0]!);
+    const timer = r.queue.items.at(-1)!;
+
+    await r.runtime.hitl.respond({ threadId: ran.threadId, toolCallId: 'call_1', approved: true });
+    const answer = r.queue.items.at(-1)!;
+
+    expect(answer.runId).toBe(ran.runId!);
+    expect(answer.runId).toBe(timer.runId!);
+
+    await r.runtime.worker.handleJob(answer);
+    const settled = roles(r.storage, ran.threadId);
+
+    // The expiry lands late on a finished run and changes nothing.
+    await r.runtime.worker.handleJob(timer);
+
+    expect(r.sent).toEqual([1]); // the tool ran once
+    expect(roles(r.storage, ran.threadId)).toEqual(settled); // no second reply
+    expect(await r.kv.get(`agent:state:${ran.threadId}`)).toBe('COMPLETED');
+  });
+
+  it('an expiry job that wins the race to an answered park honours the answer', async () => {
+    const r = makeHitlRuntime({ hitlTtlMs: 30 });
+    const threadId = await park(r);
+    const timer = r.queue.items.at(-1)!;
+
+    // The verdict is recorded, but the expiry job reaches the lock first.
+    await r.kv.set('agent:hitl:call_1', JSON.stringify({ approved: true }));
+    await r.runtime.worker.handleJob(timer);
+
+    expect(r.sent).toEqual([1]); // approved, not denied by timeout
+    // It still owned the run, so it wrote the state rather than going silent.
+    expect(await r.kv.get(`agent:state:${threadId}`)).toBe('COMPLETED');
+  });
 });

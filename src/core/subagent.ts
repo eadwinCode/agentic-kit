@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { SubagentsConfig } from './types.js';
 import type { RuntimePorts } from '../ports/runtime.js';
 import { publish } from './publish.js';
+import { drainOrThrow } from './stream.js';
 import { attributeTokens } from './usage.js';
 
 export interface SubagentCtx {
@@ -158,6 +159,10 @@ async function runStreamSubagent(
       });
     },
   });
+
+  // Without this the child hangs on a provider failure — and its parent's step
+  // hangs with it, holding the thread's run lock (see drainOrThrow).
+  await drainOrThrow(result.fullStream);
 
   return result.text;
 }

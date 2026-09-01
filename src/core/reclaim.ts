@@ -1,6 +1,6 @@
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { ResumeInfo } from './types.js';
-import { claimRun } from './keys.js';
+import { currentRunId } from './keys.js';
 import { publish } from './publish.js';
 
 // Small grace so an in-flight /respond delivery always lands first —
@@ -13,9 +13,14 @@ export function reclaimGraceAfterMs(deps: RuntimePorts): number {
 
 /** §2.5 orphan reclamation: heals a thread whose parked HITL request expired
  *  with no answer (the TTL turns it into the timeout denial and the run
- *  continues). Invoked by listeners — SSE distributor (death notices +
- *  heartbeat) and first-touch checks in run/stop/respond — never by a
- *  scheduler.
+ *  continues).
+ *
+ *  This is now the FALLBACK, not the mechanism: parkForApproval schedules the
+ *  expiry as a delayed dispatch, so the deadline exists whether or not anyone
+ *  is watching. Reclamation still covers what a timer cannot — threads parked
+ *  before the timer existed, and queue adapters that deliver without honoring
+ *  a delay. Callers are first-touch checks in run() and respond(), plus any
+ *  listener that wants the denial to land live in front of a user.
  *  Returns true iff THIS caller performed the reclamation. */
 export async function reclaimIfOrphaned(deps: RuntimePorts, threadId: string): Promise<boolean> {
   const stale = await deps.storage.events.latest(threadId, 'INPUT_REQUIRED');
@@ -59,7 +64,9 @@ export async function reclaimIfOrphaned(deps: RuntimePorts, threadId: string): P
   // Re-enter via the queue (§2.8) — the ticket persisted in the event payload
   // rebuilds the original dispatch; a legacy park falls back to the default.
   if (thread) {
-    const runId = await claimRun(deps, threadId);
+    // Same rule as respond(): resuming the parked run reuses its id so the
+    // park's own expiry job stays a duplicate of this one, not a rival run.
+    const runId = await currentRunId(deps, threadId);
     await deps.queue.enqueue({
       threadId,
       runId,
