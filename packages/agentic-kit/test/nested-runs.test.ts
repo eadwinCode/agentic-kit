@@ -261,6 +261,60 @@ async function plainDelegatingRuntime(config: Partial<AgentConfig> = {}) {
 const terminal = (bus: MemoryBus) =>
   bus.published.filter((e) => e.type === 'STATE_CHANGE').at(-1)!.payload as any;
 
+const cacheControlOf = (entry: any) =>
+  entry?.providerMetadata?.anthropic?.cacheControl ??
+  (Array.isArray(entry?.content)
+    ? entry.content.at(-1)?.providerMetadata?.anthropic?.cacheControl
+    : undefined) ??
+  null;
+
+describe('a nested run caches its prompt too (§2.6)', () => {
+  // A child re-sends its whole brief and history on every step, so it is
+  // exactly the shape caching is for — and it was the one prompt in the system
+  // going out with no breakpoints at all.
+  it('stamps the child persona and the tail of its history', async () => {
+    const seen: any[] = [];
+    const state = { childCalls: 0 };
+    const model = new MockLanguageModelV1({
+      provider: 'mock',
+      modelId: 'mock-cache-child',
+      doStream: async ({ prompt }: any) => {
+        if (isChild(prompt)) {
+          seen.push(prompt);
+          state.childCalls += 1;
+          return stream([say('did it'), finish('stop')]);
+        }
+        return toolResults(prompt).some((r: any) => r.toolName === 'spawnSubagent')
+          ? stream([say('all set'), finish('stop')])
+          : stream([
+              call('parent_call_1', 'spawnSubagent', { name: 'helper', instructions: 'do it' }),
+              finish('tool-calls'),
+            ]);
+      },
+    });
+    const r = await makeRuntime(model);
+    const chat = r.runtime.createStreamTextAgent({
+      name: 'chat',
+      model: 'gpt-4o',
+      subagents: true,
+    });
+
+    const ran = await chat.run({ prompt: 'delegate it' });
+    await r.runtime.worker.handleJob(r.queue.items[0]!);
+
+    expect(state.childCalls).toBeGreaterThan(0);
+    const childPrompt = seen[0]!;
+
+    const system = childPrompt.find((m: any) => m.role === 'system');
+    expect(system.content).toContain('subagent');
+    expect(cacheControlOf(system)).toEqual({ type: 'ephemeral' });
+
+    // ... and the tail of its own history, so the next step reads the prefix
+    expect(cacheControlOf(childPrompt.at(-1))).toEqual({ type: 'ephemeral' });
+    expect(ran.accepted).toBe(true);
+  });
+});
+
 describe('the run-wide token ledger (§2.7)', () => {
   it("counts a child's spend into the run's total, and still attributes it", async () => {
     const r = await plainDelegatingRuntime();

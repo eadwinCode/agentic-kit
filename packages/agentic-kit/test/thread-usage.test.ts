@@ -66,6 +66,80 @@ function cachingModel() {
   });
 }
 
+/** Captures the prompt as the PROVIDER receives it — after the SDK has
+ *  converted messages and the `system:` parameter. Asserting on what we passed
+ *  in proves nothing; only this shows whether a breakpoint survived. */
+function capturingModel(seen: { prompt?: any }) {
+  return new MockLanguageModelV1({
+    provider: 'mock',
+    modelId: 'mock-capture',
+    doStream: async ({ prompt }: any) => {
+      seen.prompt = prompt;
+      return {
+        stream: simulateReadableStream({
+          chunks: [
+            { type: 'text-delta', textDelta: 'ok' },
+            { type: 'finish', finishReason: 'stop', usage: { promptTokens: 5, completionTokens: 1 } },
+          ] as LanguageModelV1StreamPart[],
+        }),
+        rawCall: { rawPrompt: null, rawSettings: {} },
+      };
+    },
+  });
+}
+
+const cacheControlOf = (entry: any) =>
+  entry?.providerMetadata?.anthropic?.cacheControl ??
+  (Array.isArray(entry?.content)
+    ? entry.content.at(-1)?.providerMetadata?.anthropic?.cacheControl
+    : undefined) ??
+  null;
+
+describe('prompt caching reaches the provider (§2.6)', () => {
+  // The SDK's `system:` string parameter is converted to a bare
+  // { role, content } with no metadata channel, so a system prompt passed that
+  // way CANNOT hold a breakpoint — and it is the largest, most stable part of
+  // the prompt, the thing caching exists for.
+  it('carries the agent system prompt as a stamped message', async () => {
+    const seen: { prompt?: any } = {};
+    const { runtime, store } = await makeRuntime(capturingModel(seen));
+    const agent = runtime.createStreamTextAgent({
+      name: 'sys',
+      model: 'mock',
+      system: 'You are a big expensive persona worth caching.',
+    } as any);
+
+    const threadId = (await store.threads.create({ model: 'mock' })).id;
+    const started = await agent.run({ threadId, prompt: 'hi' });
+    await runtime.worker.handleJob({ threadId, runId: started.runId, model: 'mock', agent: 'sys' });
+
+    const system = seen.prompt.find((m: any) => m.role === 'system');
+    expect(system).toBeDefined();
+    expect(system.content).toContain('big expensive persona');
+    expect(cacheControlOf(system)).toEqual({ type: 'ephemeral' });
+    // ... and it is not ALSO sent as the plain parameter, which would repeat it
+    expect(seen.prompt.filter((m: any) => m.role === 'system')).toHaveLength(1);
+  });
+
+  it('leaves the system prompt as a plain parameter when caching is off', async () => {
+    const seen: { prompt?: any } = {};
+    const { runtime, store } = await makeRuntime(capturingModel(seen), { promptCaching: false });
+    const agent = runtime.createStreamTextAgent({
+      name: 'sys2',
+      model: 'mock',
+      system: 'plain persona',
+    } as any);
+
+    const threadId = (await store.threads.create({ model: 'mock' })).id;
+    const started = await agent.run({ threadId, prompt: 'hi' });
+    await runtime.worker.handleJob({ threadId, runId: started.runId, model: 'mock', agent: 'sys2' });
+
+    const system = seen.prompt.find((m: any) => m.role === 'system');
+    expect(system.content).toBe('plain persona');
+    expect(cacheControlOf(system)).toBeNull();
+  });
+});
+
 describe('cached prompt tokens (§4)', () => {
   // The cache hit exists only in provider metadata. If a step drops it on the
   // way out of the model, every cached prompt is billed at full input price and

@@ -447,6 +447,7 @@ export async function execute(
         abortSignal: abort.signal,
         providerOptions,
         tokenBudget,
+        cacheSystemPrompt: deps.config.promptCaching,
         onChunk: async (chunk) => {
           // One canonical path for every client: durable log + live Pub/Sub (§2.1, §2.2)
           await publish(deps, threadId, 'CHUNK', chunk);

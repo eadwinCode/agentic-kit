@@ -372,6 +372,10 @@ export async function execute(
 
 The stamp goes where the SDK reads it: `providerOptions` (with `experimental_providerMetadata` alongside for older builds). A bare `providerMetadata` is read by nothing and leaves the breakpoint inert. A **system** message carries the stamp on the message itself and keeps its content a string — splitting it into parts, as a user message allows, fails prompt validation and throws on every run.
 
+The agent's own `system` prompt is carried **as a stamped message, not as the SDK's `system:` string**. That string is converted to a bare `{ role, content }` with no metadata channel, so a system prompt passed that way can never hold a breakpoint — and it is the largest, most stable part of a tool-heavy prompt, the thing caching is for. With `config.promptCaching` off it stays a plain parameter.
+
+**Nested runs are stamped the same way** (§2.7). A child re-sends its whole brief and history on every step, which is the shape caching most rewards.
+
 Cache hits are reported **only in the step's provider metadata**, never in `usage`, so a step must carry `providerMetadata` out of the model or the counter can never leave zero. `attributeTokens` reads `openai.cachedPromptTokens` and `anthropic.cacheReadInputTokens` from it.
 
 ```typescript

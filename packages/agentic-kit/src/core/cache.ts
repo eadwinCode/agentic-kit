@@ -66,6 +66,24 @@ function stampCacheBreakpoint<T extends CacheableMessage>(message: T, provider: 
   return { ...message, content: stamped };
 }
 
+/** A system prompt, in the one shape that can carry a cache breakpoint.
+ *
+ *  The SDK's `system:` STRING parameter becomes `{ role, content }` with no
+ *  metadata channel at all, so a system prompt passed that way can never be
+ *  cached — and it is usually the largest, most stable part of the prompt, the
+ *  very thing caching exists for. Carried as a message it can be stamped. */
+export function systemCacheMessage(
+  system: string,
+  provider = 'anthropic',
+): { role: 'system'; content: string } & Record<string, unknown> {
+  return {
+    role: 'system',
+    content: system,
+    providerOptions: cacheStamp(provider),
+    experimental_providerMetadata: cacheStamp(provider),
+  };
+}
+
 /** Mark the stable prefix of a prompt for provider-side caching:
  *  the system message (if any) plus the last message of the history. */
 export function markPromptCaching<T extends CacheableMessage>(

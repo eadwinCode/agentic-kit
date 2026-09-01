@@ -13,6 +13,7 @@ import type { RegisteredAgent } from './agent.js';
 import { publish } from './publish.js';
 import { HITL_PARKED, withHitl, type HitlFrame } from './hitl.js';
 import { withRunState, type AgentRunState } from './state.js';
+import { markPromptCaching } from './cache.js';
 import { runLoop, type LoopOutcome, type RunLedger } from './loop.js';
 
 /** Everything a nested run needs from the run that spawned it (§2.7). The
@@ -201,6 +202,12 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
 
 /** Close a nested run's record with the same detail a dispatched run gets
  *  (§2.9): how it ended, how long it took, what it cost. */
+/** Stamp a nested run's prompt when caching is on, exactly as the main path
+ *  does. */
+function maybeCache(ports: RuntimePorts, messages: any[]): any[] {
+  return ports.config.promptCaching ? markPromptCaching(messages) : messages;
+}
+
 async function closeNested(
   ctx: SubagentCtx,
   run: RunRecord,
@@ -315,13 +322,20 @@ export async function runNestedAgent(
       runId: d.agentId,
       kind: ctx.sub.kind ?? 'stream-text',
       model: resolveNestedModel(ctx, d.model).instance(),
-      messages: persisted.map((m) => ({ role: m.role, content: m.content }) as any),
+      // Stamped like the parent's (§2.6). A nested run re-sends its whole
+      // brief and history on every step, so it is exactly the shape caching
+      // is for — it was the one prompt in the system going out unstamped.
+      messages: maybeCache(
+        ports,
+        persisted.map((m) => ({ role: m.role, content: m.content }) as any),
+      ),
       tools: nestedTools(ctx, d, frames, abortSignal),
       maxSteps: ports.config.subagentMaxSteps,
       abortSignal: abortSignal ?? new AbortController().signal,
       providerOptions: ctx.providerOptions,
       tokenBudget: ctx.tokenBudget,
       system: `You are the "${d.name}" subagent. Complete the task, then stop.`,
+      cacheSystemPrompt: ports.config.promptCaching,
       onChunk: async (chunk) => {
         // Namespaced into the shared thread event log → same multi-user pipeline (§2.2)
         await publish(ports, threadId, 'SUBAGENT_CHUNK', { agentId: d.agentId, chunk });

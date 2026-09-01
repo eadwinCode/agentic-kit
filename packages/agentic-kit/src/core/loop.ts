@@ -3,6 +3,7 @@ import type { LanguageModel } from 'ai';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { AgentKind, ProviderOptions } from './types.js';
 import type { RegisteredAgent } from './agent.js';
+import { systemCacheMessage } from './cache.js';
 import { attributeTokens, type TokenAttribution } from './usage.js';
 import { drainOrThrow } from './stream.js';
 import { publishNotice } from './publish.js';
@@ -47,6 +48,10 @@ export async function executeStep(
     /** Overrides the user's spec args — a nested run brings its own persona
      *  and must not inherit the parent's (§2.7). */
     system?: string;
+    /** Move the system prompt into `messages` as a stamped message so it can
+     *  carry a cache breakpoint (§2.6). As the SDK's `system:` string it
+     *  reaches the provider with no metadata channel and never caches. */
+    cacheSystemPrompt?: boolean;
   },
 ): Promise<StepResult> {
   // Ownership rule (§3.1): user args spread FIRST, platform keys LAST. The
@@ -56,17 +61,25 @@ export async function executeStep(
     onChunk: _userOnChunk,
     onFinish: _userOnFinish,
     onStepFinish: userOnStepFinish,
+    system: specSystem,
     ...userArgs
   } = agent.args as Record<string, any>;
+
+  // A nested run brings its own persona and must not inherit the parent's.
+  const system = call.system ?? specSystem;
+  const hoistSystem =
+    call.cacheSystemPrompt === true && typeof system === 'string' && system.length > 0;
 
   const shared = {
     ...userArgs,
     model: call.model,
-    messages: call.messages,
+    // Hoisted, the system prompt leads the messages and carries the
+    // breakpoint; a fresh array each step leaves the loop's own array alone.
+    messages: hoistSystem ? [systemCacheMessage(system), ...call.messages] : call.messages,
     tools: call.tools,
     abortSignal: call.abortSignal,
     maxSteps: 1, // the loop owns continuation
-    ...(call.system !== undefined ? { system: call.system } : {}),
+    ...(hoistSystem || system === undefined ? {} : { system }),
     // Provider-specific options (§3.1): forwarded under both the v5-native
     // key and the v4 alias.
     ...(call.providerOptions
@@ -162,6 +175,9 @@ export interface LoopInput {
   onChunk?: (chunk: unknown) => Promise<void>;
   /** Persona for a nested run; omitted, the agent's own spec `system` stands. */
   system?: string;
+  /** Carry the system prompt as a stamped message rather than the SDK's
+   *  `system:` string, so it can hold a cache breakpoint (§2.6). */
+  cacheSystemPrompt?: boolean;
 }
 
 export interface LoopOutcome {
@@ -224,6 +240,7 @@ export async function runLoop(
         abortSignal: input.abortSignal,
         onChunk: input.kind === 'stream-text' ? input.onChunk : undefined,
         system: input.system,
+        cacheSystemPrompt: input.cacheSystemPrompt,
       });
     } catch (err) {
       if (input.abortSignal.aborted) break; // user stop mid-step
