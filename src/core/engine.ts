@@ -15,6 +15,15 @@ export { countTokens } from './usage.js';
 
 const runLockKey = (threadId: string) => `agent:lock:${threadId}`;
 
+/** The safety cap (§2.1) must be either absent (unbounded apart from
+ *  maxSteps) or a positive number — `0`/negative/NaN would silently disable
+ *  the cap and let a run spend without bound. */
+export function validateTokenBudget(value: number | undefined, label: string): void {
+  if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+    throw new Error(`${label} must be a positive finite number`);
+  }
+}
+
 /** Tools the engine treats as destructive: parked behind suspendForApproval
  *  (§2.5) instead of executing directly. Purely a marker — see withHitl. */
 export function markRequiresConfirmation<T extends object>(t: T): T {
@@ -65,6 +74,8 @@ export async function execute(
 ): Promise<'executed' | 'lock-conflict'> {
   const { threadId } = input;
   const abort = new AbortController();
+
+  validateTokenBudget(input.tokenBudget, 'tokenBudget');
 
   const locked = await deps.kv.set(runLockKey(threadId), randomUUID(), {
     onlyIfNotExists: true,
