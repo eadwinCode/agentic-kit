@@ -4,58 +4,58 @@
   "description": "Durable runtime for AI agent runs \u2014 a platform-owned loop, queue-dispatched execution that outlives the request, HITL suspension, nested runs, and context compaction. Bring your own storage, queue, bus and kv via four ports.",
   "license": "MIT",
   "type": "module",
-  "main": "./dist/src/index.js",
-  "types": "./dist/src/index.d.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/src/index.d.ts",
-      "import": "./dist/src/index.js",
-      "default": "./dist/src/index.js"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     },
     "./adapters/prisma": {
-      "types": "./dist/src/adapters/prisma.d.ts",
-      "import": "./dist/src/adapters/prisma.js",
-      "default": "./dist/src/adapters/prisma.js"
+      "types": "./dist/adapters/prisma.d.ts",
+      "import": "./dist/adapters/prisma.js",
+      "default": "./dist/adapters/prisma.js"
     },
     "./adapters/redis": {
-      "types": "./dist/src/adapters/redis.d.ts",
-      "import": "./dist/src/adapters/redis.js",
-      "default": "./dist/src/adapters/redis.js"
+      "types": "./dist/adapters/redis.d.ts",
+      "import": "./dist/adapters/redis.js",
+      "default": "./dist/adapters/redis.js"
     },
     "./adapters/qstash": {
-      "types": "./dist/src/adapters/qstash.d.ts",
-      "import": "./dist/src/adapters/qstash.js",
-      "default": "./dist/src/adapters/qstash.js"
+      "types": "./dist/adapters/qstash.d.ts",
+      "import": "./dist/adapters/qstash.js",
+      "default": "./dist/adapters/qstash.js"
     },
     "./adapters/upstash": {
-      "types": "./dist/src/adapters/upstash.d.ts",
-      "import": "./dist/src/adapters/upstash.js",
-      "default": "./dist/src/adapters/upstash.js"
+      "types": "./dist/adapters/upstash.d.ts",
+      "import": "./dist/adapters/upstash.js",
+      "default": "./dist/adapters/upstash.js"
     },
     "./adapters/memory": {
-      "types": "./dist/src/adapters/memory.d.ts",
-      "import": "./dist/src/adapters/memory.js",
-      "default": "./dist/src/adapters/memory.js"
+      "types": "./dist/adapters/memory.d.ts",
+      "import": "./dist/adapters/memory.js",
+      "default": "./dist/adapters/memory.js"
     },
     "./adapters/*": {
-      "types": "./dist/src/adapters/*.d.ts",
-      "import": "./dist/src/adapters/*.js",
-      "default": "./dist/src/adapters/*.js"
+      "types": "./dist/adapters/*.d.ts",
+      "import": "./dist/adapters/*.js",
+      "default": "./dist/adapters/*.js"
     },
     "./admin/sqlite": {
-      "types": "./dist/src/admin/sqlite.d.ts",
-      "import": "./dist/src/admin/sqlite.js",
-      "default": "./dist/src/admin/sqlite.js"
+      "types": "./dist/admin/sqlite.d.ts",
+      "import": "./dist/admin/sqlite.js",
+      "default": "./dist/admin/sqlite.js"
     },
     "./admin/postgres": {
-      "types": "./dist/src/admin/postgres.d.ts",
-      "import": "./dist/src/admin/postgres.js",
-      "default": "./dist/src/admin/postgres.js"
+      "types": "./dist/admin/postgres.d.ts",
+      "import": "./dist/admin/postgres.js",
+      "default": "./dist/admin/postgres.js"
     },
     "./admin/memory": {
-      "types": "./dist/src/admin/memory.d.ts",
-      "import": "./dist/src/admin/memory.js",
-      "default": "./dist/src/admin/memory.js"
+      "types": "./dist/admin/memory.d.ts",
+      "import": "./dist/admin/memory.js",
+      "default": "./dist/admin/memory.js"
     }
   },
   "files": [
