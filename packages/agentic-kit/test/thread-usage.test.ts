@@ -42,6 +42,61 @@ async function makeRuntime(model: any, config: Partial<AgentConfig> = {}) {
   return { deps, store: bindStorage(storage, { state: {} }), runtime: await setupAgentCore(deps), storage, queue };
 }
 
+/** A model that reports an OpenAI-style cache hit. Note promptTokens INCLUDES
+ *  the cached ones — that is what makes double-counting easy. */
+function cachingModel() {
+  return new MockLanguageModelV1({
+    provider: 'mock',
+    modelId: 'mock-cache',
+    doStream: async () => {
+      const chunks: LanguageModelV1StreamPart[] = [
+        { type: 'text-delta', textDelta: 'cached hello' },
+        {
+          type: 'finish',
+          finishReason: 'stop',
+          usage: { promptTokens: 1200, completionTokens: 40 },
+          providerMetadata: { openai: { cachedPromptTokens: 1024 } },
+        },
+      ];
+      return {
+        stream: simulateReadableStream({ chunks }),
+        rawCall: { rawPrompt: null, rawSettings: {} },
+      };
+    },
+  });
+}
+
+describe('cached prompt tokens (§4)', () => {
+  // The cache hit exists only in provider metadata. If a step drops it on the
+  // way out of the model, every cached prompt is billed at full input price and
+  // no counter anywhere in the system can ever be non-zero.
+  it('carries a cache hit from the model into the step record and thread total', async () => {
+    const { deps, runtime, storage, store } = await makeRuntime(cachingModel());
+    const agent = runtime.createStreamTextAgent({ name: 'cacher', model: 'mock' });
+    const threadId = (await store.threads.create({ model: 'mock' })).id;
+
+    const started = await agent.run({ threadId, prompt: 'hi' });
+    expect(started.accepted).toBe(true);
+    await runtime.worker.handleJob({
+      threadId,
+      runId: started.runId,
+      model: 'mock',
+      agent: 'cacher',
+    });
+
+    const total = await storage.usage.total(threadId);
+    expect(total.cachedInputTokens).toBe(1024);
+    // 1200 reported minus the 1024 already cached — NOT 1200 + 1024.
+    expect(total.inputTokens).toBe(176);
+    expect(total.outputTokens).toBe(40);
+
+    const steps = await deps.admin!.steps.listByThread(threadId);
+    expect(steps.length).toBeGreaterThan(0);
+    expect(steps[0].cachedInputTokens).toBe(1024);
+    expect(steps[0].inputTokens).toBe(176);
+  });
+});
+
 describe('thread usage (§4)', () => {
   it('sums every run segment, per thread', async () => {
     const storage = new MemoryStorage();

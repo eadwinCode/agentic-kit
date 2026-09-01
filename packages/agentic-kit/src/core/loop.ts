@@ -28,6 +28,10 @@ export interface StepResult {
   responseMessages: Array<{ role: string; content: unknown }>;
   /** The step's executed tool calls and their results. */
   toolResults: Array<{ toolCallId: string; toolName: string; result: unknown }>;
+  /** Provider metadata for this step — the only place a cache hit is reported
+   *  (§2.6). Without carrying it, cachedInputTokens can never be anything but
+   *  zero. */
+  providerMetadata?: Record<string, Record<string, unknown> | undefined>;
 }
 
 export async function executeStep(
@@ -86,12 +90,14 @@ export async function executeStep(
     // never settle (see drainOrThrow).
     await drainOrThrow(result.fullStream);
 
-    const [text, usage, finishReason, response, steps] = await Promise.all([
+    const [text, usage, finishReason, response, steps, meta] = await Promise.all([
       result.text,
       result.usage,
       result.finishReason,
       result.response,
       result.steps,
+      // v4 exposes it under the experimental name; v5 drops the prefix.
+      (result as any).providerMetadata ?? (result as any).experimental_providerMetadata,
     ]);
     return {
       text,
@@ -99,6 +105,7 @@ export async function executeStep(
       usage: usage as any,
       responseMessages: (response?.messages ?? []) as any,
       toolResults: (steps?.at(-1)?.toolResults ?? []) as any,
+      providerMetadata: meta as any,
     };
   }
 
@@ -109,6 +116,9 @@ export async function executeStep(
     usage: result.usage as any,
     responseMessages: (result.response?.messages ?? []) as any,
     toolResults: (result.steps?.at(-1)?.toolResults ?? []) as any,
+    providerMetadata:
+      ((result as any).providerMetadata ??
+        (result as any).experimental_providerMetadata) as any,
   };
 }
 
@@ -239,7 +249,7 @@ export async function runLoop(
 
     // Token attribution (§4), accumulated across the segment's steps — and
     // into the run-wide ledger the safety cap is checked against (§2.7).
-    const a = attributeTokens(step.usage as any);
+    const a = attributeTokens(step.usage as any, step.providerMetadata);
     attribution.inputTokens += a.inputTokens;
     attribution.cachedInputTokens += a.cachedInputTokens;
     attribution.outputTokens += a.outputTokens;

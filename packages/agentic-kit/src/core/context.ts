@@ -80,7 +80,7 @@ export async function compactContext(
   if (older.length === 0) return history; // single oversized turn — blocked by the input guards above
 
   // ... and summarize everything before it with a cheap model
-  const { text, usage } = await generateText({
+  const { text, usage, ...rest } = await generateText({
     model: deps.resolveModel('gpt-4o-mini').instance(),
     prompt:
       'Summarize the following conversation history into a dense context brief ' +
@@ -93,10 +93,15 @@ export async function compactContext(
     content: { type: 'CONTEXT_SUMMARY', text },
   });
 
-  // Token attribution (§4): input + cached + output
+  // Token attribution (§4): input + cached + output. The cache hit is reported
+  // in provider metadata, never in `usage` — attributing without it books every
+  // cached prompt at the full input price.
   await deps.storage.usage.record(threadId, {
     agentId: null,
-    ...attributeTokens(usage),
+    ...attributeTokens(
+      usage,
+      (rest as any).providerMetadata ?? (rest as any).experimental_providerMetadata,
+    ),
   });
   await publish(deps, threadId, 'CONTEXT_COMPACTED', { summarizedMessages: older.length });
 

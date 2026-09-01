@@ -368,7 +368,11 @@ export async function execute(
 2. **NaN-guard the usage counters.** Some OpenAI-compatible providers omit streaming usage; the AI SDK represents those as `NaN`. Clamp to `0` — optional metering must never keep a successfully completed run stuck in `RUNNING`.
 3. **Stop classification.** A budget break is NOT a user stop — the run still completes with `stopReason: 'token_budget'` and the tokens it actually spent. The budget no longer touches the abort signal at all, so `aborted` unambiguously means the user pressed stop.
 
-**Prompt caching (§2.6):** when `config.promptCaching` is on (the default), `execute` stamps Anthropic-style ephemeral cache breakpoints on the prompt prefix (system message + last message of the compacted history) once per segment, before the loop. Appended step messages extend the prompt without invalidating the breakpoints, so multi-step runs keep serving the stable prefix from cache. OpenAI-family models cache automatically for prompts ≥1024 tokens and ignore the markers. Cached hits surface as `usage.cachedInputTokens` in the run's usage rows and the final `STATE_CHANGE` — the budget counts them once, inside input.
+**Prompt caching (§2.6):** when `config.promptCaching` is on (the default), `execute` stamps Anthropic-style ephemeral cache breakpoints on the prompt prefix (system message + last message of the compacted history) once per segment, before the loop. Appended step messages extend the prompt without invalidating the breakpoints, so multi-step runs keep serving the stable prefix from cache. OpenAI-family models cache automatically for prompts ≥1024 tokens and ignore the markers.
+
+The stamp goes where the SDK reads it: `providerOptions` (with `experimental_providerMetadata` alongside for older builds). A bare `providerMetadata` is read by nothing and leaves the breakpoint inert. A **system** message carries the stamp on the message itself and keeps its content a string — splitting it into parts, as a user message allows, fails prompt validation and throws on every run.
+
+Cache hits are reported **only in the step's provider metadata**, never in `usage`, so a step must carry `providerMetadata` out of the model or the counter can never leave zero. `attributeTokens` reads `openai.cachedPromptTokens` and `anthropic.cacheReadInputTokens` from it.
 
 ```typescript
 export interface FinalizeInput {
@@ -407,7 +411,7 @@ export async function finalize(
 #### Token Budget Semantics
 
 - **Precedence:** `execute input.tokenBudget` → `spec.tokenBudget` → `config.tokenBudget` (default `undefined` = unbounded apart from `maxSteps`).
-- **Counted:** NaN-guarded `input + cached + output`, accumulated across steps — one sample per `executeStep`, including tool-call steps. `cachedInputTokens` are a subset of input on providers that report them — never double-counted.
+- **Counted:** NaN-guarded `input + cached + output`, accumulated across steps — one sample per `executeStep`, including tool-call steps. The two providers disagree about what the prompt count means, and getting it wrong doubles the bill: OpenAI's `promptTokens` **includes** the cached tokens, so `inputTokens` is the difference; Anthropic reports `cacheReadInputTokens` **alongside** input, so they add. Either way `totalTokens` matches what the provider billed.
 - **Break:** checked BETWEEN steps on the accumulated total, with **no abort at all** — the step that crossed the line completed fully and its tokens count; the next step simply never starts. The run finalizes `COMPLETED` with `stopReason: 'token_budget'`; `STATE_CHANGE.tokensUsed` reports the actual spend.
 - **Not a user stop:** the budget check and the stop poller are separate mechanisms — `abort.signal.aborted` means only one thing in `finalize`: the user pressed stop.
 - **Partial is correct:** on a budget break the recorded usage is partial by definition — the budget was spent.
