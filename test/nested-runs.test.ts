@@ -513,3 +513,137 @@ describe('a nested run that fails (§2.7)', () => {
     ).toBe(false);
   });
 });
+
+/** main → child → grandchild, and the deepest one parks. */
+function threeLevelRuntime() {
+  const sent: string[] = [];
+  const firstUserText = (prompt: any) => {
+    const u = (prompt ?? []).find((m: any) => m.role === 'user');
+    const c = u?.content;
+    return typeof c === 'string' ? c : (c ?? []).map((p: any) => p?.text ?? '').join('');
+  };
+  const model = new MockLanguageModelV1({
+    provider: 'mock',
+    modelId: 'mock-three-levels',
+    doStream: async ({ prompt }: any) => {
+      const results = toolResults(prompt);
+      const spawned = results.some((t: any) => t.toolName === 'spawnSubagent');
+      if (!isChild(prompt)) {
+        return spawned
+          ? stream([say('main done'), finish('stop')])
+          : stream([
+              call('main_spawn', 'spawnSubagent', { name: 'child', instructions: 'level1' }),
+              finish('tool-calls'),
+            ]);
+      }
+      if (firstUserText(prompt) === 'level1') {
+        return spawned
+          ? stream([say('child done'), finish('stop')])
+          : stream([
+              call('child_spawn', 'spawnSubagent', { name: 'grand', instructions: 'level2' }),
+              finish('tool-calls'),
+            ]);
+      }
+      // the grandchild
+      return results.some((t: any) => t.toolName === 'sendEmail')
+        ? stream([say('grand done'), finish('stop')])
+        : stream([call('grand_call', 'sendEmail', { to: 'deep@x.c' }), finish('tool-calls')]);
+    },
+  });
+  const r = makeRuntime(model);
+  const chat = r.runtime.createStreamTextAgent({
+    name: 'chat',
+    model: 'gpt-4o',
+    subagents: {
+      tools: {
+        sendEmail: markRequiresConfirmation(
+          tool({
+            parameters: z.object({ to: z.string() }),
+            execute: async ({ to }) => { sent.push(to); return { status: 'SENT', to }; },
+          }),
+        ),
+      },
+    },
+  });
+  return { ...r, chat, sent };
+}
+
+describe('a park two levels down (§2.7)', () => {
+  it('records both waiting calls and unwinds through both', async () => {
+    const r = threeLevelRuntime();
+    const ran = await r.chat.run({ prompt: 'go deep' });
+    await r.runtime.worker.handleJob(r.queue.items[0]!);
+
+    expect((await r.storage.threads.get(ran.threadId))!.state).toBe('WAITING_FOR_INPUT');
+    const req = r.bus.published.find((e) => e.type === 'INPUT_REQUIRED')!.payload as any;
+    expect(req.nested).toMatchObject({ name: 'grand', depth: 2 });
+
+    // Innermost first: the child's spawn call waits, then the main agent's.
+    expect(req.frames).toHaveLength(2);
+    expect(req.frames[1]).toEqual({ agentId: null, toolCallId: 'main_spawn' });
+    expect(req.frames[0].toolCallId).toBe('child_spawn');
+    expect(req.frames[0].nested).toMatchObject({ name: 'child', depth: 1 });
+
+    await r.runtime.hitl.respond({
+      threadId: ran.threadId, toolCallId: 'grand_call', approved: true,
+    });
+    await r.runtime.worker.handleJob(r.queue.items.at(-1)!);
+
+    expect(r.sent).toEqual(['deep@x.c']);
+    expect((await r.storage.threads.get(ran.threadId))!.state).toBe('COMPLETED');
+
+    const rows = r.storage.messages.store.get(ran.threadId)!;
+    const streamsSeen = new Set(rows.map((m) => m.agentId ?? 'main'));
+    expect(streamsSeen.size).toBe(3); // main, child, grandchild — each its own
+
+    // Each level's spawn call got answered by the level beneath it.
+    const answered = rows
+      .filter((m) => m.role === 'tool')
+      .flatMap((m) => (m.content as any[]).map((p) => p.toolCallId));
+    expect(answered).toContain('grand_call');   // the approved tool
+    expect(answered).toContain('child_spawn');  // grandchild → child
+    expect(answered).toContain('main_spawn');   // child → main agent
+  });
+});
+
+describe('the depth cap (§2.7)', () => {
+  it('refuses a fourth level and tells the model why, rather than failing', async () => {
+    const firstUserText = (prompt: any) => {
+      const u = (prompt ?? []).find((m: any) => m.role === 'user');
+      const c = u?.content;
+      return typeof c === 'string' ? c : (c ?? []).map((p: any) => p?.text ?? '').join('');
+    };
+    // Every level tries to delegate one more time.
+    const model = new MockLanguageModelV1({
+      provider: 'mock',
+      modelId: 'mock-too-deep',
+      doStream: async ({ prompt }: any) => {
+        const results = toolResults(prompt);
+        if (results.length) return stream([say(`stopped at ${firstUserText(prompt)}`), finish('stop')]);
+        const level = isChild(prompt) ? firstUserText(prompt) : 'main';
+        return stream([
+          call(`${level}_spawn`, 'spawnSubagent', { name: 'deeper', instructions: `${level}+1` }),
+          finish('tool-calls'),
+        ]);
+      },
+    });
+    const r = makeRuntime(model);
+    const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', subagents: true });
+
+    const ran = await chat.run({ prompt: 'keep delegating' });
+    await r.runtime.worker.handleJob(r.queue.items[0]!);
+
+    // main (0) → sub (1) → sub-sub (2), and no further.
+    const runs = await r.storage.runs.list(ran.threadId);
+    expect(runs.map((x) => x.depth).sort()).toEqual([1, 2]);
+
+    // The refusal is a tool result the model can read, not an exception.
+    const refusal = r.storage.messages.store
+      .get(ran.threadId)!
+      .filter((m) => m.role === 'tool')
+      .flatMap((m) => (m.content as any[]).map((p) => p.result))
+      .find((res: any) => typeof res?.error === 'string' && res.error.includes('depth'));
+    expect(refusal).toEqual({ error: 'Max subagent depth (2) reached' });
+    expect((await r.storage.threads.get(ran.threadId))!.state).toBe('COMPLETED');
+  });
+});
