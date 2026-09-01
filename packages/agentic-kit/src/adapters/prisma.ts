@@ -1,5 +1,5 @@
-import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewRun, NewUsage, RunDTO, ThreadDTO, UsageTotals } from '../core/types.js';
-import type { Storage } from '../ports/storage.js';
+import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewRunRecord, NewUsage, RunPatch, RunRecord, ThreadDTO, UsageTotals } from '../core/types.js';
+import type { RunFilter, Storage } from '../ports/storage.js';
 
 /** Minimal structural type of the Prisma client surface we use. The real
  *  `PrismaClient` satisfies it — no SDK import needed in the package. */
@@ -11,6 +11,9 @@ export interface PrismaLike {
     update(a: { where: { id: string }; data: { state: ExecutionState } }): Promise<unknown>;
     updateMany(a: { where: { id: string; state: ExecutionState }; data: { state: ExecutionState } }): Promise<{ count: number }>;
     delete(a: { where: { id: string } }): Promise<unknown>;
+    groupBy(a: { by: ['state']; _count: { _all: true } }): Promise<
+      Array<{ state: ExecutionState; _count: { _all: number } }>
+    >;
   };
   message: {
     create(a: { data: { threadId: string; agentId?: string | null; role: string; content: any } }): Promise<any>;
@@ -42,10 +45,15 @@ export interface PrismaLike {
       };
     }): Promise<{ _sum: Partial<Record<keyof UsageTotals, number | null>> }>;
   };
-  subagentRun: {
-    create(a: { data: { threadId: string } & NewRun }): Promise<RunDTO>;
-    findMany(a: { where: { threadId: string }; orderBy: { createdAt: 'asc' } }): Promise<RunDTO[]>;
-    update(a: { where: { id: string }; data: Record<string, unknown> }): Promise<RunDTO>;
+  agentRun: {
+    create(a: { data: Record<string, unknown> }): Promise<unknown>;
+    update(a: { where: { id: string }; data: Record<string, unknown> }): Promise<unknown>;
+    findUnique(a: { where: { id: string } }): Promise<RunRecord | null>;
+    findMany(a: {
+      where: Record<string, unknown>;
+      orderBy: { startedAt: 'desc' };
+      take?: number;
+    }): Promise<RunRecord[]>;
   };
 }
 
@@ -163,12 +171,36 @@ export class PrismaStorage implements Storage {
   };
 
   runs = {
-    create: (threadId: string, run: NewRun) =>
-      this.prisma.subagentRun.create({ data: { threadId, ...run } }),
-    list: (threadId: string) =>
-      this.prisma.subagentRun.findMany({ where: { threadId }, orderBy: { createdAt: 'asc' } }),
-    update: async (runId: string, patch: Partial<RunDTO>) => {
-      await this.prisma.subagentRun.update({ where: { id: runId }, data: patch });
+    start: (run: NewRunRecord) =>
+      this.prisma.agentRun.create({
+        data: { depth: 0, parentRunId: null, ...run, state: 'RUNNING' },
+      }) as Promise<RunRecord>,
+    patch: async (runId: string, patch: RunPatch) => {
+      await this.prisma.agentRun.update({ where: { id: runId }, data: patch as any });
+    },
+    get: (runId: string) => this.prisma.agentRun.findUnique({ where: { id: runId } }),
+    listByThread: (threadId: string) =>
+      this.prisma.agentRun.findMany({ where: { threadId }, orderBy: { startedAt: 'desc' } }),
+  };
+
+  admin = {
+    listRuns: (f: RunFilter) =>
+      this.prisma.agentRun.findMany({
+        where: {
+          ...(f.state?.length ? { state: { in: f.state } } : {}),
+          ...(f.agent ? { agent: f.agent } : {}),
+          ...(f.since || f.until
+            ? { startedAt: { ...(f.since ? { gte: f.since } : {}), ...(f.until ? { lte: f.until } : {}) } }
+            : {}),
+        },
+        orderBy: { startedAt: 'desc' },
+        take: f.limit ?? 100,
+      }),
+    countThreadsByState: async () => {
+      const rows = await this.prisma.thread.groupBy({ by: ['state'], _count: { _all: true } });
+      return Object.fromEntries(rows.map((r) => [r.state, r._count._all])) as Partial<
+        Record<ExecutionState, number>
+      >;
     },
   };
 }

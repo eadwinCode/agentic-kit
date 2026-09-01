@@ -69,7 +69,17 @@ export async function run(
   // in-flight chunks from earlier completed turns.
   await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
 
-  await deps.queue.enqueue({ threadId, runId, model, agent: agent.name, tokenBudget: input.tokenBudget, providerOptions: input.providerOptions });
+  // The run's durable record opens here (§2.9): a thread accumulates many runs
+  // and Thread.state only ever describes the latest, so this is the only place
+  // "what happened, how long, what did it cost" can be answered from.
+  await deps.storage.runs.start({ id: runId, threadId, agent: agent.name, model });
+
+  await deps.queue.enqueue({
+    threadId, runId, model, agent: agent.name,
+    enqueuedAt: Date.now(),
+    tokenBudget: input.tokenBudget,
+    providerOptions: input.providerOptions,
+  });
 
   return { accepted: true, threadId, runId, state: 'RUNNING' };
 }

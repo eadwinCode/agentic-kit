@@ -124,9 +124,10 @@ async function unwindVerdict(
     if (outcome.parked) return false; // parked again, one level down
     if (outcome.aborted) return false; // user stop mid-unwind (§2.1)
 
-    await deps.storage.runs.update(producer.agentId, {
+    await deps.storage.runs.patch(producer.agentId, {
       state: 'COMPLETED',
       result: { text: outcome.text },
+      endedAt: new Date(),
     });
     await publish(deps, threadId, 'SUBAGENT_COMPLETED', { agentId: producer.agentId });
 
@@ -149,6 +150,57 @@ async function unwindVerdict(
     producer = frame.nested;
   }
   return true;
+}
+
+/** Sum this segment onto the run's record and stamp how it ended (§2.9). */
+async function closeRunRecord(
+  deps: RuntimePorts,
+  runId: string,
+  f: FinalizeInput,
+): Promise<void> {
+  try {
+    const prior = await deps.storage.runs.get(runId);
+    if (!prior) return; // a run started before §2.9, or a foreign dispatch
+    const endedAt = new Date();
+    await deps.storage.runs.patch(runId, {
+      state: f.state,
+      stopReason: f.stopReason,
+      ...(f.error ? { error: f.error } : {}),
+      endedAt,
+      durationMs: endedAt.getTime() - new Date(prior.startedAt).getTime(),
+      steps: prior.steps + (f.steps ?? 0),
+      inputTokens: prior.inputTokens + f.attribution.inputTokens,
+      cachedInputTokens: prior.cachedInputTokens + f.attribution.cachedInputTokens,
+      outputTokens: prior.outputTokens + f.attribution.outputTokens,
+      totalTokens: prior.totalTokens + f.attribution.totalTokens,
+    });
+  } catch {
+    // Observability must never be able to fail a run that otherwise succeeded.
+  }
+}
+
+/** Finalise a run as FAILED on both homes AND keep why (§2.9). The reason used
+ *  to be dropped entirely, so an operator could see that something failed but
+ *  never what. */
+async function failRun(
+  deps: RuntimePorts,
+  threadId: string,
+  runId: string | undefined,
+  error: string,
+): Promise<void> {
+  await deps.kv.set(`agent:state:${threadId}`, 'FAILED');
+  await deps.storage.threads.setState(threadId, 'FAILED');
+  if (runId) {
+    await closeRunRecord(deps, runId, {
+      state: 'FAILED',
+      stopReason: 'completed',
+      tokensUsed: 0,
+      attribution: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      error,
+      runId,
+    });
+  }
+  await publish(deps, threadId, 'STATE_CHANGE', { state: 'FAILED', error });
 }
 
 /** Resolve every parked request at segment start (§2.5, §2.7) and flip the
@@ -215,6 +267,8 @@ export interface ExecuteInput {
   /** This dispatch's run id (§2.1). A job without one keeps the old
    *  behavior: no staleness check, and no redrive on a lock conflict. */
   runId?: string;
+  /** Epoch ms at enqueue, for the queue-wait measurement (§2.9). */
+  enqueuedAt?: number;
   tokenBudget?: number;
   providerOptions?: ProviderOptions;
 }
@@ -291,6 +345,7 @@ export async function execute(
     const resume: ResumeInfo = {
       agent: agent.name,
       model: input.model,
+      ...(runId ? { runId } : {}),
       ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
       ...(providerOptions ? { providerOptions } : {}),
     };
@@ -298,6 +353,13 @@ export async function execute(
     // One ledger for the whole run: a nested run's spend counts against the
     // same safety cap the main agent is checked against (§2.7).
     const ledger: RunLedger = { tokensUsed: 0 };
+
+    // How long the dispatch sat in the queue before a worker took it (§2.9).
+    if (runId && input.enqueuedAt) {
+      await deps.storage.runs
+        .patch(runId, { queuedMs: Date.now() - input.enqueuedAt })
+        .catch(() => undefined);
+    }
 
     // Platform-owned toolset: HITL (§2.5) over the user's set; spawnSubagent
     // added ONLY when the spec opts in (§2.7). rawTools keeps the real
@@ -368,6 +430,7 @@ export async function execute(
       threadId,
       {
         agentId: null, // the main agent's stream (§2.7)
+        runId,
         kind: agent.kind,
         model: model.instance(),
         messages,
@@ -413,6 +476,7 @@ export async function execute(
       attribution,
       oneShotText: agent.kind === 'generate-text' ? lastText : undefined,
       runId,
+      steps: loop.steps,
     });
 
     return 'executed';
@@ -432,6 +496,10 @@ export interface FinalizeInput {
   /** The run this finalize speaks for (§2.1). State is written only while
    *  that run is still the thread's current one. */
   runId?: string;
+  /** Loop iterations this segment completed (§2.9). */
+  steps?: number;
+  /** Why it failed, when it did (§2.9). */
+  error?: string;
 }
 
 /** Finalize a finished run (§5.6): attribute the segment's total tokens
@@ -450,6 +518,12 @@ export async function finalize(
   // Tokens this segment actually spent are always ours to record (§4), even
   // when the run was replaced part-way through.
   await deps.storage.usage.record(threadId, { agentId: agent.name, ...f.attribution });
+
+  // Close the run's durable record (§2.9). Additive: a run that parked and
+  // resumed finalises once, but its steps and tokens accrued over several
+  // segments, so they are summed onto what is already there. The run lock
+  // (§3.4) makes this read-modify-write single-writer.
+  if (f.runId) await closeRunRecord(deps, f.runId, f);
 
   // Past that, a replaced run stays silent. Its CANCELLED would otherwise land
   // on top of the next run's RUNNING and wedge the thread: the new worker
@@ -497,6 +571,7 @@ async function redriveOnLockConflict(
       {
         threadId: input.threadId,
         runId: input.runId,
+        enqueuedAt: Date.now(),
         model: input.model,
         agent: agent.name,
         tokenBudget: input.tokenBudget,
@@ -507,9 +582,7 @@ async function redriveOnLockConflict(
   }
 
   await deps.kv.del(redriveKey(input.threadId));
-  await deps.kv.set(`agent:state:${input.threadId}`, 'FAILED');
-  await deps.storage.threads.setState(input.threadId, 'FAILED');
-  await publish(deps, input.threadId, 'STATE_CHANGE', { state: 'FAILED' });
+  await failRun(deps, input.threadId, input.runId, 'the run lock never cleared');
 }
 
 /** §2.8 failure policy: transient errors redrive through the queue; exhausted
@@ -552,6 +625,7 @@ export async function executeWithPolicy(
         // left the retried job unable to notice it had been replaced, and
         // unable to redrive if it found the lock held.
         runId: input.runId,
+        enqueuedAt: Date.now(),
         model: input.model,
         agent: agent.name,
         tokenBudget: input.tokenBudget,
@@ -561,9 +635,12 @@ export async function executeWithPolicy(
 
     // Attempts exhausted: finalize FAILED on BOTH the hot cache and durable
     // truth, or subsequent runs would still treat the thread as active (§2.1)
-    await deps.kv.set(`agent:state:${input.threadId}`, 'FAILED');
-    await deps.storage.threads.setState(input.threadId, 'FAILED');
-    await publish(deps, input.threadId, 'STATE_CHANGE', { state: 'FAILED' });
+    await failRun(
+      deps,
+      input.threadId,
+      input.runId,
+      err instanceof Error ? err.message : String(err),
+    );
     await deps.kv.del(`agent:attempts:${input.threadId}`);
   }
 }

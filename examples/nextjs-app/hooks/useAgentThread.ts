@@ -111,7 +111,8 @@ interface StreamEvent {
 
 interface SnapshotRun {
   id: string;
-  name: string;
+  agent: string;
+  /** 0 is the dispatched run itself; nested runs are 1+ (§2.7). */
   depth: number;
   state: SubagentStatus;
 }
@@ -552,10 +553,14 @@ export function useAgentThread(initialThreadId?: string) {
         // the SUBAGENT_* events only replay while a run is unfinished, so on a
         // completed thread they are all a client has (§2.7).
         const byAgent = new Map<string, SubagentView>(
-          (snapshot.runs ?? []).map((r) => [
-            r.id,
-            { agentId: r.id, name: r.name, depth: r.depth, status: r.state, text: '' },
-          ]),
+          // Nested runs only: depth 0 is this thread's own dispatched run,
+          // which the transcript already represents (§2.9).
+          (snapshot.runs ?? [])
+            .filter((r) => r.depth > 0)
+            .map((r) => [
+              r.id,
+              { agentId: r.id, name: r.agent, depth: r.depth, status: r.state, text: '' },
+            ]),
         );
         for (const m of snapshot.messages) {
           const id = m.agentId ?? null;

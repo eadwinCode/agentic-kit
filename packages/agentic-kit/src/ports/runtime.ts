@@ -8,8 +8,8 @@ import type {
   MessageDTO,
   ProviderOptions,
   ResolvedModel,
-  RunDTO,
   RunJob,
+  RunRecord,
   SubagentsConfig,
   ThreadDTO,
   UsageTotals,
@@ -19,6 +19,22 @@ import type { EventBus } from './bus.js';
 import type { Queue } from './queue.js';
 import type { Kv } from './kv.js';
 import type { ExecuteInput, ExecuteOutcome } from '../core/engine.js';
+import type {
+  AdminOverview,
+  RunDetail,
+  RunStats,
+  StepMarker,
+} from '../core/admin.js';
+import type { RunFilter } from './storage.js';
+
+export type {
+  AdminOverview,
+  Percentiles,
+  RunDetail,
+  RunStats,
+  StepMarker,
+} from '../core/admin.js';
+export type { RunFilter } from './storage.js';
 
 export type { ExecuteInput, ExecuteOutcome } from '../core/engine.js';
 
@@ -118,7 +134,7 @@ export interface ThreadSnapshot {
   /** Nested runs on this thread (§2.7) — name, depth and final state, so a
    *  reconnecting client rebuilds its subagent panel without depending on
    *  events that only replay while a run is unfinished. */
-  runs: RunDTO[];
+  runs: RunRecord[];
   /** Cursor for starting live replay without duplicating snapshot state. */
   lastEventSeq: number;
   /** Only the unfinished run's events, used to restore transient activity. */
@@ -226,6 +242,21 @@ export interface AgentCore {
 
   /** Worker-side resolution of a registered handle from the queue job. */
   getAgent(name: string): AgentHandle | null;
+
+  /** Operational reads (§2.9). The platform records what runs did; building a
+   *  view over it is the caller's business. Cross-thread methods need the
+   *  optional `Storage.admin` queries and throw AdminUnavailableError without
+   *  them — `available` says which you have. */
+  admin: {
+    readonly available: boolean;
+    overview(range?: { since?: Date }): Promise<AdminOverview>;
+    listRuns(filter?: RunFilter): Promise<RunRecord[]>;
+    stats(range?: { since?: Date; until?: Date }): Promise<RunStats>;
+    /** Per-thread reads — these work on any adapter. */
+    getRun(runId: string): Promise<RunDetail | null>;
+    listRunsByThread(threadId: string): Promise<RunRecord[]>;
+    listSteps(threadId: string, runId?: string): Promise<StepMarker[]>;
+  };
 
   /** The queue dispatch side of the platform (§2.8): resolves the handle,
    *  applies the failure policy, and is idempotent under at-least-once

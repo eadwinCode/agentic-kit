@@ -237,7 +237,7 @@ describe('runtime.deleteThread (§3.2)', () => {
     await deps.storage.usage.record(thread.id, {
       agentId: null, inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, totalTokens: 2,
     });
-    await deps.storage.runs.create(thread.id, { name: 'sub', model: 'gpt-4o', depth: 1, state: 'COMPLETED' });
+    await deps.storage.runs.start({ id: 'sub-1', threadId: thread.id, agent: 'sub', model: 'gpt-4o', depth: 1 });
     await deps.kv.set(`agent:state:${thread.id}`, 'COMPLETED');
     await deps.kv.set(`agent:seq:${thread.id}`, '1');
     await deps.kv.set(`agent:attempts:${thread.id}`, '2');

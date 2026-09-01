@@ -1,5 +1,5 @@
-import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewRun, NewUsage, RunDTO, RunJob, ThreadDTO, UsageTotals } from '../core/types.js';
-import type { Storage } from '../ports/storage.js';
+import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewRunRecord, NewUsage, RunJob, RunPatch, RunRecord, ThreadDTO, UsageTotals } from '../core/types.js';
+import type { RunFilter, Storage } from '../ports/storage.js';
 import type { EventBus } from '../ports/bus.js';
 import type { EnqueueOptions, Queue } from '../ports/queue.js';
 import type { Kv } from '../ports/kv.js';
@@ -181,20 +181,46 @@ export class MemoryStorage implements Storage {
   };
 
   runs = {
-    store: new Map<string, RunDTO>(),
-    async list(t: string) {
-      return [...this.store.values()].filter((r) => r.threadId === t);
+    store: new Map<string, RunRecord>(),
+    async start(r: NewRunRecord) {
+      const rec: RunRecord = {
+        parentRunId: null, depth: 0, ...r,
+        state: 'RUNNING', startedAt: new Date(), steps: 0, attempts: 0,
+        inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0,
+      };
+      this.store.set(rec.id, rec);
+      return rec;
     },
-    async create(t: string, r: NewRun) {
-      const now = new Date();
-      const dto: RunDTO = { id: id(), threadId: t, ...r, createdAt: now, updatedAt: now };
-      this.store.set(dto.id, dto);
-      return dto;
+    async patch(runId: string, patch: RunPatch) {
+      const cur = this.store.get(runId);
+      if (cur) this.store.set(runId, { ...cur, ...patch });
     },
-    async update(runId: string, patch: Partial<RunDTO>) {
-      const run = this.store.get(runId);
-      if (!run) throw new Error(`Unknown run ${runId}`);
-      Object.assign(run, patch, { updatedAt: new Date() });
+    async get(runId: string) { return this.store.get(runId) ?? null; },
+    async listByThread(t: string) {
+      return [...this.store.values()]
+        .filter((r) => r.threadId === t)
+        .sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime());
     },
   };
+
+  admin = {
+    parent: this as MemoryStorage,
+    async listRuns(f: RunFilter) {
+      let rows = [...this.parent.runs.store.values()];
+      if (f.state?.length) rows = rows.filter((r) => f.state!.includes(r.state));
+      if (f.agent) rows = rows.filter((r) => r.agent === f.agent);
+      if (f.since) rows = rows.filter((r) => r.startedAt >= f.since!);
+      if (f.until) rows = rows.filter((r) => r.startedAt <= f.until!);
+      rows.sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime());
+      return rows.slice(0, f.limit ?? 100);
+    },
+    async countThreadsByState() {
+      const out: Record<string, number> = {};
+      for (const t of this.parent.threads.store.values()) {
+        out[t.state] = (out[t.state] ?? 0) + 1;
+      }
+      return out as any;
+    },
+  };
+
 }

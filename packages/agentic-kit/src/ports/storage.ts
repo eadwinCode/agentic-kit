@@ -3,10 +3,11 @@ import type {
   ExecutionState,
   MessageDTO,
   NewMessage,
-  NewRun,
+  NewRunRecord,
   NewUsage,
   UsageTotals,
-  RunDTO,
+  RunPatch,
+  RunRecord,
   ThreadDTO,
 } from '../core/types.js';
 
@@ -65,13 +66,43 @@ export interface Storage {
      *  usage rows yet returns zeroes, never null. */
     total(threadId: string): Promise<UsageTotals>;
   };
+  /** One row per run — dispatched or nested (§2.7, §2.9). A subagent IS a
+   *  run: same loop, same steps, same duration, same tokens, same ability to
+   *  fail. It is distinguished by `depth > 0` and a `parentRunId`, not by
+   *  living in a different table. */
   runs: {
-    create(threadId: string, run: NewRun): Promise<RunDTO>;
-    /** Every nested run on the thread, oldest first (§2.7). A client rebuilds
-     *  its subagent panel from these: the SUBAGENT_* events only replay while
-     *  a run is unfinished, so a reloaded COMPLETED thread has nothing else to
-     *  read a child's name or final state from. */
-    list(threadId: string): Promise<RunDTO[]>;
-    update(runId: string, patch: Partial<RunDTO>): Promise<void>;
+    start(run: NewRunRecord): Promise<RunRecord>;
+    /** Merge fields into the record. The run lock (§3.4) guarantees a single
+     *  writer, so a read-modify-write by the engine is safe. */
+    patch(runId: string, patch: RunPatch): Promise<void>;
+    get(runId: string): Promise<RunRecord | null>;
+    /** This thread's runs, newest first — children included. */
+    listByThread(threadId: string): Promise<RunRecord[]>;
   };
+
+  /** OPTIONAL cross-thread queries, for operational views (§2.9).
+   *
+   *  Optional on purpose: `Storage` is an interface users implement against
+   *  their own database, and nobody should have to write aggregate queries to
+   *  run an agent. `runtime.admin` reports plainly when an adapter omits it.
+   *
+   *  Deliberately thin. Percentiles and rollups are computed in core over the
+   *  rows `listRuns` returns, so an adapter only ever writes filters it can
+   *  express in one indexed query — not statistics. */
+  admin?: {
+    listRuns(filter: RunFilter): Promise<RunRecord[]>;
+    /** The one aggregate worth pushing down: it answers "what is happening
+     *  right now" without dragging every thread into memory. */
+    countThreadsByState(): Promise<Partial<Record<ExecutionState, number>>>;
+  };
+}
+
+export interface RunFilter {
+  /** Any of these states; omitted means all. */
+  state?: ExecutionState[];
+  agent?: string;
+  since?: Date;
+  until?: Date;
+  /** Newest first. Adapters SHOULD cap this — core passes a bounded value. */
+  limit?: number;
 }

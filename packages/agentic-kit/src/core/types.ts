@@ -51,24 +51,61 @@ export interface AgentEvent {
   createdAt: Date;
 }
 
-export interface RunDTO {
+/** The durable record of ONE agent run (§2.9): when it started, how it ended,
+ *  what it cost. Keyed by the run id the platform already mints to fence stale
+ *  workers (§2.1), so a run is observable by the same identity that makes it
+ *  correct. A thread accumulates many of these over its life — `Thread.state`
+ *  only ever describes the latest one. */
+export interface RunRecord {
+  /** The run id (§2.1) for a dispatched run; the nested run's id otherwise —
+   *  which is also the `agentId` its messages and events are tagged with. */
   id: string;
   threadId: string;
-  name: string;
-  model: string;
+  /** The run that spawned this one; null for a dispatched run (§2.7). */
+  parentRunId?: string | null;
+  /** 0 = the main agent, 1+ = nested. */
   depth: number;
+  /** Registered handle for a dispatched run; the delegation's name for a
+   *  nested one. */
+  agent: string;
+  model: string;
   state: ExecutionState;
+  /** 'completed' | 'cancelled' | 'token_budget' | 'max_steps', set at finalize. */
+  stopReason?: string | null;
+  /** Why it failed, when it did. Previously dropped on the floor (§2.8). */
+  error?: string | null;
+  /** When the run was accepted and enqueued. */
+  startedAt: Date;
+  endedAt?: Date | null;
+  /** endedAt - startedAt, denormalised so a listing never recomputes it. A
+   *  parked run legitimately spans however long the human took (§2.5). */
+  durationMs?: number | null;
+  /** Milliseconds between enqueue and a worker starting work — the number that
+   *  says whether workers are keeping up (§2.8). */
+  queuedMs?: number | null;
+  /** Loop iterations completed, summed across every segment of the run. */
+  steps: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  /** §2.8 redrive attempts consumed. Only a dispatched run has these. */
+  attempts: number;
+  /** A nested run's capped result, handed back to its parent (§2.7). */
   result?: unknown;
-  createdAt: Date;
-  updatedAt: Date;
 }
 
-export interface NewRun {
-  name: string;
+export interface NewRunRecord {
+  id: string;
+  threadId: string;
+  agent: string;
   model: string;
-  depth: number;
-  state: ExecutionState;
+  /** Defaults to 0 — a dispatched run. */
+  depth?: number;
+  parentRunId?: string | null;
 }
+
+export type RunPatch = Partial<Omit<RunRecord, 'id' | 'threadId'>>;
 
 /** Token attribution only (§4): total tokens used. USD/credit pricing is a
  *  downstream concern computed over the recorded counters. */
@@ -138,6 +175,9 @@ export interface RunJob {
    *  been replaced by a newer run and must not execute. Omitted on legacy
    *  dispatches, which keep the old no-identity behavior. */
   runId?: string;
+  /** Epoch ms at enqueue. The worker subtracts it on pickup to record how long
+   *  the job waited — the number that says whether workers keep up (§2.9). */
+  enqueuedAt?: number;
   tokenBudget?: number;
   providerOptions?: ProviderOptions;
 }
@@ -157,6 +197,8 @@ export interface NestedDescriptor {
 export interface ResumeInfo {
   agent: string;
   model: string;
+  /** The run these segments belong to (§2.9). */
+  runId?: string;
   tokenBudget?: number;
   providerOptions?: ProviderOptions;
 }

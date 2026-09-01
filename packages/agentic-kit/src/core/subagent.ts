@@ -1,6 +1,13 @@
+import { randomUUID } from 'node:crypto';
 import { tool } from 'ai';
 import { z } from 'zod';
-import type { NestedDescriptor, ProviderOptions, ResumeInfo, SubagentsConfig } from './types.js';
+import type {
+  NestedDescriptor,
+  ProviderOptions,
+  ResumeInfo,
+  RunRecord,
+  SubagentsConfig,
+} from './types.js';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { RegisteredAgent } from './agent.js';
 import { publish } from './publish.js';
@@ -88,11 +95,16 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
 
       const release = await ctx.sem.acquire();
       try {
-        const run = await ctx.ports.storage.runs.create(ctx.threadId, {
-          name,
-          model: model ?? ctx.sub.model ?? 'gpt-4o',
+        // A nested run is a run (§2.9): same table, distinguished by depth and
+        // a parent. Its id is also the agentId its messages and events carry.
+        const run = await ctx.ports.storage.runs.start({
+          id: randomUUID(),
+          threadId: ctx.threadId,
+          // The spawner: another nested run, or the dispatched run itself.
+          parentRunId: ctx.agentId ?? ctx.resume.runId ?? null,
           depth,
-          state: 'RUNNING',
+          agent: name,
+          model: model ?? ctx.sub.model ?? 'gpt-4o',
         });
         await publish(ctx.ports, ctx.threadId, 'SUBAGENT_STARTED', {
           agentId: run.id, name, depth,
@@ -131,7 +143,7 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
             return { [HITL_PARKED]: opts.toolCallId ?? run.id };
           }
 
-          await ctx.ports.storage.runs.update(run.id, {
+          await closeNested(ctx, run, outcome, {
             state: 'COMPLETED',
             result: { text: outcome.text },
           });
@@ -147,7 +159,7 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
             (await ctx.ports.kv.get(`agent:state:${ctx.threadId}`)) === 'CANCELLED';
           const state = cancelled ? 'CANCELLED' : 'FAILED';
           const message = err instanceof Error ? err.message : String(err);
-          await ctx.ports.storage.runs.update(run.id, { state });
+          await closeNested(ctx, run, null, { state, error: message });
           // Carry the reason: a bare state tells an operator a child died but
           // not why, and a nested run's failure is otherwise invisible.
           await publish(ctx.ports, ctx.threadId, 'SUBAGENT_FAILED', {
@@ -171,6 +183,31 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
         release();
       }
     },
+  });
+}
+
+/** Close a nested run's record with the same detail a dispatched run gets
+ *  (§2.9): how it ended, how long it took, what it cost. */
+async function closeNested(
+  ctx: SubagentCtx,
+  run: RunRecord,
+  outcome: LoopOutcome | null,
+  end: { state: RunRecord['state']; result?: unknown; error?: string },
+): Promise<void> {
+  const endedAt = new Date();
+  await ctx.ports.storage.runs.patch(run.id, {
+    ...end,
+    endedAt,
+    durationMs: endedAt.getTime() - new Date(run.startedAt).getTime(),
+    ...(outcome
+      ? {
+          steps: outcome.steps,
+          inputTokens: outcome.attribution.inputTokens,
+          cachedInputTokens: outcome.attribution.cachedInputTokens,
+          outputTokens: outcome.attribution.outputTokens,
+          totalTokens: outcome.attribution.totalTokens,
+        }
+      : {}),
   });
 }
 
@@ -255,6 +292,7 @@ export async function runNestedAgent(
     threadId,
     {
       agentId: d.agentId,
+      runId: ctx.resume.runId,
       kind: ctx.sub.kind ?? 'stream-text',
       model: resolveNestedModel(ctx, d.model).instance(),
       messages: persisted.map((m) => ({ role: m.role, content: m.content }) as any),

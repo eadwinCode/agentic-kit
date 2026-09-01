@@ -436,15 +436,26 @@ describe('rebuilding the subagent panel after a reload (§2.7)', () => {
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
     const snapshot = (await r.runtime.getThreadSnapshot(ran.threadId))!;
-    expect(snapshot.runs).toHaveLength(1);
-    expect(snapshot.runs[0]).toMatchObject({ name: 'helper', depth: 1, state: 'COMPLETED' });
+    // Every run on the thread: the dispatched one and its children (§2.9).
+    // A caller scopes by depth, the same way it scopes messages by agentId.
+    expect(snapshot.runs).toHaveLength(2);
+    expect(snapshot.runs.find((x) => x.depth === 0)).toMatchObject({
+      agent: 'chat', state: 'COMPLETED',
+    });
+    const child = snapshot.runs.find((x) => x.depth === 1)!;
+    expect(child).toMatchObject({ agent: 'helper', depth: 1, state: 'COMPLETED' });
+    // A nested run now carries the same detail a dispatched one does (§2.9).
+    expect(child.totalTokens).toBe(15);
+    expect(child.steps).toBe(1);
+    expect(typeof child.durationMs).toBe('number');
+    expect(child.parentRunId).toBe(ran.runId!);
 
     // On a finished thread there are no active events left to replay, so the
     // runs are the only place a client can read a child's name and state.
     expect(snapshot.activeEvents).toHaveLength(0);
     // And the child's turns are in the log, under its own agentId.
     expect(
-      snapshot.messages.filter((m) => m.agentId === snapshot.runs[0]!.id).length,
+      snapshot.messages.filter((m) => m.agentId === child.id).length,
     ).toBeGreaterThan(0);
   });
 });
@@ -634,8 +645,9 @@ describe('the depth cap (§2.7)', () => {
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
     // main (0) → sub (1) → sub-sub (2), and no further.
-    const runs = await r.storage.runs.list(ran.threadId);
-    expect(runs.map((x) => x.depth).sort()).toEqual([1, 2]);
+    const runs = await r.storage.runs.listByThread(ran.threadId);
+    // depth 0 is the dispatched run itself; its children are 1 and 2.
+    expect(runs.map((x: any) => x.depth).sort()).toEqual([0, 1, 2]);
 
     // The refusal is a tool result the model can read, not an exception.
     const refusal = r.storage.messages.store

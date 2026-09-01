@@ -14,6 +14,7 @@ import type {
 import type { ThreadUsage } from './ports/runtime.js';
 import { contextUsage } from './core/context.js';
 import { createGenerateTextAgent, createStreamTextAgent } from './core/agent.js';
+import * as admin from './core/admin.js';
 import { reclaimIfOrphaned } from './core/reclaim.js';
 import { respond } from './core/hitl.js';
 import { deleteThread } from './core/deleteThread.js';
@@ -61,7 +62,7 @@ export function setupAgentCore(opts: RuntimeOptions): AgentCore {
       if (!thread) return null;
 
       const messages = await deps.storage.messages.list(threadId);
-      const runs = await deps.storage.runs.list(threadId);
+      const runs = await deps.storage.runs.listByThread(threadId);
       const events = await deps.storage.events.listSince(threadId, -1);
 
       const lastEventSeq = events.at(-1)?.seq ?? -1;
@@ -82,6 +83,18 @@ export function setupAgentCore(opts: RuntimeOptions): AgentCore {
       }
 
       return { thread, messages, runs, lastEventSeq, activeEvents };
+    },
+
+    admin: {
+      get available() {
+        return deps.storage.admin !== undefined;
+      },
+      overview: (range) => admin.overview(deps, range),
+      listRuns: (filter) => admin.listRuns(deps, filter),
+      stats: (range) => admin.runStats(deps, range),
+      getRun: (runId: string) => admin.getRun(deps, runId),
+      listRunsByThread: (threadId: string) => deps.storage.runs.listByThread(threadId),
+      listSteps: (threadId: string, runId?: string) => admin.listSteps(deps, threadId, runId),
     },
 
     getThreadUsage: async (threadId: string): Promise<ThreadUsage | null> => {
@@ -139,6 +152,8 @@ export function setupAgentCore(opts: RuntimeOptions): AgentCore {
           // The dispatch's identity (§2.1) — without it the worker cannot tell
           // it has been replaced by a newer run, and a blocked job is dropped.
           runId: job.runId,
+          // Carries the queue wait through to the run record (§2.9).
+          enqueuedAt: job.enqueuedAt,
           model: job.model,
           tokenBudget: job.tokenBudget,
           providerOptions: job.providerOptions,

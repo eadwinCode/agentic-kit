@@ -5,6 +5,7 @@ import type { AgentKind, ProviderOptions } from './types.js';
 import type { RegisteredAgent } from './agent.js';
 import { attributeTokens, type TokenAttribution } from './usage.js';
 import { drainOrThrow } from './stream.js';
+import { publish } from './publish.js';
 import { HITL_PARKED } from './hitl.js';
 
 /** True for the sentinel a parked `requiresConfirmation` tool returns (§2.5).
@@ -121,6 +122,9 @@ export interface RunLedger {
 export interface LoopInput {
   /** Whose stream this loop persists to (§2.7). `null` is the main agent. */
   agentId: string | null;
+  /** The run these steps belong to (§2.9) — a thread has many runs, so a step
+   *  marker without it cannot be attributed to one. */
+  runId?: string;
   kind: AgentKind;
   model: LanguageModel;
   /** Seeded context: compacted history for the main agent, the brief plus its
@@ -149,6 +153,8 @@ export interface LoopOutcome {
   parkedToolCallId?: string;
   /** The abort signal fired mid-loop — a user stop (§2.1). */
   aborted: boolean;
+  /** Iterations this loop completed (§2.9). */
+  steps: number;
 }
 
 /** The platform-owned loop (§2.1, §5.6), run by the main agent and by every
@@ -179,9 +185,11 @@ export async function runLoop(
   let parked = false;
   let parkedToolCallId: string | undefined;
   let stepsLeft = input.maxSteps;
+  let stepsRun = 0;
 
   while (stepsLeft > 0 && !input.abortSignal.aborted) {
     stepsLeft--;
+    const stepStartedAt = Date.now();
     let step: StepResult;
     try {
       step = await executeStep(agent, {
@@ -227,6 +235,20 @@ export async function runLoop(
     ledger.tokensUsed += a.totalTokens;
     lastText = step.text ?? '';
     lastFinishReason = step.finishReason;
+    stepsRun += 1;
+
+    // §2.9: one marker per step, so a timeline can be read straight off the
+    // event log. A step TABLE would be write amplification on every iteration
+    // for something read rarely; the log is already indexed by (thread, type).
+    await publish(deps, threadId, 'STEP_FINISHED', {
+      runId: input.runId,
+      agentId: input.agentId,
+      index: stepsRun,
+      durationMs: Date.now() - stepStartedAt,
+      finishReason: step.finishReason,
+      tokens: a,
+      tools: (step.toolResults ?? []).map((r: any) => r?.toolName).filter(Boolean),
+    });
 
     // §2.5 park: a requiresConfirmation tool returned the sentinel — the
     // segment ends here on WAITING_FOR_INPUT (set by parkForApproval).
@@ -254,5 +276,6 @@ export async function runLoop(
     parked,
     parkedToolCallId,
     aborted: input.abortSignal.aborted,
+    steps: stepsRun,
   };
 }
