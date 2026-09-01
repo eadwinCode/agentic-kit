@@ -175,6 +175,13 @@ export function useAgentThread(initialThreadId?: string) {
     void loadThreads();
   }, [loadThreads]);
 
+  /** Slow-cadence sidebar refresh: other tabs (or the worker) can flip thread
+   *  states without this tab seeing the event. */
+  useEffect(() => {
+    const id = setInterval(() => void loadThreads(), 30_000);
+    return () => clearInterval(id);
+  }, [loadThreads]);
+
   /** Start a new thread: clear the pointer so the next Run creates one. */
   const newThread = useCallback(() => {
     setThreadId(undefined);
@@ -220,6 +227,11 @@ export function useAgentThread(initialThreadId?: string) {
           return stateActivity(nextState);
         });
         if (nextState !== 'WAITING_FOR_INPUT') setPendingInput(null);
+        // Terminal states land in the durable thread row — refresh the
+        // sidebar so it stops claiming a finished run is still RUNNING.
+        if (nextState === 'COMPLETED' || nextState === 'FAILED' || nextState === 'CANCELLED') {
+          void loadThreads();
+        }
         break;
       }
 
@@ -342,7 +354,7 @@ export function useAgentThread(initialThreadId?: string) {
         );
         break;
     }
-  }, []);
+  }, [loadThreads]);
 
   useEffect(() => {
     if (!threadId) return;

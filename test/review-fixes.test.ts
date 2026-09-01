@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { createAgentRuntime } from '../src/runtime.js';
+import { setupAgentCore } from '../src/runtime.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import { RedisKv } from '../src/adapters/redis.js';
 import type { RuntimePorts } from '../src/ports/runtime.js';
@@ -25,10 +25,10 @@ function makeDeps(config: Partial<AgentConfig> = {}) {
     }),
     config: resolveConfig(config),
   };
-  return { deps, runtime: createAgentRuntime(deps), storage, bus, queue, kv };
+  return { deps, runtime: setupAgentCore(deps), storage, bus, queue, kv };
 }
 
-function chatHandle(runtime: ReturnType<typeof createAgentRuntime>) {
+function chatHandle(runtime: ReturnType<typeof setupAgentCore>) {
   return runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 }
 

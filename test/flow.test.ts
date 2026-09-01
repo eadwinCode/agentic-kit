@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { createAgentRuntime } from '../src/runtime.js';
+import { setupAgentCore } from '../src/runtime.js';
 import { contextBudget } from '../src/core/context.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import type { AgentConfig } from '../src/core/types.js';
@@ -30,7 +30,7 @@ function makeDeps(config: Partial<AgentConfig> = {}) {
     }),
     config: resolveConfig(config),
   };
-  return { deps, runtime: createAgentRuntime(deps), storage, bus, queue, kv };
+  return { deps, runtime: setupAgentCore(deps), storage, bus, queue, kv };
 }
 
 /** Simulate a thread parked mid-HITL (§2.5): WAITING_FOR_INPUT + pending request. */
