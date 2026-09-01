@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "sh -c 'qstash-cli dev & QSTASH_PID=$!; trap \"kill $QSTASH_PID\" EXIT INT TERM; next dev -p 5000'",
+    "db:migrate": "bunx prisma migrate dev --name init",
+    "dev": "sh -c 'bunx prisma migrate dev --name init || exit $?; qstash-cli dev & QSTASH_PID=$!; trap \"kill $QSTASH_PID\" EXIT INT TERM; next dev -p 5000'",
     "dev:next": "next dev -p 5000",
     "dev:qstash": "qstash-cli dev",
     "build": "next build",

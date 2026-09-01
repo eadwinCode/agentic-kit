@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { runtime } from '@/lib/runtime';
+import { chat } from '@/lib/agents';
 
-// One stop button: runtime.stop is the single `state → CANCELLED` write (§2.1)
+// One stop button: the handle's stop is the single `state → CANCELLED` write (§2.1)
 export async function POST(req: NextRequest) {
   const { threadId } = await req.json();
-  const result = await runtime.stop(threadId);
+  const result = await chat.stop(threadId);
   return NextResponse.json(result, { status: result.accepted ? 200 : 409 });
 }

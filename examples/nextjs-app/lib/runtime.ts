@@ -8,7 +8,7 @@ import {
   RedisKv,
   setupAgentCore,
 } from '@agent/core';
-import { MODELS } from './models'; // §2.3 — models in your shape
+import { modelRegistry } from './models'; // §2.3 — models in your shape
 
 // Local Docker / self-hosted Redis — no Upstash required.
 // (Using Upstash instead? Swap in UpstashKv/UpstashBus from '@agent/core/adapters/upstash'.)
@@ -30,11 +30,11 @@ export const runtime = setupAgentCore({
   // Models can come in any shape — the platform only ever sees
   // ResolvedModel { instance, contextWindow } (§3.3).
   resolveModel: (modelName) => {
-    const m = MODELS[modelName];
+    const m = modelRegistry[modelName as keyof typeof modelRegistry];
     if (!m) throw new Error(`Unknown model: ${modelName}`);
     return {
-      instance: () => m.create(),
-      contextWindow: m.contextWindow,
+      instance: () => m,
+      contextWindow: 265_000,
     };
   },
 });

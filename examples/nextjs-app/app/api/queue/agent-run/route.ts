@@ -8,9 +8,9 @@ import { runtime } from '@/lib/runtime';
 // response inside the worker. executeWithPolicy redrives transient failures
 // and finalizes FAILED when attempts are exhausted.
 async function handler(req: NextRequest) {
-  const { threadId, model } = await req.json();
+  const job = await req.json();
 
-  waitUntil(runtime.engine.executeWithPolicy({ threadId, model }));
+  waitUntil(runtime.worker.handleJob(job));
 
   // Ack immediately. Delivery is at-least-once, so double dispatch is possible;
   // the per-thread run lock (§3.4) makes it a no-op.
