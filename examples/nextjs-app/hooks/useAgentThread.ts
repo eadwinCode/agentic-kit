@@ -490,11 +490,21 @@ export function useAgentThread(initialThreadId?: string) {
     };
   }, [applyEvent, loadUsage, threadId]);
 
-  const run = useCallback(async (prompt: string, model = 'gpt-4o') => {
-    setEntries((prev) => [
-      ...prev,
-      { id: `optimistic:user:${Date.now()}`, kind: 'text', role: 'user', text: prompt },
-    ]);
+  const run = useCallback(async (
+    prompt: string,
+    model = 'gpt-4o',
+    editMessageId?: string,
+  ) => {
+    setEntries((prev) => {
+      // An edit replaces that turn and everything it led to, mirroring what
+      // the server just did to the durable history.
+      const at = editMessageId ? prev.findIndex((e) => e.id === editMessageId) : -1;
+      const kept = at === -1 ? prev : prev.slice(0, at);
+      return [
+        ...kept,
+        { id: `optimistic:user:${Date.now()}`, kind: 'text', role: 'user', text: prompt },
+      ];
+    });
     setSubagents([]);
     setPendingInput(null);
     setAgentState('RUNNING');
@@ -504,7 +514,7 @@ export function useAgentThread(initialThreadId?: string) {
       const response = await fetch('/api/agent/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ threadId: threadRef.current, prompt, model }),
+        body: JSON.stringify({ threadId: threadRef.current, prompt, model, editMessageId }),
       });
       const data = await response.json();
       if (!response.ok || !data.accepted) {

@@ -15,6 +15,7 @@ export interface PrismaLike {
   message: {
     create(a: { data: { threadId: string; agentId?: string | null; role: string; content: any } }): Promise<any>;
     findMany(a: { where: { threadId: string }; orderBy: { createdAt: 'asc' } }): Promise<any[]>;
+    deleteMany(a: { where: { id: { in: string[] } } }): Promise<{ count: number }>;
   };
   agentEvent: {
     create(a: { data: { threadId: string; seq: number; type: string; payload: any } }): Promise<unknown>;
@@ -73,6 +74,21 @@ export class PrismaStorage implements Storage {
       }),
     list: (threadId: string) =>
       this.prisma.message.findMany({ where: { threadId }, orderBy: { createdAt: 'asc' } }),
+    deleteFrom: async (threadId: string, messageId: string) => {
+      // Delete by id over the same ordering `list` uses, rather than a
+      // `createdAt >=` range: a run appends several messages inside one
+      // millisecond, and a range would take neighbours with it.
+      const rows = await this.prisma.message.findMany({
+        where: { threadId },
+        orderBy: { createdAt: 'asc' },
+      });
+      const from = rows.findIndex((m: { id: string }) => m.id === messageId);
+      if (from === -1) return 0;
+      const { count } = await this.prisma.message.deleteMany({
+        where: { id: { in: rows.slice(from).map((m: { id: string }) => m.id) } },
+      });
+      return count;
+    },
   };
 
   events = {

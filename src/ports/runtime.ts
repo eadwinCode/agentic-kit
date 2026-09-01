@@ -51,6 +51,10 @@ export interface RunInput {
   /** Omit to create a fresh thread first (threads.create, §3.2) */
   threadId?: string;
   prompt: string;
+  /** Edit + resend (§5.1): replace this user message with `prompt` and drop
+   *  every message after it, then answer again from that point. Must name a
+   *  message in this thread whose role is 'user'. Omit for a normal turn. */
+  editMessageId?: string;
   /** Registry key or provider instance reference — resolved via
    *  `AgentCore.resolveModel`. Overrides the spec default. */
   model?: string;

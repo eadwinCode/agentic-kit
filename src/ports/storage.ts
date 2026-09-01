@@ -32,6 +32,15 @@ export interface Storage {
   messages: {
     append(threadId: string, message: NewMessage): Promise<MessageDTO>;
     list(threadId: string): Promise<MessageDTO[]>;
+    /** Delete `messageId` and every message after it, in the same order
+     *  `list` returns (§5.1 edit + resend). Returns how many rows went; 0 when
+     *  the id is not in this thread.
+     *
+     *  Dropping a suffix only leaves the history well-formed if it starts at a
+     *  user turn — cutting from a tool result would strip it off the assistant
+     *  tool-call that produced it, and a dangling call is a conversation no
+     *  provider accepts. `run()` enforces that; adapters just delete. */
+    deleteFrom(threadId: string, messageId: string): Promise<number>;
   };
   events: {
     append(threadId: string, event: AgentEvent): Promise<void>;

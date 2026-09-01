@@ -128,6 +128,12 @@ export class MemoryStorage implements Storage {
       return dto;
     },
     async list(t: string) { return [...(this.store.get(t) ?? [])]; },
+    async deleteFrom(t: string, messageId: string) {
+      const rows = this.store.get(t) ?? [];
+      const from = rows.findIndex((m) => m.id === messageId);
+      if (from === -1) return 0;
+      return rows.splice(from).length;
+    },
   };
 
   events = {

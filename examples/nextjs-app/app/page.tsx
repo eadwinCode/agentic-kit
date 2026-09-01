@@ -32,6 +32,9 @@ export default function Page() {
     respondToInput,
   } = useAgentThread();
   const [prompt, setPrompt] = useState('');
+  // The message being edited, and its working text. Editing is a resend: the
+  // turn and everything after it is replaced (§5.1).
+  const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
   // One button, two jobs: while a run is live it stops; otherwise it sends.
   const running = agentState === 'RUNNING' || agentState === 'WAITING_FOR_INPUT';
   const canSend = !historyLoading && !running && prompt.trim().length > 0;
@@ -41,6 +44,13 @@ export default function Page() {
     if (!canSend) return;
     void run(prompt.trim());
     setPrompt('');
+  };
+
+  const submitEdit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editing || running || !editing.text.trim()) return;
+    void run(editing.text.trim(), 'gpt-4o', editing.id);
+    setEditing(null);
   };
 
   return (
@@ -132,7 +142,48 @@ export default function Page() {
           ) : (
             <div key={e.id} className={`message ${e.role}`}>
               <span className="message-role">{e.role === 'user' ? 'You' : 'Agent'}</span>
-              <div className="bubble">{e.text}</div>
+              {editing?.id === e.id ? (
+                <form className="bubble editing" onSubmit={submitEdit}>
+                  <textarea
+                    value={editing.text}
+                    autoFocus
+                    rows={Math.min(8, editing.text.split('\n').length + 1)}
+                    onChange={(ev) => setEditing({ id: e.id, text: ev.target.value })}
+                    onKeyDown={(ev) => {
+                      if (ev.key === 'Escape') setEditing(null);
+                      if (ev.key === 'Enter' && !ev.shiftKey) {
+                        ev.preventDefault();
+                        submitEdit(ev);
+                      }
+                    }}
+                  />
+                  <div className="edit-actions">
+                    <span className="edit-note">replaces everything below</span>
+                    <button type="button" onClick={() => setEditing(null)}>
+                      Cancel
+                    </button>
+                    <button type="submit" className="send" disabled={!editing.text.trim()}>
+                      Resend
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <div className="bubble">
+                  {e.text}
+                  {e.role === 'user' && !e.id.startsWith('optimistic:') && (
+                    <button
+                      type="button"
+                      className="edit-message"
+                      title={running ? 'Stop the run to edit' : 'Edit and resend'}
+                      aria-label="Edit this message and resend"
+                      disabled={running}
+                      onClick={() => setEditing({ id: e.id, text: e.text })}
+                    >
+                      ✎
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           ),
         )}

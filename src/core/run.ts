@@ -38,6 +38,21 @@ export async function run(
     }
   }
 
+  // Edit + resend (§5.1): the edited turn and everything it led to are
+  // dropped, then the new text is appended in its place — one thread, no
+  // forking. Only a user turn may be edited: cutting from anywhere else can
+  // strip a tool result off the assistant tool-call that produced it, and a
+  // dangling call is a conversation no provider accepts.
+  if (input.editMessageId) {
+    const history = await deps.storage.messages.list(threadId);
+    const target = history.find((m) => m.id === input.editMessageId);
+    if (!target) return { accepted: false, threadId, error: 'Message not found' };
+    if (target.role !== 'user') {
+      return { accepted: false, threadId, error: 'Only a user message can be edited' };
+    }
+    await deps.storage.messages.deleteFrom(threadId, input.editMessageId);
+  }
+
   await deps.storage.messages.append(threadId, { role: 'user', content: input.prompt });
 
   // Claim the thread for THIS run before the state key is touched (§2.1). The
