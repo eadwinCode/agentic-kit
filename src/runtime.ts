@@ -130,8 +130,3 @@ export function setupAgentCore(opts: RuntimeOptions): AgentCore {
   return core;
 }
 
-/** Deprecated alias for `setupAgentCore` — kept for the one-minor
- *  migration window (§7). */
-export function createAgentRuntime(opts: RuntimeOptions): AgentCore {
-  return setupAgentCore(opts);
-}

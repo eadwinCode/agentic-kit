@@ -23,8 +23,6 @@ export type {
 
 // runtime — the factory that binds ports to behaviors
 export { setupAgentCore } from './runtime.js';
-/** @deprecated use `setupAgentCore` — removed in the next minor (§7) */
-export { createAgentRuntime } from './runtime.js';
 
 // core — behaviors, all ports-only
 export { execute, executeWithPolicy, finalize, markRequiresConfirmation } from './core/engine.js';

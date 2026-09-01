@@ -16,7 +16,6 @@ export async function run(
   const model = input.model ?? agent.spec.model ?? 'gpt-4o';
 
   let threadId = input.threadId;
-  console.log('threadId', threadId);
   if (!threadId) {
     const created = await deps.storage.threads.create({ model });
     threadId = created.id;
