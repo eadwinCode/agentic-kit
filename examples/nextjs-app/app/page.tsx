@@ -70,6 +70,9 @@ export default function Page() {
           <button type="button" className="new-thread" onClick={newThread}>
             + New
           </button>
+          <a className="admin-link" href="/admin" title="Runs, steps and timings (§2.9)">
+            ◴
+          </a>
         </div>
         <nav className="thread-list">
           {threadsLoading && threads.length === 0 && (

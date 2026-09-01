@@ -108,6 +108,16 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
           depth,
           agent: name,
           model: model ?? ctx.sub.model ?? 'gpt-4o',
+          // A nested run's "prompt" is the brief it was delegated (§2.7).
+          ...(ctx.ports.config.recordPayloads
+            ? {
+                prompt:
+                  instructions.length > ctx.ports.config.payloadCapChars
+                    ? `${instructions.slice(0, ctx.ports.config.payloadCapChars)}…`
+                    : instructions,
+                runState: ctx.state ?? null,
+              }
+            : {}),
         });
         await publish(ctx.ports, ctx.threadId, 'SUBAGENT_STARTED', {
           agentId: run.id, name, depth,
@@ -299,7 +309,10 @@ export async function runNestedAgent(
     threadId,
     {
       agentId: d.agentId,
-      runId: ctx.resume.runId,
+      // Its OWN run id, not its parent's: a nested run is a run (§2.7, §2.9),
+      // so its steps belong to its own record. Attributing them upward mixed
+      // two agents' steps into one timeline and made the indexes collide.
+      runId: d.agentId,
       kind: ctx.sub.kind ?? 'stream-text',
       model: resolveNestedModel(ctx, d.model).instance(),
       messages: persisted.map((m) => ({ role: m.role, content: m.content }) as any),

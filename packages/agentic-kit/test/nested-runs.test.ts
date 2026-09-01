@@ -665,3 +665,29 @@ describe('the depth cap (§2.7)', () => {
     expect((await r.storage.threads.get(ran.threadId))!.state).toBe('COMPLETED');
   });
 });
+
+describe('step attribution (§2.9)', () => {
+  it('gives a nested run its own steps, not its parent\'s', async () => {
+    const r = await plainDelegatingRuntime();
+    const ran = await r.chat.run({ prompt: 'delegate' });
+    await r.runtime.worker.handleJob(r.queue.items[0]!);
+
+    const runs = await r.runtime.admin.listRunsByThread(ran.threadId);
+    const child = runs.find((x) => x.depth === 1)!;
+
+    const parentSteps = await r.runtime.admin.listSteps(ran.runId!);
+    const childSteps = await r.runtime.admin.listSteps(child.id);
+
+    // Two parent steps and one child step, each on its own record — mixing
+    // them made a run look slower than it was and collided their indexes.
+    expect(parentSteps).toHaveLength(2);
+    expect(childSteps).toHaveLength(1);
+    expect(parentSteps.every((s) => s.agentId === null)).toBe(true);
+    expect(childSteps[0]!.agentId).toBe(child.id);
+
+    // A run's own steps never exceed its wall clock.
+    const accounted = parentSteps.reduce((n, s) => n + s.durationMs, 0);
+    const parent = runs.find((x) => x.depth === 0)!;
+    expect(accounted).toBeLessThanOrEqual(parent.durationMs! + 5);
+  });
+});

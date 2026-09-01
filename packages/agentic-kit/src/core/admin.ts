@@ -38,6 +38,31 @@ export interface AdminOverview {
   active: RunRecord[];
 }
 
+/** A thread with its runs rolled up (§2.9) — what a listing needs to rank and
+ *  compare threads without opening each one. */
+export interface ThreadSummary {
+  id: string;
+  state: ExecutionState;
+  model: string;
+  firstSeenAt: Date;
+  updatedAt: Date;
+  /** Runs on this thread, nested ones included. */
+  runs: number;
+  steps: number;
+  tokens: UsageTotals;
+  /** Summed run durations. Not wall time: nested runs overlap their parent. */
+  durationMs: number;
+  /** What started it — the first dispatched run's prompt. */
+  prompt?: string | null;
+}
+
+/** A thread opened up: its runs, and every step across them in order. */
+export interface ThreadDetail {
+  thread: ThreadSummary;
+  runs: RunRecord[];
+  steps: StepRecord[];
+}
+
 /** Everything about one run, assembled for a timeline view. */
 export interface RunDetail {
   run: RunRecord;
@@ -128,6 +153,74 @@ export async function overview(
  *  than a scan of the caller's event log. */
 export async function listSteps(deps: RuntimePorts, runId: string): Promise<StepRecord[]> {
   return deps.admin.steps.listByRun(runId);
+}
+
+const addTokens = (into: UsageTotals, from: UsageTotals) => {
+  into.inputTokens += from.inputTokens;
+  into.cachedInputTokens += from.cachedInputTokens;
+  into.outputTokens += from.outputTokens;
+  into.totalTokens += from.totalTokens;
+};
+
+function rollUp(thread: {
+  id: string; state: ExecutionState; model: string; firstSeenAt: Date; updatedAt: Date;
+}, runs: RunRecord[]): ThreadSummary {
+  const tokens = { ...EMPTY };
+  let steps = 0;
+  let durationMs = 0;
+  for (const r of runs) {
+    addTokens(tokens, r);
+    steps += r.steps;
+    durationMs += r.durationMs ?? 0;
+  }
+  // The dispatched run is the one a person started; a nested run's prompt is
+  // a brief the model wrote.
+  const root = runs.filter((r) => r.depth === 0).sort(
+    (a, b) => a.startedAt.getTime() - b.startedAt.getTime(),
+  )[0];
+  return { ...thread, runs: runs.length, steps, tokens, durationMs, prompt: root?.prompt ?? null };
+}
+
+/** Threads with their runs rolled up, newest activity first (§2.9). One pass
+ *  over the window's runs rather than a query per thread. */
+export async function listThreads(
+  deps: RuntimePorts,
+  filter: { state?: ExecutionState[]; since?: Date; limit?: number } = {},
+): Promise<ThreadSummary[]> {
+  const [threads, runs] = await Promise.all([
+    deps.admin.threads.list({ ...filter, limit: filter.limit ?? DEFAULT_LIMIT }),
+    deps.admin.runs.list({ since: filter.since, limit: 5_000 }),
+  ]);
+  const byThread = new Map<string, RunRecord[]>();
+  for (const r of runs) {
+    const list = byThread.get(r.threadId) ?? [];
+    list.push(r);
+    byThread.set(r.threadId, list);
+  }
+  return threads.map((t) => rollUp(t, byThread.get(t.id) ?? []));
+}
+
+/** One thread opened up: its runs and every step across them (§2.9). */
+export async function getThread(
+  deps: RuntimePorts,
+  threadId: string,
+): Promise<ThreadDetail | null> {
+  const [runs, steps] = await Promise.all([
+    deps.admin.runs.listByThread(threadId),
+    deps.admin.steps.listByThread(threadId),
+  ]);
+  const rows = await deps.admin.threads.list({ limit: 5_000 });
+  const thread = rows.find((t) => t.id === threadId);
+  if (!thread && runs.length === 0) return null;
+
+  const base = thread ?? {
+    id: threadId,
+    state: (runs[0]?.state ?? 'IDLE') as ExecutionState,
+    model: runs[0]?.model ?? 'unknown',
+    firstSeenAt: runs.at(-1)?.startedAt ?? new Date(),
+    updatedAt: runs[0]?.startedAt ?? new Date(),
+  };
+  return { thread: rollUp(base, runs), runs, steps };
 }
 
 export async function getRun(deps: RuntimePorts, runId: string): Promise<RunDetail | null> {

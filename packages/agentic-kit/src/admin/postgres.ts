@@ -46,18 +46,28 @@ const SCHEMA = [
      attempts INT NOT NULL DEFAULT 0, steps INT NOT NULL DEFAULT 0,
      "inputTokens" INT NOT NULL DEFAULT 0, "cachedInputTokens" INT NOT NULL DEFAULT 0,
      "outputTokens" INT NOT NULL DEFAULT 0, "totalTokens" INT NOT NULL DEFAULT 0,
-     result JSONB
+     result JSONB, prompt TEXT, "tokenBudget" INT, "runState" JSONB
    )`,
+  `ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS prompt TEXT`,
+  `ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS "tokenBudget" INT`,
+  `ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS "runState" JSONB`,
   `CREATE INDEX IF NOT EXISTS agentic_runs_thread ON agentic_runs("threadId", "startedAt" DESC)`,
   `CREATE INDEX IF NOT EXISTS agentic_runs_state ON agentic_runs(state, "startedAt" DESC)`,
   `CREATE INDEX IF NOT EXISTS agentic_runs_parent ON agentic_runs("parentRunId")`,
   `CREATE TABLE IF NOT EXISTS agentic_steps (
-     "runId" TEXT NOT NULL, "agentId" TEXT, "index" INT NOT NULL,
+     "runId" TEXT NOT NULL, "threadId" TEXT, "agentId" TEXT, "index" INT NOT NULL,
      "durationMs" INT NOT NULL, "finishReason" TEXT NOT NULL,
      "inputTokens" INT NOT NULL DEFAULT 0, "cachedInputTokens" INT NOT NULL DEFAULT 0,
      "outputTokens" INT NOT NULL DEFAULT 0, "totalTokens" INT NOT NULL DEFAULT 0,
-     tools JSONB, at TIMESTAMPTZ NOT NULL DEFAULT now()
+     tools JSONB, text TEXT, "toolCalls" JSONB,
+     at TIMESTAMPTZ NOT NULL DEFAULT now()
    )`,
+  // CREATE TABLE IF NOT EXISTS leaves an existing table alone, so newer
+  // columns are added separately.
+  `ALTER TABLE agentic_steps ADD COLUMN IF NOT EXISTS text TEXT`,
+  `ALTER TABLE agentic_steps ADD COLUMN IF NOT EXISTS "threadId" TEXT`,
+  `CREATE INDEX IF NOT EXISTS agentic_steps_thread ON agentic_steps("threadId", at)`,
+  `ALTER TABLE agentic_steps ADD COLUMN IF NOT EXISTS "toolCalls" JSONB`,
   `CREATE INDEX IF NOT EXISTS agentic_steps_run ON agentic_steps("runId", "index")`,
 ];
 
@@ -71,6 +81,8 @@ const toRun = (r: any): RunRecord => ({
   inputTokens: r.inputTokens, cachedInputTokens: r.cachedInputTokens,
   outputTokens: r.outputTokens, totalTokens: r.totalTokens,
   result: r.result ?? null,
+  prompt: r.prompt ?? null, tokenBudget: r.tokenBudget ?? null,
+  runState: r.runState ?? null,
 });
 
 /** Operational history in Postgres — the production store (§2.9), reached
@@ -126,9 +138,15 @@ export class PostgresAdminStore implements AdminStore {
   runs = {
     start: async (run: NewRunRecord) => {
       const { rows } = await this.db.query(
-        `INSERT INTO agentic_runs (id, "threadId", "parentRunId", depth, agent, model, state)
-         VALUES ($1, $2, $3, $4, $5, $6, 'RUNNING') RETURNING *`,
-        [run.id, run.threadId, run.parentRunId ?? null, run.depth ?? 0, run.agent, run.model],
+        `INSERT INTO agentic_runs
+           (id, "threadId", "parentRunId", depth, agent, model, state,
+            prompt, "tokenBudget", "runState")
+         VALUES ($1, $2, $3, $4, $5, $6, 'RUNNING', $7, $8, $9) RETURNING *`,
+        [
+          run.id, run.threadId, run.parentRunId ?? null, run.depth ?? 0,
+          run.agent, run.model, run.prompt ?? null, run.tokenBudget ?? null,
+          run.runState ? JSON.stringify(run.runState) : null,
+        ],
       );
       return toRun(rows[0]);
     },
@@ -186,13 +204,16 @@ export class PostgresAdminStore implements AdminStore {
     record: async (s: NewStepRecord) => {
       await this.db.query(
         `INSERT INTO agentic_steps
-           ("runId", "agentId", "index", "durationMs", "finishReason",
-            "inputTokens", "cachedInputTokens", "outputTokens", "totalTokens", tools, at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+           ("runId", "threadId", "agentId", "index", "durationMs", "finishReason",
+            "inputTokens", "cachedInputTokens", "outputTokens", "totalTokens",
+            tools, text, "toolCalls", at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
         [
-          s.runId, s.agentId, s.index, s.durationMs, s.finishReason,
+          s.runId, s.threadId, s.agentId, s.index, s.durationMs, s.finishReason,
           s.inputTokens, s.cachedInputTokens, s.outputTokens, s.totalTokens,
-          JSON.stringify(s.tools), s.at ?? new Date(),
+          JSON.stringify(s.tools), s.text ?? null,
+          s.toolCalls ? JSON.stringify(s.toolCalls) : null,
+          s.at ?? new Date(),
         ],
       );
     },
@@ -201,13 +222,23 @@ export class PostgresAdminStore implements AdminStore {
         'SELECT * FROM agentic_steps WHERE "runId" = $1 ORDER BY "index"',
         [runId],
       );
-      return rows.map((r) => ({
-        runId: r.runId, agentId: r.agentId ?? null, index: r.index,
-        durationMs: r.durationMs, finishReason: r.finishReason,
-        inputTokens: r.inputTokens, cachedInputTokens: r.cachedInputTokens,
-        outputTokens: r.outputTokens, totalTokens: r.totalTokens,
-        tools: r.tools ?? [], at: new Date(r.at),
-      }));
+      return rows.map(toStep);
+    },
+    listByThread: async (threadId: string): Promise<StepRecord[]> => {
+      const { rows } = await this.db.query(
+        'SELECT * FROM agentic_steps WHERE "threadId" = $1 ORDER BY at',
+        [threadId],
+      );
+      return rows.map(toStep);
     },
   };
 }
+
+const toStep = (r: any): StepRecord => ({
+        runId: r.runId, threadId: r.threadId ?? '', agentId: r.agentId ?? null, index: r.index,
+        durationMs: r.durationMs, finishReason: r.finishReason,
+        inputTokens: r.inputTokens, cachedInputTokens: r.cachedInputTokens,
+        outputTokens: r.outputTokens, totalTokens: r.totalTokens,
+        tools: r.tools ?? [], text: r.text ?? null,
+        toolCalls: r.toolCalls ?? [], at: new Date(r.at),
+});

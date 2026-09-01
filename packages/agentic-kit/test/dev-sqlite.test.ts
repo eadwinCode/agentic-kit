@@ -133,7 +133,7 @@ describe('SqliteAdminStore', () => {
     expect(await a.runs.countByState()).toMatchObject({ COMPLETED: 1, RUNNING: 1 });
 
     await a.steps.record({
-      runId: 'r1', agentId: null, index: 1, durationMs: 12, finishReason: 'stop',
+      runId: 'r1', threadId: 't1', agentId: null, index: 1, durationMs: 12, finishReason: 'stop',
       inputTokens: 10, cachedInputTokens: 0, outputTokens: 5, totalTokens: 15,
       tools: ['sendEmail'],
     });

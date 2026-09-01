@@ -36,6 +36,8 @@ export interface AdminStore {
     record(step: NewStepRecord): Promise<void>;
     /** A run's steps in order. */
     listByRun(runId: string): Promise<StepRecord[]>;
+    /** Every step on a thread, oldest first — the shape a timeline wants. */
+    listByThread(threadId: string): Promise<StepRecord[]>;
   };
   /** Release any handles. Development stores hold an open file. */
   close?(): Promise<void>;
@@ -44,6 +46,9 @@ export interface AdminStore {
 /** One completed loop iteration (§2.9). */
 export interface StepRecord {
   runId: string;
+  /** Denormalised so a thread's whole timeline — across every run on it, main
+   *  and nested — is one query rather than one per run. */
+  threadId: string;
   /** Which stream ran it — null is the main agent (§2.7). */
   agentId: string | null;
   index: number;
@@ -53,8 +58,17 @@ export interface StepRecord {
   cachedInputTokens: number;
   outputTokens: number;
   totalTokens: number;
-  /** Tools the step executed. */
+  /** Tools the step executed, by name — the summary line. */
   tools: string[];
+  /** What the step said, capped. Timing tells you where a run spent itself;
+   *  this tells you what it actually did. */
+  text?: string | null;
+  /** The tools it ran, with arguments and results, each capped.
+   *
+   *  Note what this means: tool arguments and results are operational data now,
+   *  sitting in the platform's store. If yours carry anything you would not
+   *  want there, set `recordPayloads: false`. */
+  toolCalls?: Array<{ toolName: string; args: unknown; result: unknown }>;
   at: Date;
 }
 

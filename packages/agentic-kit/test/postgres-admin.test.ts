@@ -114,7 +114,7 @@ describe('PostgresAdminStore (§2.9)', () => {
     if (!requireDb()) return;
     for (const index of [2, 1]) {
       await store.steps.record({
-        runId: 'pg-r1', agentId: null, index, durationMs: index * 10,
+        runId: 'pg-r1', threadId: 'pg-t1', agentId: null, index, durationMs: index * 10,
         finishReason: 'stop', inputTokens: 10, cachedInputTokens: 0,
         outputTokens: 5, totalTokens: 15, tools: ['sendEmail'],
       });

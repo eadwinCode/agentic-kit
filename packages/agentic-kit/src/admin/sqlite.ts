@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS agentic_runs (
   attempts INTEGER NOT NULL DEFAULT 0, steps INTEGER NOT NULL DEFAULT 0,
   inputTokens INTEGER NOT NULL DEFAULT 0, cachedInputTokens INTEGER NOT NULL DEFAULT 0,
   outputTokens INTEGER NOT NULL DEFAULT 0, totalTokens INTEGER NOT NULL DEFAULT 0,
-  result TEXT
+  result TEXT, prompt TEXT, tokenBudget INTEGER, runState TEXT
 );
 CREATE INDEX IF NOT EXISTS agentic_runs_thread ON agentic_runs(threadId, startedAt);
 CREATE INDEX IF NOT EXISTS agentic_runs_state ON agentic_runs(state, startedAt);
@@ -29,13 +29,14 @@ CREATE TABLE IF NOT EXISTS agentic_threads (
 );
 CREATE INDEX IF NOT EXISTS agentic_threads_state ON agentic_threads(state, updatedAt);
 CREATE TABLE IF NOT EXISTS agentic_steps (
-  runId TEXT NOT NULL, agentId TEXT, "index" INTEGER NOT NULL,
+  runId TEXT NOT NULL, threadId TEXT, agentId TEXT, "index" INTEGER NOT NULL,
   durationMs INTEGER NOT NULL, finishReason TEXT NOT NULL,
   inputTokens INTEGER NOT NULL DEFAULT 0, cachedInputTokens INTEGER NOT NULL DEFAULT 0,
   outputTokens INTEGER NOT NULL DEFAULT 0, totalTokens INTEGER NOT NULL DEFAULT 0,
-  tools TEXT, at INTEGER NOT NULL
+  tools TEXT, text TEXT, toolCalls TEXT, at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS agentic_steps_run ON agentic_steps(runId, "index");
+CREATE INDEX IF NOT EXISTS agentic_steps_thread ON agentic_steps(threadId, at);
 `;
 
 /** Operational history in SQLite — what `dev: true` uses (§2.9).
@@ -47,6 +48,23 @@ export class SqliteAdminStore implements AdminStore {
     for (const stmt of SCHEMA.split(';')) {
       const sql = stmt.trim();
       if (sql) this.db.prepare(sql).run();
+    }
+    // CREATE TABLE IF NOT EXISTS never adds a column to a database that already
+    // exists, so newer fields are added separately. SQLite has no
+    // ADD COLUMN IF NOT EXISTS, hence the check.
+    const have = new Set(
+      (this.db.prepare('PRAGMA table_info(agentic_steps)').all() as any[]).map((c) => c.name),
+    );
+    for (const col of ['text', 'toolCalls', 'threadId']) {
+      if (!have.has(col)) this.db.prepare(`ALTER TABLE agentic_steps ADD COLUMN ${col} TEXT`).run();
+    }
+    const runCols = new Set(
+      (this.db.prepare('PRAGMA table_info(agentic_runs)').all() as any[]).map((c) => c.name),
+    );
+    for (const [col, type] of [['prompt', 'TEXT'], ['tokenBudget', 'INTEGER'], ['runState', 'TEXT']]) {
+      if (!runCols.has(col)) {
+        this.db.prepare(`ALTER TABLE agentic_runs ADD COLUMN ${col} ${type}`).run();
+      }
     }
   }
 
@@ -70,6 +88,8 @@ export class SqliteAdminStore implements AdminStore {
     inputTokens: r.inputTokens, cachedInputTokens: r.cachedInputTokens,
     outputTokens: r.outputTokens, totalTokens: r.totalTokens,
     result: parse(r.result),
+    prompt: r.prompt ?? null, tokenBudget: r.tokenBudget ?? null,
+    runState: parse(r.runState),
   });
 
   threads = {
@@ -111,9 +131,10 @@ export class SqliteAdminStore implements AdminStore {
     start: async (run: NewRunRecord) => {
       const startedAt = Date.now();
       this.write(
-        'INSERT INTO agentic_runs (id,threadId,parentRunId,depth,agent,model,state,startedAt) VALUES (?,?,?,?,?,?,?,?)',
+        'INSERT INTO agentic_runs (id,threadId,parentRunId,depth,agent,model,state,startedAt,prompt,tokenBudget,runState) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
         run.id, run.threadId, run.parentRunId ?? null, run.depth ?? 0,
         run.agent, run.model, 'RUNNING', startedAt,
+        run.prompt ?? null, run.tokenBudget ?? null, json(run.runState),
       );
       return this.toRun({
         ...run, parentRunId: run.parentRunId ?? null, depth: run.depth ?? 0,
@@ -166,20 +187,27 @@ export class SqliteAdminStore implements AdminStore {
   steps = {
     record: async (s: NewStepRecord) => {
       this.write(
-        'INSERT INTO agentic_steps (runId,agentId,"index",durationMs,finishReason,inputTokens,cachedInputTokens,outputTokens,totalTokens,tools,at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-        s.runId, s.agentId, s.index, s.durationMs, s.finishReason,
+        'INSERT INTO agentic_steps (runId,threadId,agentId,"index",durationMs,finishReason,inputTokens,cachedInputTokens,outputTokens,totalTokens,tools,text,toolCalls,at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        s.runId, s.threadId, s.agentId, s.index, s.durationMs, s.finishReason,
         s.inputTokens, s.cachedInputTokens, s.outputTokens, s.totalTokens,
-        json(s.tools), (s.at ?? new Date()).getTime(),
+        json(s.tools), s.text ?? null, json(s.toolCalls),
+        (s.at ?? new Date()).getTime(),
       );
     },
     listByRun: async (runId: string): Promise<StepRecord[]> =>
       this.all('SELECT * FROM agentic_steps WHERE runId = ? ORDER BY "index"', runId)
-        .map((r) => ({
-          runId: r.runId, agentId: r.agentId ?? null, index: r.index,
+        .map(this.toStep),
+    listByThread: async (threadId: string): Promise<StepRecord[]> =>
+      this.all('SELECT * FROM agentic_steps WHERE threadId = ? ORDER BY at', threadId)
+        .map(this.toStep),
+  };
+
+  private toStep = (r: any): StepRecord => ({
+          runId: r.runId, threadId: r.threadId ?? '', agentId: r.agentId ?? null, index: r.index,
           durationMs: r.durationMs, finishReason: r.finishReason,
           inputTokens: r.inputTokens, cachedInputTokens: r.cachedInputTokens,
           outputTokens: r.outputTokens, totalTokens: r.totalTokens,
-          tools: parse(r.tools) ?? [], at: new Date(r.at),
-        })),
-  };
+          tools: parse(r.tools) ?? [], text: r.text ?? null,
+          toolCalls: parse(r.toolCalls) ?? [], at: new Date(r.at),
+  });
 }

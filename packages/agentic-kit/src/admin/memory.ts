@@ -37,7 +37,7 @@ export class MemoryAdminStore implements AdminStore {
   runs = {
     start: async (r: NewRunRecord) => {
       const rec: RunRecord = {
-        parentRunId: null, depth: 0, ...r,
+        parentRunId: null, depth: 0, prompt: null, tokenBudget: null, runState: null, ...r,
         state: 'RUNNING', startedAt: new Date(), steps: 0, attempts: 0,
         inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0,
       };
@@ -77,5 +77,9 @@ export class MemoryAdminStore implements AdminStore {
     },
     listByRun: async (runId: string) =>
       this.stepRows.filter((s) => s.runId === runId).sort((a, b) => a.index - b.index),
+    listByThread: async (threadId: string) =>
+      this.stepRows
+        .filter((s) => s.threadId === threadId)
+        .sort((a, b) => a.at.getTime() - b.at.getTime()),
   };
 }

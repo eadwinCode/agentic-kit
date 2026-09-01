@@ -28,6 +28,8 @@ import type {
   AdminOverview,
   RunDetail,
   RunStats,
+  ThreadDetail,
+  ThreadSummary,
 } from '../core/admin.js';
 export type {
   AdminOverview,
@@ -267,6 +269,14 @@ export interface AgentCore {
     getRun(runId: string): Promise<RunDetail | null>;
     listRunsByThread(threadId: string): Promise<RunRecord[]>;
     listSteps(runId: string): Promise<StepRecord[]>;
+    /** Threads with their runs rolled up — the top level of an operational
+     *  view, since a thread is what a person recognises (§2.9). */
+    listThreads(filter?: {
+      state?: ExecutionState[];
+      since?: Date;
+      limit?: number;
+    }): Promise<ThreadSummary[]>;
+    getThread(threadId: string): Promise<ThreadDetail | null>;
   };
 
   /** The queue dispatch side of the platform (§2.8): resolves the handle,

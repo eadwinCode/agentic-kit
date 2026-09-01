@@ -72,7 +72,21 @@ export async function run(
   // The run's durable record opens here (§2.9): a thread accumulates many runs
   // and Thread.state only ever describes the latest, so this is the only place
   // "what happened, how long, what did it cost" can be answered from.
-  await deps.admin.runs.start({ id: runId, threadId, agent: agent.name, model });
+  await deps.admin.runs.start({
+    id: runId, threadId, agent: agent.name, model,
+    // What this run was asked to do (§2.9) — without it a dashboard can show
+    // that a run was slow but not what it was slow at.
+    ...(deps.config.recordPayloads
+      ? {
+          prompt:
+            input.prompt.length > deps.config.payloadCapChars
+              ? `${input.prompt.slice(0, deps.config.payloadCapChars)}…`
+              : input.prompt,
+          tokenBudget: input.tokenBudget ?? null,
+          runState: input.state ?? null,
+        }
+      : {}),
+  });
 
   await deps.queue.enqueue({
     threadId, runId, model, agent: agent.name,

@@ -112,6 +112,19 @@ export async function executeStep(
   };
 }
 
+/** Keep a recorded value small: one oversized tool result should not be able
+ *  to bloat the operational store (§2.9). Structured values are truncated by
+ *  their serialised form so the shape stays readable. */
+const cap = (text: string | undefined, limit: number): string | null =>
+  !text ? null : text.length > limit ? `${text.slice(0, limit)}…` : text;
+
+function capValue(value: unknown, limit: number): unknown {
+  if (value === undefined) return null;
+  if (typeof value === 'string') return cap(value, limit);
+  const json = JSON.stringify(value) ?? 'null';
+  return json.length <= limit ? value : `${json.slice(0, limit)}…`;
+}
+
 /** Tokens a run has spent, main agent and nested runs together (§2.7). Shared
  *  by reference so a child's spend counts against the run's safety cap the
  *  moment it happens — a budget that ignores delegated work is not a budget. */
@@ -242,6 +255,7 @@ export async function runLoop(
     // caller's event log — operational history is not their data to carry.
     const marker = {
       runId: input.runId ?? '',
+      threadId,
       agentId: input.agentId,
       index: stepsRun,
       durationMs: Date.now() - stepStartedAt,
@@ -253,6 +267,16 @@ export async function runLoop(
       tools: (step.toolResults ?? [])
         .map((r: any) => r?.toolName)
         .filter(Boolean) as string[],
+      ...(deps.config.recordPayloads
+        ? {
+            text: cap(step.text, deps.config.payloadCapChars),
+            toolCalls: (step.toolResults ?? []).map((r: any) => ({
+              toolName: r?.toolName,
+              args: capValue(r?.args, deps.config.payloadCapChars),
+              result: capValue(r?.result, deps.config.payloadCapChars),
+            })),
+          }
+        : {}),
     };
     if (input.runId) await deps.admin.steps.record(marker);
     await publishNotice(deps, threadId, 'STEP_FINISHED', marker);

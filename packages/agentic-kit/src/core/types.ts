@@ -92,6 +92,12 @@ export interface RunRecord {
   totalTokens: number;
   /** §2.8 redrive attempts consumed. Only a dispatched run has these. */
   attempts: number;
+  /** What the run was dispatched with (§2.9) — the prompt that started it, the
+   *  budget it was given, and the state it carries. Present only when
+   *  `recordPayloads` is on. A nested run's is its brief. */
+  prompt?: string | null;
+  tokenBudget?: number | null;
+  runState?: Record<string, unknown> | null;
   /** A nested run's capped result, handed back to its parent (§2.7). */
   result?: unknown;
 }
@@ -101,6 +107,9 @@ export interface NewRunRecord {
   threadId: string;
   agent: string;
   model: string;
+  prompt?: string | null;
+  tokenBudget?: number | null;
+  runState?: Record<string, unknown> | null;
   /** Defaults to 0 — a dispatched run. */
   depth?: number;
   parentRunId?: string | null;
@@ -260,6 +269,17 @@ export interface AgentConfig {
   subagentMaxSteps: number;
   /** Characters of a subagent result handed back to the parent (§2.7) */
   subagentResultCapChars: number;
+  /** Record payloads into the operational store (§2.9): the prompt and state a
+   *  run was dispatched with, and the text and tool arguments/results each step
+   *  produced. Off means timings and counts only.
+   *
+   *  On by default because a dashboard that cannot show what happened is worth
+   *  little — but this is the flag to turn off when prompts or tool payloads
+   *  carry anything that should not sit in an operational database. */
+  recordPayloads: boolean;
+  /** Characters kept per recorded value, so one large prompt or tool result
+   *  cannot bloat the store. */
+  payloadCapChars: number;
   /** Universal context ceiling (§2.6) */
   contextCeilingTokens: number;
   /** Tokens reserved for the completion when compacting (§2.6) */
@@ -294,6 +314,8 @@ export const DEFAULT_CONFIG: AgentConfig = {
   subagentMaxConcurrent: 3,
   subagentMaxSteps: 10,
   subagentResultCapChars: 8_000,
+  recordPayloads: true,
+  payloadCapChars: 2_000,
   contextCeilingTokens: 265_000,
   contextOutputReserveTokens: 16_000,
   compactionTrigger: 0.8,

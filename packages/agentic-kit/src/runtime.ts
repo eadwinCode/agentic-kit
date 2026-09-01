@@ -116,6 +116,8 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
       getRun: (runId: string) => adminReads.getRun(deps, runId),
       listRunsByThread: (threadId: string) => deps.admin.runs.listByThread(threadId),
       listSteps: (runId: string) => adminReads.listSteps(deps, runId),
+      listThreads: (filter) => adminReads.listThreads(deps, filter),
+      getThread: (threadId: string) => adminReads.getThread(deps, threadId),
     },
 
     getThreadUsage: async (threadId: string): Promise<ThreadUsage | null> => {
