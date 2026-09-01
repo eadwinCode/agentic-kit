@@ -38,11 +38,22 @@ export interface AgentActivity {
   detail?: string;
 }
 
+export type SubagentStatus =
+  | 'RUNNING'
+  | 'WAITING_FOR_INPUT'
+  | 'COMPLETED'
+  | 'FAILED'
+  | 'CANCELLED';
+
 export interface SubagentView {
   agentId: string;
   name: string;
-  status: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+  /** 1 = spawned by the main agent (§2.7). */
+  depth: number;
+  status: SubagentStatus;
   text: string;
+  /** Why it died — SUBAGENT_FAILED carries the reason. */
+  error?: string;
 }
 
 export interface UsageTotals {
@@ -68,7 +79,12 @@ export interface ThreadUsage {
 export interface PendingInput {
   toolCallId: string;
   toolName: string;
+  /** The stream that asked — null when the main agent did (§2.7). */
   agentId?: string | null;
+  /** The nested run's own name and depth, straight off the park, so the card
+   *  can say "mailer" rather than an opaque id. */
+  agentName?: string;
+  depth?: number;
   arguments: unknown;
 }
 
@@ -93,9 +109,17 @@ interface StreamEvent {
   payload: any;
 }
 
+interface SnapshotRun {
+  id: string;
+  name: string;
+  depth: number;
+  state: SubagentStatus;
+}
+
 interface ThreadSnapshotResponse {
   thread: { id: string; state: AgentState };
   messages: SnapshotMessage[];
+  runs: SnapshotRun[];
   lastEventSeq: number;
   activeEvents: StreamEvent[];
 }
@@ -183,6 +207,10 @@ export function useAgentThread(initialThreadId?: string) {
   const [usage, setUsage] = useState<ThreadUsage | null>(null);
   const threadRef = useRef<string | undefined>(threadId);
   threadRef.current = threadId;
+  /** Tool calls already visible from the durable messages. The snapshot's
+   *  activeEvents replay the same step's CHUNKs (§2.2), so without this a
+   *  reconnect renders every finished tool call twice. */
+  const seenToolCalls = useRef<Set<string>>(new Set());
 
   /** Tokens spent (§4) and context load (§2.6). Read after hydration and
    *  again whenever a run ends — both only change when a run writes. */
@@ -281,6 +309,15 @@ export function useAgentThread(initialThreadId?: string) {
       case 'STATE_CHANGE': {
         const nextState = p.state as AgentState;
         setAgentState(nextState);
+        if (nextState === 'RUNNING') {
+          // The park was resolved: every child that was waiting is re-entered
+          // where it stopped (§2.7).
+          setSubagents((prev) =>
+            prev.map((s) =>
+              s.status === 'WAITING_FOR_INPUT' ? { ...s, status: 'RUNNING' } : s,
+            ),
+          );
+        }
         setActivity((current) => {
           if (
             nextState === 'RUNNING' &&
@@ -333,6 +370,8 @@ export function useAgentThread(initialThreadId?: string) {
             detail: p.toolName,
           });
         } else if (p?.type === 'tool-call') {
+          if (p.toolCallId && seenToolCalls.current.has(p.toolCallId)) break; // already durable
+          if (p.toolCallId) seenToolCalls.current.add(p.toolCallId);
           setActivity({ phase: 'tool-call', label: 'Calling tool', detail: p.toolName });
           setEntries((prev) => [
             ...prev,
@@ -344,6 +383,11 @@ export function useAgentThread(initialThreadId?: string) {
             },
           ]);
         } else if (p?.type === 'tool-result') {
+          // The park sentinel is an internal marker, not a result (§2.5) —
+          // it is never persisted and must never be shown.
+          if (p.result && typeof p.result === 'object' && '__hitl_parked__' in p.result) break;
+          if (p.toolCallId && seenToolCalls.current.has(p.toolCallId)) break; // already durable
+          if (p.toolCallId) seenToolCalls.current.add(p.toolCallId);
           setActivity({ phase: 'tool-result', label: 'Tool completed', detail: p.toolName });
           setEntries((prev) => [
             ...prev,
@@ -370,10 +414,20 @@ export function useAgentThread(initialThreadId?: string) {
                   toolCallId: p.toolCallId,
                   toolName: p.toolName,
                   agentId: p.agentId ?? null,
+                  agentName: p.nested?.name,
+                  depth: p.nested?.depth,
                   arguments: p.arguments,
                 },
               ],
         );
+        // The child that asked is suspended, not working (§2.7).
+        if (p.agentId) {
+          setSubagents((prev) =>
+            prev.map((s) =>
+              s.agentId === p.agentId ? { ...s, status: 'WAITING_FOR_INPUT' } : s,
+            ),
+          );
+        }
         break;
 
       case 'INPUT_EXPIRED':
@@ -395,8 +449,22 @@ export function useAgentThread(initialThreadId?: string) {
         ]);
         setSubagents((prev) =>
           prev.some((s) => s.agentId === p.agentId)
-            ? prev
-            : [...prev, { agentId: p.agentId, name: p.name, status: 'RUNNING', text: '' }],
+            ? // Already hydrated from its persisted turns — name it.
+              prev.map((s) =>
+                s.agentId === p.agentId
+                  ? { ...s, name: p.name, depth: p.depth ?? s.depth }
+                  : s,
+              )
+            : [
+                ...prev,
+                {
+                  agentId: p.agentId,
+                  name: p.name,
+                  depth: p.depth ?? 1,
+                  status: 'RUNNING',
+                  text: '',
+                },
+              ],
         );
         break;
 
@@ -421,7 +489,7 @@ export function useAgentThread(initialThreadId?: string) {
         setSubagents((prev) =>
           prev.map((s) =>
             s.agentId === p.agentId
-              ? { ...s, status: (p.state as SubagentView['status']) ?? 'FAILED' }
+              ? { ...s, status: (p.state as SubagentStatus) ?? 'FAILED', error: p.error }
               : s,
           ),
         );
@@ -461,11 +529,50 @@ export function useAgentThread(initialThreadId?: string) {
         const snapshot = (await response.json()) as ThreadSnapshotResponse;
         if (cancelled) return;
 
-        const durableEntries = snapshot.messages
+        // A nested run's turns live in the same log under its own agentId
+        // (§2.7). They are its transcript, not the main conversation's.
+        const mainMessages = snapshot.messages.filter((m) => (m.agentId ?? null) === null);
+        const durableEntries = mainMessages
           .map(messageToEntry)
           .filter((entry): entry is ChatEntry => entry !== null);
         setEntries(durableEntries);
-        setSubagents([]);
+
+        // Rebuild each child's card from what it actually wrote, so a reload
+        // no longer loses a subagent's output. SUBAGENT_STARTED names them
+        // during the replay below.
+        seenToolCalls.current = new Set(
+          snapshot.messages.flatMap((m) =>
+            (Array.isArray(m.content) ? m.content : [])
+              .map((part: any) => part?.toolCallId)
+              .filter((id: unknown): id is string => typeof id === 'string'),
+          ),
+        );
+
+        // Name, depth and final state come from the durable SubagentRun rows;
+        // the SUBAGENT_* events only replay while a run is unfinished, so on a
+        // completed thread they are all a client has (§2.7).
+        const byAgent = new Map<string, SubagentView>(
+          (snapshot.runs ?? []).map((r) => [
+            r.id,
+            { agentId: r.id, name: r.name, depth: r.depth, status: r.state, text: '' },
+          ]),
+        );
+        for (const m of snapshot.messages) {
+          const id = m.agentId ?? null;
+          if (id === null) continue;
+          const view = byAgent.get(id) ?? {
+            agentId: id, name: id.slice(0, 8), depth: 1, status: 'RUNNING' as const, text: '',
+          };
+          if (m.role === 'assistant') {
+            const text = contentToText(m.content);
+            if (text) view.text = view.text ? `${view.text}\n${text}` : text;
+          }
+          byAgent.set(id, view);
+        }
+        // Trailing break so live deltas from a resumed child start on their
+        // own line instead of running into what it already wrote.
+        for (const view of byAgent.values()) if (view.text) view.text += '\n';
+        setSubagents([...byAgent.values()]);
         setPendingInputs([]);
         void loadUsage(threadId);
         setAgentState(snapshot.thread.state);

@@ -1,7 +1,12 @@
 'use client';
 
 import { useState } from 'react';
-import { useAgentThread, type ThreadUsage } from '../hooks/useAgentThread';
+import {
+  useAgentThread,
+  type PendingInput,
+  type SubagentStatus,
+  type ThreadUsage,
+} from '../hooks/useAgentThread';
 
 const stateLabel: Record<string, string> = {
   IDLE: 'idle',
@@ -37,6 +42,7 @@ export default function Page() {
   const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
   // One button, two jobs: while a run is live it stops; otherwise it sends.
   const running = agentState === 'RUNNING' || agentState === 'WAITING_FOR_INPUT';
+  const waiting = agentState === 'WAITING_FOR_INPUT';
   const canSend = !historyLoading && !running && prompt.trim().length > 0;
 
   const submit = (e: React.FormEvent) => {
@@ -188,50 +194,40 @@ export default function Page() {
           ),
         )}
 
-        {subagents.map((s) => (
-          <div key={s.agentId} className={`subagent ${s.status.toLowerCase()}`}>
-            <p className="subagent-head">
-              ▸ {s.name} <span className={`dot ${s.status.toLowerCase()}`} /> {s.status}
-            </p>
-            {s.text && <pre>{s.text}</pre>}
-          </div>
-        ))}
-
-        {agentState === 'WAITING_FOR_INPUT' && pendingInputs.length > 1 && (
+        {waiting && pendingInputs.length > 1 && (
           <p className="hitl-count">
             {pendingInputs.length} approvals open — the run continues once every one is
             answered (§2.7)
           </p>
         )}
-        {agentState === 'WAITING_FOR_INPUT' &&
-          pendingInputs.map((req) => (
-            <div key={req.toolCallId} className="hitl">
-              <p>
-                ⏸ approval required — <code>{req.toolName}</code>
-                {req.agentId && (
-                  <>
-                    {' '}
-                    requested by subagent <code>{req.agentId}</code>
-                  </>
-                )}
-              </p>
-              <pre>{truncate(JSON.stringify(req.arguments, null, 2), 400)}</pre>
-              <div className="row">
-                <button
-                  className="approve"
-                  onClick={() => void respondToInput(req.toolCallId, true)}
-                >
-                  Approve
-                </button>
-                <button
-                  className="deny"
-                  onClick={() => void respondToInput(req.toolCallId, false)}
-                >
-                  Deny
-                </button>
-              </div>
-            </div>
-          ))}
+
+        {/* A nested run's approval belongs to the agent that raised it, so it
+            renders inside that agent's card rather than floating free (§2.7). */}
+        {subagents.map((s) => (
+          <div key={s.agentId} className={`subagent ${s.status.toLowerCase()}`}>
+            <p className="subagent-head">
+              ▸ {s.name}
+              {s.depth > 1 && <span className="subagent-depth">depth {s.depth}</span>}
+              <span className={`dot ${s.status.toLowerCase()}`} /> {subagentLabel[s.status]}
+            </p>
+            {s.text && <pre>{s.text}</pre>}
+            {s.error && <p className="subagent-error">✕ {s.error}</p>}
+            {waiting &&
+              pendingInputs
+                .filter((req) => req.agentId === s.agentId)
+                .map((req) => (
+                  <Approval key={req.toolCallId} req={req} onRespond={respondToInput} />
+                ))}
+          </div>
+        ))}
+
+        {/* Approvals the MAIN agent raised have no subagent to sit under. */}
+        {waiting &&
+          pendingInputs
+            .filter((req) => !req.agentId)
+            .map((req) => (
+              <Approval key={req.toolCallId} req={req} onRespond={respondToInput} />
+            ))}
       </section>
 
       <form className="composer" onSubmit={submit}>
@@ -259,6 +255,48 @@ export default function Page() {
         </button>
       </form>
       </main>
+    </div>
+  );
+}
+
+const subagentLabel: Record<SubagentStatus, string> = {
+  RUNNING: 'working',
+  WAITING_FOR_INPUT: 'waiting for you',
+  COMPLETED: 'done',
+  FAILED: 'failed',
+  CANCELLED: 'stopped',
+};
+
+/** One approval, rendered wherever the agent that raised it lives (§2.5). */
+function Approval({
+  req,
+  onRespond,
+}: {
+  req: PendingInput;
+  onRespond: (toolCallId: string, approved: boolean) => void | Promise<unknown>;
+}) {
+  return (
+    <div className="hitl">
+      <p>
+        ⏸ approval required — <code>{req.toolName}</code>
+        {req.agentName ? (
+          <>
+            {' '}
+            asked by <strong>{req.agentName}</strong>
+          </>
+        ) : (
+          ' asked by the main agent'
+        )}
+      </p>
+      <pre>{truncate(JSON.stringify(req.arguments, null, 2), 400)}</pre>
+      <div className="row">
+        <button className="approve" onClick={() => void onRespond(req.toolCallId, true)}>
+          Approve
+        </button>
+        <button className="deny" onClick={() => void onRespond(req.toolCallId, false)}>
+          Deny
+        </button>
+      </div>
     </div>
   );
 }

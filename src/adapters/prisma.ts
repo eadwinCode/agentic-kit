@@ -44,6 +44,7 @@ export interface PrismaLike {
   };
   subagentRun: {
     create(a: { data: { threadId: string } & NewRun }): Promise<RunDTO>;
+    findMany(a: { where: { threadId: string }; orderBy: { createdAt: 'asc' } }): Promise<RunDTO[]>;
     update(a: { where: { id: string }; data: Record<string, unknown> }): Promise<RunDTO>;
   };
 }
@@ -164,6 +165,8 @@ export class PrismaStorage implements Storage {
   runs = {
     create: (threadId: string, run: NewRun) =>
       this.prisma.subagentRun.create({ data: { threadId, ...run } }),
+    list: (threadId: string) =>
+      this.prisma.subagentRun.findMany({ where: { threadId }, orderBy: { createdAt: 'asc' } }),
     update: async (runId: string, patch: Partial<RunDTO>) => {
       await this.prisma.subagentRun.update({ where: { id: runId }, data: patch });
     },

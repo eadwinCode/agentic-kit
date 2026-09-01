@@ -182,6 +182,9 @@ export class MemoryStorage implements Storage {
 
   runs = {
     store: new Map<string, RunDTO>(),
+    async list(t: string) {
+      return [...this.store.values()].filter((r) => r.threadId === t);
+    },
     async create(t: string, r: NewRun) {
       const now = new Date();
       const dto: RunDTO = { id: id(), threadId: t, ...r, createdAt: now, updatedAt: now };

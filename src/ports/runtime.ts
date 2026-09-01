@@ -8,6 +8,7 @@ import type {
   MessageDTO,
   ProviderOptions,
   ResolvedModel,
+  RunDTO,
   RunJob,
   SubagentsConfig,
   ThreadDTO,
@@ -114,6 +115,10 @@ export interface ThreadUsage {
 export interface ThreadSnapshot {
   thread: ThreadDTO;
   messages: MessageDTO[];
+  /** Nested runs on this thread (§2.7) — name, depth and final state, so a
+   *  reconnecting client rebuilds its subagent panel without depending on
+   *  events that only replay while a run is unfinished. */
+  runs: RunDTO[];
   /** Cursor for starting live replay without duplicating snapshot state. */
   lastEventSeq: number;
   /** Only the unfinished run's events, used to restore transient activity. */

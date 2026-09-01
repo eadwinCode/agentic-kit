@@ -462,3 +462,17 @@ button.stop { border-color: var(--red); }
   color: var(--yellow);
   font-size: 12px;
 }
+
+/* A nested run that is suspended on an approval (§2.7) */
+.subagent.waiting_for_input { border-color: var(--yellow); }
+.subagent.waiting_for_input .dot { background: var(--yellow); }
+.subagent-depth {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.subagent-error { margin: 6px 0 0; color: var(--red); font-size: 12px; }
+.subagent .hitl { margin-top: 10px; }

@@ -61,6 +61,7 @@ export function setupAgentCore(opts: RuntimeOptions): AgentCore {
       if (!thread) return null;
 
       const messages = await deps.storage.messages.list(threadId);
+      const runs = await deps.storage.runs.list(threadId);
       const events = await deps.storage.events.listSince(threadId, -1);
 
       const lastEventSeq = events.at(-1)?.seq ?? -1;
@@ -80,7 +81,7 @@ export function setupAgentCore(opts: RuntimeOptions): AgentCore {
         activeEvents = events.slice(Math.max(0, boundary));
       }
 
-      return { thread, messages, lastEventSeq, activeEvents };
+      return { thread, messages, runs, lastEventSeq, activeEvents };
     },
 
     getThreadUsage: async (threadId: string): Promise<ThreadUsage | null> => {

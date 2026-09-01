@@ -67,6 +67,11 @@ export interface Storage {
   };
   runs: {
     create(threadId: string, run: NewRun): Promise<RunDTO>;
+    /** Every nested run on the thread, oldest first (§2.7). A client rebuilds
+     *  its subagent panel from these: the SUBAGENT_* events only replay while
+     *  a run is unfinished, so a reloaded COMPLETED thread has nothing else to
+     *  read a child's name or final state from. */
+    list(threadId: string): Promise<RunDTO[]>;
     update(runId: string, patch: Partial<RunDTO>): Promise<void>;
   };
 }

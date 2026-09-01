@@ -428,3 +428,23 @@ describe('a model name the LLM invented (§2.7)', () => {
     expect((await storage.threads.get(ran.threadId))!.state).toBe('COMPLETED');
   });
 });
+
+describe('rebuilding the subagent panel after a reload (§2.7)', () => {
+  it('the snapshot carries nested runs, which outlive their events', async () => {
+    const r = plainDelegatingRuntime();
+    const ran = await r.chat.run({ prompt: 'delegate' });
+    await r.runtime.worker.handleJob(r.queue.items[0]!);
+
+    const snapshot = (await r.runtime.getThreadSnapshot(ran.threadId))!;
+    expect(snapshot.runs).toHaveLength(1);
+    expect(snapshot.runs[0]).toMatchObject({ name: 'helper', depth: 1, state: 'COMPLETED' });
+
+    // On a finished thread there are no active events left to replay, so the
+    // runs are the only place a client can read a child's name and state.
+    expect(snapshot.activeEvents).toHaveLength(0);
+    // And the child's turns are in the log, under its own agentId.
+    expect(
+      snapshot.messages.filter((m) => m.agentId === snapshot.runs[0]!.id).length,
+    ).toBeGreaterThan(0);
+  });
+});
