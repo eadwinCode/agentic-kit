@@ -44,7 +44,7 @@ export async function run(
   // in-flight chunks from earlier completed turns.
   await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
 
-  await deps.queue.enqueue({ threadId, model, agent: agent.name, tokenBudget: input.tokenBudget });
+  await deps.queue.enqueue({ threadId, model, agent: agent.name, tokenBudget: input.tokenBudget, providerOptions: input.providerOptions });
 
   return { accepted: true, threadId, state: 'RUNNING' };
 }

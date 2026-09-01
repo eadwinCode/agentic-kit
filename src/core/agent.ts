@@ -3,6 +3,7 @@ import type {
   AgentHandle,
   AgentKind,
   GenerateTextAgentSpec,
+  ProviderOptions,
   RunInput,
   StopResult,
   StreamTextAgentSpec,
@@ -23,6 +24,8 @@ export interface RegisteredAgent {
     model?: string;
     subagents?: boolean | SubagentsConfig;
     tokenBudget?: number;
+    /** Additional provider-specific options (§3.1) — merged per run. */
+    providerOptions?: ProviderOptions;
   };
   /** The user's generation args — spread first, platform keys last (§3.1). */
   args: Record<string, any>;
@@ -56,11 +59,11 @@ export function createStreamTextAgent(
   deps: RuntimePorts,
   spec: StreamTextAgentSpec,
 ): AgentHandle {
-  const { name, model, subagents, tokenBudget, ...args } = spec;
+  const { name, model, subagents, tokenBudget, providerOptions, ...args } = spec;
   return createHandle(deps, {
     name,
     kind: 'stream-text',
-    spec: { model, subagents, tokenBudget },
+    spec: { model, subagents, tokenBudget, providerOptions },
     args: args as Record<string, any>,
     sem: new Semaphore(deps.config.subagentMaxConcurrent),
   });
@@ -70,11 +73,11 @@ export function createGenerateTextAgent(
   deps: RuntimePorts,
   spec: GenerateTextAgentSpec,
 ): AgentHandle {
-  const { name, model, subagents, tokenBudget, ...args } = spec;
+  const { name, model, subagents, tokenBudget, providerOptions, ...args } = spec;
   return createHandle(deps, {
     name,
     kind: 'generate-text',
-    spec: { model, subagents, tokenBudget },
+    spec: { model, subagents, tokenBudget, providerOptions },
     args: args as Record<string, any>,
     sem: new Semaphore(deps.config.subagentMaxConcurrent),
   });

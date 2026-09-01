@@ -213,6 +213,7 @@ export interface SubagentsConfig {
 | `abortSignal` | **platform** | wired to the stop poller (§2.1) |
 | `maxSteps` | **config** (`maxSteps`, §2.1 safety cap) | |
 | `tools` | **user + platform** | user-supplied set; platform wraps `requiresConfirmation` tools. `spawnSubagent` is **opt-in** (`subagents` config) — never injected silently |
+| `providerOptions` | **user (spec default + execute input)** | additional provider-specific options passed through to the provider from the AI SDK — per-provider namespace, execute input wins, platform never inspects them |
 | `onChunk` / `onFinish` | **platform + user** | platform persists, bills, and publishes first, **then chains the user's callback** — replacing it would silently drop user code |
 | `system`, `temperature`, `toolChoice`, … | **user (spec)** | the agent's identity and behavior |
 
@@ -263,10 +264,14 @@ export async function execute(
       // Model resolution (§3.3): registry key → { instance, contextWindow }
       const model = deps.resolveModel(input.model);
 
+      // Provider-specific options (§3.1): spec default <- execute input
+      const providerOptions = mergeProviderOptions(agent.spec.providerOptions, input.providerOptions);
+
       const result = streamText({
         ...agent.args,                                   // user: system, temperature, toolChoice…
         model: model.instance(),                         // platform: resolved provider instance
         messages: history.map(toCoreMessage),            // platform: durable history
+        ...(providerOptions ? { providerOptions } : {}), // passthrough - platform never inspects
         tools: withHitl(deps, input.threadId, {          // platform: HITL wrap (§2.5) over the user's set.
           ...(agent.args.tools ?? {}),                   // spawnSubagent is added ONLY when the
           ...(agent.spec.subagents ? {                   // spec opts in (§2.7) — never silently

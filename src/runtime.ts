@@ -122,6 +122,7 @@ export function setupAgentCore(opts: RuntimeOptions): AgentCore {
           threadId: job.threadId,
           model: job.model,
           tokenBudget: job.tokenBudget,
+          providerOptions: job.providerOptions,
         });
         return { accepted: true };
       },

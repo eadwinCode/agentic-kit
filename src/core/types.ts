@@ -85,6 +85,22 @@ export interface NewUsage {
   totalTokens: number;
 }
 
+/** Additional provider-specific options, passed through to the provider from
+ *  the AI SDK. Namespaced per provider — the platform never inspects them. */
+export interface ProviderOptions {
+  [provider: string]: any;
+}
+
+/** Shallow per-provider merge: the execute input wins over the spec default. */
+export function mergeProviderOptions(
+  base?: ProviderOptions,
+  override?: ProviderOptions,
+): ProviderOptions | undefined {
+  if (!base) return override;
+  if (!override) return base;
+  return { ...base, ...override };
+}
+
 /** Dispatch ticket for the queue (§2.8). At-least-once — consumers must be
  *  idempotent. `agent` resolves via `AgentCore.getAgent`; when missing, the
  *  default handle executes. */
@@ -93,6 +109,7 @@ export interface RunJob {
   model: string;
   agent?: string;
   tokenBudget?: number;
+  providerOptions?: ProviderOptions;
 }
 
 /** A model identity after resolution: the real provider instance (created

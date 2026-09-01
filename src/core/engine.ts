@@ -1,10 +1,11 @@
 import { generateText, streamText } from 'ai';
 import { randomUUID } from 'node:crypto';
 import type { RuntimePorts } from '../ports/runtime.js';
-import type { ExecutionState } from './types.js';
+import type { ExecutionState, ProviderOptions } from './types.js';
 import { compactContext } from './context.js';
 import { attributeTokens, countTokens } from './usage.js';
 import { markPromptCaching } from './cache.js';
+import { mergeProviderOptions } from './types.js';
 import type { RegisteredAgent } from './agent.js';
 import { suspendForApproval, type SuspendInput } from './hitl.js';
 import { publish } from './publish.js';
@@ -60,7 +61,7 @@ function withHitl(deps: RuntimePorts, threadId: string, tools: Record<string, an
 export async function execute(
   deps: RuntimePorts,
   agent: RegisteredAgent,
-  input: { threadId: string; model: string; tokenBudget?: number },
+  input: { threadId: string; model: string; tokenBudget?: number; providerOptions?: ProviderOptions },
 ): Promise<'executed' | 'lock-conflict'> {
   const { threadId } = input;
   const abort = new AbortController();
@@ -77,6 +78,13 @@ export async function execute(
   const tokenBudget = input.tokenBudget ?? agent.spec.tokenBudget ?? deps.config.tokenBudget;
   let tokensUsed = 0;
   let budgetExceeded = false;
+
+  // Provider-specific options (§3.1): spec default <- execute input,
+  // shallow per-provider namespace; the execute input wins.
+  const providerOptions = mergeProviderOptions(
+    agent.spec.providerOptions,
+    input.providerOptions,
+  );
 
   // One signal, one behavior: the moment the state key reads CANCELLED —
   // the user pressed stop (§2.1) — everything tears down immediately.
@@ -133,6 +141,14 @@ export async function execute(
       tools,
       abortSignal: abort.signal,
       maxSteps: deps.config.maxSteps,
+      // Provider-specific options (§3.1): spec default <- execute input;
+      // forwarded under both the v5-native key and the v4 alias.
+      ...(providerOptions
+        ? {
+            providerOptions,
+            experimental_providerMetadata: providerOptions as any,
+          }
+        : {}),
       onStepFinish: (step: any) => {
         agent.args.onStepFinish?.(step); // user callback still fires
         // Budget tracking — break the loop BEFORE the next step
@@ -245,7 +261,7 @@ export async function finalize(
 export async function executeWithPolicy(
   deps: RuntimePorts,
   agent: RegisteredAgent,
-  input: { threadId: string; model: string; tokenBudget?: number },
+  input: { threadId: string; model: string; tokenBudget?: number; providerOptions?: ProviderOptions },
   policy?: { maxAttempts?: number },
   exec: typeof execute = execute,
 ): Promise<void> {
@@ -268,6 +284,7 @@ export async function executeWithPolicy(
         model: input.model,
         agent: agent.name,
         tokenBudget: input.tokenBudget,
+        providerOptions: input.providerOptions,
       });
     }
 

@@ -5,6 +5,7 @@ import type {
   AgentKind,
   ExecutionState,
   MessageDTO,
+  ProviderOptions,
   ResolvedModel,
   RunJob,
   SubagentsConfig,
@@ -16,7 +17,7 @@ import type { Queue } from './queue.js';
 import type { Kv } from './kv.js';
 
 // Re-exported for consumers: these flow through RuntimeOptions/RunJob/AgentCore.
-export type { AgentKind, ResolvedModel, RunJob, SubagentsConfig } from '../core/types.js';
+export type { AgentKind, ProviderOptions, ResolvedModel, RunJob, SubagentsConfig } from '../core/types.js';
 
 /** The ports bundle — everything in core/ receives this and nothing else. */
 export interface RuntimePorts {
@@ -52,6 +53,10 @@ export interface RunInput {
    *  spec.tokenBudget / config (§2.1 safety cap). Flows to the worker
    *  via RunJob.tokenBudget. */
   tokenBudget?: number;
+  /** Additional provider-specific options, passed through to the provider
+   *  from the AI SDK (§3.1). Merged over the spec default: the execute
+   *  input wins per provider namespace. */
+  providerOptions?: ProviderOptions;
 }
 
 export interface RunResult {
@@ -101,6 +106,9 @@ export type StreamTextAgentSpec = {
   /** Default per-run token budget (input + output). Per-run
    *  `input.tokenBudget` wins; `undefined` = unbounded apart from `maxSteps`. */
   tokenBudget?: number;
+  /** Additional provider-specific options, passed through to the provider
+   *  from the AI SDK. Per-provider namespace; the execute input wins. */
+  providerOptions?: ProviderOptions;
 } & Omit<Parameters<typeof import('ai').streamText>[0],
     'model' | 'messages' | 'prompt' | 'system' | 'abortSignal'
     | 'maxSteps' | 'onStepFinish' | 'onError'> & {
@@ -117,6 +125,7 @@ export type GenerateTextAgentSpec = {
   model?: string;
   subagents?: boolean | SubagentsConfig;
   tokenBudget?: number;
+  providerOptions?: ProviderOptions;
 } & Omit<Parameters<typeof import('ai').generateText>[0],
     'model' | 'messages' | 'prompt' | 'abortSignal' | 'onFinish' | 'onStepFinish'> & {
   tools?: ToolSet;
@@ -136,11 +145,12 @@ export interface AgentHandle {
     threadId: string;
     model: string;
     tokenBudget?: number;
+    providerOptions?: ProviderOptions;
   }): Promise<'executed' | 'lock-conflict'>;
 
   /** execute + §2.8 failure policy: redrive < maxAttempts, else finalize FAILED */
   executeWithPolicy(
-    input: { threadId: string; model: string; tokenBudget?: number },
+    input: { threadId: string; model: string; tokenBudget?: number; providerOptions?: ProviderOptions },
     policy?: { maxAttempts?: number },
   ): Promise<void>;
 
