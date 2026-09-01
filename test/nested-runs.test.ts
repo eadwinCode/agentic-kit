@@ -448,3 +448,68 @@ describe('rebuilding the subagent panel after a reload (§2.7)', () => {
     ).toBeGreaterThan(0);
   });
 });
+
+describe('a nested run that fails (§2.7)', () => {
+  it('is reported to the agent that delegated it, not thrown at the run', async () => {
+    const model = new MockLanguageModelV1({
+      provider: 'mock',
+      modelId: 'mock-failing-child',
+      doStream: async ({ prompt }: any) => {
+        if (isChild(prompt)) throw new Error('child provider exploded');
+        return toolResults(prompt).some((t: any) => t.toolName === 'spawnSubagent')
+          ? stream([say('the helper could not do it'), finish('stop')])
+          : stream([
+              call('parent_call_1', 'spawnSubagent', { name: 'helper', instructions: 'do it' }),
+              finish('tool-calls'),
+            ]);
+      },
+    });
+    const r = makeRuntime(model);
+    const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', subagents: true });
+
+    const ran = await chat.run({ prompt: 'delegate' });
+    await chat.executeWithPolicy({ threadId: ran.threadId, runId: ran.runId, model: 'gpt-4o' });
+
+    // The failure reached the parent as the delegation's result…
+    const parentResult = r.storage.messages.store
+      .get(ran.threadId)!
+      .find((m) => m.agentId === null && m.role === 'tool')!;
+    expect((parentResult.content as any)[0].result).toMatchObject({
+      error: 'child provider exploded',
+    });
+    // …and it recovered instead of the run dying with the child.
+    expect((await r.storage.threads.get(ran.threadId))!.state).toBe('COMPLETED');
+    expect(await r.kv.get(`agent:attempts:${ran.threadId}`)).toBeNull(); // never retried
+    // The child is still recorded as failed, with its reason.
+    const failed = r.bus.published.find((e) => e.type === 'SUBAGENT_FAILED')!.payload as any;
+    expect(failed).toMatchObject({ state: 'FAILED', error: 'child provider exploded' });
+  });
+
+  it('a user stop still tears the whole run down', async () => {
+    const model = new MockLanguageModelV1({
+      provider: 'mock',
+      modelId: 'mock-stopped-child',
+      doStream: async ({ prompt }: any) =>
+        isChild(prompt)
+          ? Promise.reject(new Error('aborted'))
+          : stream([
+              call('parent_call_1', 'spawnSubagent', { name: 'helper', instructions: 'do it' }),
+              finish('tool-calls'),
+            ]),
+    });
+    const r = makeRuntime(model);
+    const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', subagents: true });
+    const ran = await chat.run({ prompt: 'delegate' });
+    // The user pressed stop while the child was in flight.
+    await r.kv.set(`agent:state:${ran.threadId}`, 'CANCELLED');
+
+    await chat.executeWithPolicy({ threadId: ran.threadId, runId: ran.runId, model: 'gpt-4o' });
+
+    const failed = r.bus.published.find((e) => e.type === 'SUBAGENT_FAILED')!.payload as any;
+    expect(failed.state).toBe('CANCELLED');
+    // It propagated rather than being handed back as a result the model reads.
+    expect(
+      r.storage.messages.store.get(ran.threadId)!.some((m) => m.role === 'tool'),
+    ).toBe(false);
+  });
+});

@@ -206,11 +206,12 @@ export default function Page() {
 
         {/* A nested run's approval belongs to the agent that raised it, so it
             renders inside that agent's card rather than floating free (§2.7).
-            A child that finished is dropped entirely: its result is already in
-            the transcript as the spawnSubagent result, so the card would only
-            repeat it. A failure stays — nothing else says why it died. */}
+            A child that is no longer running is dropped entirely: whatever it
+            produced — a result, or the reason it failed — has already been
+            reported to the agent that delegated it and is in the transcript,
+            so the card would only say it twice. */}
         {subagents
-          .filter((s) => s.status !== 'COMPLETED')
+          .filter((s) => s.status === 'RUNNING' || s.status === 'WAITING_FOR_INPUT')
           .map((s) => {
             // Working children stay folded; anything needing attention opens.
             const open = openAgents[s.agentId] ?? s.status !== 'RUNNING';

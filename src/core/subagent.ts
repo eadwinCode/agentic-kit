@@ -143,19 +143,29 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
             result: outcome.text.slice(0, ctx.ports.config.subagentResultCapChars),
           };
         } catch (err) {
-          const state =
-            (await ctx.ports.kv.get(`agent:state:${ctx.threadId}`)) === 'CANCELLED'
-              ? 'CANCELLED'
-              : 'FAILED';
+          const cancelled =
+            (await ctx.ports.kv.get(`agent:state:${ctx.threadId}`)) === 'CANCELLED';
+          const state = cancelled ? 'CANCELLED' : 'FAILED';
+          const message = err instanceof Error ? err.message : String(err);
           await ctx.ports.storage.runs.update(run.id, { state });
           // Carry the reason: a bare state tells an operator a child died but
           // not why, and a nested run's failure is otherwise invisible.
           await publish(ctx.ports, ctx.threadId, 'SUBAGENT_FAILED', {
             agentId: run.id,
             state,
-            error: err instanceof Error ? err.message : String(err),
+            error: message,
           });
-          throw err; // propagate: the parent step sees the failure / abort
+
+          // A user stop tears the whole run down (§2.1), so that one keeps
+          // propagating.
+          if (cancelled) throw err;
+
+          // Anything else is reported TO THE PARENT as the delegation's
+          // result, the same way an approved tool's failure is reported to the
+          // model rather than thrown (§2.5): a delegated task that went wrong
+          // is news the agent can act on — retry, try another way, tell the
+          // user — not a reason to kill the run it was part of.
+          return { agentId: run.id, error: message };
         }
       } finally {
         release();
