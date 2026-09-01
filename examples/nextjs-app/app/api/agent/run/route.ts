@@ -4,9 +4,9 @@ import { runtime, INLINE_WORKER } from '@/lib/runtime';
 import { chat } from '@/lib/agents';
 
 export async function POST(req: NextRequest) {
-  const { prompt, model, tokenBudget } = await req.json();
+  const { threadId, prompt, model, tokenBudget } = await req.json();
 
-  const result = await chat.run({ prompt, model, tokenBudget });
+  const result = await chat.run({ threadId, prompt, model, tokenBudget });
   // chat.run: heal orphans (§2.5) → billing pre-check (§4) → persist user
   // message → state RUNNING → enqueue `agent-runs` (§2.8)
   if (!result.accepted) return NextResponse.json(result, { status: 409 });
