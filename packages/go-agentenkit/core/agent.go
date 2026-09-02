@@ -20,13 +20,14 @@ type SpecDefaults struct {
 // AgentArgs are the user's generation args: applied first, platform keys
 // last (§3.1).
 type AgentArgs struct {
-	System   string
-	SystemFn ports.SystemFunc
-	Tools    []ports.Tool
-	Options  []goai.Option
-	OnChunk  func(provider.StreamChunk)
-	OnSettle ports.SettleFunc
-	OnFinish func(ports.RunFinishInfo)
+	System      string
+	SystemFn    ports.SystemFunc
+	PrepareStep ports.PrepareStepFunc
+	Tools       []ports.Tool
+	Options     []goai.Option
+	OnChunk     func(provider.StreamChunk)
+	OnSettle    ports.SettleFunc
+	OnFinish    func(ports.RunFinishInfo)
 }
 
 // RegisteredAgent is the registry entry behind a handle: the bound
@@ -95,7 +96,7 @@ func NewStreamTextAgent(scope ScopeFn, spec ports.StreamTextAgentSpec) *Handle {
 	return newHandle(scope, &RegisteredAgent{
 		Name: spec.Name, Kind: ports.KindStreamText,
 		Spec: SpecDefaults{Model: spec.Model, Subagents: spec.Subagents, TokenBudget: spec.TokenBudget, ProviderOptions: spec.ProviderOptions},
-		Args: AgentArgs{System: spec.System, SystemFn: spec.SystemFn, Tools: spec.Tools, Options: spec.Options, OnChunk: spec.OnChunk, OnSettle: spec.OnSettle, OnFinish: spec.OnFinish},
+		Args: AgentArgs{System: spec.System, SystemFn: spec.SystemFn, PrepareStep: spec.PrepareStep, Tools: spec.Tools, Options: spec.Options, OnChunk: spec.OnChunk, OnSettle: spec.OnSettle, OnFinish: spec.OnFinish},
 	})
 }
 
@@ -104,6 +105,6 @@ func NewGenerateTextAgent(scope ScopeFn, spec ports.GenerateTextAgentSpec) *Hand
 	return newHandle(scope, &RegisteredAgent{
 		Name: spec.Name, Kind: ports.KindGenerateText,
 		Spec: SpecDefaults{Model: spec.Model, Subagents: spec.Subagents, TokenBudget: spec.TokenBudget, ProviderOptions: spec.ProviderOptions},
-		Args: AgentArgs{System: spec.System, SystemFn: spec.SystemFn, Tools: spec.Tools, Options: spec.Options, OnSettle: spec.OnSettle, OnFinish: spec.OnFinish},
+		Args: AgentArgs{System: spec.System, SystemFn: spec.SystemFn, PrepareStep: spec.PrepareStep, Tools: spec.Tools, Options: spec.Options, OnSettle: spec.OnSettle, OnFinish: spec.OnFinish},
 	})
 }

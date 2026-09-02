@@ -71,6 +71,7 @@ type (
 	SubagentProfile       = ports.SubagentProfile
 	Attachment            = ports.Attachment
 	SystemFunc            = ports.SystemFunc
+	PrepareStepFunc       = ports.PrepareStepFunc
 	SettleFunc            = ports.SettleFunc
 
 	AgentRunState  = ports.AgentRunState

@@ -84,6 +84,14 @@ type Attachment struct {
 // while it does not move.
 type SystemFunc func(ctx context.Context, threadID string, state AgentRunState) (string, error)
 
+// PrepareStepFunc edits the prompt for one step, just before it is sent
+// (§3.1): messages is the durable history the platform assembled (compacted,
+// repaired, cache-stamped) and the return value is what the model sees. It
+// is the place for context that must NOT be persisted — a screenshot the
+// model should look at once, an editor snapshot — because anything appended
+// here is gone on the next step unless it is appended again.
+type PrepareStepFunc func(ctx context.Context, threadID string, state AgentRunState, messages []provider.Message) ([]provider.Message, error)
+
 // SettleFunc runs after a run's last step and BEFORE its terminal
 // STATE_CHANGE is written (§5.6): the place to commit what the run produced
 // so every client sees it settled the moment the state flips. An error fails
@@ -190,7 +198,10 @@ type StreamTextAgentSpec struct {
 	// SystemFn builds the persona per step, with the run's state (§3.1). It
 	// wins over System when set.
 	SystemFn SystemFunc
-	Tools    []Tool
+	// PrepareStep edits the prompt per step, for ephemeral context. See
+	// PrepareStepFunc.
+	PrepareStep PrepareStepFunc
+	Tools       []Tool
 	// Options are extra goai options (temperature, hooks, retries, ...).
 	// Platform-owned options are applied after these and win.
 	Options []goai.Option
@@ -212,6 +223,7 @@ type GenerateTextAgentSpec struct {
 	ProviderOptions ProviderOptions
 	System          string
 	SystemFn        SystemFunc
+	PrepareStep     PrepareStepFunc
 	Tools           []Tool
 	Options         []goai.Option
 	OnSettle        SettleFunc

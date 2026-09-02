@@ -506,7 +506,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		Messages: messages, Tools: tools, MaxSteps: maxSteps,
 		GenCtx: genCtx, Aborted: aborted,
 		ProviderOptions: providerOptions, TokenBudget: tokenBudget,
-		SystemFn: agent.Args.SystemFn, State: input.State,
+		SystemFn: agent.Args.SystemFn, PrepareStep: agent.Args.PrepareStep, State: input.State,
 		CacheSystemPrompt: deps.Config.PromptCaching,
 		OnChunk: func(chunk provider.StreamChunk) {
 			// One canonical path for every client: durable log + live bus (§2.1, §2.2)

@@ -246,6 +246,8 @@ type LoopInput struct {
 	// SystemFn builds the persona per step (§3.1); it wins over System and
 	// over the spec's.
 	SystemFn ports.SystemFunc
+	// PrepareStep edits the prompt per step; what it adds is never persisted.
+	PrepareStep ports.PrepareStepFunc
 	// State is the run's state, handed to SystemFn (§2.10).
 	State             ports.AgentRunState
 	CacheSystemPrompt bool
@@ -331,8 +333,16 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			}
 			system = built
 		}
+		prompt := messages
+		if input.PrepareStep != nil {
+			prepared, err := input.PrepareStep(ctx, threadID, input.State, messages)
+			if err != nil {
+				return out, err
+			}
+			prompt = prepared
+		}
 		step, err := ExecuteStep(genCtx, agent, StepCall{
-			Kind: input.Kind, Model: input.Model, Messages: messages, Tools: input.Tools,
+			Kind: input.Kind, Model: input.Model, Messages: prompt, Tools: input.Tools,
 			ProviderOptions: input.ProviderOptions, OnChunk: onChunk,
 			System: system, CacheSystemPrompt: input.CacheSystemPrompt,
 		})

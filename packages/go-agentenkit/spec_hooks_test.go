@@ -406,3 +406,39 @@ func TestModelCalls_CarryTheRunIDAndStateOnTheirContext(t *testing.T) {
 	childID := payload(h.events(ran.ThreadID, "SUBAGENT_STARTED")[0])["agentId"].(string)
 	mustStrings(t, model.seen, []string{"run-x|acme", childID + "|acme", "run-x|acme"}, "run id and state per model call")
 }
+
+func TestPrepareStep_AddsEphemeralContextThatIsNeverPersisted(t *testing.T) {
+	h := makeRuntime(t, scripted(
+		step{calls: []call{{"c1", "ping", `{}`}}},
+		step{text: "done"},
+	))
+	var calls atomic.Int32
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
+		Name: "chat",
+		PrepareStep: func(_ context.Context, _ string, state agentenkit.AgentRunState, messages []provider.Message) ([]provider.Message, error) {
+			calls.Add(1)
+			extra := provider.Message{Role: provider.RoleUser, Content: []provider.Part{
+				{Type: provider.PartImage, URL: "data:image/png;base64,AAAA", MediaType: "image/png"},
+				{Type: provider.PartText, Text: "look at this once"},
+			}}
+			return append(append([]provider.Message{}, messages...), extra), nil
+		},
+		Tools: []agentenkit.Tool{tool("ping", func(context.Context, map[string]any) (string, error) { return "pong", nil })},
+	})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
+	h.handleNext(t)
+	mustEqual(t, calls.Load(), int32(2), "once per step")
+	for i, p := range h.model.Params() {
+		last := p.Messages[len(p.Messages)-1]
+		if last.Content[0].Type != provider.PartImage {
+			t.Fatalf("step %d: the prepared image is not the last message: %+v", i, last)
+		}
+	}
+	// Nothing ephemeral reached the durable history
+	for _, m := range h.storage.MessageRows(ran.ThreadID) {
+		if strings.Contains(string(m.Content), "look at this once") {
+			t.Fatal("ephemeral context was persisted")
+		}
+	}
+	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "state")
+}

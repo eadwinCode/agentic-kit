@@ -380,12 +380,14 @@ func RunNestedAgent(genCtx context.Context, sctx *SubagentCtx, d ports.NestedDes
 	// carries the name, so a re-entry after an approval finds the same one.
 	system := fmt.Sprintf("You are the %q subagent. Complete the task, then stop.", d.Name)
 	var systemFn ports.SystemFunc
+	var prepareStep ports.PrepareStepFunc
 	maxSteps := deps.Config.SubagentMaxSteps
 	if p := profileFor(sctx, d.Name); p != nil {
 		if p.System != "" {
 			system = p.System
 		}
 		systemFn = p.SystemFn
+		prepareStep = p.PrepareStep
 		if p.MaxSteps > 0 && p.MaxSteps < maxSteps {
 			maxSteps = p.MaxSteps
 		}
@@ -404,6 +406,7 @@ func RunNestedAgent(genCtx context.Context, sctx *SubagentCtx, d ports.NestedDes
 		TokenBudget:       sctx.TokenBudget,
 		System:            system,
 		SystemFn:          systemFn,
+		PrepareStep:       prepareStep,
 		State:             sctx.State,
 		CacheSystemPrompt: deps.Config.PromptCaching,
 		OnChunk: func(chunk provider.StreamChunk) {

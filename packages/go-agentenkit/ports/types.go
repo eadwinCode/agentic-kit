@@ -378,6 +378,8 @@ type SubagentProfile struct {
 	// System is the child's static persona; SystemFn wins when set.
 	System   string
 	SystemFn SystemFunc
+	// PrepareStep edits the child's prompt per step; see PrepareStepFunc.
+	PrepareStep PrepareStepFunc
 	// Model is the registry key; empty falls back to the config's Model,
 	// then the parent's.
 	Model string
