@@ -20,6 +20,25 @@ jobs:
   release:
     runs-on: ubuntu-latest
 
+    # The same Postgres CI uses. The suite fails loudly without it rather than
+    # skipping — which is right, and is why the first v0.1.0 run stopped before
+    # publishing anything.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: agentic_admin_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TEST_ADMIN_PG: postgresql://postgres:password@localhost:5432/agentic_admin_test
+
     steps:
       - uses: actions/checkout@v4
 

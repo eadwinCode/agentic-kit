@@ -1,0 +1,4 @@
+-- AlterTable
+ALTER TABLE "TokenUsage" ADD COLUMN     "cachedInputTokens" INTEGER NOT NULL DEFAULT 0,
+ADD COLUMN     "inputTokens" INTEGER NOT NULL DEFAULT 0,
+ADD COLUMN     "outputTokens" INTEGER NOT NULL DEFAULT 0;
