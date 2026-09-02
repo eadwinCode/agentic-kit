@@ -92,3 +92,60 @@ jobs:
       - name: Typecheck the example
         working-directory: examples/nextjs-app
         run: bunx tsc --noEmit
+
+      - name: Build the Go example's SPA
+        run: bun run --cwd examples/go-app/web build
+
+  go:
+    name: go-agentenkit (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The minimum the module declares, plus the current release to catch drift.
+        go: ['1.25', 'stable']
+
+    # The Postgres store and storage adapter are tested for real, like the
+    # TypeScript suite: an unreachable database skips loudly rather than
+    # passing with zero assertions.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: agentic_admin_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TEST_ADMIN_PG: postgres://postgres:password@localhost:5432/agentic_admin_test?sslmode=disable
+
+    defaults:
+      run:
+        working-directory: packages/go-agentenkit
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: packages/go-agentenkit/go.sum
+
+      - name: Format
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      # The Go example must keep compiling against the package.
+      - name: Build the Go example
+        working-directory: examples/go-app
+        run: go vet ./... && go build -o /dev/null .
