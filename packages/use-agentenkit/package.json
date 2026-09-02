@@ -3,6 +3,15 @@
   "version": "0.1.0",
   "description": "React hook for agentenkit \u2014 durable threads, live streaming, human-in-the-loop approvals and nested runs, with every route and label under your control.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eadwinCode/agentic-kit.git",
+    "directory": "packages/use-agentenkit"
+  },
+  "homepage": "https://eadwincode.github.io/agentic-kit/",
+  "bugs": {
+    "url": "https://github.com/eadwinCode/agentic-kit/issues"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

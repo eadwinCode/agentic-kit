@@ -3,6 +3,15 @@
   "version": "0.1.0",
   "description": "Durable runtime for AI agent runs \u2014 a platform-owned loop, queue-dispatched execution that outlives the request, HITL suspension, nested runs, and context compaction. Bring your own storage, queue, bus and kv via four ports.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eadwinCode/agentic-kit.git",
+    "directory": "packages/agentenkit"
+  },
+  "homepage": "https://eadwincode.github.io/agentic-kit/",
+  "bugs": {
+    "url": "https://github.com/eadwinCode/agentic-kit/issues"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
