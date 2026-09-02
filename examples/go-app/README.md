@@ -43,6 +43,7 @@ Flags and env: `-addr` / `ADDR`, `-db` / `DB_FILE` (SQLite file, default
 | `show my orders` | a tool reading the run state (`orgId`) the client attached |
 | `research goroutines` | a subagent with its own stream and card |
 | `what is (12*7)+3` | a plain tool |
+| `think about what 6*7 is` | a reasoning stream first: shown live as a "Thinking" block, folded to one line once the answer starts, restored from the durable message on reload |
 | **Simulate credit limit** button | sets the thread's allowance to zero, like a billing webhook. The composer stays open: the next message meets `BillingPreCheck`, which publishes `CREDIT_LIMIT` and refuses, and the chat shows *credit limit reached. resets … - clear it to continue*. **Clear limit** restores the allowance with `CREDIT_RESTORED` |
 | a long multi-tool prompt with a small `tokenBudget` (send `{"tokenBudget": 900}` on the run body) | the platform publishes `TOKEN_BUDGET_EXHAUSTED` between steps and finalizes with `stopReason: token_budget`; the chat shows it |
 

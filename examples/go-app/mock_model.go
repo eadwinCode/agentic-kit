@@ -23,8 +23,9 @@ type mockModel struct{ id string }
 func (m *mockModel) ModelID() string { return "mock:" + m.id }
 
 type plan struct {
-	text  string
-	calls []provider.ToolCall
+	text      string
+	reasoning string
+	calls     []provider.ToolCall
 }
 
 // numberExpr finds an arithmetic expression: digits, operators, parentheses.
@@ -168,6 +169,23 @@ func (m *mockModel) plan(p provider.GenerateParams) plan {
 		return plan{text: "Research summary: Go's scheduler multiplexes goroutines onto OS threads; channels and sync primitives coordinate them. Prefer contexts for cancellation."}
 	}
 
+	// "think" streams a reasoning block first, the way a provider with
+	// extended thinking would.
+	var reasoning string
+	if strings.Contains(prompt, "think") {
+		reasoning = "The user wants me to show my reasoning. I will consider the request, pick the right tool if one applies, and keep the answer short."
+	}
+	pl := m.route(p, prompt, original)
+	pl.reasoning = reasoning
+	return pl
+}
+
+// route picks the tool or text for a main-agent turn.
+func (m *mockModel) route(p provider.GenerateParams, prompt, original string) plan {
+	call := func(name string, args map[string]any) provider.ToolCall {
+		b, _ := json.Marshal(args)
+		return provider.ToolCall{ID: "call_" + agentenkit.NewID()[:8], Name: name, Input: b}
+	}
 	switch {
 	case strings.Contains(prompt, "weather") && hasTool(p, "getWeather"):
 		var calls []provider.ToolCall
@@ -233,7 +251,7 @@ func finishOf(pl plan) provider.FinishReason {
 
 func (m *mockModel) DoGenerate(ctx context.Context, p provider.GenerateParams) (*provider.GenerateResult, error) {
 	pl := m.plan(p)
-	return &provider.GenerateResult{Text: pl.text, ToolCalls: pl.calls, FinishReason: finishOf(pl), Usage: usageFor(p, pl.text)}, nil
+	return &provider.GenerateResult{Text: pl.text, Reasoning: pl.reasoning, ToolCalls: pl.calls, FinishReason: finishOf(pl), Usage: usageFor(p, pl.text)}, nil
 }
 
 func (m *mockModel) DoStream(ctx context.Context, p provider.GenerateParams) (*provider.StreamResult, error) {
@@ -241,6 +259,20 @@ func (m *mockModel) DoStream(ctx context.Context, p provider.GenerateParams) (*p
 	ch := make(chan provider.StreamChunk, 8)
 	go func() {
 		defer close(ch)
+		for _, word := range strings.SplitAfter(pl.reasoning, " ") {
+			if word == "" {
+				continue
+			}
+			select {
+			case <-time.After(25 * time.Millisecond):
+			case <-ctx.Done():
+				ch <- provider.StreamChunk{Type: provider.ChunkError, Error: ctx.Err()}
+				return
+			}
+			if !provider.TrySend(ctx, ch, provider.StreamChunk{Type: provider.ChunkReasoning, Text: word}) {
+				return
+			}
+		}
 		for _, word := range strings.SplitAfter(pl.text, " ") {
 			if word == "" {
 				continue

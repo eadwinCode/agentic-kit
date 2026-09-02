@@ -28,14 +28,16 @@ export function App() {
   // thread change, after each run, and after the two billing buttons, so
   // what the pre-check will decide is visible before a message is sent.
   const [credit, setCredit] = useState<Credit | null>(null);
-  // onEvent is created before the hook hands the thread id back; a ref lets
-  // it read the current one at call time.
+  // onEvent and refreshCredit are created before the hook hands the thread
+  // id back; a ref lets them read the current one at call time.
   const threadIdRef = useRef<string | undefined>(undefined);
   const refreshCredit = useCallback(async (id: string | undefined) => {
     if (!id) return setCredit(null);
     try {
       const res = await fetch(`/api/demo/credit?threadId=${encodeURIComponent(id)}`);
-      if (res.ok) setCredit((await res.json()) as Credit);
+      // A thread that was closed while the request was in flight (a stale
+      // id from persistence, a 404 on history) must not paint its balance.
+      if (res.ok && threadIdRef.current === id) setCredit((await res.json()) as Credit);
     } catch {
       // the panel is best-effort
     }
@@ -77,12 +79,20 @@ export function App() {
   const [prompt, setPrompt] = useState('');
   const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
   const [openAgents, setOpenAgents] = useState<Record<string, boolean>>({});
+  // Thought blocks a user has toggled by hand; anything absent falls back to
+  // the default for its state: open while it streams, folded once done.
+  const [openThoughts, setOpenThoughts] = useState<Record<string, boolean>>({});
 
   const running = agentState === 'RUNNING' || agentState === 'WAITING_FOR_INPUT';
   const waiting = agentState === 'WAITING_FOR_INPUT';
   // Exhausted by the button, or by spending: either way the next message
   // will be refused, and the panel says so before it happens.
   const limited = credit !== null && credit.remaining <= 0;
+  // A thought is still being written while it is the newest entry of a live
+  // run; once the answer starts, another entry follows it.
+  const lastEntry = entries.at(-1);
+  const streamingThoughtId = running && lastEntry?.kind === 'reasoning' ? lastEntry.id : undefined;
+  const thoughtOpen = (id: string) => openThoughts[id] ?? id === streamingThoughtId;
   // The composer stays open under a credit limit: sending is how the user
   // meets the billing check, and the chat shows the refusal.
   const canSend = !historyLoading && !running && prompt.trim().length > 0;
@@ -179,7 +189,15 @@ export function App() {
             <p className="empty">{historyLoading ? 'Loading previous messages…' : 'No messages yet.'}</p>
           )}
           {entries.map((e) =>
-            e.kind === 'tool' || e.kind === 'reasoning' ? (
+            e.kind === 'reasoning' ? (
+              <ThoughtBlock
+                key={e.id}
+                text={e.text}
+                streaming={e.id === streamingThoughtId}
+                isOpen={thoughtOpen(e.id)}
+                onToggle={() => setOpenThoughts((prev) => ({ ...prev, [e.id]: !thoughtOpen(e.id) }))}
+              />
+            ) : e.kind === 'tool' ? (
               <p key={e.id} className="tool">{e.text}</p>
             ) : (
               <div key={e.id} className={`message ${e.role}`}>
@@ -382,6 +400,26 @@ function Approval({ req, onRespond }: {
         <button className="approve" onClick={() => void onRespond(req.toolCallId, true)}>Approve</button>
         <button className="deny" onClick={() => void onRespond(req.toolCallId, false)}>Deny</button>
       </div>
+    </div>
+  );
+}
+
+/** The model's thinking. Shown live while it is being written, then folded
+ *  to a single line: it is context for the answer, not the answer. */
+function ThoughtBlock({ text, streaming, isOpen, onToggle }: {
+  text: string;
+  streaming: boolean;
+  isOpen: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div className={`thought${streaming ? ' streaming' : ''}${isOpen ? ' open' : ''}`}>
+      <button type="button" className="thought-header" onClick={onToggle}>
+        <span className="thought-caret" aria-hidden>{isOpen ? '▾' : '▸'}</span>
+        <span className="thought-title">{streaming ? 'Thinking' : 'Thought'}</span>
+        {!isOpen && <span className="thought-peek">{truncate(text.replace(/\s+/g, ' '), 90)}</span>}
+      </button>
+      {isOpen && <div className="thought-body">{text}</div>}
     </div>
   );
 }
