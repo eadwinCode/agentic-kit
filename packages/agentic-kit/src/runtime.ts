@@ -103,7 +103,25 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
             break;
           }
         }
-        activeEvents = events.slice(Math.max(0, boundary));
+        const active = events.slice(Math.max(0, boundary));
+
+        // Everything up to the last committed step is ALREADY in `messages`
+        // (§2.2). Replaying those chunks too would render each finished step's
+        // text twice — once from the durable message, once from the stream
+        // that produced it. Only the in-flight step's chunks are missing from
+        // durable history, so only those are transient.
+        //
+        // Chunks alone: a park (INPUT_REQUIRED) is published DURING the step,
+        // before its messages commit, so slicing the whole window by this
+        // boundary would drop the very approval a reconnecting client needs.
+        const lastCommitted = active.reduce(
+          (seq, e) => (e.type === 'STEP_COMMITTED' ? e.seq : seq),
+          -1,
+        );
+        const isStream = (type: string) => type === 'CHUNK' || type === 'SUBAGENT_CHUNK';
+        activeEvents = active.filter(
+          (e) => !(isStream(e.type) && e.seq !== 0 && e.seq <= lastCommitted),
+        );
       }
 
       return { thread, messages, runs, lastEventSeq, activeEvents };

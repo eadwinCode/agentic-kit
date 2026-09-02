@@ -98,6 +98,129 @@ const lastTerminal = (bus: MemoryBus) =>
 const roles = (storage: MemoryStorage, threadId: string) =>
   storage.messages.store.get(threadId)!.map((m) => m.role);
 
+describe('reconnecting mid-run (§2.2)', () => {
+  const assistantText = (snap: any) =>
+    snap.messages
+      .filter((m: any) => m.role === 'assistant')
+      .map((m: any) =>
+        (Array.isArray(m.content) ? m.content : []).map((p: any) => p?.text ?? '').join(''),
+      )
+      .join('');
+  const replayedText = (snap: any) =>
+    snap.activeEvents
+      .filter((e: any) => e.type === 'CHUNK' && e.payload?.type === 'text-delta')
+      .map((e: any) => e.payload.textDelta)
+      .join('');
+
+  // A client rebuilds from durable messages and THEN replays activeEvents. So
+  // a step whose messages are already committed must not have its chunks
+  // replayed as well, or its text lands twice — once from the message, once
+  // from the stream that produced it.
+  it('replays only the step that has not been committed yet', async () => {
+    let snap: any = null;
+    let r: any;
+    let threadId: string | undefined;
+
+    r = await makeRuntime(
+      scriptedModel([
+        { text: 'PART ONE. ', toolCalls: [{ toolCallId: 'c1', toolName: 'probe', args: { n: 1 } }] },
+        { text: 'PART TWO. ', toolCalls: [{ toolCallId: 'c2', toolName: 'probe', args: { n: 2 } }] },
+        { text: 'DONE.' },
+      ]),
+    );
+    const chat = r.runtime.createStreamTextAgent({
+      name: 'chat',
+      model: 'gpt-4o',
+      tools: {
+        // Runs during step 2 — after step 1's messages are durable.
+        probe: tool({
+          parameters: z.object({ n: z.number() }),
+          execute: async ({ n }: any) => {
+            if (n === 2) snap = await r.runtime.getThreadSnapshot(threadId!);
+            return { ok: true };
+          },
+        }),
+      },
+    });
+
+    const ran = await chat.run({ prompt: 'go' });
+    threadId = ran.threadId;
+    await r.runtime.worker.handleJob(r.queue.items[0]!);
+
+    expect(snap).not.toBeNull();
+    // Step 1 is durable, step 2 is still in flight — each appears exactly once
+    expect(assistantText(snap)).toBe('PART ONE. ');
+    expect(replayedText(snap)).toBe('PART TWO. ');
+    expect(assistantText(snap) + replayedText(snap)).toBe('PART ONE. PART TWO. ');
+  });
+
+  // Nothing is committed during the very first step, so its chunks are the
+  // only record of it and must all replay.
+  it('replays everything when no step has committed', async () => {
+    let snap: any = null;
+    let r: any;
+    let threadId: string | undefined;
+
+    r = await makeRuntime(
+      scriptedModel([
+        { text: 'ONLY. ', toolCalls: [{ toolCallId: 'c1', toolName: 'probe', args: { n: 1 } }] },
+        { text: 'DONE.' },
+      ]),
+    );
+    const chat = r.runtime.createStreamTextAgent({
+      name: 'chat',
+      model: 'gpt-4o',
+      tools: {
+        probe: tool({
+          parameters: z.object({ n: z.number() }),
+          execute: async ({ n }: any) => {
+            if (n === 1) snap = await r.runtime.getThreadSnapshot(threadId!);
+            return { ok: true };
+          },
+        }),
+      },
+    });
+
+    const ran = await chat.run({ prompt: 'go' });
+    threadId = ran.threadId;
+    await r.runtime.worker.handleJob(r.queue.items[0]!);
+
+    expect(assistantText(snap)).toBe('');
+    expect(replayedText(snap)).toBe('ONLY. ');
+  });
+
+  // A park is published DURING the step, before its messages commit. Slicing
+  // the whole window at the commit boundary would drop the very approval the
+  // reconnecting client needs to render.
+  it('keeps a pending approval that was raised before the step committed', async () => {
+    const { runtime, queue } = await makeRuntime(
+      scriptedModel([
+        { text: 'about to send. ', toolCalls: [{ toolCallId: 'c1', toolName: 'sendEmail', args: { to: 'a@b.com' } }] },
+        { text: 'sent.' },
+      ]),
+    );
+    const chat = runtime.createStreamTextAgent({
+      name: 'chat',
+      model: 'gpt-4o',
+      tools: {
+        sendEmail: markRequiresConfirmation(
+          tool({
+            parameters: z.object({ to: z.string() }),
+            execute: async ({ to }: any) => ({ sent: to }),
+          }),
+        ),
+      },
+    });
+
+    const ran = await chat.run({ prompt: 'send it' });
+    await runtime.worker.handleJob(queue.items[0]!);
+
+    const snap = (await runtime.getThreadSnapshot(ran.threadId))!;
+    expect(snap.thread.state).toBe('WAITING_FOR_INPUT');
+    expect(snap.activeEvents.map((e: any) => e.type)).toContain('INPUT_REQUIRED');
+  });
+});
+
 describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
   it('feeds tool results back between single-round-trip steps and persists per step', async () => {
     const executed: string[] = [];

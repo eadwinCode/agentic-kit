@@ -6,7 +6,7 @@ import type { RegisteredAgent } from './agent.js';
 import { systemCacheMessage } from './cache.js';
 import { attributeTokens, type TokenAttribution } from './usage.js';
 import { drainOrThrow } from './stream.js';
-import { publishNotice } from './publish.js';
+import { publish, publishNotice } from './publish.js';
 import { HITL_PARKED } from './hitl.js';
 
 /** True for the sentinel a parked `requiresConfirmation` tool returns (§2.5).
@@ -263,6 +263,16 @@ export async function runLoop(
       });
     }
     input.messages.push(...step.responseMessages);
+
+    // A replay boundary (§2.2). Everything this step produced is now durable
+    // history, so a reconnecting client must NOT also replay its chunks — it
+    // would render the same text twice, once from the message and once from
+    // the stream that produced it. Persisted (not a bus notice) because the
+    // snapshot needs its seq to know where durable ends and live begins.
+    await publish(deps, threadId, 'STEP_COMMITTED', {
+      index: stepsRun,
+      agentId: input.agentId,
+    });
 
     // Token attribution (§4), accumulated across the segment's steps — and
     // into the run-wide ledger the safety cap is checked against (§2.7).
