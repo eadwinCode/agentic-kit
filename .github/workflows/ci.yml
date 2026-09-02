@@ -18,9 +18,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # bun.lock is the text lockfile, which Bun understands from 1.2 —
-        # --frozen-lockfile cannot run on anything older.
-        bun: ['1.2.0', 'latest']
+        # A pinned leg for reproducibility, plus `latest` to catch drift.
+        #
+        # 1.4.0 rather than something older: bun.lock is the text lockfile,
+        # which needs Bun 1.2+, and the test suite's mock model comes from
+        # `ai/test`, which imports HTTPParser from node:http — absent from
+        # Bun 1.2.0's shim, so every test file failed to load there. 1.4.0 is
+        # the oldest version this suite is known to pass on.
+        bun: ['1.4.0', 'latest']
 
     # The admin store's Postgres path is tested for real rather than skipped.
     # Without this the suite fails loudly by design — an unreachable database

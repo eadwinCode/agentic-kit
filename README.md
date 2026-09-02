@@ -164,8 +164,13 @@ docs/                 the documentation
 
 ## Development
 
-Requires [Bun](https://bun.sh) ≥ 1.2 to work in this repository — the text
-lockfile needs it. The published packages themselves declare `>= 1.1`.
+Requires [Bun](https://bun.sh) ≥ 1.4 to work in this repository. The text
+lockfile needs 1.2, and the test suite's mock model comes from `ai/test`,
+which needs a newer `node:http` shim than 1.2 provides. CI runs 1.4 and
+`latest`.
+
+The published packages declare `engines.bun >= 1.1` — that floor is for
+*consuming* them and is not exercised by CI.
 
 ```bash
 bun install

@@ -3,7 +3,7 @@
 ## Requirements
 
 - [Bun](https://bun.sh) ≥ 1.1, or Node ≥ 20 (contributing to the repository
-  itself needs Bun ≥ 1.2 for the text lockfile)
+  itself needs Bun ≥ 1.4 — see its readme)
 - A model provider through the [AI SDK](https://sdk.vercel.ai) (v4)
 
 ## Install
