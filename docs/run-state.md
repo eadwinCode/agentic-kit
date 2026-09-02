@@ -70,7 +70,7 @@ storage throw rather than fall back to an unscoped query — see
 | Place | How |
 | :--- | :--- |
 | Storage methods | trailing `ctx` argument |
-| Tools | second argument of `execute` — use `agenticTool` to type it |
+| Tools | second argument of `execute` — use `agentTool` to type it |
 | Nested runs | inherited by every child |
 | Resumed runs | rebuilt from the durable job, not from memory |
 | After an approval | persisted with the park, restored on resume |

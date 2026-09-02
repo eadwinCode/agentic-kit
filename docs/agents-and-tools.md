@@ -83,12 +83,12 @@ Every tool receives the run's [state](./run-state.md) as part of its second
 argument — the same object the caller attached to `run()`, present for nested
 runs and for segments resumed after an approval.
 
-Use `agenticTool` to get it **typed**:
+Use `agentTool` to get it **typed**:
 
 ```ts
-import { agenticTool } from 'agentrun';
+import { agentTool } from 'agentrun';
 
-const lookupInvoice = agenticTool({
+const lookupInvoice = agentTool({
   description: 'Find one invoice',
   parameters: z.object({ invoiceId: z.string() }),
   execute: async ({ invoiceId }, { state, toolCallId }) =>
@@ -101,7 +101,7 @@ composes with `markRequiresConfirmation`:
 
 ```ts
 const sendEmail = markRequiresConfirmation(
-  agenticTool({
+  agentTool({
     parameters: z.object({ to: z.string().email() }),
     execute: async ({ to }, { state }) => send(to, state.orgId),
   }),

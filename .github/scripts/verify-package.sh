@@ -40,7 +40,7 @@ if (typeof mem.MemoryStorage !== 'function') fail('adapters/memory missing');
 if (typeof adminMem.MemoryAdminStore !== 'function') fail('admin/memory missing');
 if (!Object.keys(adminSqlite).length) fail('admin/sqlite empty');
 if (typeof react.useAgentThread !== 'function') fail('use-agentrun hook missing');
-if (typeof react.AgentKitProvider !== 'function') fail('AgentKitProvider missing');
+if (typeof react.AgentRunProvider !== 'function') fail('AgentRunProvider missing');
 
 // The hook package's routing is pure — exercise it without a DOM.
 const url = react.routeUrl(react.defaultRoutes.stream, { threadId: 't1', since: 7 }, '');

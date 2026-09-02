@@ -1,7 +1,7 @@
 'use client';
 
 import type { ReactNode } from 'react';
-import { AgentKitProvider, type AgentKitConfig } from 'use-agentrun';
+import { AgentRunProvider, type AgentRunConfig } from 'use-agentrun';
 
 /** Where this app's agent API lives, declared once. These happen to be the
  *  hook's defaults — spelled out here because they are the thing you change
@@ -11,7 +11,7 @@ import { AgentKitProvider, type AgentKitConfig } from 'use-agentrun';
  *  A route can also be a function when a path cannot express it, e.g.
  *    history: ({ threadId }) => `/api/threads/${threadId}/history`
  */
-const config: AgentKitConfig = {
+const config: AgentRunConfig = {
   routes: {
     run: '/api/agent/run',
     stop: '/api/agent/control',
@@ -26,5 +26,5 @@ const config: AgentKitConfig = {
 };
 
 export function Providers({ children }: { children: ReactNode }) {
-  return <AgentKitProvider config={config}>{children}</AgentKitProvider>;
+  return <AgentRunProvider config={config}>{children}</AgentRunProvider>;
 }

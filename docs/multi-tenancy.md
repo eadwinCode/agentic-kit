@@ -188,16 +188,16 @@ integration. It turns a silent cross-tenant read into a stack trace.
 ## 6. Tools inherit it
 
 ```ts
-import { agenticTool } from 'agentrun';
+import { agentTool } from 'agentrun';
 
-const lookupInvoice = agenticTool({
+const lookupInvoice = agentTool({
   parameters: z.object({ invoiceId: z.string() }),
   execute: async ({ invoiceId }, { state }) =>
     db.invoice.findFirst({ where: { id: invoiceId, orgId: state.orgId } }),
 });
 ```
 
-`agenticTool` rather than the SDK's `tool()` because the latter cannot type
+`agentTool` rather than the SDK's `tool()` because the latter cannot type
 `state` — see [Agents and tools](./agents-and-tools.md#tools-see-the-runs-state).
 
 The model cannot reach outside the tenant even if it asks to, because the tool —

@@ -137,13 +137,13 @@ useAgentThread({
 
 ```tsx
 'use client';
-import { AgentKitProvider } from 'use-agentrun';
+import { AgentRunProvider } from 'use-agentrun';
 
 export function Providers({ children }: { children: React.ReactNode }) {
   return (
-    <AgentKitProvider config={{ routes: { run: '/v2/agent/start' } }}>
+    <AgentRunProvider config={{ routes: { run: '/v2/agent/start' } }}>
       {children}
-    </AgentKitProvider>
+    </AgentRunProvider>
   );
 }
 ```

@@ -73,19 +73,19 @@ useAgentThread({
 
 ## Configure once
 
-`AgentKitProvider` sets the config for everything below it. A hook's own
+`AgentRunProvider` sets the config for everything below it. A hook's own
 options still win, section by section, so a component can replace one route
 without restating the rest.
 
 ```tsx
 'use client';
-import { AgentKitProvider } from 'use-agentrun';
+import { AgentRunProvider } from 'use-agentrun';
 
 export function Providers({ children }) {
   return (
-    <AgentKitProvider config={{ routes: { run: '/v2/agent/start' } }}>
+    <AgentRunProvider config={{ routes: { run: '/v2/agent/start' } }}>
       {children}
-    </AgentKitProvider>
+    </AgentRunProvider>
   );
 }
 ```

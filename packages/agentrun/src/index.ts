@@ -38,7 +38,7 @@ export {
   type FinalizeInput,
   type StepResult,
 } from './core/engine.js';
-export { agenticTool, type ToolContext } from './core/tools.js';
+export { agentTool, type ToolContext } from './core/tools.js';
 export {
   followEvents,
   toSseStream,

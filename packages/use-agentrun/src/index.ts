@@ -1,9 +1,9 @@
 export { useAgentThread } from './useAgentThread.js';
 export type { UseAgentThread, UseAgentThreadOptions, RunOptions } from './useAgentThread.js';
 
-export { AgentKitProvider } from './provider.js';
-export type { AgentKitProviderProps } from './provider.js';
-export { useAgentKitConfig, mergeConfig } from './context.js';
+export { AgentRunProvider } from './provider.js';
+export type { AgentRunProviderProps } from './provider.js';
+export { useAgentRunConfig, mergeConfig } from './context.js';
 
 export {
   defaultRoutes,
@@ -16,7 +16,7 @@ export {
   routeUrl,
 } from './config.js';
 export type {
-  AgentKitConfig,
+  AgentRunConfig,
   ResolvedConfig,
   AgentRoutes,
   Route,

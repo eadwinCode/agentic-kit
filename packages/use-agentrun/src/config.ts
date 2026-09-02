@@ -191,7 +191,7 @@ export const browserEventStream: OpenStream = (url, { onMessage, onError }) => {
   return { close: () => source.close() };
 };
 
-export interface AgentKitConfig {
+export interface AgentRunConfig {
   /** Override any subset; the rest keep their defaults. */
   routes?: Partial<AgentRoutes>;
   /** Prefix applied to string routes — for an API on another origin. Routes
@@ -239,7 +239,7 @@ export interface ResolvedConfig {
   loadThreadsOnMount: boolean;
 }
 
-export function resolveConfig(config: AgentKitConfig = {}): ResolvedConfig {
+export function resolveConfig(config: AgentRunConfig = {}): ResolvedConfig {
   // Hoisted: TypeScript cannot narrow `config.headers` inside the closure.
   const headers = config.headers;
   return {

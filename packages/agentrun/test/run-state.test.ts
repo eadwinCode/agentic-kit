@@ -7,7 +7,7 @@ import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import { markRequiresConfirmation } from '../src/core/engine.js';
-import { agenticTool } from '../src/core/tools.js';
+import { agentTool } from '../src/core/tools.js';
 import { resolveConfig } from '../src/core/types.js';
 import { bindStorage } from '../src/core/state.js';
 import type { StorageContext } from '../src/core/state.js';
@@ -226,11 +226,11 @@ describe('run state survives a park (§2.10, §2.5)', () => {
   });
 });
 
-describe('agenticTool types the run state (§2.10)', () => {
+describe('agentTool types the run state (§2.10)', () => {
   // A plain `tool()` cannot be told about `state`: the SDK's own
   // ToolExecutionOptions has no such field, and narrowing the options
   // parameter is rejected as unsound. So the state arrived at runtime but only
-  // through a cast. agenticTool is that cast, done once, in one place.
+  // through a cast. agentTool is that cast, done once, in one place.
   it('hands a typed state to a plain tool', async () => {
     const seen: Array<{ org: unknown; hasToolCallId: boolean }> = [];
     const calling = new MockLanguageModelV1({
@@ -269,7 +269,7 @@ describe('agenticTool types the run state (§2.10)', () => {
       model: 'gpt-4o',
       tools: {
         // No cast anywhere in this block — that is the point.
-        whoami: agenticTool({
+        whoami: agentTool({
           parameters: z.object({}),
           execute: async (_args, { state, toolCallId }) => {
             seen.push({ org: state.orgId, hasToolCallId: typeof toolCallId === 'string' });
@@ -288,7 +288,7 @@ describe('agenticTool types the run state (§2.10)', () => {
 
   it('still composes with markRequiresConfirmation', () => {
     const marked = markRequiresConfirmation(
-      agenticTool({
+      agentTool({
         parameters: z.object({ to: z.string() }),
         execute: async ({ to }, { state }) => ({ to, org: state.orgId }),
       }),

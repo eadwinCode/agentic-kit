@@ -5,10 +5,10 @@ import {
   resolveConfig,
   routeUrl,
   withQuery,
-  type AgentKitConfig,
+  type AgentRunConfig,
   type ResolvedConfig,
 } from './config.js';
-import { mergeConfig, useAgentKitConfig } from './context.js';
+import { mergeConfig, useAgentRunConfig } from './context.js';
 import { messageToEntries, messageToEntry, stateActivity } from './format.js';
 import type {
   AgentActivity,
@@ -25,7 +25,7 @@ import type {
   ThreadUsage,
 } from './types.js';
 
-export interface UseAgentThreadOptions extends AgentKitConfig {
+export interface UseAgentThreadOptions extends AgentRunConfig {
   /** Open this thread instead of whatever persistence remembers. */
   initialThreadId?: string;
 }
@@ -64,14 +64,14 @@ export interface RunOptions {
  *  conversation with the server as the only source of truth.
  *
  *  Every endpoint, label and formatter is replaceable through the options or a
- *  surrounding provider; see `AgentKitConfig`. */
+ *  surrounding provider; see `AgentRunConfig`. */
 export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThread {
   const { initialThreadId, ...config } = options;
 
   // Provider first, own options over it. Resolved every render rather than
   // memoized: the options object is almost always an inline literal, so a
   // dependency array on it would either churn or go stale.
-  const resolved = resolveConfig(mergeConfig(useAgentKitConfig(), config));
+  const resolved = resolveConfig(mergeConfig(useAgentRunConfig(), config));
 
   // Callbacks below must stay stable across renders, so they read config from
   // a ref instead of listing it in deps. A route changed after mount therefore
