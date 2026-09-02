@@ -351,6 +351,9 @@ export async function execute(
       ...(runId ? { runId } : {}),
       ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
       ...(providerOptions ? { providerOptions } : {}),
+      // Carried so the resumed segment scopes its storage the same way this
+      // one does (§2.10).
+      ...(input.state ? { state: input.state } : {}),
     };
 
     // One ledger for the whole run: a nested run's spend counts against the

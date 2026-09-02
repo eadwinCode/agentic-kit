@@ -77,11 +77,18 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
   const core: AgentCore = {
     resolveModel: (modelName: string) => deps.resolveModel(modelName),
 
-    listThreads: () => deps.storage.threads.list(),
+    // Reads take the run state too (§2.10). A run carries it on its ticket,
+    // but a read has no ticket to carry — so a tenant-scoped Storage would see
+    // an empty context here and either return nothing or, worse, everything.
+    listThreads: (state) => scope(state).storage.threads.list(),
 
-    deleteThread: (threadId: string) => deleteThread(deps, threadId),
+    deleteThread: (threadId: string, state) => deleteThread(scope(state), threadId),
 
-    getThreadSnapshot: async (threadId: string): Promise<ThreadSnapshot | null> => {
+    getThreadSnapshot: async (
+      threadId: string,
+      state?: AgentRunState,
+    ): Promise<ThreadSnapshot | null> => {
+      const deps = scope(state);
       const thread = await deps.storage.threads.get(threadId);
       if (!thread) return null;
 
@@ -138,7 +145,11 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
       getThread: (threadId: string) => adminReads.getThread(deps, threadId),
     },
 
-    getThreadUsage: async (threadId: string): Promise<ThreadUsage | null> => {
+    getThreadUsage: async (
+      threadId: string,
+      state?: AgentRunState,
+    ): Promise<ThreadUsage | null> => {
+      const deps = scope(state);
       const thread = await deps.storage.threads.get(threadId);
       if (!thread) return null;
       const [tokens, context] = await Promise.all([
@@ -150,19 +161,23 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
 
     hitl: {
       respond: (input: RespondInput): Promise<RespondResult> => {
+        // Scoped like the run it resumes: answering an approval reads and
+        // writes the caller's rows (§2.10).
+        const scoped = scope(input.state);
         // Heal an orphaned wait first — if reclamation claims the thread, the
         // response is rejected as late (§2.5)
         return (async () => {
-          await reclaimIfOrphaned(deps, input.threadId);
-          return respond(deps, input);
+          await reclaimIfOrphaned(scoped, input.threadId);
+          return respond(scoped, input);
         })();
       },
-      reclaimIfOrphaned: (threadId: string) => reclaimIfOrphaned(deps, threadId),
+      reclaimIfOrphaned: (threadId: string, state?: AgentRunState) =>
+        reclaimIfOrphaned(scope(state), threadId),
     },
 
     events: {
-      since: (threadId: string, sinceSeq: number): Promise<AgentEvent[]> =>
-        deps.storage.events.listSince(threadId, sinceSeq),
+      since: (threadId: string, sinceSeq: number, state?: AgentRunState): Promise<AgentEvent[]> =>
+        scope(state).storage.events.listSince(threadId, sinceSeq),
       subscribe: async (threadId: string, handler: (event: AgentEvent) => void) =>
         deps.bus.subscribe(threadId, handler),
     },

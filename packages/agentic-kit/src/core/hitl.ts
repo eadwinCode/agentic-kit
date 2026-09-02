@@ -140,6 +140,7 @@ export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise
         agent: i.resume.agent,
         ...(i.resume.tokenBudget !== undefined ? { tokenBudget: i.resume.tokenBudget } : {}),
         ...(i.resume.providerOptions ? { providerOptions: i.resume.providerOptions } : {}),
+        ...(i.resume.state ? { state: i.resume.state } : {}),
       },
       { delaySeconds: Math.ceil(reclaimGraceAfterMs(deps) / 1000) },
     );
@@ -287,6 +288,9 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
           agent: resume.agent,
           ...(resume.tokenBudget !== undefined ? { tokenBudget: resume.tokenBudget } : {}),
           ...(resume.providerOptions ? { providerOptions: resume.providerOptions } : {}),
+          // The answer resumes the SAME run, so it must scope storage the same
+          // way the parked segment did (§2.10).
+          ...(resume.state ? { state: resume.state } : {}),
         }
       : {}),
   });

@@ -6,7 +6,9 @@ import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
+import { markRequiresConfirmation } from '../src/core/engine.js';
 import { resolveConfig } from '../src/core/types.js';
+import { bindStorage } from '../src/core/state.js';
 import type { StorageContext } from '../src/core/state.js';
 import type { RuntimeOptions } from '../src/ports/runtime.js';
 
@@ -113,6 +115,113 @@ describe('run state (§2.10)', () => {
     r.seen.length = 0;
     await chat.run({ prompt: 'b', state: { orgId: 'two' } });
     for (const call of r.seen) expect(call.ctx.state).toEqual({ orgId: 'two' });
+  });
+});
+
+describe('run state survives a park (§2.10, §2.5)', () => {
+  // A park can outlive the process that made it. The state therefore has to
+  // travel on the ticket, not in a closure — otherwise every storage call the
+  // resumed run makes loses whatever the caller attached, tenant scope with
+  // it, and a multi-tenant app silently reads the wrong rows after every
+  // approval.
+  it('carries the state into the segment resumed by an approval', async () => {
+    let call = 0;
+    const parkThenAnswer = new MockLanguageModelV1({
+      provider: 'mock',
+      modelId: 'mock-park',
+      doStream: async () => {
+        call += 1;
+        const chunks: LanguageModelV1StreamPart[] =
+          call === 1
+            ? [
+                {
+                  type: 'tool-call',
+                  toolCallType: 'function',
+                  toolCallId: 'c1',
+                  toolName: 'sendEmail',
+                  args: JSON.stringify({ to: 'a@b.com' }),
+                },
+                { type: 'finish', finishReason: 'tool-calls', usage: { promptTokens: 5, completionTokens: 1 } },
+              ]
+            : [
+                { type: 'text-delta', textDelta: 'done' },
+                { type: 'finish', finishReason: 'stop', usage: { promptTokens: 5, completionTokens: 1 } },
+              ];
+        return {
+          stream: simulateReadableStream({ chunks }),
+          rawCall: { rawPrompt: null, rawSettings: {} },
+        };
+      },
+    });
+
+    const { storage, seen } = spyingStorage();
+    const queue = new MemoryQueue();
+    const runtime = await setupAgentCore({
+      storage,
+      bus: new MemoryBus(),
+      queue,
+      kv: new MemoryKv(),
+      admin: new MemoryAdminStore(),
+      resolveModel: () => ({ instance: () => parkThenAnswer, contextWindow: 128_000 }),
+      config: resolveConfig(),
+    });
+    const chat = runtime.createStreamTextAgent({
+      name: 'chat',
+      model: 'gpt-4o',
+      tools: {
+        sendEmail: markRequiresConfirmation(
+          tool({
+            parameters: z.object({ to: z.string() }),
+            execute: async ({ to }: any) => ({ sent: to }),
+          }),
+        ),
+      },
+    });
+
+    const threadId = (await bindStorage(storage, { state: {} }).threads.create({ model: 'gpt-4o' })).id;
+    seen.length = 0; // drop the unscoped setup call
+    await chat.run({ threadId, prompt: 'send it', state: { orgId: 'acme' } });
+    await runtime.worker.handleJob(queue.items.at(-1)!);
+
+    // Parked. Everything so far was scoped.
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((s) => s.ctx.state.orgId === 'acme')).toBe(true);
+
+    seen.length = 0;
+    await runtime.hitl.respond({
+      threadId,
+      toolCallId: 'c1',
+      approved: true,
+      state: { orgId: 'acme' },
+    });
+    await runtime.worker.handleJob(queue.items.at(-1)!);
+
+    // ... and so is everything the answer and the resumed run touch.
+    expect(seen.length).toBeGreaterThan(0);
+    const unscoped = seen.filter((s) => s.ctx.state.orgId !== 'acme');
+    expect(unscoped.map((s) => s.method)).toEqual([]);
+  });
+
+  it('scopes the reads a UI makes, which carry no ticket of their own', async () => {
+    const { storage, seen } = spyingStorage();
+    const runtime = await setupAgentCore({
+      storage,
+      bus: new MemoryBus(),
+      queue: new MemoryQueue(),
+      kv: new MemoryKv(),
+      admin: new MemoryAdminStore(),
+      resolveModel: () => ({ instance: () => model(), contextWindow: 128_000 }),
+      config: resolveConfig(),
+    });
+    const threadId = (await bindStorage(storage, { state: {} }).threads.create({ model: 'gpt-4o' })).id;
+
+    seen.length = 0;
+    await runtime.listThreads({ orgId: 'acme' });
+    await runtime.getThreadSnapshot(threadId, { orgId: 'acme' });
+    await runtime.getThreadUsage(threadId, { orgId: 'acme' });
+
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((s) => s.ctx.state.orgId === 'acme')).toBe(true);
   });
 });
 

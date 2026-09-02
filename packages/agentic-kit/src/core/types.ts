@@ -214,6 +214,11 @@ export interface ResumeInfo {
   runId?: string;
   tokenBudget?: number;
   providerOptions?: ProviderOptions;
+  /** The run's state (§2.10). A park can outlive the process that made it, so
+   *  the state has to travel on the ticket — rebuilt from here, not from a
+   *  closure that is long gone. Without it every storage call after an
+   *  approval loses whatever the caller attached, tenant scope included. */
+  state?: AgentRunState;
 }
 
 /** A model identity after resolution: the real provider instance (created

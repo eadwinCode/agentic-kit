@@ -126,6 +126,10 @@ export interface RespondInput {
   toolCallId: string;
   approved: boolean;
   payload?: unknown;
+  /** The run state (§2.10) for the storage calls answering makes. The RESUMED
+   *  run rebuilds its own state from the park's ticket — this is only for the
+   *  reads and writes `respond` itself performs. */
+  state?: AgentRunState;
 }
 
 export interface RespondResult {
@@ -227,28 +231,30 @@ export interface AgentCore {
    *  by execution, compaction, usage attribution, and persisted run metadata. */
   resolveModel(modelName: string): ResolvedModel;
 
-  /** Most recent first — thread pickers / sidebars. */
-  listThreads(): Promise<ThreadDTO[]>;
+  /** Most recent first — thread pickers / sidebars. Takes the run state
+   *  (§2.10) so a tenant-scoped Storage can filter; a read has no dispatch
+   *  ticket to carry it on. */
+  listThreads(state?: AgentRunState): Promise<ThreadDTO[]>;
 
   /** One call for UIs / history routes: thread + messages + recent events. */
-  getThreadSnapshot(threadId: string): Promise<ThreadSnapshot | null>;
+  getThreadSnapshot(threadId: string, state?: AgentRunState): Promise<ThreadSnapshot | null>;
 
   /** Tokens spent so far and the §2.6 context load. Null when the thread is
    *  gone. Kept out of the snapshot so hydration stays one cheap read. */
-  getThreadUsage(threadId: string): Promise<ThreadUsage | null>;
+  getThreadUsage(threadId: string, state?: AgentRunState): Promise<ThreadUsage | null>;
 
   /** Delete a thread and everything that follows it — messages, events,
    *  usage rows, subagent runs, and the thread's hot kv keys (§3.2).
    *  Refused while a run is active; stop() first. */
-  deleteThread(threadId: string): Promise<DeleteThreadResult>;
+  deleteThread(threadId: string, state?: AgentRunState): Promise<DeleteThreadResult>;
 
   hitl: {
     respond(input: RespondInput): Promise<RespondResult>;
-    reclaimIfOrphaned(threadId: string): Promise<boolean>;
+    reclaimIfOrphaned(threadId: string, state?: AgentRunState): Promise<boolean>;
   };
 
   events: {
-    since(threadId: string, sinceSeq: number): Promise<AgentEvent[]>;
+    since(threadId: string, sinceSeq: number, state?: AgentRunState): Promise<AgentEvent[]>;
     subscribe(threadId: string, handler: (event: AgentEvent) => void): Promise<() => void>;
   };
 
