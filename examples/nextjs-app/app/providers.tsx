@@ -1,7 +1,7 @@
 'use client';
 
 import type { ReactNode } from 'react';
-import { AgentRunProvider, type AgentRunConfig } from 'use-agentrun';
+import { AgentRunProvider, type AgentRunConfig } from 'use-agentenkit';
 
 /** Where this app's agent API lives, declared once. These happen to be the
  *  hook's defaults — spelled out here because they are the thing you change

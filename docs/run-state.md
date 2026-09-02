@@ -38,7 +38,7 @@ parameter would ripple through `Storage`, `AgentCore`, tools and subagents
 before reaching the one place it is read:
 
 ```ts
-declare module 'agentrun' {
+declare module 'agentenkit' {
   interface AgentRunState {
     orgId: string;
     userId: string;

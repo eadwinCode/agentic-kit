@@ -4,7 +4,7 @@ import { Providers } from './providers';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'agentrun — example',
+  title: 'agentenkit — example',
   description: 'Queue-dispatched agent runs with SSE sync, HITL approval, and subagents',
 };
 

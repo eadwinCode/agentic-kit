@@ -1,4 +1,4 @@
-# agentrun
+# agentenkit
 
 A durable runtime for AI agent runs, as a **library**.
 
@@ -22,11 +22,11 @@ then obvious rather than magic.
 
 ```ts
 import { Database } from 'bun:sqlite';           // or node:sqlite — see openSqlite
-import { setupAgentCore } from 'agentrun';
-import { SqliteStorage } from 'agentrun/adapters/sqlite';
-import { InlineQueue } from 'agentrun/adapters/inline';
-import { MemoryBus, MemoryKv } from 'agentrun/adapters/memory';
-import { SqliteAdminStore } from 'agentrun/admin/sqlite';
+import { setupAgentCore } from 'agentenkit';
+import { SqliteStorage } from 'agentenkit/adapters/sqlite';
+import { InlineQueue } from 'agentenkit/adapters/inline';
+import { MemoryBus, MemoryKv } from 'agentenkit/adapters/memory';
+import { SqliteAdminStore } from 'agentenkit/admin/sqlite';
 import { openai } from '@ai-sdk/openai';
 
 // One file holds both: your tables, and — prefixed `agentic_` — the platform's
@@ -64,7 +64,7 @@ for a database that dies with the process.
 ## Install
 
 ```bash
-bun add agentrun ai zod
+bun add agentenkit ai zod
 # optional reference adapters:
 bun add @prisma/client @upstash/redis @upstash/qstash redis
 ```
@@ -77,10 +77,10 @@ Same shape, durable pieces. Each line above swaps for one here.
 import { Client } from '@upstash/qstash';
 import { createClient } from 'redis';
 import { PrismaClient } from '@prisma/client';
-import { setupAgentCore } from 'agentrun';
-import { PrismaStorage } from 'agentrun/adapters/prisma';
-import { RedisBus, RedisKv } from 'agentrun/adapters/redis';
-import { QStashQueue } from 'agentrun/adapters/qstash';
+import { setupAgentCore } from 'agentenkit';
+import { PrismaStorage } from 'agentenkit/adapters/prisma';
+import { RedisBus, RedisKv } from 'agentenkit/adapters/redis';
+import { QStashQueue } from 'agentenkit/adapters/qstash';
 
 const redis = createClient({ url: process.env.REDIS_URL });
 await redis.connect();
@@ -141,7 +141,7 @@ Type your own fields by augmenting the interface — no `<TState>` rippling thro
 `Storage`, `AgentCore`, tools and subagents before it reaches the one place it is read:
 
 ```ts
-declare module 'agentrun' {
+declare module 'agentenkit' {
   interface AgentRunState { orgId: string; userId: string }
 }
 ```

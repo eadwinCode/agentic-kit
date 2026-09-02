@@ -1,4 +1,4 @@
-# agentrun — Next.js example (spec §5)
+# agentenkit — Next.js example (spec §5)
 
 Thin reference integration: every route handler is a few lines over the runtime; all behavior lives in the package. Runs on [Bun](https://bun.sh).
 

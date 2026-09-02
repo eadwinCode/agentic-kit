@@ -7,7 +7,7 @@ import type { Storage } from '../ports/storage.js';
  *  Augment it to type your own fields:
  *
  * ```ts
- * declare module 'agentrun' {
+ * declare module 'agentenkit' {
  *   interface AgentRunState { orgId: string; userId: string }
  * }
  * ```

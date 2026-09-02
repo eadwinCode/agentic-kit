@@ -1,7 +1,7 @@
-# React: use-agentrun
+# React: use-agentenkit
 
 ```bash
-bun add use-agentrun
+bun add use-agentenkit
 ```
 
 A hook that owns the client state machine — hydrate from the durable snapshot,
@@ -12,7 +12,7 @@ string and transport to you.
 
 ```tsx
 'use client';
-import { useAgentThread } from 'use-agentrun';
+import { useAgentThread } from 'use-agentenkit';
 
 export function Chat() {
   const { entries, run, stop, agentState, pendingInputs, respondToInput } = useAgentThread();
@@ -137,7 +137,7 @@ useAgentThread({
 
 ```tsx
 'use client';
-import { AgentRunProvider } from 'use-agentrun';
+import { AgentRunProvider } from 'use-agentenkit';
 
 export function Providers({ children }: { children: React.ReactNode }) {
   return (

@@ -7,9 +7,9 @@
     "examples/*"
   ],
   "scripts": {
-    "typecheck": "bun run --cwd packages/agentrun typecheck && bun run --cwd packages/use-agentrun typecheck",
-    "build": "bun run --cwd packages/agentrun build && bun run --cwd packages/use-agentrun build",
-    "test": "bun run --cwd packages/agentrun test && bun run --cwd packages/use-agentrun test",
+    "typecheck": "bun run --cwd packages/agentenkit typecheck && bun run --cwd packages/use-agentenkit typecheck",
+    "build": "bun run --cwd packages/agentenkit build && bun run --cwd packages/use-agentenkit build",
+    "test": "bun run --cwd packages/agentenkit test && bun run --cwd packages/use-agentenkit test",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs"

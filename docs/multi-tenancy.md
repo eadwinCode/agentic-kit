@@ -16,8 +16,8 @@ query.
 ## 1. Type the state
 
 ```ts
-// types/agentrun.d.ts
-declare module 'agentrun' {
+// types/agentenkit.d.ts
+declare module 'agentenkit' {
   interface AgentRunState {
     orgId: string;
     userId: string;
@@ -188,7 +188,7 @@ integration. It turns a silent cross-tenant read into a stack trace.
 ## 6. Tools inherit it
 
 ```ts
-import { agentTool } from 'agentrun';
+import { agentTool } from 'agentenkit';
 
 const lookupInvoice = agentTool({
   parameters: z.object({ invoiceId: z.string() }),

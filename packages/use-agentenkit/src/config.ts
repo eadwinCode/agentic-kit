@@ -128,7 +128,7 @@ export interface ThreadPersistence {
 
 /** The default: a `threadId` query parameter so a conversation is linkable,
  *  backed by localStorage so a bare visit reopens the last one. */
-export function browserPersistence(storageKey = 'use-agentrun:last-thread'): ThreadPersistence {
+export function browserPersistence(storageKey = 'use-agentenkit:last-thread'): ThreadPersistence {
   const canUseDom = () => typeof window !== 'undefined';
   const read = (): string | null => {
     try {

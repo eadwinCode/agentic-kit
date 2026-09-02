@@ -16,10 +16,10 @@
     "plugins": [{ "name": "next" }],
     "paths": {
       "@/*": ["./*"],
-      "agentrun": ["../../packages/agentrun/src/index.ts"],
-      "agentrun/adapters/*": ["../../packages/agentrun/src/adapters/*"],
-      "agentrun/admin/*": ["../../packages/agentrun/src/admin/*"],
-      "use-agentrun": ["../../packages/use-agentrun/src/index.ts"]
+      "agentenkit": ["../../packages/agentenkit/src/index.ts"],
+      "agentenkit/adapters/*": ["../../packages/agentenkit/src/adapters/*"],
+      "agentenkit/admin/*": ["../../packages/agentenkit/src/admin/*"],
+      "use-agentenkit": ["../../packages/use-agentenkit/src/index.ts"]
     }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],

@@ -19,27 +19,27 @@ cat > package.json <<'JSON'
 JSON
 
 echo "--- packing"
-(cd "$root/packages/agentrun" && npm pack --silent --pack-destination "$work")
-(cd "$root/packages/use-agentrun" && npm pack --silent --pack-destination "$work")
+(cd "$root/packages/agentenkit" && npm pack --silent --pack-destination "$work")
+(cd "$root/packages/use-agentenkit" && npm pack --silent --pack-destination "$work")
 
 echo "--- installing"
-bun add ./agentrun-*.tgz ./use-agentrun-*.tgz react
+bun add ./agentenkit-*.tgz ./use-agentenkit-*.tgz react
 
 cat > check.mjs <<'JS'
 const fail = (m) => { console.error('FAIL: ' + m); process.exit(1); };
 
 // Every entry point in the export maps.
-const core = await import('agentrun');
-const mem = await import('agentrun/adapters/memory');
-const adminMem = await import('agentrun/admin/memory');
-const adminSqlite = await import('agentrun/admin/sqlite');
-const react = await import('use-agentrun');
+const core = await import('agentenkit');
+const mem = await import('agentenkit/adapters/memory');
+const adminMem = await import('agentenkit/admin/memory');
+const adminSqlite = await import('agentenkit/admin/sqlite');
+const react = await import('use-agentenkit');
 
 if (typeof core.setupAgentCore !== 'function') fail('core.setupAgentCore missing');
 if (typeof mem.MemoryStorage !== 'function') fail('adapters/memory missing');
 if (typeof adminMem.MemoryAdminStore !== 'function') fail('admin/memory missing');
 if (!Object.keys(adminSqlite).length) fail('admin/sqlite empty');
-if (typeof react.useAgentThread !== 'function') fail('use-agentrun hook missing');
+if (typeof react.useAgentThread !== 'function') fail('use-agentenkit hook missing');
 if (typeof react.AgentRunProvider !== 'function') fail('AgentRunProvider missing');
 
 // The hook package's routing is pure — exercise it without a DOM.

@@ -1,7 +1,7 @@
 {
-  "name": "use-agentrun",
+  "name": "use-agentenkit",
   "version": "0.1.0",
-  "description": "React hook for agentrun \u2014 durable threads, live streaming, human-in-the-loop approvals and nested runs, with every route and label under your control.",
+  "description": "React hook for agentenkit \u2014 durable threads, live streaming, human-in-the-loop approvals and nested runs, with every route and label under your control.",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",

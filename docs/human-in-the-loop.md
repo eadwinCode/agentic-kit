@@ -6,7 +6,7 @@ parks when the model calls it.
 ## Marking a tool
 
 ```ts
-import { markRequiresConfirmation } from 'agentrun';
+import { markRequiresConfirmation } from 'agentenkit';
 
 const sendEmail = markRequiresConfirmation(
   tool({
@@ -91,7 +91,7 @@ frame stack unwinds the answer back through the nesting levels.
 
 ## Building the UI
 
-With [`use-agentrun`](./react.md) it is two fields and a call:
+With [`use-agentenkit`](./react.md) it is two fields and a call:
 
 ```tsx
 {pendingInputs.map((input) => (

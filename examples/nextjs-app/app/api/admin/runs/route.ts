@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { runtime } from '@/lib/runtime';
-import type { ExecutionState } from 'agentrun';
+import type { ExecutionState } from 'agentenkit';
 
 /** The run list (§2.9). `state` may repeat: ?state=FAILED&state=CANCELLED. */
 export async function GET(req: NextRequest) {

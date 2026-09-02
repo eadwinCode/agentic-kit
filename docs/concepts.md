@@ -130,7 +130,7 @@ watching.
 
 - It does not own your prompts, models or tools. The AI SDK does.
 - It does not own your database schema. You implement `Storage`.
-- It does not render anything. `use-agentrun` is one option; the event log is a
+- It does not render anything. `use-agentenkit` is one option; the event log is a
   public contract you can build any client over.
 
 ## Next

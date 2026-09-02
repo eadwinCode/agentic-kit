@@ -9,13 +9,13 @@
 ## Install
 
 ```bash
-bun add agentrun ai zod
+bun add agentenkit ai zod
 ```
 
 The React hook is separate, and only needed if you want it:
 
 ```bash
-bun add use-agentrun
+bun add use-agentenkit
 ```
 
 Reference adapters lean on optional peers. Install only the ones you use:
@@ -33,11 +33,11 @@ equivalent later is then obvious rather than magic.
 ```ts
 // lib/runtime.ts
 import { Database } from 'bun:sqlite';
-import { setupAgentCore } from 'agentrun';
-import { SqliteStorage } from 'agentrun/adapters/sqlite';
-import { InlineQueue } from 'agentrun/adapters/inline';
-import { MemoryBus, MemoryKv } from 'agentrun/adapters/memory';
-import { SqliteAdminStore } from 'agentrun/admin/sqlite';
+import { setupAgentCore } from 'agentenkit';
+import { SqliteStorage } from 'agentenkit/adapters/sqlite';
+import { InlineQueue } from 'agentenkit/adapters/inline';
+import { MemoryBus, MemoryKv } from 'agentenkit/adapters/memory';
+import { SqliteAdminStore } from 'agentenkit/admin/sqlite';
 import { openai } from '@ai-sdk/openai';
 
 // One file holds both your tables and — under an `agentic_` prefix — the
@@ -107,7 +107,7 @@ const unsubscribe = await runtime.events.subscribe(threadId, (event) => {
 ```
 
 For a browser, expose the [HTTP endpoints](./http-api.md) and use
-[`use-agentrun`](./react.md), which does the hydrate-then-tail dance for you.
+[`use-agentenkit`](./react.md), which does the hydrate-then-tail dance for you.
 
 ## Next
 

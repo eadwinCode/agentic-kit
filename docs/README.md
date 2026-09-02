@@ -9,8 +9,8 @@ Two packages:
 
 | Package | What it is |
 | :--- | :--- |
-| [`agentrun`](https://github.com/eadwinCode/agentic-kit/tree/main/packages/agentrun) | The server-side runtime. Owns the lifecycle of a run. |
-| [`use-agentrun`](https://github.com/eadwinCode/agentic-kit/tree/main/packages/use-agentrun) | The React hook. Owns the client state machine. |
+| [`agentenkit`](https://github.com/eadwinCode/agentic-kit/tree/main/packages/agentenkit) | The server-side runtime. Owns the lifecycle of a run. |
+| [`use-agentenkit`](https://github.com/eadwinCode/agentic-kit/tree/main/packages/use-agentenkit) | The React hook. Owns the client state machine. |
 
 You can use the core on its own — the hook is one way to build a UI over it, not
 a requirement.
@@ -54,7 +54,7 @@ a requirement.
 
 ## Client
 
-- **[React: use-agentrun](./react.md)** — the hook, its routes, and its options.
+- **[React: use-agentenkit](./react.md)** — the hook, its routes, and its options.
 
 ## Reference
 

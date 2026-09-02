@@ -82,7 +82,7 @@ you can see the split — but the cap is enforced across the whole tree.
 ## Watching them
 
 Four event types describe a child's life: `SUBAGENT_STARTED`, `SUBAGENT_CHUNK`,
-`SUBAGENT_COMPLETED`, `SUBAGENT_FAILED`. `use-agentrun` turns them into a
+`SUBAGENT_COMPLETED`, `SUBAGENT_FAILED`. `use-agentenkit` turns them into a
 `subagents` array:
 
 ```tsx

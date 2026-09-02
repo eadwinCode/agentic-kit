@@ -1,6 +1,6 @@
-# use-agentrun
+# use-agentenkit
 
-A React hook for an [`agentrun`](../agentrun) backend: durable
+A React hook for an [`agentenkit`](../agentenkit) backend: durable
 threads, live streaming, human-in-the-loop approvals and nested runs.
 
 It owns the client state machine — hydrate from the durable snapshot, replay
@@ -8,7 +8,7 @@ the active run, then tail the event stream — and leaves every endpoint, string
 and transport to you.
 
 ```bash
-bun add use-agentrun
+bun add use-agentenkit
 ```
 
 **[Full documentation](https://eadwincode.github.io/agentic-kit/)** · [React guide](https://eadwincode.github.io/agentic-kit/react) ·
@@ -18,7 +18,7 @@ bun add use-agentrun
 
 ```tsx
 'use client';
-import { useAgentThread } from 'use-agentrun';
+import { useAgentThread } from 'use-agentenkit';
 
 export function Chat() {
   const { entries, run, stop, agentState, pendingInputs, respondToInput } =
@@ -79,7 +79,7 @@ without restating the rest.
 
 ```tsx
 'use client';
-import { AgentRunProvider } from 'use-agentrun';
+import { AgentRunProvider } from 'use-agentenkit';
 
 export function Providers({ children }) {
   return (
