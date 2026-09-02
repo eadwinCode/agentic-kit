@@ -310,7 +310,12 @@ export async function execute(
 
   // Provider-specific options (§3.1): spec default <- execute input,
   // shallow per-provider namespace; the execute input wins.
-  const providerOptions = mergeProviderOptions(agent.spec.providerOptions, input.providerOptions);
+  // Three levels, widest first: runtime config → agent spec → this run.
+  // Each wins over the one before it, per provider namespace (§3.1).
+  const providerOptions = mergeProviderOptions(
+    mergeProviderOptions(deps.config.providerOptions, agent.spec.providerOptions),
+    input.providerOptions,
+  );
 
   // Two ways a run ends early, one behavior — everything tears down at once:
   //   1. the state key reads CANCELLED: the user pressed stop (§2.1);

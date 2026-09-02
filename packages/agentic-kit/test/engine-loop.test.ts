@@ -221,6 +221,83 @@ describe('reconnecting mid-run (§2.2)', () => {
   });
 });
 
+describe('providerOptions (§3.1)', () => {
+  /** Captures what the provider is actually handed. Asserting on what we
+   *  passed in proves only that an object was copied. */
+  function capturing(seen: { options?: any }) {
+    return new MockLanguageModelV1({
+      provider: 'mock',
+      modelId: 'mock-po',
+      doStream: async (call: any) => {
+        seen.options = call.providerMetadata ?? call.providerOptions;
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: 'text-delta', textDelta: 'ok' },
+              { type: 'finish', finishReason: 'stop', usage: { promptTokens: 5, completionTokens: 1 } },
+            ] as LanguageModelV1StreamPart[],
+          }),
+          rawCall: { rawPrompt: null, rawSettings: {} },
+        };
+      },
+    });
+  }
+
+  async function runWith(
+    config: Partial<AgentConfig>,
+    spec?: Record<string, unknown>,
+    runOpts?: Record<string, unknown>,
+  ) {
+    const seen: { options?: any } = {};
+    const { runtime, queue, store } = await makeRuntime(capturing(seen), config);
+    const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', ...spec } as any);
+    const threadId = (await store.threads.create({ model: 'gpt-4o' })).id;
+    await chat.run({ threadId, prompt: 'hi', ...runOpts } as any);
+    await runtime.worker.handleJob(queue.items.at(-1)!);
+    return seen.options;
+  }
+
+  // The widest level: set once at setupAgentCore, applied to every run.
+  it('applies the runtime-wide default', async () => {
+    const options = await runWith({ providerOptions: { openai: { serviceTier: 'flex' } } });
+    expect(options).toMatchObject({ openai: { serviceTier: 'flex' } });
+  });
+
+  it('lets an agent spec override the runtime default', async () => {
+    const options = await runWith(
+      { providerOptions: { openai: { serviceTier: 'flex' } } },
+      { providerOptions: { openai: { serviceTier: 'priority' } } },
+    );
+    expect(options).toMatchObject({ openai: { serviceTier: 'priority' } });
+  });
+
+  it('lets a run override both', async () => {
+    const options = await runWith(
+      { providerOptions: { openai: { serviceTier: 'flex' } } },
+      { providerOptions: { openai: { serviceTier: 'priority' } } },
+      { providerOptions: { openai: { serviceTier: 'auto' } } },
+    );
+    expect(options).toMatchObject({ openai: { serviceTier: 'auto' } });
+  });
+
+  // Merging is per provider namespace, so options for a provider nobody
+  // overrode survive.
+  it('keeps a namespace no later level mentions', async () => {
+    const options = await runWith(
+      { providerOptions: { anthropic: { thinking: { type: 'enabled' } } } },
+      { providerOptions: { openai: { serviceTier: 'flex' } } },
+    );
+    expect(options).toMatchObject({
+      anthropic: { thinking: { type: 'enabled' } },
+      openai: { serviceTier: 'flex' },
+    });
+  });
+
+  it('sends nothing when no level sets it', async () => {
+    expect(await runWith({})).toBeUndefined();
+  });
+});
+
 describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
   it('feeds tool results back between single-round-trip steps and persists per step', async () => {
     const executed: string[] = [];

@@ -306,6 +306,11 @@ export interface AgentConfig {
   runLockLeaseSeconds: number;
   /** Billing pre-execution check (§4). Return `{ ok: false, error }` to reject a run. */
   billingPreCheck?: (threadId: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Provider-specific options applied to EVERY run (§3.1) — a reasoning
+   *  budget, a service tier, a safety identifier. The lowest of three levels:
+   *  an agent spec overrides this, and a run input overrides both, per
+   *  provider namespace. */
+  providerOptions?: ProviderOptions;
 }
 
 export const DEFAULT_CONFIG: AgentConfig = {

@@ -7,6 +7,7 @@ import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import { markRequiresConfirmation } from '../src/core/engine.js';
+import { agenticTool } from '../src/core/tools.js';
 import { resolveConfig } from '../src/core/types.js';
 import { bindStorage } from '../src/core/state.js';
 import type { StorageContext } from '../src/core/state.js';
@@ -222,6 +223,78 @@ describe('run state survives a park (§2.10, §2.5)', () => {
 
     expect(seen.length).toBeGreaterThan(0);
     expect(seen.every((s) => s.ctx.state.orgId === 'acme')).toBe(true);
+  });
+});
+
+describe('agenticTool types the run state (§2.10)', () => {
+  // A plain `tool()` cannot be told about `state`: the SDK's own
+  // ToolExecutionOptions has no such field, and narrowing the options
+  // parameter is rejected as unsound. So the state arrived at runtime but only
+  // through a cast. agenticTool is that cast, done once, in one place.
+  it('hands a typed state to a plain tool', async () => {
+    const seen: Array<{ org: unknown; hasToolCallId: boolean }> = [];
+    const calling = new MockLanguageModelV1({
+      provider: 'mock',
+      modelId: 'calling',
+      doStream: async ({ prompt }: any) => {
+        const answered = (prompt ?? []).some((m: any) => m.role === 'tool');
+        const chunks: LanguageModelV1StreamPart[] = answered
+          ? [{ type: 'text-delta', textDelta: 'done' }]
+          : [{
+              type: 'tool-call', toolCallType: 'function', toolCallId: 'c1',
+              toolName: 'whoami', args: '{}',
+            }];
+        chunks.push({
+          type: 'finish',
+          finishReason: answered ? 'stop' : 'tool-calls',
+          usage: { promptTokens: 10, completionTokens: 5 },
+        });
+        return {
+          stream: simulateReadableStream({ chunks }),
+          rawCall: { rawPrompt: null, rawSettings: {} },
+        };
+      },
+    });
+
+    const queue = new MemoryQueue();
+    const runtime = await setupAgentCore({
+      storage: new MemoryStorage(), bus: new MemoryBus(), queue, kv: new MemoryKv(),
+      admin: new MemoryAdminStore(),
+      resolveModel: () => ({ instance: () => calling, contextWindow: 128_000 }),
+      config: resolveConfig(),
+    });
+
+    const chat = runtime.createStreamTextAgent({
+      name: 'chat',
+      model: 'gpt-4o',
+      tools: {
+        // No cast anywhere in this block — that is the point.
+        whoami: agenticTool({
+          parameters: z.object({}),
+          execute: async (_args, { state, toolCallId }) => {
+            seen.push({ org: state.orgId, hasToolCallId: typeof toolCallId === 'string' });
+            return { ok: true };
+          },
+        }),
+      },
+    });
+
+    await chat.run({ prompt: 'hi', state: { orgId: 'acme' } });
+    await runtime.worker.handleJob(queue.items[0]!);
+
+    // The state arrived, and the SDK's own options are still there beside it.
+    expect(seen).toEqual([{ org: 'acme', hasToolCallId: true }]);
+  });
+
+  it('still composes with markRequiresConfirmation', () => {
+    const marked = markRequiresConfirmation(
+      agenticTool({
+        parameters: z.object({ to: z.string() }),
+        execute: async ({ to }, { state }) => ({ to, org: state.orgId }),
+      }),
+    );
+    expect((marked as any).requiresConfirmation).toBe(true);
+    expect(typeof (marked as any).execute).toBe('function');
   });
 });
 
