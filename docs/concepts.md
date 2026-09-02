@@ -111,6 +111,13 @@ Common event types:
 | `SUBAGENT_STARTED` / `_CHUNK` / `_COMPLETED` / `_FAILED` | Nested run activity |
 | `CONTEXT_COMPACTED` | History was summarized |
 
+### Your own events
+
+The log is not only the platform's. A tool, or any server code, can
+[publish an event](./custom-events.md) on a thread, and a client reads it
+through the same stream. Durable by default; a notice when nobody needs to see
+it twice.
+
 ## Thread states
 
 ```

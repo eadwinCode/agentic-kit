@@ -177,7 +177,7 @@ config: {
   hitlTtlMs: 5 * 60_000,
   maxSteps: 12,
   recordPayloads: false,
-  billingPreCheck: async (threadId) => ({ ok: await hasCredit(threadId) }),
+  billingPreCheck: async ({ threadId }) => ({ ok: await hasCredit(threadId) }),
 }
 ```
 

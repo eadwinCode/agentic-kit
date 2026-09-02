@@ -198,7 +198,9 @@ useAgentThread({
 });
 ```
 
-Returning `true` also lets you override a built-in type.
+Returning `true` also lets you override a built-in type. Your own events come
+from `publishEvent` on the server; [Custom events](./custom-events.md) walks
+through a full reducer.
 
 ### Translating
 

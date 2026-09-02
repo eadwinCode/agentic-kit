@@ -115,7 +115,11 @@ for await (const e of runtime.events.follow(threadId, { signal })) { … }     /
 const missed = await runtime.events.since(threadId, lastSeq);              // raw replay
 const unsub  = await runtime.events.subscribe(threadId, handler);          // raw tail
 await runtime.worker.handleJob(job);                     // queue consumer (§2.8)
+await runtime.events.publishEvent(threadId, 'MY_EVENT', payload); // your own event, same pipe
 ```
+
+Tools get `publishEvent` on their second argument, bound to their thread; see
+[Custom events](../../docs/custom-events.md).
 
 The Next.js routes in [`examples/nextjs-app`](../../examples/nextjs-app) show the HTTP
 wiring — each handler is a few lines over the runtime.

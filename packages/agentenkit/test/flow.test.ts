@@ -88,12 +88,22 @@ describe('runtime.run via handle (§5.1)', () => {
   });
 
   it('rejects when the billing pre-check fails (§4)', async () => {
-    const { runtime } = await makeDeps({
-      billingPreCheck: async () => ({ ok: false, error: 'Insufficient credits' }),
+    const { runtime, bus } = await makeDeps({
+      billingPreCheck: async ({ state, publishEvent }) => {
+        // The check can tell every client why, before the refusal lands
+        await publishEvent('CREDIT_LIMIT', { org: state.orgId });
+        return { ok: false, error: 'Insufficient credits' };
+      },
     });
     const chat = runtime.createStreamTextAgent({ name: 'chat' });
-    const res = await chat.run({ prompt: 'x' });
+    const res = await chat.run({ prompt: 'x', state: { orgId: 'acme' } });
     expect(res.accepted).toBe(false);
+    // Both the check's own event and the platform's refusal are on the log, durably
+    const limit = bus.published.find((e) => e.type === 'CREDIT_LIMIT')!;
+    expect(limit.payload).toEqual({ org: 'acme' });
+    const refused = bus.published.find((e) => e.type === 'RUN_REFUSED')!;
+    expect(refused.payload).toEqual({ reason: 'billing', error: 'Insufficient credits' });
+    expect(refused.seq).toBeGreaterThan(limit.seq);
     expect(res.error).toMatch(/Insufficient credits/);
   });
 

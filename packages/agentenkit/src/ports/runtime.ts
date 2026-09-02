@@ -18,6 +18,7 @@ import type { Storage } from './storage.js';
 import type { AdminStore, RunFilter, StepRecord } from './admin.js';
 import type { AgentRunState, BoundStorage } from '../core/state.js';
 import type { FollowOptions, SseOptions, SseStream } from '../core/follow.js';
+import type { PublishEventOptions } from '../core/publish.js';
 
 export type { AdminStore, NewStepRecord, RunFilter, StepRecord } from './admin.js';
 export type { AgentRunState, BoundStorage, StorageContext } from '../core/state.js';
@@ -271,6 +272,17 @@ export interface AgentCore {
     /** `follow`, encoded as Server-Sent Events. Returns the stream and the
      *  headers rather than a Response, because half the ecosystem has none. */
     sse(threadId: string, options?: SseOptions & { state?: AgentRunState }): SseStream;
+    /** Publish an event of your own on a thread, from anywhere on the server
+     *  — a webhook, a cron job, a route. Tools get the same thing bound to
+     *  their thread as `publishEvent` on their options. Durable by default;
+     *  `{ durable: false }` is a bus-only notice. Platform event types are
+     *  refused. */
+    publishEvent(
+      threadId: string,
+      type: string,
+      payload: unknown,
+      options?: PublishEventOptions & { state?: AgentRunState },
+    ): Promise<AgentEvent>;
   };
 
   /** Agent factories — see §4. Each call registers a handle under `spec.name`. */

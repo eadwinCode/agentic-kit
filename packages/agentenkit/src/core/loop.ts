@@ -328,8 +328,16 @@ export async function runLoop(
     }
 
     // Budget check BETWEEN steps (§2.1) — the step that crossed the line is
-    // kept in full; the next one never starts.
-    if (input.tokenBudget && ledger.tokensUsed >= input.tokenBudget) break;
+    // kept in full; the next one never starts. Published before the break, so
+    // a client learns why the run ended the moment it does.
+    if (input.tokenBudget && ledger.tokensUsed >= input.tokenBudget) {
+      await publish(deps, threadId, 'TOKEN_BUDGET_EXHAUSTED', {
+        agentId: input.agentId,
+        tokensUsed: ledger.tokensUsed,
+        tokenBudget: input.tokenBudget,
+      });
+      break;
+    }
 
     // 'tool-calls' → the SDK executed the step's tools; the loop feeds the
     // results back. Anything else ('stop', 'length', …) ends the run.

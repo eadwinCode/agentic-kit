@@ -135,6 +135,23 @@ tool({
 The model cannot reach outside the tenant even if it asks to, because the tool
 — not the prompt — decides what it can see.
 
+### Tools can publish events
+
+The same second argument carries `publishEvent`, bound to the thread the tool
+runs on. Anything the tool learns can reach the UI through the event log, live
+and on reconnect:
+
+```ts
+execute: async ({ brief }, { publishEvent }) => {
+  const url = await render(brief);
+  await publishEvent('DESIGN_PREVIEW', { url });
+  return { url };
+},
+```
+
+See [Custom events](./custom-events.md) for the durable/notice choice and the
+client side.
+
 ## Budgets and ceilings
 
 Three different limits, easy to confuse:

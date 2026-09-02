@@ -51,6 +51,7 @@ export {
 // The run-state types, named here so they are discoverable rather than
 // reachable only by chance through another module's re-export.
 export type { AgentRunState, BoundStorage, StorageContext } from './core/state.js';
+export type { BillingCheck } from './core/types.js';
 export { claimRun, redriveKey, runIdKey } from './core/keys.js';
 export { countTokens } from './core/usage.js';
 export {
@@ -71,7 +72,15 @@ export { reclaimIfOrphaned } from './core/reclaim.js';
 export { contextBudget, contextUsage, compactContext, CONTEXT_TOKEN_CEILING } from './core/context.js';
 export { Semaphore, runNestedAgent, spawnSubagentTool, type SubagentCtx } from './core/subagent.js';
 export { run } from './core/run.js';
+export {
+  publishEvent,
+  withPublishEvent,
+  RESERVED_EVENT_TYPES,
+  type PublishEventOptions,
+  type ToolPublishEvent,
+} from './core/publish.js';
 export { stop } from './core/stop.js';
+export { repairDanglingToolCalls, DANGLING_CALL_RESULT } from './core/messages.js';
 
 // types
 export {

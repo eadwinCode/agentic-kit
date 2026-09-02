@@ -74,7 +74,7 @@ be opened should be a startup error.
 
 | Setting | Default | Meaning |
 | :--- | ---: | :--- |
-| `billingPreCheck` | — | `(threadId) => { ok, error? }`. Reject a run before it costs anything. |
+| `billingPreCheck` | — | `({ threadId, state, publishEvent }) => { ok, error? }`. Reject a run before it costs anything; the check can publish on the thread, and the platform publishes `RUN_REFUSED`. |
 
 ## Environment variables
 

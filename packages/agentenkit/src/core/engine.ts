@@ -4,6 +4,7 @@ import type { ExecutionState, ProviderOptions, ResumeInfo } from './types.js';
 import { compactContext } from './context.js';
 import type { TokenAttribution } from './usage.js';
 import { markPromptCaching } from './cache.js';
+import { repairDanglingToolCalls } from './messages.js';
 import { mergeProviderOptions } from './types.js';
 import type { RegisteredAgent } from './agent.js';
 import {
@@ -12,7 +13,7 @@ import {
   withHitl,
   type PendingHitl,
 } from './hitl.js';
-import { publish, setThreadState } from './publish.js';
+import { publish, publishEvent, setThreadState, withPublishEvent } from './publish.js';
 import { runNestedAgent, spawnSubagentTool, type SubagentCtx } from './subagent.js';
 import { redriveKey, runIdKey } from './keys.js';
 import { withRunState, type AgentRunState } from './state.js';
@@ -65,6 +66,7 @@ async function settleVerdict(
   pending: PendingHitl,
   target: { execute?: (args: unknown, opts: unknown) => Promise<unknown> } | undefined,
   signal: AbortSignal,
+  state: AgentRunState,
 ): Promise<unknown> {
   const raw = await deps.kv.get(hitlKey(pending.toolCallId));
   await deps.kv.del(hitlKey(pending.toolCallId));
@@ -82,6 +84,13 @@ async function settleVerdict(
       ? await target.execute(pending.arguments, {
           toolCallId: pending.toolCallId,
           abortSignal: signal,
+          // The resumed tool gets the same context a live one does (§2.10).
+          state,
+          publishEvent: (type: string, payload: unknown, options?: { durable?: boolean }) =>
+            publishEvent(deps, threadId, type, payload, options),
+          // What the human sent back with the approval (§2.5): answers to
+          // the questions the tool asked, a corrected value, a reason.
+          approval: { payload: answer.payload },
         })
       : { error: `Unknown tool: ${pending.toolName}` };
   } catch (err) {
@@ -215,6 +224,7 @@ async function resumePendingHitl(
   rawTools: Record<string, any>,
   subCtx: SubagentCtx | null,
   signal: AbortSignal,
+  state: AgentRunState,
 ): Promise<boolean> {
   // Readiness first, side effects second: the thread resumes only when EVERY
   // open approval has been answered or has expired (§2.7).
@@ -230,7 +240,7 @@ async function resumePendingHitl(
         ? rawTools[pending.toolName]
         : (subCtx?.sub.tools as Record<string, any> | undefined)?.[pending.toolName];
 
-    const result = await settleVerdict(deps, threadId, pending, target, signal);
+    const result = await settleVerdict(deps, threadId, pending, target, signal, state);
     if ((result as { reason?: string })?.reason === 'timeout') expiredAny = true;
     if (!(await unwindVerdict(deps, threadId, pending, result, subCtx, signal))) return false;
   }
@@ -404,8 +414,14 @@ export async function execute(
     };
     // The main agent's own toolset: nothing is waiting on its parks (§2.7).
     // Every tool also sees the run's state (§2.10).
+    // Every tool also sees the run's state (§2.10) and can publish its own
+    // events on the thread.
     const tools = withRunState(
-      withHitl(deps, threadId, rawTools, { resume, agentId: null, frames: [] }),
+      withPublishEvent(
+        deps,
+        threadId,
+        withHitl(deps, threadId, rawTools, { resume, agentId: null, frames: [] }),
+      ),
       input.state ?? {},
     );
 
@@ -421,7 +437,7 @@ export async function execute(
         throw new Error(`Thread ${threadId} is WAITING_FOR_INPUT without a pending INPUT_REQUIRED`);
       }
       const resumed = await resumePendingHitl(
-        deps, threadId, open, rawTools, subCtx, abort.signal,
+        deps, threadId, open, rawTools, subCtx, abort.signal, input.state ?? {},
       );
       if (!resumed) return 'executed'; // still parked — nothing to do yet
     }
@@ -433,7 +449,9 @@ export async function execute(
 
     // Prompt caching (§2.6): stamp the stable prefix once — appended step
     // messages extend the prompt without invalidating the breakpoints.
-    let messages = history.map((m) => ({ role: m.role, content: m.content }) as any);
+    let messages = repairDanglingToolCalls(
+      history.map((m) => ({ role: m.role, content: m.content }) as any),
+    );
     if (deps.config.promptCaching) {
       messages = markPromptCaching(messages);
     }

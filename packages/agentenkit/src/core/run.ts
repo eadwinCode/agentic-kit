@@ -2,7 +2,7 @@ import type { RuntimePorts, RunInput, RunResult } from '../ports/runtime.js';
 import type { RegisteredAgent } from './agent.js';
 import { reclaimIfOrphaned } from './reclaim.js';
 import { claimRun } from './keys.js';
-import { publish, setThreadState } from './publish.js';
+import { publish, setThreadState, publishEvent } from './publish.js';
 
 /** The §5.1 behavior: heal orphans → billing pre-check (§4) → persist the user
  *  message → state RUNNING (hot + durable) → enqueue on the dispatch queue
@@ -30,11 +30,19 @@ export async function run(
     return { accepted: false, threadId, error: 'Thread has an active run' };
   }
 
-  // Billing pre-execution check (§4) — user-injected hook
+  // Billing pre-execution check (§4) — user-injected hook. A refusal is
+  // published on the thread as well as returned, so every client on the
+  // thread sees it, and a reload still shows it.
   if (deps.config.billingPreCheck) {
-    const check = await deps.config.billingPreCheck(threadId);
+    const check = await deps.config.billingPreCheck({
+      threadId,
+      state: input.state ?? {},
+      publishEvent: (type, payload, options) => publishEvent(deps, threadId, type, payload, options),
+    });
     if (!check.ok) {
-      return { accepted: false, threadId, error: check.error ?? 'Billing check failed' };
+      const error = check.error ?? 'Billing check failed';
+      await publish(deps, threadId, 'RUN_REFUSED', { reason: 'billing', error });
+      return { accepted: false, threadId, error };
     }
   }
 

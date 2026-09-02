@@ -23,10 +23,94 @@ export async function publishNotice(
   threadId: string,
   type: string,
   payload: unknown,
-): Promise<void> {
-  await deps.bus.publish(threadId, {
-    threadId, seq: 0, type, payload, createdAt: new Date(),
-  } as AgentEvent);
+): Promise<AgentEvent> {
+  const event: AgentEvent = { threadId, seq: 0, type, payload, createdAt: new Date() };
+  await deps.bus.publish(threadId, event);
+  return event;
+}
+
+/** Event types the platform itself emits. An app cannot publish these: a
+ *  client's reducer trusts them to mean what the engine meant. */
+export const RESERVED_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'CHUNK',
+  'STATE_CHANGE',
+  'STEP_COMMITTED',
+  'STEP_FINISHED',
+  'INPUT_REQUIRED',
+  'INPUT_EXPIRED',
+  'HITL_RESPONSE',
+  'MESSAGE_APPENDED',
+  'MESSAGES_DROPPED',
+  'CONTEXT_COMPACTED',
+  'SUBAGENT_STARTED',
+  'SUBAGENT_CHUNK',
+  'SUBAGENT_COMPLETED',
+  'SUBAGENT_FAILED',
+  'TEXT_RESULT',
+  'THREAD_DELETED',
+  'HEARTBEAT',
+  'RUN_REFUSED',
+  'TOKEN_BUDGET_EXHAUSTED',
+]);
+
+export interface PublishEventOptions {
+  /** `true` (the default) writes the event to the thread's log, so it is
+   *  replayed to a client that reconnects. `false` sends it over the bus only:
+   *  a progress tick, a typing indicator — anything nobody needs to see twice. */
+  durable?: boolean;
+}
+
+/** Publish an event of your own on a thread, through the same pipeline the
+ *  platform's events take: the durable log and the live bus (§2.2). A client
+ *  sees it in `onEvent`, exactly like a built-in one. */
+export async function publishEvent(
+  deps: RuntimePorts,
+  threadId: string,
+  type: string,
+  payload: unknown,
+  options: PublishEventOptions = {},
+): Promise<AgentEvent> {
+  if (!type || typeof type !== 'string') {
+    throw new Error('publishEvent: an event type is required');
+  }
+  if (RESERVED_EVENT_TYPES.has(type)) {
+    throw new Error(`publishEvent: ${type} is a platform event type — pick your own`);
+  }
+  return options.durable === false
+    ? publishNotice(deps, threadId, type, payload)
+    : publish(deps, threadId, type, payload);
+}
+
+/** What a tool calls to publish: `publishEvent(type, payload, options?)`,
+ *  already bound to the thread the tool is acting on. */
+export type ToolPublishEvent = (
+  type: string,
+  payload: unknown,
+  options?: PublishEventOptions,
+) => Promise<AgentEvent>;
+
+/** Give every tool `publishEvent` alongside the SDK's own options, bound to
+ *  the thread it runs on — main agent, nested run, or a segment resumed after
+ *  an approval alike. */
+export function withPublishEvent(
+  deps: RuntimePorts,
+  threadId: string,
+  tools: Record<string, any>,
+): Record<string, any> {
+  const publishHere: ToolPublishEvent = (type, payload, options) =>
+    publishEvent(deps, threadId, type, payload, options);
+  const out: Record<string, any> = {};
+  for (const [name, t] of Object.entries(tools)) {
+    out[name] =
+      typeof t?.execute === 'function'
+        ? {
+            ...t,
+            execute: (args: unknown, opts: object) =>
+              t.execute(args, { ...opts, publishEvent: publishHere }),
+          }
+        : t;
+  }
+  return out;
 }
 
 /** Move a thread to a new state on BOTH the caller's storage and the

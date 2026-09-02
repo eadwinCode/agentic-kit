@@ -95,11 +95,22 @@ Reject a run before it costs anything:
 
 ```ts
 config: {
-  billingPreCheck: async (threadId) => {
-    const org = await orgForThread(threadId);
-    return org.credits > 0 ? { ok: true } : { ok: false, error: 'Out of credits' };
+  billingPreCheck: async ({ threadId, state, publishEvent }) => {
+    const org = await orgById(state.orgId);
+    if (org.credits > 0) return { ok: true };
+    await publishEvent('CREDIT_LIMIT', { resetAt: org.periodEndsAt });
+    return { ok: false, error: 'Out of credits' };
   },
 }
 ```
 
-A rejected run writes nothing and returns `accepted: false` with your message.
+A rejected run writes no message and returns `accepted: false` with your
+error. It does publish: your own event, if the check sent one, and the
+platform's `RUN_REFUSED` with the error, so the chat can show the refusal
+where the user is looking rather than only in an HTTP response.
+
+Mid-run, the token budget is the credit check. When the run's cumulative
+spend crosses `tokenBudget` between steps, the platform publishes
+`TOKEN_BUDGET_EXHAUSTED` (`tokensUsed`, `tokenBudget`, `agentId`) and then
+finalizes with `stopReason: 'token_budget'`. Passing the account's remaining
+credit as the run's `tokenBudget` is how a run is kept from overspending.

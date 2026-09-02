@@ -21,6 +21,7 @@ import { openDefaultAdminStore } from './admin/default.js';
 import { reclaimIfOrphaned } from './core/reclaim.js';
 import { respond } from './core/hitl.js';
 import { deleteThread } from './core/deleteThread.js';
+import { publishEvent } from './core/publish.js';
 
 /** Bind the ports to the core behaviors (§3.3). This is the package's public
  *  entry point — the only place where anything is wired together. */
@@ -188,6 +189,8 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
         followEvents(scope(options.state), threadId, options),
       sse: (threadId, options = {}) =>
         toSseStream(followEvents(scope(options.state), threadId, options), options),
+      publishEvent: (threadId, type, payload, options = {}) =>
+        publishEvent(scope(options.state), threadId, type, payload, options),
     },
 
     createStreamTextAgent: (spec) => {
