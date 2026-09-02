@@ -3,6 +3,7 @@ import type { RegisteredAgent } from './agent.js';
 import { reclaimIfOrphaned } from './reclaim.js';
 import { claimRun } from './keys.js';
 import { publish, setThreadState, publishEvent } from './publish.js';
+import { mergeProviderOptions } from './types.js';
 
 /** The §5.1 behavior: heal orphans → billing pre-check (§4) → persist the user
  *  message → state RUNNING (hot + durable) → enqueue on the dispatch queue
@@ -110,9 +111,30 @@ export async function run(
               : input.prompt,
           tokenBudget: input.tokenBudget ?? null,
           runState: input.state ?? null,
+          providerOptions: providerOptionsFor(deps, agent, input),
         }
       : {}),
   });
+
+  // What started the thread (§2.9), recorded once: the first dispatched
+  // run's parameters. A later run never overwrites it. Observability must
+  // never fail a run, so this is best-effort.
+  await deps.admin.threads
+    .upsert({
+      id: threadId, state: 'RUNNING', model,
+      startedWith: {
+        runId, agent: agent.name, model, at: new Date(),
+        ...(deps.config.recordPayloads
+          ? {
+              prompt: capText(input.prompt, deps.config.payloadCapChars),
+              tokenBudget: input.tokenBudget ?? null,
+              state: input.state ?? null,
+              providerOptions: providerOptionsFor(deps, agent, input),
+            }
+          : {}),
+      },
+    })
+    .catch(() => undefined);
 
   await deps.queue.enqueue({
     threadId, runId, model, agent: agent.name,
@@ -125,4 +147,23 @@ export async function run(
   });
 
   return { accepted: true, threadId, runId, state: 'RUNNING' };
+}
+
+/** The provider options a run is dispatched with (§3.1): config → spec →
+ *  input, each winning over the one before, per provider namespace. Null when
+ *  no level sets any, so the column stays empty rather than `{}`. */
+function providerOptionsFor(
+  deps: RuntimePorts,
+  agent: RegisteredAgent,
+  input: RunInput,
+): Record<string, unknown> | null {
+  const merged = mergeProviderOptions(
+    mergeProviderOptions(deps.config.providerOptions, agent.spec.providerOptions),
+    input.providerOptions,
+  );
+  return merged && Object.keys(merged).length > 0 ? merged : null;
+}
+
+function capText(text: string, limit: number): string {
+  return text.length > limit ? `${text.slice(0, limit)}…` : text;
 }

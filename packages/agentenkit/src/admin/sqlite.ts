@@ -1,11 +1,16 @@
 import type { ExecutionState, NewRunRecord, RunPatch, RunRecord } from '../core/types.js';
 import type {
   AdminStore, AdminThread, AdminThreadFilter, NewAdminThread,
-  NewStepRecord, RunFilter, StepRecord,
+  NewStepRecord, RunFilter, StepRecord, ThreadStart,
 } from '../ports/admin.js';
 import type { SqliteLike } from '../adapters/sqlite.js';
 
 const date = (n: number | null | undefined) => (n == null ? null : new Date(n));
+/** The stored ThreadStart, with its `at` back as a Date. */
+const parseStart = (v: unknown): ThreadStart | null => {
+  const raw = typeof v === 'string' ? JSON.parse(v) : (v ?? null);
+  return raw ? { ...raw, at: new Date(raw.at) } : null;
+};
 const json = (v: unknown) => (v === undefined ? null : JSON.stringify(v));
 const parse = (v: unknown) => (typeof v === 'string' ? JSON.parse(v) : (v ?? null));
 
@@ -18,14 +23,14 @@ CREATE TABLE IF NOT EXISTS agentic_runs (
   attempts INTEGER NOT NULL DEFAULT 0, steps INTEGER NOT NULL DEFAULT 0,
   inputTokens INTEGER NOT NULL DEFAULT 0, cachedInputTokens INTEGER NOT NULL DEFAULT 0,
   outputTokens INTEGER NOT NULL DEFAULT 0, totalTokens INTEGER NOT NULL DEFAULT 0,
-  result TEXT, prompt TEXT, tokenBudget INTEGER, runState TEXT
+  result TEXT, prompt TEXT, tokenBudget INTEGER, runState TEXT, providerOptions TEXT
 );
 CREATE INDEX IF NOT EXISTS agentic_runs_thread ON agentic_runs(threadId, startedAt);
 CREATE INDEX IF NOT EXISTS agentic_runs_state ON agentic_runs(state, startedAt);
 CREATE INDEX IF NOT EXISTS agentic_runs_parent ON agentic_runs(parentRunId);
 CREATE TABLE IF NOT EXISTS agentic_threads (
   id TEXT PRIMARY KEY, state TEXT NOT NULL, model TEXT NOT NULL,
-  firstSeenAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+  firstSeenAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL, startedWith TEXT
 );
 CREATE INDEX IF NOT EXISTS agentic_threads_state ON agentic_threads(state, updatedAt);
 CREATE TABLE IF NOT EXISTS agentic_steps (
@@ -61,10 +66,16 @@ export class SqliteAdminStore implements AdminStore {
     const runCols = new Set(
       (this.db.prepare('PRAGMA table_info(agentic_runs)').all() as any[]).map((c) => c.name),
     );
-    for (const [col, type] of [['prompt', 'TEXT'], ['tokenBudget', 'INTEGER'], ['runState', 'TEXT']]) {
+    for (const [col, type] of [['prompt', 'TEXT'], ['tokenBudget', 'INTEGER'], ['runState', 'TEXT'], ['providerOptions', 'TEXT']]) {
       if (!runCols.has(col)) {
         this.db.prepare(`ALTER TABLE agentic_runs ADD COLUMN ${col} ${type}`).run();
       }
+    }
+    const threadCols = new Set(
+      (this.db.prepare('PRAGMA table_info(agentic_threads)').all() as any[]).map((c) => c.name),
+    );
+    if (!threadCols.has('startedWith')) {
+      this.db.prepare('ALTER TABLE agentic_threads ADD COLUMN startedWith TEXT').run();
     }
   }
 
@@ -89,18 +100,21 @@ export class SqliteAdminStore implements AdminStore {
     outputTokens: r.outputTokens, totalTokens: r.totalTokens,
     result: parse(r.result),
     prompt: r.prompt ?? null, tokenBudget: r.tokenBudget ?? null,
-    runState: parse(r.runState),
+    runState: parse(r.runState), providerOptions: parse(r.providerOptions),
   });
 
   threads = {
     upsert: async (t: NewAdminThread) => {
       const now = Date.now();
-      // firstSeenAt survives an update; everything else is overwritten.
+      // firstSeenAt and startedWith survive an update; the rest is overwritten.
       this.write(
-        `INSERT INTO agentic_threads (id,state,model,firstSeenAt,updatedAt) VALUES (?,?,?,?,?)
+        `INSERT INTO agentic_threads (id,state,model,firstSeenAt,updatedAt,startedWith) VALUES (?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET state = excluded.state,
-           model = excluded.model, updatedAt = excluded.updatedAt`,
-        t.id, t.state, t.model, now, now,
+           model = excluded.model, updatedAt = excluded.updatedAt,
+           startedWith = COALESCE(agentic_threads.startedWith, excluded.startedWith)`,
+        // SQL NULL when absent, never the string "null": COALESCE must see
+        // the column as empty for the first sight to land.
+        t.id, t.state, t.model, now, now, t.startedWith ? json(t.startedWith) : null,
       );
     },
     countByState: async () =>
@@ -123,6 +137,7 @@ export class SqliteAdminStore implements AdminStore {
       ).map((r) => ({
         id: r.id, state: r.state as ExecutionState, model: r.model,
         firstSeenAt: new Date(r.firstSeenAt), updatedAt: new Date(r.updatedAt),
+        startedWith: parseStart(r.startedWith),
       }));
     },
   };
@@ -131,10 +146,10 @@ export class SqliteAdminStore implements AdminStore {
     start: async (run: NewRunRecord) => {
       const startedAt = Date.now();
       this.write(
-        'INSERT INTO agentic_runs (id,threadId,parentRunId,depth,agent,model,state,startedAt,prompt,tokenBudget,runState) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        'INSERT INTO agentic_runs (id,threadId,parentRunId,depth,agent,model,state,startedAt,prompt,tokenBudget,runState,providerOptions) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
         run.id, run.threadId, run.parentRunId ?? null, run.depth ?? 0,
         run.agent, run.model, 'RUNNING', startedAt,
-        run.prompt ?? null, run.tokenBudget ?? null, json(run.runState),
+        run.prompt ?? null, run.tokenBudget ?? null, json(run.runState), json(run.providerOptions),
       );
       return this.toRun({
         ...run, parentRunId: run.parentRunId ?? null, depth: run.depth ?? 0,

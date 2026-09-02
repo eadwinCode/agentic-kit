@@ -63,6 +63,33 @@ await runtime.admin.listSteps(runId);
 Percentiles are computed in the library, not in SQL, so every backing store
 reports them the same way.
 
+## What started a thread
+
+A thread's first dispatched run is recorded on the thread itself, once, as
+`startedWith`, and a later run never overwrites it. It is what a listing shows
+when it has to say who asked for what without opening the thread:
+
+```ts
+const threads = await runtime.admin.listThreads({ limit: 50 });
+threads[0].startedWith;
+// {
+//   runId: '…', agent: 'chat', model: 'gpt-4o', at: Date,
+//   prompt: 'send the quarterly report',          // recordPayloads only
+//   tokenBudget: 50_000,                          // recordPayloads only
+//   state: { orgId: 'acme', userId: 'u1' },       // recordPayloads only
+//   providerOptions: { openai: { reasoningEffort: 'low' } }, // recordPayloads only
+// }
+```
+
+`runId`, `agent`, `model` and `at` are always there. The rest follows
+`recordPayloads`, like every other payload in this store. Every run record
+carries the same `providerOptions` it was dispatched with, merged across the
+three levels (config, spec, input), next to its `prompt`, `tokenBudget` and
+`runState`.
+
+A thread recorded before this existed has `startedWith: null`; the roll-up
+then falls back to the earliest dispatched run inside the query window.
+
 ## What a step record holds
 
 Timings and counts always; payloads when you allow them:

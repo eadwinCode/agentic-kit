@@ -51,6 +51,7 @@ export {
 // The run-state types, named here so they are discoverable rather than
 // reachable only by chance through another module's re-export.
 export type { AgentRunState, BoundStorage, StorageContext } from './core/state.js';
+export type { AdminThread, ThreadStart, StepRecord, RunFilter, AdminThreadFilter } from './ports/admin.js';
 export type { BillingCheck } from './core/types.js';
 export { claimRun, redriveKey, runIdKey } from './core/keys.js';
 export { countTokens } from './core/usage.js';

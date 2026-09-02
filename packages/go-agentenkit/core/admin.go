@@ -56,6 +56,9 @@ type ThreadSummary struct {
 	DurationMs int64 `json:"durationMs"`
 	// Prompt is what started it: the first dispatched run's prompt.
 	Prompt string `json:"prompt,omitempty"`
+	// StartedWith is the parameters that started it, as recorded on first
+	// sight (§2.9); falls back to the earliest dispatched run in the window.
+	StartedWith *ports.ThreadStart `json:"startedWith,omitempty"`
 }
 
 // ThreadDetail is a thread opened up: its runs, and every step across them.
@@ -196,8 +199,15 @@ func rollUp(t ports.AdminThread, runs []ports.RunRecord) ThreadSummary {
 			root = r
 		}
 	}
-	if root != nil {
-		out.Prompt = root.Prompt
+	out.StartedWith = t.StartedWith
+	if out.StartedWith == nil && root != nil {
+		out.StartedWith = &ports.ThreadStart{
+			RunID: root.ID, Agent: root.Agent, Model: root.Model, At: root.StartedAt,
+			Prompt: root.Prompt, TokenBudget: root.TokenBudget, State: root.RunState, ProviderOptions: root.ProviderOptions,
+		}
+	}
+	if out.StartedWith != nil {
+		out.Prompt = out.StartedWith.Prompt
 	}
 	return out
 }

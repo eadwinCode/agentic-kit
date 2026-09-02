@@ -17,7 +17,13 @@ export class MemoryAdminStore implements AdminStore {
     upsert: async (t: NewAdminThread) => {
       const now = new Date();
       const prior = this.threadRows.get(t.id);
-      this.threadRows.set(t.id, { ...t, firstSeenAt: prior?.firstSeenAt ?? now, updatedAt: now });
+      this.threadRows.set(t.id, {
+        ...t,
+        // First sight only: a later upsert never replaces what started it.
+        startedWith: prior?.startedWith ?? t.startedWith ?? null,
+        firstSeenAt: prior?.firstSeenAt ?? now,
+        updatedAt: now,
+      });
     },
     countByState: async () => {
       const out: Partial<Record<ExecutionState, number>> = {};
@@ -37,7 +43,7 @@ export class MemoryAdminStore implements AdminStore {
   runs = {
     start: async (r: NewRunRecord) => {
       const rec: RunRecord = {
-        parentRunId: null, depth: 0, prompt: null, tokenBudget: null, runState: null, ...r,
+        parentRunId: null, depth: 0, prompt: null, tokenBudget: null, runState: null, providerOptions: null, ...r,
         state: 'RUNNING', startedAt: new Date(), steps: 0, attempts: 0,
         inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0,
       };

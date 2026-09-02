@@ -179,19 +179,23 @@ type RunRecord struct {
 	Prompt      string        `json:"prompt,omitempty"`
 	TokenBudget *int          `json:"tokenBudget,omitempty"`
 	RunState    AgentRunState `json:"runState,omitempty"`
+	// ProviderOptions the run was dispatched with (§3.1), merged across
+	// config, spec and input. Present only when RecordPayloads is on.
+	ProviderOptions ProviderOptions `json:"providerOptions,omitempty"`
 	// Result is a nested run's capped result, handed back to its parent (§2.7).
 	Result json.RawMessage `json:"result,omitempty"`
 }
 
 // NewRunRecord opens a run record.
 type NewRunRecord struct {
-	ID          string
-	ThreadID    string
-	Agent       string
-	Model       string
-	Prompt      string
-	TokenBudget *int
-	RunState    AgentRunState
+	ID              string
+	ThreadID        string
+	Agent           string
+	Model           string
+	Prompt          string
+	TokenBudget     *int
+	RunState        AgentRunState
+	ProviderOptions ProviderOptions
 	// Depth defaults to 0, a dispatched run.
 	Depth       int
 	ParentRunID string

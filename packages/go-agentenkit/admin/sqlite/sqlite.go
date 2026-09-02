@@ -26,13 +26,13 @@ var Schema = []string{
 	  attempts INTEGER NOT NULL DEFAULT 0, steps INTEGER NOT NULL DEFAULT 0,
 	  inputTokens INTEGER NOT NULL DEFAULT 0, cachedInputTokens INTEGER NOT NULL DEFAULT 0,
 	  outputTokens INTEGER NOT NULL DEFAULT 0, totalTokens INTEGER NOT NULL DEFAULT 0,
-	  result TEXT, prompt TEXT, tokenBudget INTEGER, runState TEXT)`,
+	  result TEXT, prompt TEXT, tokenBudget INTEGER, runState TEXT, providerOptions TEXT)`,
 	`CREATE INDEX IF NOT EXISTS agentic_runs_thread ON agentic_runs(threadId, startedAt)`,
 	`CREATE INDEX IF NOT EXISTS agentic_runs_state ON agentic_runs(state, startedAt)`,
 	`CREATE INDEX IF NOT EXISTS agentic_runs_parent ON agentic_runs(parentRunId)`,
 	`CREATE TABLE IF NOT EXISTS agentic_threads (
 	  id TEXT PRIMARY KEY, state TEXT NOT NULL, model TEXT NOT NULL,
-	  firstSeenAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL)`,
+	  firstSeenAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL, startedWith TEXT)`,
 	`CREATE INDEX IF NOT EXISTS agentic_threads_state ON agentic_threads(state, updatedAt)`,
 	`CREATE TABLE IF NOT EXISTS agentic_steps (
 	  runId TEXT NOT NULL, threadId TEXT, agentId TEXT, "index" INTEGER NOT NULL,
@@ -60,7 +60,10 @@ func New(db *sql.DB) (*Store, error) {
 	if err := addMissing(db, "agentic_steps", map[string]string{"text": "TEXT", "toolCalls": "TEXT", "threadId": "TEXT"}); err != nil {
 		return nil, err
 	}
-	if err := addMissing(db, "agentic_runs", map[string]string{"prompt": "TEXT", "tokenBudget": "INTEGER", "runState": "TEXT"}); err != nil {
+	if err := addMissing(db, "agentic_runs", map[string]string{"prompt": "TEXT", "tokenBudget": "INTEGER", "runState": "TEXT", "providerOptions": "TEXT"}); err != nil {
+		return nil, err
+	}
+	if err := addMissing(db, "agentic_threads", map[string]string{"startedWith": "TEXT"}); err != nil {
 		return nil, err
 	}
 	return &Store{db: db}, nil
@@ -110,11 +113,17 @@ type threadStore struct{ db *sql.DB }
 
 func (t threadStore) Upsert(ctx context.Context, n ports.NewAdminThread) error {
 	now := ms(time.Now())
-	// firstSeenAt survives an update; everything else is overwritten.
+	var started sql.NullString
+	if n.StartedWith != nil {
+		b, _ := json.Marshal(n.StartedWith)
+		started = sql.NullString{String: string(b), Valid: true}
+	}
+	// firstSeenAt and startedWith survive an update; the rest is overwritten.
 	_, err := t.db.ExecContext(ctx,
-		`INSERT INTO agentic_threads (id,state,model,firstSeenAt,updatedAt) VALUES (?,?,?,?,?)
-		 ON CONFLICT(id) DO UPDATE SET state = excluded.state, model = excluded.model, updatedAt = excluded.updatedAt`,
-		n.ID, string(n.State), n.Model, now, now)
+		`INSERT INTO agentic_threads (id,state,model,firstSeenAt,updatedAt,startedWith) VALUES (?,?,?,?,?,?)
+		 ON CONFLICT(id) DO UPDATE SET state = excluded.state, model = excluded.model, updatedAt = excluded.updatedAt,
+		   startedWith = COALESCE(agentic_threads.startedWith, excluded.startedWith)`,
+		n.ID, string(n.State), n.Model, now, now, started)
 	return err
 }
 
@@ -153,7 +162,7 @@ func (t threadStore) List(ctx context.Context, f ports.AdminThreadFilter) ([]por
 		where = append(where, `updatedAt >= ?`)
 		args = append(args, ms(*f.Since))
 	}
-	q := `SELECT id, state, model, firstSeenAt, updatedAt FROM agentic_threads`
+	q := `SELECT id, state, model, firstSeenAt, updatedAt, startedWith FROM agentic_threads`
 	if len(where) > 0 {
 		q += ` WHERE ` + strings.Join(where, " AND ")
 	}
@@ -171,10 +180,17 @@ func (t threadStore) List(ctx context.Context, f ports.AdminThreadFilter) ([]por
 	for rows.Next() {
 		var th ports.AdminThread
 		var first, updated int64
-		if err := rows.Scan(&th.ID, &th.State, &th.Model, &first, &updated); err != nil {
+		var started sql.NullString
+		if err := rows.Scan(&th.ID, &th.State, &th.Model, &first, &updated, &started); err != nil {
 			return nil, err
 		}
 		th.FirstSeenAt, th.UpdatedAt = fromMs(first), fromMs(updated)
+		if started.Valid {
+			var s ports.ThreadStart
+			if json.Unmarshal([]byte(started.String), &s) == nil {
+				th.StartedWith = &s
+			}
+		}
 		out = append(out, th)
 	}
 	return out, rows.Err()
@@ -184,16 +200,16 @@ type runStore struct{ db *sql.DB }
 
 const runCols = `id, threadId, parentRunId, depth, agent, model, state, stopReason, error, startedAt, endedAt,
 	durationMs, queuedMs, attempts, steps, inputTokens, cachedInputTokens, outputTokens, totalTokens,
-	result, prompt, tokenBudget, runState`
+	result, prompt, tokenBudget, runState, providerOptions`
 
 func scanRun(row interface{ Scan(...any) error }) (*ports.RunRecord, error) {
 	var r ports.RunRecord
-	var parent, stop, errMsg, result, prompt, runState sql.NullString
+	var parent, stop, errMsg, result, prompt, runState, providerOptions sql.NullString
 	var started int64
 	var ended, duration, queued, budget sql.NullInt64
 	if err := row.Scan(&r.ID, &r.ThreadID, &parent, &r.Depth, &r.Agent, &r.Model, &r.State, &stop, &errMsg,
 		&started, &ended, &duration, &queued, &r.Attempts, &r.Steps, &r.InputTokens, &r.CachedInputTokens,
-		&r.OutputTokens, &r.TotalTokens, &result, &prompt, &budget, &runState); err != nil {
+		&r.OutputTokens, &r.TotalTokens, &result, &prompt, &budget, &runState, &providerOptions); err != nil {
 		return nil, err
 	}
 	r.ParentRunID, r.StopReason, r.Error, r.Prompt = parent.String, stop.String, errMsg.String, prompt.String
@@ -217,6 +233,9 @@ func scanRun(row interface{ Scan(...any) error }) (*ports.RunRecord, error) {
 	if runState.Valid {
 		_ = json.Unmarshal([]byte(runState.String), &r.RunState)
 	}
+	if providerOptions.Valid {
+		_ = json.Unmarshal([]byte(providerOptions.String), &r.ProviderOptions)
+	}
 	return &r, nil
 }
 
@@ -226,16 +245,20 @@ func (r runStore) Start(ctx context.Context, n ports.NewRunRecord) (*ports.RunRe
 	if n.TokenBudget != nil {
 		budget = sql.NullInt64{Int64: int64(*n.TokenBudget), Valid: true}
 	}
-	var runState sql.NullString
+	var runState, providerOptions sql.NullString
 	if n.RunState != nil {
 		b, _ := json.Marshal(n.RunState)
 		runState = sql.NullString{String: string(b), Valid: true}
 	}
+	if n.ProviderOptions != nil {
+		b, _ := json.Marshal(n.ProviderOptions)
+		providerOptions = sql.NullString{String: string(b), Valid: true}
+	}
 	if _, err := r.db.ExecContext(ctx,
-		`INSERT INTO agentic_runs (id,threadId,parentRunId,depth,agent,model,state,startedAt,prompt,tokenBudget,runState)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO agentic_runs (id,threadId,parentRunId,depth,agent,model,state,startedAt,prompt,tokenBudget,runState,providerOptions)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		n.ID, n.ThreadID, nullStr(n.ParentRunID), n.Depth, n.Agent, n.Model, string(ports.StateRunning), started,
-		nullStr(n.Prompt), budget, runState); err != nil {
+		nullStr(n.Prompt), budget, runState, providerOptions); err != nil {
 		return nil, err
 	}
 	return r.Get(ctx, n.ID)

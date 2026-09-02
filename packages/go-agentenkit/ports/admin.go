@@ -88,6 +88,21 @@ type StepRecord struct {
 // NewStepRecord is a step about to be recorded. A zero At means now.
 type NewStepRecord = StepRecord
 
+// ThreadStart is what started a thread (§2.9): the first dispatched run's
+// parameters, recorded once and never overwritten, so a listing can say who
+// asked for what without opening the thread. Prompt, State and
+// ProviderOptions are present only when RecordPayloads is on.
+type ThreadStart struct {
+	RunID           string          `json:"runId"`
+	Agent           string          `json:"agent"`
+	Model           string          `json:"model"`
+	At              time.Time       `json:"at"`
+	Prompt          string          `json:"prompt,omitempty"`
+	TokenBudget     *int            `json:"tokenBudget,omitempty"`
+	State           AgentRunState   `json:"state,omitempty"`
+	ProviderOptions ProviderOptions `json:"providerOptions,omitempty"`
+}
+
 // AdminThread is the platform's view of one thread.
 type AdminThread struct {
 	ID          string         `json:"id"`
@@ -95,13 +110,18 @@ type AdminThread struct {
 	Model       string         `json:"model"`
 	FirstSeenAt time.Time      `json:"firstSeenAt"`
 	UpdatedAt   time.Time      `json:"updatedAt"`
+	// StartedWith is the parameters that started it; nil for a thread seen
+	// before this was recorded.
+	StartedWith *ThreadStart `json:"startedWith,omitempty"`
 }
 
-// NewAdminThread is a thread transition to record.
+// NewAdminThread is a thread transition to record. StartedWith is written on
+// first sight only: a later upsert never replaces what started the thread.
 type NewAdminThread struct {
-	ID    string
-	State ExecutionState
-	Model string
+	ID          string
+	State       ExecutionState
+	Model       string
+	StartedWith *ThreadStart
 }
 
 // AdminThreadFilter narrows an admin thread listing.

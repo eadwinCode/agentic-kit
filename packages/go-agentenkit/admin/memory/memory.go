@@ -39,9 +39,12 @@ func (t threadStore) Upsert(_ context.Context, n ports.NewAdminThread) error {
 	now := time.Now()
 	if prior, ok := t.s.threads[n.ID]; ok {
 		prior.State, prior.Model, prior.UpdatedAt = n.State, n.Model, now
+		if prior.StartedWith == nil {
+			prior.StartedWith = n.StartedWith // first sight only
+		}
 		return nil
 	}
-	t.s.threads[n.ID] = &ports.AdminThread{ID: n.ID, State: n.State, Model: n.Model, FirstSeenAt: now, UpdatedAt: now}
+	t.s.threads[n.ID] = &ports.AdminThread{ID: n.ID, State: n.State, Model: n.Model, FirstSeenAt: now, UpdatedAt: now, StartedWith: n.StartedWith}
 	return nil
 }
 
@@ -99,7 +102,7 @@ func (r runStore) Start(_ context.Context, n ports.NewRunRecord) (*ports.RunReco
 	rec := &ports.RunRecord{
 		ID: n.ID, ThreadID: n.ThreadID, ParentRunID: n.ParentRunID, Depth: n.Depth,
 		Agent: n.Agent, Model: n.Model, State: ports.StateRunning, StartedAt: time.Now(),
-		Prompt: n.Prompt, TokenBudget: n.TokenBudget, RunState: n.RunState,
+		Prompt: n.Prompt, TokenBudget: n.TokenBudget, RunState: n.RunState, ProviderOptions: n.ProviderOptions,
 	}
 	r.s.runs[rec.ID] = rec
 	copy := *rec

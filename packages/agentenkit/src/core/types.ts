@@ -98,6 +98,9 @@ export interface RunRecord {
   prompt?: string | null;
   tokenBudget?: number | null;
   runState?: Record<string, unknown> | null;
+  /** The provider options the run was dispatched with (§3.1), merged across
+   *  config, spec and input. Present only when `recordPayloads` is on. */
+  providerOptions?: Record<string, unknown> | null;
   /** A nested run's capped result, handed back to its parent (§2.7). */
   result?: unknown;
 }
@@ -110,6 +113,7 @@ export interface NewRunRecord {
   prompt?: string | null;
   tokenBudget?: number | null;
   runState?: Record<string, unknown> | null;
+  providerOptions?: Record<string, unknown> | null;
   /** Defaults to 0 — a dispatched run. */
   depth?: number;
   parentRunId?: string | null;

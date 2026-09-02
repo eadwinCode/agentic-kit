@@ -140,16 +140,23 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 
 	// The run's durable record opens here (§2.9).
 	rec := ports.NewRunRecord{ID: runID, ThreadID: threadID, Agent: agent.Name, Model: model}
+	start := &ports.ThreadStart{RunID: runID, Agent: agent.Name, Model: model, At: time.Now()}
 	if deps.Config.RecordPayloads {
 		rec.Prompt = capText(input.Prompt, deps.Config.PayloadCapChars)
 		if input.TokenBudget > 0 {
 			rec.TokenBudget = ports.Ptr(input.TokenBudget)
 		}
 		rec.RunState = input.State
+		rec.ProviderOptions = providerOptionsFor(deps, agent, input)
+		start.Prompt, start.TokenBudget, start.State, start.ProviderOptions = rec.Prompt, rec.TokenBudget, rec.RunState, rec.ProviderOptions
 	}
 	if _, err := deps.Admin.Runs().Start(ctx, rec); err != nil {
 		return ports.RunResult{}, err
 	}
+	// What started the thread (§2.9), recorded once: the first dispatched
+	// run's parameters. A later run never overwrites it. Observability must
+	// never fail a run, so this is best-effort.
+	_ = deps.Admin.Threads().Upsert(ctx, ports.NewAdminThread{ID: threadID, State: ports.StateRunning, Model: model, StartedWith: start})
 
 	if err := deps.Queue.Enqueue(ctx, ports.RunJob{
 		ThreadID: threadID, RunID: runID, Model: model, Agent: agent.Name,
@@ -161,4 +168,16 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 		return ports.RunResult{}, err
 	}
 	return ports.RunResult{Accepted: true, ThreadID: threadID, RunID: runID, State: ports.StateRunning}, nil
+}
+
+// providerOptionsFor is the provider options a run is dispatched with (§3.1):
+// config → spec → input, each winning over the one before, per provider
+// namespace. Nil when no level sets any, so the column stays empty.
+func providerOptionsFor(deps ports.RuntimePorts, agent *RegisteredAgent, input ports.RunInput) ports.ProviderOptions {
+	merged := ports.MergeProviderOptions(
+		ports.MergeProviderOptions(deps.Config.ProviderOptions, agent.Spec.ProviderOptions), input.ProviderOptions)
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
 }

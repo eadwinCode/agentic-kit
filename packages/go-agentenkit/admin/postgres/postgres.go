@@ -36,7 +36,8 @@ var Schema = []string{
 	`CREATE TABLE IF NOT EXISTS agentic_threads (
 	   id TEXT PRIMARY KEY, state TEXT NOT NULL, model TEXT NOT NULL,
 	   "firstSeenAt" TIMESTAMPTZ NOT NULL DEFAULT now(),
-	   "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT now())`,
+	   "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT now(), "startedWith" JSONB)`,
+	`ALTER TABLE agentic_threads ADD COLUMN IF NOT EXISTS "startedWith" JSONB`,
 	`CREATE INDEX IF NOT EXISTS agentic_threads_state ON agentic_threads(state, "updatedAt")`,
 	`CREATE TABLE IF NOT EXISTS agentic_runs (
 	   id TEXT PRIMARY KEY, "threadId" TEXT NOT NULL, "parentRunId" TEXT,
@@ -47,7 +48,8 @@ var Schema = []string{
 	   attempts INT NOT NULL DEFAULT 0, steps INT NOT NULL DEFAULT 0,
 	   "inputTokens" INT NOT NULL DEFAULT 0, "cachedInputTokens" INT NOT NULL DEFAULT 0,
 	   "outputTokens" INT NOT NULL DEFAULT 0, "totalTokens" INT NOT NULL DEFAULT 0,
-	   result JSONB, prompt TEXT, "tokenBudget" INT, "runState" JSONB)`,
+	   result JSONB, prompt TEXT, "tokenBudget" INT, "runState" JSONB, "providerOptions" JSONB)`,
+	`ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS "providerOptions" JSONB`,
 	`ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS prompt TEXT`,
 	`ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS "tokenBudget" INT`,
 	`ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS "runState" JSONB`,
@@ -108,10 +110,16 @@ func (a *args) in(states []ports.ExecutionState) string {
 type threadStore struct{ db *sql.DB }
 
 func (t threadStore) Upsert(ctx context.Context, n ports.NewAdminThread) error {
+	var started any
+	if n.StartedWith != nil {
+		b, _ := json.Marshal(n.StartedWith)
+		started = string(b)
+	}
 	_, err := t.db.ExecContext(ctx,
-		`INSERT INTO agentic_threads (id, state, model) VALUES ($1, $2, $3)
-		 ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, model = EXCLUDED.model, "updatedAt" = now()`,
-		n.ID, string(n.State), n.Model)
+		`INSERT INTO agentic_threads (id, state, model, "startedWith") VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, model = EXCLUDED.model, "updatedAt" = now(),
+		   "startedWith" = COALESCE(agentic_threads."startedWith", EXCLUDED."startedWith")`,
+		n.ID, string(n.State), n.Model, started)
 	return err
 }
 
@@ -146,7 +154,7 @@ func (t threadStore) List(ctx context.Context, f ports.AdminThreadFilter) ([]por
 	if f.Since != nil {
 		where = append(where, `"updatedAt" >= `+a.add(*f.Since))
 	}
-	q := `SELECT id, state, model, "firstSeenAt", "updatedAt" FROM agentic_threads`
+	q := `SELECT id, state, model, "firstSeenAt", "updatedAt", "startedWith" FROM agentic_threads`
 	if len(where) > 0 {
 		q += ` WHERE ` + strings.Join(where, " AND ")
 	}
@@ -163,8 +171,15 @@ func (t threadStore) List(ctx context.Context, f ports.AdminThreadFilter) ([]por
 	var out []ports.AdminThread
 	for rows.Next() {
 		var th ports.AdminThread
-		if err := rows.Scan(&th.ID, &th.State, &th.Model, &th.FirstSeenAt, &th.UpdatedAt); err != nil {
+		var started []byte
+		if err := rows.Scan(&th.ID, &th.State, &th.Model, &th.FirstSeenAt, &th.UpdatedAt, &started); err != nil {
 			return nil, err
+		}
+		if len(started) > 0 {
+			var s ports.ThreadStart
+			if json.Unmarshal(started, &s) == nil {
+				th.StartedWith = &s
+			}
 		}
 		out = append(out, th)
 	}
@@ -175,17 +190,17 @@ type runStore struct{ db *sql.DB }
 
 const runCols = `id, "threadId", "parentRunId", depth, agent, model, state, "stopReason", error, "startedAt", "endedAt",
 	"durationMs", "queuedMs", attempts, steps, "inputTokens", "cachedInputTokens", "outputTokens", "totalTokens",
-	result, prompt, "tokenBudget", "runState"`
+	result, prompt, "tokenBudget", "runState", "providerOptions"`
 
 func scanRun(row interface{ Scan(...any) error }) (*ports.RunRecord, error) {
 	var r ports.RunRecord
 	var parent, stop, errMsg, prompt sql.NullString
 	var ended sql.NullTime
 	var duration, queued, budget sql.NullInt64
-	var result, runState []byte
+	var result, runState, providerOptions []byte
 	if err := row.Scan(&r.ID, &r.ThreadID, &parent, &r.Depth, &r.Agent, &r.Model, &r.State, &stop, &errMsg,
 		&r.StartedAt, &ended, &duration, &queued, &r.Attempts, &r.Steps, &r.InputTokens, &r.CachedInputTokens,
-		&r.OutputTokens, &r.TotalTokens, &result, &prompt, &budget, &runState); err != nil {
+		&r.OutputTokens, &r.TotalTokens, &result, &prompt, &budget, &runState, &providerOptions); err != nil {
 		return nil, err
 	}
 	r.ParentRunID, r.StopReason, r.Error, r.Prompt = parent.String, stop.String, errMsg.String, prompt.String
@@ -208,6 +223,9 @@ func scanRun(row interface{ Scan(...any) error }) (*ports.RunRecord, error) {
 	if len(runState) > 0 {
 		_ = json.Unmarshal(runState, &r.RunState)
 	}
+	if len(providerOptions) > 0 {
+		_ = json.Unmarshal(providerOptions, &r.ProviderOptions)
+	}
 	return &r, nil
 }
 
@@ -216,14 +234,17 @@ func (r runStore) Start(ctx context.Context, n ports.NewRunRecord) (*ports.RunRe
 	if n.TokenBudget != nil {
 		budget = sql.NullInt64{Int64: int64(*n.TokenBudget), Valid: true}
 	}
-	var runState []byte
+	var runState, providerOptions []byte
 	if n.RunState != nil {
 		runState, _ = json.Marshal(n.RunState)
 	}
+	if n.ProviderOptions != nil {
+		providerOptions, _ = json.Marshal(n.ProviderOptions)
+	}
 	rec, err := scanRun(r.db.QueryRowContext(ctx,
-		`INSERT INTO agentic_runs (id, "threadId", "parentRunId", depth, agent, model, state, prompt, "tokenBudget", "runState")
-		 VALUES ($1, $2, $3, $4, $5, $6, 'RUNNING', $7, $8, $9) RETURNING `+runCols,
-		n.ID, n.ThreadID, nullStr(n.ParentRunID), n.Depth, n.Agent, n.Model, nullStr(n.Prompt), budget, nullBytes(runState)))
+		`INSERT INTO agentic_runs (id, "threadId", "parentRunId", depth, agent, model, state, prompt, "tokenBudget", "runState", "providerOptions")
+		 VALUES ($1, $2, $3, $4, $5, $6, 'RUNNING', $7, $8, $9, $10) RETURNING `+runCols,
+		n.ID, n.ThreadID, nullStr(n.ParentRunID), n.Depth, n.Agent, n.Model, nullStr(n.Prompt), budget, nullBytes(runState), nullBytes(providerOptions)))
 	return rec, err
 }
 

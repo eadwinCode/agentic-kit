@@ -46,6 +46,7 @@ type (
 	RunStore          = ports.RunStore
 	StepStore         = ports.StepStore
 	AdminThread       = ports.AdminThread
+	ThreadStart       = ports.ThreadStart
 	NewAdminThread    = ports.NewAdminThread
 	AdminThreadFilter = ports.AdminThreadFilter
 	RunFilter         = ports.RunFilter

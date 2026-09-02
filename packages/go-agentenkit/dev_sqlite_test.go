@@ -146,6 +146,7 @@ func adminStoreRoundTrip(t *testing.T, ctx context.Context, store ports.AdminSto
 	run, err := store.Runs().Start(ctx, ports.NewRunRecord{
 		ID: "r1", ThreadID: "t1", Agent: "chat", Model: "gpt-4o", Prompt: "hi",
 		TokenBudget: ports.Ptr(100), RunState: ports.AgentRunState{"orgId": "acme"},
+		ProviderOptions: ports.ProviderOptions{"openai": map[string]any{"tier": "flex"}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -154,6 +155,7 @@ func adminStoreRoundTrip(t *testing.T, ctx context.Context, store ports.AdminSto
 	mustEqual(t, run.Prompt, "hi", "prompt")
 	mustEqual(t, *run.TokenBudget, 100, "budget")
 	mustEqual(t, run.RunState["orgId"], "acme", "state")
+	mustEqual(t, run.ProviderOptions["openai"].(map[string]any)["tier"], "flex", "provider options")
 	child, _ := store.Runs().Start(ctx, ports.NewRunRecord{ID: "r2", ThreadID: "t1", Agent: "researcher", Model: "gpt-4o", Depth: 1, ParentRunID: "r1"})
 	mustEqual(t, child.ParentRunID, "r1", "parent")
 	mustEqual(t, child.Depth, 1, "depth")
@@ -196,11 +198,22 @@ func adminStoreRoundTrip(t *testing.T, ctx context.Context, store ports.AdminSto
 	mustEqual(t, counts[ports.StateCompleted], 1, "count completed")
 	mustEqual(t, counts[ports.StateRunning], 1, "count running")
 
-	_ = store.Threads().Upsert(ctx, ports.NewAdminThread{ID: "t1", State: ports.StateRunning, Model: "gpt-4o"})
+	at := time.Now().Truncate(time.Millisecond)
+	_ = store.Threads().Upsert(ctx, ports.NewAdminThread{ID: "t1", State: ports.StateRunning, Model: "gpt-4o",
+		StartedWith: &ports.ThreadStart{RunID: "r1", Agent: "chat", Model: "gpt-4o", At: at, Prompt: "hi",
+			ProviderOptions: ports.ProviderOptions{"openai": map[string]any{"tier": "flex"}}}})
+	// The transition upserts that follow must not clear what started it
 	_ = store.Threads().Upsert(ctx, ports.NewAdminThread{ID: "t1", State: ports.StateCompleted, Model: "gpt-4o"})
 	threads, _ := store.Threads().List(ctx, ports.AdminThreadFilter{})
 	mustEqual(t, len(threads), 1, "upsert, not duplicate")
 	mustEqual(t, threads[0].State, ports.StateCompleted, "latest state")
+	if threads[0].StartedWith == nil {
+		t.Fatal("startedWith lost on upsert")
+	}
+	mustEqual(t, threads[0].StartedWith.RunID, "r1", "startedWith runId")
+	mustEqual(t, threads[0].StartedWith.Prompt, "hi", "startedWith prompt")
+	mustEqual(t, threads[0].StartedWith.At.UnixMilli(), at.UnixMilli(), "startedWith at")
+	mustEqual(t, threads[0].StartedWith.ProviderOptions["openai"].(map[string]any)["tier"], "flex", "startedWith provider options")
 	tc, _ := store.Threads().CountByState(ctx)
 	mustEqual(t, tc[ports.StateCompleted], 1, "thread count")
 
