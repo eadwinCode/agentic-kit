@@ -11,6 +11,9 @@ and transport to you.
 bun add use-agentkit
 ```
 
+**[Full documentation](../../docs/README.md)** · [React guide](../../docs/react.md) ·
+[the HTTP contract it expects](../../docs/http-api.md)
+
 ## Use it
 
 ```tsx

@@ -7,6 +7,9 @@ It owns the **lifecycle of a run**: that a run outlives the request that started
 survives a worker dying mid-step, can be stopped, parked for a human, resumed exactly
 where it stopped, nested, metered, and watched by several people at once.
 
+**[Full documentation](../../docs/README.md)** — getting started, concepts, the HTTP
+contract, ports, production settings and troubleshooting.
+
 The [technical specification](../../agent-platform-technical-spec.md) (§ numbers below
 refer to it) is the behavioural source of truth.
 
@@ -104,10 +107,12 @@ Runs belong to an agent handle; reads belong to the runtime.
 ```ts
 await chat.run({ prompt: 'hi', state: { orgId } });      // persist + enqueue → 202 (§5.1)
 await chat.stop(threadId);                               // one write: state → CANCELLED (§2.1)
-await runtime.hitl.respond({ threadId, toolCallId, approved, payload });   // §2.5
-await runtime.getThreadSnapshot(threadId);               // hydrate a client (§2.2)
-const missed = await runtime.events.since(threadId, lastSeq);              // SSE replay
-const unsub  = await runtime.events.subscribe(threadId, handler);          // live tail
+await runtime.hitl.respond({ threadId, toolCallId, approved, payload, state });  // §2.5
+await runtime.getThreadSnapshot(threadId, state);        // hydrate a client (§2.2)
+const { stream, headers } = runtime.events.sse(threadId, { since, signal }); // SSE, any framework
+for await (const e of runtime.events.follow(threadId, { signal })) { … }     // or iterate
+const missed = await runtime.events.since(threadId, lastSeq);              // raw replay
+const unsub  = await runtime.events.subscribe(threadId, handler);          // raw tail
 await runtime.worker.handleJob(job);                     // queue consumer (§2.8)
 ```
 
