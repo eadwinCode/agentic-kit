@@ -26,6 +26,32 @@ every job to an unknown agent.
 Put `setupAgentCore` and every `create*Agent` call in one module, and import that
 module everywhere.
 
+### A system prompt built per step
+
+> Go runtime. The TypeScript package will follow.
+
+`system` is a string. When the persona depends on what the run is acting on
+— a project, a page, a user's settings — give the spec a `SystemFn` instead.
+It is called once per step with the thread id and the run's
+[state](./run-state.md), and wins over `system`:
+
+```go
+rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
+	Name: "designer",
+	SystemFn: func(ctx context.Context, threadID string, state agentenkit.AgentRunState) (string, error) {
+		project, err := projects.Load(ctx, state["projectId"].(string))
+		if err != nil {
+			return "", err // fails the run rather than prompting blind
+		}
+		return stablePersona + "\n\n" + project.Brief(), nil
+	},
+})
+```
+
+Keep the stable part first. Prompt caching stamps the system message as a
+cached prefix, and a prefix that moves every step is a prefix that never
+hits.
+
 ## Models
 
 `resolveModel` turns your registry key into the two things the platform needs:
@@ -202,6 +228,53 @@ Model resolution order: run input → agent spec → `'gpt-4o'`.
 
 `accepted: false` means the thread already has an active run, or your
 `billingPreCheck` rejected it. Nothing was written.
+
+Three more fields, Go runtime for now:
+
+| Field | What it does |
+| :--- | :--- |
+| `RunID` | Name the run yourself. Your own records (a workspace, a billing line) can be keyed by it *before* dispatch, and the worker sees the same id. A reused id is refused with `accepted: false`. |
+| `MaxSteps` | Cap this run's round trips below the config's `MaxSteps`. Zero keeps the config value; more is clamped to it. |
+| `Attachments` | Images sent with the prompt (`{URL, MediaType}`). Stored as image parts on the user turn and handed to the model natively. |
+
+```go
+chat.Run(ctx, agentenkit.RunInput{
+	Prompt: "what is in this picture?", RunID: runID, MaxSteps: 8,
+	Attachments: []agentenkit.Attachment{{URL: "https://cdn.example/cat.png", MediaType: "image/png"}},
+})
+```
+
+## Settling a run
+
+> Go runtime.
+
+`OnFinish` fires after the terminal state is written, which is too late for
+work every client must see as done the moment the run ends: committing the
+files a run edited, charging for it. `OnSettle` runs after the last step and
+**before** the terminal `STATE_CHANGE`:
+
+```go
+rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
+	Name: "designer",
+	OnSettle: func(ctx context.Context, info agentenkit.RunFinishInfo) error {
+		ctx = context.WithoutCancel(ctx) // a stop arrives cancelled; the commit still has to land
+		if info.Cancelled {
+			return repo.Discard(ctx, info.RunID)
+		}
+		if err := repo.Commit(ctx, info.RunID); err != nil {
+			return err // the run finalizes FAILED, with this reason
+		}
+		return billing.Charge(ctx, info.RunID, info.TokensUsed)
+	},
+})
+```
+
+Rules: an error fails the run (the reason lands on the terminal event and the
+run record); a user stop reaches the hook with `Cancelled` set on a cancelled
+context and its error is ignored; a run whose attempts are exhausted still
+settles, as `FAILED` with `Error` set. It can run more than once for one run
+— a worker that dies inside it is redelivered — so keep it idempotent on
+`RunID`.
 
 ## Stopping
 

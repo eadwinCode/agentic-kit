@@ -13,6 +13,11 @@ stack; implement any of them for anything.
 The `Memory*` adapters are a complete implementation used by the test suite, and
 double as a template.
 
+The Go runtime also ships all four over **one Postgres**
+(`adapters/postgres`): the storage, a `Kv`, an `EventBus` over
+LISTEN/NOTIFY and a `Queue` over a jobs table. See
+[One Postgres for everything](#one-postgres-for-everything-go).
+
 ## Storage
 
 ```ts
@@ -128,6 +133,44 @@ Break one of these and the failure is subtle rather than loud.
    Writes go to **both**.
 6. Every run carries an id. A worker whose id is no longer current has been
    replaced and must not write state on the live run's behalf.
+
+## One Postgres for everything (Go)
+
+A single database can run the whole operational side. Each adapter is a few
+tables under the storage's prefix:
+
+```go
+db, _ := sql.Open("pgx", url)
+storage, _ := postgres.New(ctx, db)
+kv, _ := postgres.NewKv(ctx, db)
+queue, _ := postgres.NewQueue(ctx, db, postgres.QueueOptions{})
+bus := postgres.NewBus(db, pgxlisten.New(url), storage.Events(), kv, postgres.BusOptions{})
+// …SetupAgentCore, then:
+queue.Bind(rt.Worker.Handler())
+```
+
+**Kv.** `SET NX` is one `INSERT … ON CONFLICT DO UPDATE … WHERE expired`
+and `Incr` increments inside the conflict clause, so two workers never both
+take a lock or the same seq. Expiry is enforced on read; `DeleteExpired` is
+housekeeping.
+
+**EventBus.** One `LISTEN` connection per process (`pgxlisten`, over pgx),
+fan-out by thread id in memory. NOTIFY payloads are capped at 8000 bytes,
+which a tool result can exceed: an event that does not fit travels as
+`{threadId, seq}` and the subscriber reads it back from `Storage.Events`; a
+notice (seq 0) that does not fit is parked in the kv for a minute and
+referenced by key. At-most-once still: a dropped notification is recovered
+by the client's cursor replay.
+
+**Queue.** `Enqueue` is one insert; a delay is a future `runAt`. The consumer
+claims with `SELECT … FOR UPDATE SKIP LOCKED`, so several processes can
+share the table, and renews the row's lease while the job runs. A worker
+that dies mid-job loses its lease and the job is redelivered — at-least-once,
+which the run lock makes safe. A handler that returns an error hands the job
+back at once; after `MaxAttempts` it is dropped.
+
+Tests: `TEST_ADMIN_PG=postgres://… go test ./...` runs the platform end to end
+on these adapters, including the over-cap frames and a concurrent `Incr`.
 
 ## Writing your own
 

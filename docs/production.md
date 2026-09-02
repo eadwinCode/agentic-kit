@@ -13,6 +13,10 @@ swaps for a durable equivalent.
 | `MemoryKv` | `RedisKv`, `UpstashKv` |
 | SQLite admin store | Postgres, via `AGENTIC_KIT_ADMIN_DATABASE_URL` |
 
+Go runtime: every row of that table can also be **one Postgres** —
+`adapters/postgres` ships the storage, kv, bus and queue together. See
+[Ports and adapters](./ports-and-adapters.md#one-postgres-for-everything-go).
+
 ```ts
 import { Client } from '@upstash/qstash';
 import { createClient } from 'redis';
