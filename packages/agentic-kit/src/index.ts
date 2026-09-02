@@ -39,6 +39,15 @@ export {
   type StepResult,
 } from './core/engine.js';
 export { agenticTool, type ToolContext } from './core/tools.js';
+export {
+  followEvents,
+  toSseStream,
+  sseFrame,
+  SSE_HEADERS,
+  type FollowOptions,
+  type SseOptions,
+  type SseStream,
+} from './core/follow.js';
 // The run-state types, named here so they are discoverable rather than
 // reachable only by chance through another module's re-export.
 export type { AgentRunState, BoundStorage, StorageContext } from './core/state.js';

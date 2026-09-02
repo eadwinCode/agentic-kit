@@ -16,6 +16,7 @@ import { contextUsage } from './core/context.js';
 import { createGenerateTextAgent, createStreamTextAgent } from './core/agent.js';
 import * as adminReads from './core/admin.js';
 import { bindStorage, type AgentRunState } from './core/state.js';
+import { followEvents, toSseStream } from './core/follow.js';
 import { openDefaultAdminStore } from './admin/default.js';
 import { reclaimIfOrphaned } from './core/reclaim.js';
 import { respond } from './core/hitl.js';
@@ -180,6 +181,13 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
         scope(state).storage.events.listSince(threadId, sinceSeq),
       subscribe: async (threadId: string, handler: (event: AgentEvent) => void) =>
         deps.bus.subscribe(threadId, handler),
+      // The replay-then-tail dance lives here rather than in every route
+      // handler: subscribe first, never emit at or below the cursor, and let a
+      // seq-0 notice through without moving it (§2.2).
+      follow: (threadId, options = {}) =>
+        followEvents(scope(options.state), threadId, options),
+      sse: (threadId, options = {}) =>
+        toSseStream(followEvents(scope(options.state), threadId, options), options),
     },
 
     createStreamTextAgent: (spec) => {

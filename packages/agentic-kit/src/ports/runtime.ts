@@ -17,6 +17,7 @@ import type {
 import type { Storage } from './storage.js';
 import type { AdminStore, RunFilter, StepRecord } from './admin.js';
 import type { AgentRunState, BoundStorage } from '../core/state.js';
+import type { FollowOptions, SseOptions, SseStream } from '../core/follow.js';
 
 export type { AdminStore, NewStepRecord, RunFilter, StepRecord } from './admin.js';
 export type { AgentRunState, BoundStorage, StorageContext } from '../core/state.js';
@@ -256,6 +257,20 @@ export interface AgentCore {
   events: {
     since(threadId: string, sinceSeq: number, state?: AgentRunState): Promise<AgentEvent[]>;
     subscribe(threadId: string, handler: (event: AgentEvent) => void): Promise<() => void>;
+    /** Replay then live, as one sequence, with the cursor discipline already
+     *  applied (§2.2): subscribe before replaying, never emit at or below the
+     *  cursor, forward a seq-0 notice without moving it.
+     *
+     *  Framework-neutral — an async iterable is something Express, Nest, Hono,
+     *  Next or a plain worker can each consume in their own way. Pass a signal,
+     *  or the subscription outlives the client. */
+    follow(
+      threadId: string,
+      options?: FollowOptions & { state?: AgentRunState },
+    ): AsyncGenerator<AgentEvent>;
+    /** `follow`, encoded as Server-Sent Events. Returns the stream and the
+     *  headers rather than a Response, because half the ecosystem has none. */
+    sse(threadId: string, options?: SseOptions & { state?: AgentRunState }): SseStream;
   };
 
   /** Agent factories — see §4. Each call registers a handle under `spec.name`. */

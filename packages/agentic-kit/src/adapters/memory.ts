@@ -54,6 +54,11 @@ export class MemoryBus implements EventBus {
     set.add(handler);
     return () => { set!.delete(handler); };
   }
+  /** Live subscriptions on a thread — lets a test prove a stream cleaned up
+   *  after itself rather than leaking one per reconnect. */
+  subscribers(threadId: string): number {
+    return this.subs.get(threadId)?.size ?? 0;
+  }
 }
 
 /** In-memory queue with a drain() helper: tests process jobs exactly like the
