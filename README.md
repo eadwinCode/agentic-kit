@@ -143,11 +143,9 @@ Full docs live in **[`docs/`](./docs/README.md)**.
 | [Production](./docs/production.md) | Deployment and a checklist |
 | [Troubleshooting](./docs/troubleshooting.md) | Symptoms and causes |
 
-Behavioural source of truth:
-[`agent-platform-technical-spec.md`](./agent-platform-technical-spec.md) — the
-`§` references throughout the code point there.
-[`agent-runtime-abstraction.md`](./agent-runtime-abstraction.md) explains why
-the ports are shaped as they are.
+The `§` references throughout the source point at a behavioural specification
+that no longer lives in the repository. The pages above are the written
+description of that behaviour; the test suite is the executable one.
 
 ## Repository
 

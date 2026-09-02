@@ -10,8 +10,9 @@ where it stopped, nested, metered, and watched by several people at once.
 **[Full documentation](../../docs/README.md)** — getting started, concepts, the HTTP
 contract, ports, production settings and troubleshooting.
 
-The [technical specification](../../agent-platform-technical-spec.md) (§ numbers below
-refer to it) is the behavioural source of truth.
+The `§` numbers below refer to a behavioural specification that no longer lives
+in the repository; the [documentation](../../docs/README.md) and the test suite
+now describe that behaviour.
 
 ## Running locally, with nothing to stand up
 

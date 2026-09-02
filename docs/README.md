@@ -63,12 +63,10 @@ a requirement.
 
 ## Deeper background
 
-The `§` references throughout the source point at the specification, which is
-the behavioural source of truth:
-
-- [`agent-platform-technical-spec.md`](https://github.com/eadwinCode/agentic-kit/blob/main/agent-platform-technical-spec.md)
-- [`agent-runtime-abstraction.md`](https://github.com/eadwinCode/agentic-kit/blob/main/agent-runtime-abstraction.md) —
-  why the ports are shaped the way they are.
+The source carries `§` references — §2.5 for the human-in-the-loop rules, §2.7
+for nested runs, and so on. They point at a behavioural specification that is
+no longer kept in the repository; these pages are now the written description
+of that behaviour, and the test suite is its executable one.
 
 A full integration lives in
 [`examples/nextjs-app`](https://github.com/eadwinCode/agentic-kit/tree/main/examples/nextjs-app).
