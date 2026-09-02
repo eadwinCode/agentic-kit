@@ -7,8 +7,8 @@ It owns the **lifecycle of a run**: that a run outlives the request that started
 survives a worker dying mid-step, can be stopped, parked for a human, resumed exactly
 where it stopped, nested, metered, and watched by several people at once.
 
-**[Full documentation](../../docs/README.md)** — getting started, concepts, the HTTP
-contract, ports, production settings and troubleshooting.
+**[Full documentation](https://eadwincode.github.io/agentic-kit/)** — getting started, concepts, the HTTP contract,
+ports, production settings and troubleshooting.
 
 The `§` numbers below refer to a behavioural specification that no longer lives
 in the repository; the [documentation](../../docs/README.md) and the test suite

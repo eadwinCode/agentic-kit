@@ -121,7 +121,9 @@ export function Chat() {
 
 ## Documentation
 
-Full docs live in **[`docs/`](./docs/README.md)**.
+**[https://eadwincode.github.io/agentic-kit/](https://eadwincode.github.io/agentic-kit/)** — the docs as a site, with search.
+The same pages live in [`docs/`](./docs/README.md) if you would rather read
+them here.
 
 | | |
 | :--- | :--- |

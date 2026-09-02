@@ -11,8 +11,8 @@ and transport to you.
 bun add use-agentkit
 ```
 
-**[Full documentation](../../docs/README.md)** · [React guide](../../docs/react.md) ·
-[the HTTP contract it expects](../../docs/http-api.md)
+**[Full documentation](https://eadwincode.github.io/agentic-kit/)** · [React guide](https://eadwincode.github.io/agentic-kit/react) ·
+[the HTTP contract it expects](https://eadwincode.github.io/agentic-kit/http-api)
 
 ## Use it
 

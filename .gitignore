@@ -8,3 +8,7 @@ dist/
 .DS_Store
 *.sqlite
 *.sqlite-journal
+
+# VitePress build output and cache
+docs/.vitepress/dist/
+docs/.vitepress/cache/

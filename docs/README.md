@@ -1,5 +1,8 @@
 # agentic-kit documentation
 
+> Reading on GitHub. The same pages are published with search at
+> **[https://eadwincode.github.io/agentic-kit/](https://eadwincode.github.io/agentic-kit/)**.
+
 A durable runtime for AI agent runs, and the React hook that talks to it.
 
 Two packages:
