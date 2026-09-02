@@ -6,7 +6,7 @@ import {
   type PendingInput,
   type SubagentStatus,
   type ThreadUsage,
-} from '../hooks/useAgentThread';
+} from 'use-agentkit';
 
 const stateLabel: Record<string, string> = {
   IDLE: 'idle',
@@ -43,10 +43,21 @@ export default function Page() {
   // Subagent cards a user has toggled by hand; anything absent falls back to
   // the default for its state.
   const [openAgents, setOpenAgents] = useState<Record<string, boolean>>({});
+  // Same for thought blocks.
+  const [openThoughts, setOpenThoughts] = useState<Record<string, boolean>>({});
   // One button, two jobs: while a run is live it stops; otherwise it sends.
   const running = agentState === 'RUNNING' || agentState === 'WAITING_FOR_INPUT';
   const waiting = agentState === 'WAITING_FOR_INPUT';
   const canSend = !historyLoading && !running && prompt.trim().length > 0;
+
+  // A thought is still being written while it is the newest entry of a live
+  // run — once the answer starts, another entry follows it.
+  const lastEntry = entries.at(-1);
+  const streamingThoughtId =
+    running && lastEntry?.kind === 'reasoning' ? lastEntry.id : undefined;
+  // Open while it streams, folded once it is done — unless the user said
+  // otherwise for that particular block.
+  const thoughtOpen = (id: string) => openThoughts[id] ?? id === streamingThoughtId;
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -58,7 +69,7 @@ export default function Page() {
   const submitEdit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!editing || running || !editing.text.trim()) return;
-    void run(editing.text.trim(), 'gpt-4o', editing.id);
+    void run(editing.text.trim(), { editMessageId: editing.id });
     setEditing(null);
   };
 
@@ -147,7 +158,18 @@ export default function Page() {
           <p className="empty">{historyLoading ? 'Loading previous messages…' : 'No messages yet.'}</p>
         )}
         {entries.map((e) =>
-          e.kind === 'tool' ? (
+          e.kind === 'reasoning' ? (
+            <ThoughtBlock
+              key={e.id}
+              text={e.text}
+              streaming={e.id === streamingThoughtId}
+              open={openThoughts[e.id]}
+              onToggle={() =>
+                setOpenThoughts((prev) => ({ ...prev, [e.id]: !thoughtOpen(e.id) }))
+              }
+              isOpen={thoughtOpen(e.id)}
+            />
+          ) : e.kind === 'tool' ? (
             <p key={e.id} className="tool">
               {e.text}
             </p>
@@ -377,6 +399,34 @@ function UsageBar({ usage }: { usage: ThreadUsage }) {
         </div>
       </div>
     </section>
+  );
+}
+
+/** The model's thinking. Shown live while it is being written, then folded to
+ *  a single line — it is context for the answer, not the answer. */
+function ThoughtBlock({
+  text,
+  streaming,
+  isOpen,
+  onToggle,
+}: {
+  text: string;
+  streaming: boolean;
+  open: boolean | undefined;
+  isOpen: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div className={`thought${streaming ? ' streaming' : ''}${isOpen ? ' open' : ''}`}>
+      <button type="button" className="thought-header" onClick={onToggle}>
+        <span className="thought-caret" aria-hidden>
+          {isOpen ? '▾' : '▸'}
+        </span>
+        <span className="thought-title">{streaming ? 'Thinking' : 'Thought'}</span>
+        {!isOpen && <span className="thought-peek">{truncate(text.replace(/\s+/g, ' '), 90)}</span>}
+      </button>
+      {isOpen && <div className="thought-body">{text}</div>}
+    </div>
   );
 }
 

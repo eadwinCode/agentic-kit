@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import Script from 'next/script';
+import { Providers } from './providers';
 import './globals.css';
 
 export const metadata: Metadata = {
@@ -11,7 +12,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body>
-        {children}
+        <Providers>{children}</Providers>
         <Script id="move-devtools-indicator" strategy="afterInteractive">
           {`
             (function () {

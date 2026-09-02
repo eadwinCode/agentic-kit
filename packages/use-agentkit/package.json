@@ -1,0 +1,40 @@
+{
+  "name": "use-agentkit",
+  "version": "0.1.0",
+  "description": "React hook for @agentic-kit/core \u2014 durable threads, live streaming, human-in-the-loop approvals and nested runs, with every route and label under your control.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "bun run typecheck && bun run build",
+    "test": "bun test"
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.0",
+    "typescript": "^5.6.3"
+  },
+  "keywords": [
+    "react",
+    "hooks",
+    "ai",
+    "agents",
+    "streaming",
+    "human-in-the-loop"
+  ]
+}

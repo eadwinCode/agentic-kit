@@ -643,3 +643,70 @@ table.runs .sub { display: block; color: var(--muted); font-size: 10px; }
 .step-row { grid-template-rows: auto auto; }
 .step-row .step-bar { width: 100%; min-width: 0; }
 .step-row .step-meta { grid-column: 2; white-space: normal; }
+
+/* Streaming thought — the model's reasoning, kept apart from its answer.
+   Open while it is being written, folded to one line once the answer starts. */
+.thought {
+  margin: 6px 0 10px;
+  border-left: 2px solid var(--border, #2a2a2a);
+  padding-left: 10px;
+}
+
+.thought-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 2px 0;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+  color: var(--muted, #8a8a8a);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.thought-header:hover .thought-title {
+  color: var(--fg, #e6e6e6);
+}
+
+.thought-caret {
+  flex: none;
+  width: 10px;
+  opacity: 0.7;
+}
+
+.thought-title {
+  flex: none;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
+
+/* A soft pulse only while the tokens are still arriving. */
+.thought.streaming .thought-title {
+  animation: thought-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes thought-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+/* The folded preview: one line, never wrapping the layout. */
+.thought-peek {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.75;
+}
+
+.thought-body {
+  margin: 4px 0 2px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--muted, #8a8a8a);
+  font-size: 12.5px;
+  line-height: 1.6;
+}

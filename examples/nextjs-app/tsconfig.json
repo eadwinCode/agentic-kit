@@ -18,7 +18,8 @@
       "@/*": ["./*"],
       "@agentic-kit/core": ["../../packages/agentic-kit/src/index.ts"],
       "@agentic-kit/core/adapters/*": ["../../packages/agentic-kit/src/adapters/*"],
-      "@agentic-kit/core/admin/*": ["../../packages/agentic-kit/src/admin/*"]
+      "@agentic-kit/core/admin/*": ["../../packages/agentic-kit/src/admin/*"],
+      "use-agentkit": ["../../packages/use-agentkit/src/index.ts"]
     }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],

@@ -23,6 +23,7 @@
         "react": "^18.3.1",
         "react-dom": "^18.3.1",
         "redis": "^4.7.0",
+        "use-agentkit": "workspace:*",
         "zod": "^3.24.1",
       },
       "devDependencies": {
@@ -63,6 +64,17 @@
         "pg",
         "redis",
       ],
+    },
+    "packages/use-agentkit": {
+      "name": "use-agentkit",
+      "version": "0.1.0",
+      "devDependencies": {
+        "@types/react": "^18.3.0",
+        "typescript": "^5.6.3",
+      },
+      "peerDependencies": {
+        "react": ">=18.0.0",
+      },
     },
   },
   "packages": {
@@ -385,6 +397,8 @@
     "universalify": ["universalify@2.0.1", "", {}, "sha512-gptHNQghINnc/vTGIk0SOFGFNXw7JVrlRUtConJRlvaw6DuX0wO5Jeko9sWrMBhh+PsYAZ7oXAiOnf/UKogyiw=="],
 
     "unzipper": ["unzipper@0.12.3", "", { "dependencies": { "bluebird": "~3.7.2", "duplexer2": "~0.1.4", "fs-extra": "^11.2.0", "graceful-fs": "^4.2.2", "node-int64": "^0.4.0" } }, "sha512-PZ8hTS+AqcGxsaQntl3IRBw65QrBI6lxzqDEL7IAo/XCEqRTKGfOX56Vea5TH9SZczRVxuzk1re04z/YjuYCJA=="],
+
+    "use-agentkit": ["use-agentkit@workspace:packages/use-agentkit"],
 
     "use-sync-external-store": ["use-sync-external-store@1.6.0", "", { "peerDependencies": { "react": "^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0" } }, "sha512-Pp6GSwGP/NrPIrxVFAIkOQeyw8lFenOHijQWkUTrDvrF4ALqylP2C/KCkeS9dpUM3KvYRQhna5vt7IL95+ZQ9w=="],
 
