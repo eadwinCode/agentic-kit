@@ -10,10 +10,11 @@ import type {
 } from './types.js';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { RegisteredAgent } from './agent.js';
-import { publish } from './publish.js';
+import { publish, withPublishEvent } from './publish.js';
 import { HITL_PARKED, withHitl, type HitlFrame } from './hitl.js';
 import { withRunState, type AgentRunState } from './state.js';
 import { markPromptCaching } from './cache.js';
+import { repairDanglingToolCalls } from './messages.js';
 import { runLoop, type LoopOutcome, type RunLedger } from './loop.js';
 
 /** Everything a nested run needs from the run that spawned it (§2.7). The
@@ -254,12 +255,16 @@ function nestedTools(
   };
   // A nested run's tools see the same state as its parent's (§2.10).
   return withRunState(
-    withHitl(ctx.ports, ctx.threadId, raw, {
-      resume: ctx.resume,
-      agentId: d.agentId,
-      frames,
-      nested: d,
-    }),
+    withPublishEvent(
+      ctx.ports,
+      ctx.threadId,
+      withHitl(ctx.ports, ctx.threadId, raw, {
+        resume: ctx.resume,
+        agentId: d.agentId,
+        frames,
+        nested: d,
+      }),
+    ),
     ctx.state ?? {},
   );
 }
@@ -327,7 +332,7 @@ export async function runNestedAgent(
       // is for — it was the one prompt in the system going out unstamped.
       messages: maybeCache(
         ports,
-        persisted.map((m) => ({ role: m.role, content: m.content }) as any),
+        repairDanglingToolCalls(persisted.map((m) => ({ role: m.role, content: m.content }) as any)),
       ),
       tools: nestedTools(ctx, d, frames, abortSignal),
       maxSteps: ports.config.subagentMaxSteps,

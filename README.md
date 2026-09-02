@@ -34,6 +34,7 @@ event bus, key-value — so the engine never imports a database driver.
 | :--- | :--- | :--- |
 | **`agentenkit`** | The server runtime | [readme](./packages/agentenkit/README.md) |
 | **`use-agentenkit`** | The React hook | [readme](./packages/use-agentenkit/README.md) |
+| **`go-agentenkit`** | The same runtime in Go, on [goai](https://github.com/zendev-sh/goai) | [readme](./packages/go-agentenkit/README.md) |
 
 The hook is one way to build a UI over the core, not a requirement. The event
 log is a public contract you can build any client over.
@@ -159,8 +160,10 @@ packages/
     src/adapters/     reference adapters (Prisma, Redis, QStash, Upstash, SQLite, memory)
     src/admin/        the platform's own operational store
   use-agentenkit/       the React hook
+  go-agentenkit/        the runtime in Go, on goai — same ports, same events, same schemas
 examples/
   nextjs-app/         a full integration — an example, not the product
+  go-app/             the same, in Go: a Go server serving a React SPA, with custom events
 docs/                 the documentation
 ```
 

@@ -380,6 +380,10 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
     const terminal = lastTerminal(bus).payload as any;
     expect(terminal.stopReason).toBe('token_budget');
     expect(terminal.tokensUsed).toBe(240);
+    // The break was announced before the run ended
+    const exhausted = bus.published.find((e) => e.type === 'TOKEN_BUDGET_EXHAUSTED')!;
+    expect(exhausted.payload).toEqual({ agentId: null, tokensUsed: 240, tokenBudget: 150 });
+    expect(exhausted.seq).toBeLessThan(lastTerminal(bus).seq);
     expect(roles(storage, ran.threadId)).toEqual(['user', 'assistant', 'tool', 'assistant']);
     const last = storage.messages.store.get(ran.threadId)!.at(-1)!;
     expect((last.content as any)[0].text).toBe('done');

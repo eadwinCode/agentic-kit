@@ -61,6 +61,7 @@ export default defineConfig({
           { text: 'Subagents', link: '/subagents' },
           { text: 'Context and tokens', link: '/context-and-tokens' },
           { text: 'Provider options', link: '/provider-options' },
+          { text: 'Custom events', link: '/custom-events' },
         ],
       },
       {

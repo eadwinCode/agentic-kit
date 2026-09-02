@@ -7,11 +7,21 @@ interface Tokens {
   inputTokens: number; cachedInputTokens: number; outputTokens: number; totalTokens: number;
 }
 
+/** What started a thread (§2.9): the first dispatched run's parameters,
+ *  recorded once. The payload fields follow `recordPayloads`. */
+interface ThreadStart {
+  runId: string; agent: string; model: string; at: string;
+  prompt?: string | null; tokenBudget?: number | null;
+  state?: Record<string, unknown> | null;
+  providerOptions?: Record<string, unknown> | null;
+}
+
 interface ThreadSummary extends Tokens {
   id: string; state: State; model: string;
   firstSeenAt: string; updatedAt: string;
   runs: number; steps: number; durationMs: number;
   tokens: Tokens; prompt: string | null;
+  startedWith?: ThreadStart | null;
 }
 
 interface RunRecord extends Tokens {
@@ -22,6 +32,7 @@ interface RunRecord extends Tokens {
   durationMs: number | null; queuedMs: number | null;
   steps: number; prompt: string | null; tokenBudget: number | null;
   runState: Record<string, unknown> | null;
+  providerOptions?: Record<string, unknown> | null;
 }
 
 interface StepRecord extends Tokens {
@@ -178,6 +189,12 @@ export default function AdminPage() {
                 <tr key={t.id} onClick={() => void openThread(t.id)}>
                   <td className="thread-cell">
                     <code>{t.id.slice(0, 8)}</code>
+                    {t.startedWith && (
+                      <span className="thread-agent">
+                        {t.startedWith.agent} · {t.startedWith.model}
+                        {t.startedWith.tokenBudget != null && ` · budget ${num(t.startedWith.tokenBudget)}`}
+                      </span>
+                    )}
                     {t.prompt && <span className="thread-prompt">{t.prompt}</span>}
                   </td>
                   <td><span className={`badge ${t.state.toLowerCase()}`}>{t.state.toLowerCase()}</span></td>
@@ -234,11 +251,8 @@ function ThreadView({ detail, onStep, selected }: {
         <Tile label="Model" value={thread.model} />
       </section>
 
-      {thread.prompt && (
-        <>
-          <h3>Started with</h3>
-          <pre className="payload wide">{thread.prompt}</pre>
-        </>
+      {(thread.startedWith || thread.prompt) && (
+        <StartedWith start={thread.startedWith ?? null} prompt={thread.prompt} />
       )}
 
       {runs.map((run) => {
@@ -283,6 +297,37 @@ function ThreadView({ detail, onStep, selected }: {
         );
       })}
     </>
+  );
+}
+
+/** The parameters that started the thread (§2.9): who asked, on which
+ *  model, with what budget, state and provider options, and the prompt. A
+ *  thread recorded before this existed only has its prompt. */
+function StartedWith({ start, prompt }: { start: ThreadStart | null; prompt: string | null }) {
+  const text = start?.prompt ?? prompt;
+  return (
+    <section className="started">
+      <h3>Started with</h3>
+      {start && (
+        <dl className="started-params">
+          <dt>Agent</dt><dd>{start.agent}</dd>
+          <dt>Model</dt><dd>{start.model}</dd>
+          <dt>Run</dt><dd><code>{start.runId.slice(0, 8)}</code></dd>
+          <dt>At</dt><dd title={new Date(start.at).toLocaleString()}>{ago(start.at)}</dd>
+          <dt>Token budget</dt><dd>{start.tokenBudget != null ? num(start.tokenBudget) : 'none'}</dd>
+          {start.state && Object.keys(start.state).length > 0 && (
+            <><dt>Run state</dt><dd><code>{JSON.stringify(start.state)}</code></dd></>
+          )}
+          {start.providerOptions && Object.keys(start.providerOptions).length > 0 && (
+            <><dt>Provider options</dt><dd><code>{JSON.stringify(start.providerOptions)}</code></dd></>
+          )}
+          {!start.prompt && start.state === undefined && (
+            <><dt>Payloads</dt><dd className="tile-detail">not recorded (recordPayloads is off)</dd></>
+          )}
+        </dl>
+      )}
+      {text && <pre className="payload wide">{text}</pre>}
+    </section>
   );
 }
 

@@ -34,7 +34,8 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS agentic_threads (
      id TEXT PRIMARY KEY, state TEXT NOT NULL, model TEXT NOT NULL,
      "firstSeenAt" TIMESTAMPTZ NOT NULL DEFAULT now(),
-     "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT now()
+     "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT now(),
+     "startedWith" JSONB
    )`,
   `CREATE INDEX IF NOT EXISTS agentic_threads_state ON agentic_threads(state, "updatedAt")`,
   `CREATE TABLE IF NOT EXISTS agentic_runs (
@@ -46,8 +47,10 @@ const SCHEMA = [
      attempts INT NOT NULL DEFAULT 0, steps INT NOT NULL DEFAULT 0,
      "inputTokens" INT NOT NULL DEFAULT 0, "cachedInputTokens" INT NOT NULL DEFAULT 0,
      "outputTokens" INT NOT NULL DEFAULT 0, "totalTokens" INT NOT NULL DEFAULT 0,
-     result JSONB, prompt TEXT, "tokenBudget" INT, "runState" JSONB
+     result JSONB, prompt TEXT, "tokenBudget" INT, "runState" JSONB, "providerOptions" JSONB
    )`,
+  `ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS "providerOptions" JSONB`,
+  `ALTER TABLE agentic_threads ADD COLUMN IF NOT EXISTS "startedWith" JSONB`,
   `ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS prompt TEXT`,
   `ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS "tokenBudget" INT`,
   `ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS "runState" JSONB`,
@@ -82,7 +85,7 @@ const toRun = (r: any): RunRecord => ({
   outputTokens: r.outputTokens, totalTokens: r.totalTokens,
   result: r.result ?? null,
   prompt: r.prompt ?? null, tokenBudget: r.tokenBudget ?? null,
-  runState: r.runState ?? null,
+  runState: r.runState ?? null, providerOptions: r.providerOptions ?? null,
 });
 
 /** Operational history in Postgres — the production store (§2.9), reached
@@ -102,10 +105,11 @@ export class PostgresAdminStore implements AdminStore {
   threads = {
     upsert: async (t: NewAdminThread) => {
       await this.db.query(
-        `INSERT INTO agentic_threads (id, state, model) VALUES ($1, $2, $3)
+        `INSERT INTO agentic_threads (id, state, model, "startedWith") VALUES ($1, $2, $3, $4)
          ON CONFLICT (id) DO UPDATE
-           SET state = EXCLUDED.state, model = EXCLUDED.model, "updatedAt" = now()`,
-        [t.id, t.state, t.model],
+           SET state = EXCLUDED.state, model = EXCLUDED.model, "updatedAt" = now(),
+               "startedWith" = COALESCE(agentic_threads."startedWith", EXCLUDED."startedWith")`,
+        [t.id, t.state, t.model, t.startedWith ? JSON.stringify(t.startedWith) : null],
       );
     },
     countByState: async () => {
@@ -131,6 +135,7 @@ export class PostgresAdminStore implements AdminStore {
       return rows.map((r) => ({
         id: r.id, state: r.state as ExecutionState, model: r.model,
         firstSeenAt: new Date(r.firstSeenAt), updatedAt: new Date(r.updatedAt),
+        startedWith: r.startedWith ? { ...r.startedWith, at: new Date(r.startedWith.at) } : null,
       }));
     },
   };
@@ -140,12 +145,13 @@ export class PostgresAdminStore implements AdminStore {
       const { rows } = await this.db.query(
         `INSERT INTO agentic_runs
            (id, "threadId", "parentRunId", depth, agent, model, state,
-            prompt, "tokenBudget", "runState")
-         VALUES ($1, $2, $3, $4, $5, $6, 'RUNNING', $7, $8, $9) RETURNING *`,
+            prompt, "tokenBudget", "runState", "providerOptions")
+         VALUES ($1, $2, $3, $4, $5, $6, 'RUNNING', $7, $8, $9, $10) RETURNING *`,
         [
           run.id, run.threadId, run.parentRunId ?? null, run.depth ?? 0,
           run.agent, run.model, run.prompt ?? null, run.tokenBudget ?? null,
           run.runState ? JSON.stringify(run.runState) : null,
+          run.providerOptions ? JSON.stringify(run.providerOptions) : null,
         ],
       );
       return toRun(rows[0]);

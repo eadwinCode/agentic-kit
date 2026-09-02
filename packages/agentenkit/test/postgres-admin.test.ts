@@ -96,6 +96,21 @@ describe('PostgresAdminStore (§2.9)', () => {
     expect(await store.runs.list({ limit: 1 })).toHaveLength(1);
   });
 
+  it('keeps what started a thread across upserts', async () => {
+    const id = `t-start-${Date.now()}`;
+    const at = new Date();
+    await store.threads.upsert({
+      id, state: 'RUNNING', model: 'gpt-4o',
+      startedWith: { runId: 'r1', agent: 'chat', model: 'gpt-4o', at, prompt: 'hi', providerOptions: { openai: { tier: 'flex' } } },
+    });
+    await store.threads.upsert({ id, state: 'COMPLETED', model: 'gpt-4o' });
+    const row = (await store.threads.list({ limit: 1000 })).find((t) => t.id === id)!;
+    expect(row.state).toBe('COMPLETED');
+    expect(row.startedWith).toMatchObject({ runId: 'r1', prompt: 'hi', providerOptions: { openai: { tier: 'flex' } } });
+    expect(row.startedWith!.at.getTime()).toBe(at.getTime());
+    await pool.query('DELETE FROM agentic_threads WHERE id = $1', [id]); // the next test counts rows
+  });
+
   it('upserts a thread rather than duplicating it', async () => {
     if (!requireDb()) return;
     await store.threads.upsert({ id: 'pg-t1', state: 'RUNNING', model: 'gpt-4o' });

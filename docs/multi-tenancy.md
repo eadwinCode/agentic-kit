@@ -284,10 +284,14 @@ costs nothing:
 
 ```ts
 config: {
-  billingPreCheck: async (threadId) => {
-    const org = await orgForThread(threadId);
-    if (!org) return { ok: false, error: 'Unknown thread' };
-    if (org.creditsRemaining <= 0) return { ok: false, error: 'Out of credits' };
+  billingPreCheck: async ({ threadId, state, publishEvent }) => {
+    const org = await orgById(state.orgId);
+    if (!org) return { ok: false, error: 'Unknown organisation' };
+    if (org.creditsRemaining <= 0) {
+      // Every client on the thread sees why, now and after a reload
+      await publishEvent('CREDIT_LIMIT', { resetAt: org.periodEndsAt });
+      return { ok: false, error: `Out of credits until ${org.periodEndsAt}` };
+    }
     return { ok: true };
   },
 }

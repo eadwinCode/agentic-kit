@@ -74,14 +74,33 @@ export interface StepRecord {
 
 export type NewStepRecord = Omit<StepRecord, 'at'> & { at?: Date };
 
+/** What started a thread (§2.9): the first dispatched run's parameters,
+ *  recorded once and never overwritten, so a listing can say who asked for
+ *  what without opening the thread. `prompt`, `state` and `providerOptions`
+ *  are present only when `recordPayloads` is on. */
+export interface ThreadStart {
+  runId: string;
+  agent: string;
+  model: string;
+  at: Date;
+  prompt?: string | null;
+  tokenBudget?: number | null;
+  state?: Record<string, unknown> | null;
+  providerOptions?: Record<string, unknown> | null;
+}
+
 export interface AdminThread {
   id: string;
   state: ExecutionState;
   model: string;
   firstSeenAt: Date;
   updatedAt: Date;
+  /** The parameters that started it; null for a thread seen before this was recorded. */
+  startedWith?: ThreadStart | null;
 }
 
+/** `startedWith` is written on first sight only: a later upsert never
+ *  replaces what started the thread. */
 export type NewAdminThread = Omit<AdminThread, 'firstSeenAt' | 'updatedAt'>;
 
 export interface AdminThreadFilter {

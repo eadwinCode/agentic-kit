@@ -98,6 +98,9 @@ export interface RunRecord {
   prompt?: string | null;
   tokenBudget?: number | null;
   runState?: Record<string, unknown> | null;
+  /** The provider options the run was dispatched with (§3.1), merged across
+   *  config, spec and input. Present only when `recordPayloads` is on. */
+  providerOptions?: Record<string, unknown> | null;
   /** A nested run's capped result, handed back to its parent (§2.7). */
   result?: unknown;
 }
@@ -110,6 +113,7 @@ export interface NewRunRecord {
   prompt?: string | null;
   tokenBudget?: number | null;
   runState?: Record<string, unknown> | null;
+  providerOptions?: Record<string, unknown> | null;
   /** Defaults to 0 — a dispatched run. */
   depth?: number;
   parentRunId?: string | null;
@@ -304,13 +308,29 @@ export interface AgentConfig {
   /** Lease (seconds) for the per-thread run lock — must exceed the longest
    *  possible run segment; parked HITL waits hold NO lock (§2.8, §3.4). */
   runLockLeaseSeconds: number;
-  /** Billing pre-execution check (§4). Return `{ ok: false, error }` to reject a run. */
-  billingPreCheck?: (threadId: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Billing pre-execution check (§4). Return `{ ok: false, error }` to reject
+   *  a run. The check can publish on the thread (a credit warning, a reset
+   *  date) so every client sees why; the platform also publishes RUN_REFUSED
+   *  with the error. */
+  billingPreCheck?: (check: BillingCheck) => Promise<{ ok: boolean; error?: string }>;
   /** Provider-specific options applied to EVERY run (§3.1) — a reasoning
    *  budget, a service tier, a safety identifier. The lowest of three levels:
    *  an agent spec overrides this, and a run input overrides both, per
    *  provider namespace. */
   providerOptions?: ProviderOptions;
+}
+
+/** What `billingPreCheck` receives: the thread about to run, the run's state
+ *  (§2.10), and a way to publish on the thread before the refusal reaches the
+ *  caller. `publishEvent(type, payload, { durable })` — durable by default. */
+export interface BillingCheck {
+  threadId: string;
+  state: AgentRunState;
+  publishEvent: (
+    type: string,
+    payload: unknown,
+    options?: { durable?: boolean },
+  ) => Promise<AgentEvent>;
 }
 
 export const DEFAULT_CONFIG: AgentConfig = {

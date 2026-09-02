@@ -1,5 +1,5 @@
 import type { RuntimePorts } from '../ports/runtime.js';
-import type { RunFilter, StepRecord } from '../ports/admin.js';
+import type { RunFilter, StepRecord, ThreadStart } from '../ports/admin.js';
 import type {
   AgentEvent,
   ExecutionState,
@@ -54,6 +54,9 @@ export interface ThreadSummary {
   durationMs: number;
   /** What started it — the first dispatched run's prompt. */
   prompt?: string | null;
+  /** The parameters that started it, recorded on first sight (§2.9); falls
+   *  back to the earliest dispatched run in the window. */
+  startedWith?: ThreadStart | null;
 }
 
 /** A thread opened up: its runs, and every step across them in order. */
@@ -164,6 +167,7 @@ const addTokens = (into: UsageTotals, from: UsageTotals) => {
 
 function rollUp(thread: {
   id: string; state: ExecutionState; model: string; firstSeenAt: Date; updatedAt: Date;
+  startedWith?: ThreadStart | null;
 }, runs: RunRecord[]): ThreadSummary {
   const tokens = { ...EMPTY };
   let steps = 0;
@@ -178,7 +182,19 @@ function rollUp(thread: {
   const root = runs.filter((r) => r.depth === 0).sort(
     (a, b) => a.startedAt.getTime() - b.startedAt.getTime(),
   )[0];
-  return { ...thread, runs: runs.length, steps, tokens, durationMs, prompt: root?.prompt ?? null };
+  const startedWith: ThreadStart | null =
+    thread.startedWith ??
+    (root
+      ? {
+          runId: root.id, agent: root.agent, model: root.model, at: root.startedAt,
+          prompt: root.prompt ?? null, tokenBudget: root.tokenBudget ?? null,
+          state: root.runState ?? null, providerOptions: root.providerOptions ?? null,
+        }
+      : null);
+  return {
+    ...thread, runs: runs.length, steps, tokens, durationMs,
+    prompt: startedWith?.prompt ?? null, startedWith,
+  };
 }
 
 /** Threads with their runs rolled up, newest activity first (§2.9). One pass
