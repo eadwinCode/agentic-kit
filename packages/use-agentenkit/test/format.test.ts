@@ -93,3 +93,41 @@ describe('messageToEntry', () => {
     ).toBe('text');
   });
 });
+
+describe('structured parts', () => {
+  it('mirrors the stored parts on the entry, with tool calls settled by their results', () => {
+    const answered = new Set(['c1']);
+    const entries = messageToEntries(
+      msg([
+        { type: 'text', text: 'Looking it up.' },
+        { type: 'tool-call', toolCallId: 'c1', toolName: 'lookup', args: { q: 'x' } },
+        { type: 'tool-call', toolCallId: 'c2', toolName: 'lookup', args: { q: 'y' } },
+      ]),
+      defaultFormat,
+      answered,
+    );
+    expect(entries).toHaveLength(1);
+    const parts = entries[0]!.parts;
+    expect(parts.map((p) => p.type)).toEqual(['text', 'tool-call', 'tool-call']);
+    expect(parts[1]).toMatchObject({ toolCallId: 'c1', state: 'done' });
+    expect(parts[2]).toMatchObject({ toolCallId: 'c2', state: 'running' });
+  });
+
+  it('keeps an image-only user turn as an entry', () => {
+    const entry = messageToEntry(
+      msg([{ type: 'image', image: 'https://cdn/x.png', mimeType: 'image/png' }], { role: 'user' }),
+      defaultFormat,
+    );
+    expect(entry).not.toBeNull();
+    expect(entry!.text).toBe('');
+    expect(entry!.parts).toEqual([{ type: 'image', image: 'https://cdn/x.png', mimeType: 'image/png' }]);
+  });
+
+  it('gives a plain string message one text part and thinking its own part', () => {
+    expect(messageToEntry(msg('hello', { role: 'user' }), defaultFormat)!.parts).toEqual([
+      { type: 'text', text: 'hello' },
+    ]);
+    const [thought] = messageToEntries(msg([{ type: 'reasoning', text: 'hm' }, { type: 'text', text: 'ok' }]), defaultFormat);
+    expect(thought!.parts).toEqual([{ type: 'reasoning', text: 'hm' }]);
+  });
+});

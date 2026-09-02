@@ -12,6 +12,25 @@ export type AgentState =
 
 export type MessageRole = 'user' | 'assistant' | 'system' | 'tool';
 
+/** One structured piece of an entry, for a UI that renders more than text:
+ *  a tool card with its state, an image the user attached, the thinking.
+ *  Filled the same way from the durable snapshot and from the live stream,
+ *  so a reload and a live run produce the same shape. */
+export type EntryPart =
+  | { type: 'text'; text: string }
+  | { type: 'reasoning'; text: string }
+  | { type: 'image'; image: string; mimeType?: string }
+  | {
+      type: 'tool-call';
+      toolCallId: string;
+      toolName: string;
+      args: unknown;
+      /** `running` until its result lands; `done` or `error` after. */
+      state: 'streaming' | 'running' | 'done' | 'error';
+      result?: unknown;
+    }
+  | { type: 'tool-result'; toolCallId: string; toolName?: string; result: unknown };
+
 export interface ChatEntry {
   id: string;
   /** `reasoning` is the model's thinking, which arrives as its own stream and
@@ -20,6 +39,14 @@ export interface ChatEntry {
   role: MessageRole;
   text: string;
   agentId?: string | null;
+  /** The entry's structured parts. `text` stays the flat rendering. */
+  parts: EntryPart[];
+}
+
+/** An image sent with a prompt: a URL the provider can fetch, or a data: URL. */
+export interface Attachment {
+  url: string;
+  mediaType?: string;
 }
 
 export type ActivityPhase =
