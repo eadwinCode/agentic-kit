@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch cancels the run still in flight.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  packages:
+    name: packages (bun ${{ matrix.bun }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # bun.lock is the text lockfile, which Bun understands from 1.2 —
+        # --frozen-lockfile cannot run on anything older.
+        bun: ['1.2.0', 'latest']
+
+    # The admin store's Postgres path is tested for real rather than skipped.
+    # Without this the suite fails loudly by design — an unreachable database
+    # used to pass with zero assertions, which is worse than a red build.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: agentic_admin_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TEST_ADMIN_PG: postgresql://postgres:password@localhost:5432/agentic_admin_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ matrix.bun }}
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun run test
+
+      - name: Build
+        run: bun run build
+
+      # The published package must be importable, not merely compilable. The
+      # export map once pointed at paths the build never produced, and only a
+      # real install would have caught it.
+      - name: Pack and import as a consumer
+        run: bash .github/scripts/verify-package.sh
+
+  example:
+    name: example app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      # Typecheck needs the generated client; no database is contacted.
+      - name: Generate Prisma client
+        working-directory: examples/nextjs-app
+        run: bunx prisma generate
+
+      - name: Typecheck the example
+        working-directory: examples/nextjs-app
+        run: bunx tsc --noEmit
