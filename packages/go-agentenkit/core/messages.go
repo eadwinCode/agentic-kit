@@ -18,7 +18,8 @@ import (
 //	"hi"                                                – plain text
 //	{"type":"CONTEXT_SUMMARY","text":"..."}             – compaction summary (§2.6)
 //	[{"type":"text","text":"..."},
-//	 {"type":"reasoning","text":"..."},
+//	 {"type":"reasoning","text":"...","signature":"..."},
+//	 {"type":"redacted-reasoning","data":"..."},
 //	 {"type":"tool-call","toolCallId":"c1","toolName":"lookup","args":{...}},
 //	 {"type":"tool-result","toolCallId":"c1","toolName":"lookup","result":{...}}]
 
@@ -27,8 +28,14 @@ const ContextSummaryType = "CONTEXT_SUMMARY"
 
 // ContentPart is one element of a stored parts array.
 type ContentPart struct {
-	Type       string          `json:"type"`
-	Text       string          `json:"text,omitempty"`
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
+	// Signature is a provider's proof over a reasoning part (Anthropic
+	// extended thinking). Kept so the block can be replayed: within a tool
+	// loop Anthropic requires the thinking block back, signed.
+	Signature string `json:"signature,omitempty"`
+	// Data is a redacted reasoning block's encrypted payload.
+	Data       string          `json:"data,omitempty"`
 	ToolCallID string          `json:"toolCallId,omitempty"`
 	ToolName   string          `json:"toolName,omitempty"`
 	Args       json.RawMessage `json:"args,omitempty"`
@@ -83,7 +90,12 @@ func ContentFromMessage(m provider.Message) json.RawMessage {
 		case provider.PartText:
 			parts = append(parts, ContentPart{Type: "text", Text: p.Text})
 		case provider.PartReasoning:
-			parts = append(parts, ContentPart{Type: "reasoning", Text: p.Text})
+			sig, _ := p.ProviderOptions["signature"].(string)
+			if data, _ := p.ProviderOptions["redactedData"].(string); data != "" && p.Text == "" {
+				parts = append(parts, ContentPart{Type: "redacted-reasoning", Data: data})
+				continue
+			}
+			parts = append(parts, ContentPart{Type: "reasoning", Text: p.Text, Signature: sig})
 		case provider.PartToolCall:
 			args := p.ToolInput
 			if len(bytes.TrimSpace(args)) == 0 || !json.Valid(args) {
@@ -165,7 +177,15 @@ func MessageFromDTO(m ports.MessageDTO) provider.Message {
 		case "text":
 			out.Content = append(out.Content, provider.Part{Type: provider.PartText, Text: p.Text})
 		case "reasoning":
-			out.Content = append(out.Content, provider.Part{Type: provider.PartReasoning, Text: p.Text})
+			part := provider.Part{Type: provider.PartReasoning, Text: p.Text}
+			if p.Signature != "" {
+				part.ProviderOptions = map[string]any{"signature": p.Signature}
+			}
+			out.Content = append(out.Content, part)
+		case "redacted-reasoning":
+			out.Content = append(out.Content, provider.Part{
+				Type: provider.PartReasoning, ProviderOptions: map[string]any{"redactedData": p.Data},
+			})
 		case "tool-call":
 			args := p.Args
 			if len(bytes.TrimSpace(args)) == 0 {

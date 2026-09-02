@@ -23,11 +23,12 @@ type call struct {
 
 // step is one scripted model round-trip.
 type step struct {
-	text  string
-	calls []call
-	usage *[2]int // prompt, completion; default 10, 5
-	delay time.Duration
-	err   error
+	text      string
+	reasoning string
+	calls     []call
+	usage     *[2]int // prompt, completion; default 10, 5
+	delay     time.Duration
+	err       error
 }
 
 // scriptedModel plays back one scripted step per round-trip. The platform
@@ -100,7 +101,7 @@ func (m *scriptedModel) DoGenerate(ctx context.Context, p provider.GenerateParam
 	if s.err != nil {
 		return nil, s.err
 	}
-	res := &provider.GenerateResult{Text: s.text, FinishReason: finishOf(s), Usage: usageOf(s)}
+	res := &provider.GenerateResult{Text: s.text, Reasoning: s.reasoning, FinishReason: finishOf(s), Usage: usageOf(s)}
 	for _, c := range s.calls {
 		res.ToolCalls = append(res.ToolCalls, provider.ToolCall{ID: c.id, Name: c.name, Input: json.RawMessage(c.args)})
 	}
@@ -119,6 +120,9 @@ func (m *scriptedModel) DoStream(ctx context.Context, p provider.GenerateParams)
 		if s.err != nil {
 			ch <- provider.StreamChunk{Type: provider.ChunkError, Error: s.err}
 			return
+		}
+		if s.reasoning != "" {
+			ch <- provider.StreamChunk{Type: provider.ChunkReasoning, Text: s.reasoning}
 		}
 		if s.text != "" {
 			ch <- provider.StreamChunk{Type: provider.ChunkText, Text: s.text}
