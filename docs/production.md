@@ -17,10 +17,10 @@ swaps for a durable equivalent.
 import { Client } from '@upstash/qstash';
 import { createClient } from 'redis';
 import { PrismaClient } from '@prisma/client';
-import { setupAgentCore } from '@agentic-kit/core';
-import { PrismaStorage } from '@agentic-kit/core/adapters/prisma';
-import { RedisBus, RedisKv } from '@agentic-kit/core/adapters/redis';
-import { QStashQueue } from '@agentic-kit/core/adapters/qstash';
+import { setupAgentCore } from 'agentrun';
+import { PrismaStorage } from 'agentrun/adapters/prisma';
+import { RedisBus, RedisKv } from 'agentrun/adapters/redis';
+import { QStashQueue } from 'agentrun/adapters/qstash';
 
 const redis = createClient({ url: process.env.REDIS_URL });
 await redis.connect();

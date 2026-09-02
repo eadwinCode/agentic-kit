@@ -32,8 +32,8 @@ event bus, key-value — so the engine never imports a database driver.
 
 | Package | | |
 | :--- | :--- | :--- |
-| **`@agentic-kit/core`** | The server runtime | [readme](./packages/agentic-kit/README.md) |
-| **`use-agentkit`** | The React hook | [readme](./packages/use-agentkit/README.md) |
+| **`agentrun`** | The server runtime | [readme](./packages/agentrun/README.md) |
+| **`use-agentrun`** | The React hook | [readme](./packages/use-agentrun/README.md) |
 
 The hook is one way to build a UI over the core, not a requirement. The event
 log is a public contract you can build any client over.
@@ -41,8 +41,8 @@ log is a public contract you can build any client over.
 ## Install
 
 ```bash
-bun add @agentic-kit/core ai zod
-bun add use-agentkit          # optional, for React
+bun add agentrun ai zod
+bun add use-agentrun          # optional, for React
 ```
 
 ## A runtime with nothing to stand up
@@ -53,11 +53,11 @@ equivalent later is then obvious rather than magic.
 
 ```ts
 import { Database } from 'bun:sqlite';
-import { setupAgentCore } from '@agentic-kit/core';
-import { SqliteStorage } from '@agentic-kit/core/adapters/sqlite';
-import { InlineQueue } from '@agentic-kit/core/adapters/inline';
-import { MemoryBus, MemoryKv } from '@agentic-kit/core/adapters/memory';
-import { SqliteAdminStore } from '@agentic-kit/core/admin/sqlite';
+import { setupAgentCore } from 'agentrun';
+import { SqliteStorage } from 'agentrun/adapters/sqlite';
+import { InlineQueue } from 'agentrun/adapters/inline';
+import { MemoryBus, MemoryKv } from 'agentrun/adapters/memory';
+import { SqliteAdminStore } from 'agentrun/admin/sqlite';
 import { openai } from '@ai-sdk/openai';
 
 const db = new Database('agentic-kit.sqlite');
@@ -82,7 +82,7 @@ And the client:
 
 ```tsx
 'use client';
-import { useAgentThread } from 'use-agentkit';
+import { useAgentThread } from 'use-agentrun';
 
 export function Chat() {
   const { entries, run, stop, agentState, pendingInputs, respondToInput } = useAgentThread();
@@ -140,7 +140,7 @@ them here.
 | [Multi-tenancy](./docs/multi-tenancy.md) | A worked isolation story |
 | [Ports and adapters](./docs/ports-and-adapters.md) | Wiring your stack |
 | [Observability](./docs/observability.md) | The operational store |
-| [React](./docs/react.md) | `use-agentkit` |
+| [React](./docs/react.md) | `use-agentrun` |
 | [Configuration](./docs/configuration.md) | Every setting |
 | [Production](./docs/production.md) | Deployment and a checklist |
 | [Troubleshooting](./docs/troubleshooting.md) | Symptoms and causes |
@@ -153,12 +153,12 @@ description of that behaviour; the test suite is the executable one.
 
 ```
 packages/
-  agentic-kit/        @agentic-kit/core — the runtime
+  agentrun/           the runtime
     src/core/         the engine: loop, HITL, subagents, compaction, run identity
     src/ports/        the four interfaces you implement
     src/adapters/     reference adapters (Prisma, Redis, QStash, Upstash, SQLite, memory)
     src/admin/        the platform's own operational store
-  use-agentkit/       the React hook
+  use-agentrun/       the React hook
 examples/
   nextjs-app/         a full integration — an example, not the product
 docs/                 the documentation

@@ -202,11 +202,11 @@ worth deciding deliberately:
 
 ```ts
 import { Database } from 'bun:sqlite';
-import { setupAgentCore } from '@agentic-kit/core';
-import { SqliteStorage } from '@agentic-kit/core/adapters/sqlite';
-import { InlineQueue } from '@agentic-kit/core/adapters/inline';
-import { MemoryBus, MemoryKv } from '@agentic-kit/core/adapters/memory';
-import { SqliteAdminStore } from '@agentic-kit/core/admin/sqlite';
+import { setupAgentCore } from 'agentrun';
+import { SqliteStorage } from 'agentrun/adapters/sqlite';
+import { InlineQueue } from 'agentrun/adapters/inline';
+import { MemoryBus, MemoryKv } from 'agentrun/adapters/memory';
+import { SqliteAdminStore } from 'agentrun/admin/sqlite';
 
 const db = new Database('agentic-kit.sqlite');
 const queue = new InlineQueue();

@@ -72,7 +72,7 @@ export default defineConfig({
       },
       {
         text: 'Client',
-        items: [{ text: 'React: use-agentkit', link: '/react' }],
+        items: [{ text: 'React: use-agentrun', link: '/react' }],
       },
       {
         text: 'Operating it',

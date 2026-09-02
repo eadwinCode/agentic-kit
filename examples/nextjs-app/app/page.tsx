@@ -6,7 +6,7 @@ import {
   type PendingInput,
   type SubagentStatus,
   type ThreadUsage,
-} from 'use-agentkit';
+} from 'use-agentrun';
 
 const stateLabel: Record<string, string> = {
   IDLE: 'idle',
@@ -128,7 +128,7 @@ export default function Page() {
       <main>
       <header>
         <h1>
-          <span className={`dot ${agentState.toLowerCase()}`} /> @agentic-kit/core example
+          <span className={`dot ${agentState.toLowerCase()}`} /> agentrun example
         </h1>
         <p className="hint">
           {threadId ? (

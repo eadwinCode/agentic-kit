@@ -2,7 +2,7 @@ import path from 'path';
 import type { NextConfig } from 'next';
 
 const repoRoot = path.join(__dirname, '../..');
-const coreSrc = path.join(repoRoot, 'packages/agentic-kit/src');
+const coreSrc = path.join(repoRoot, 'packages/agentrun/src');
 
 const nextConfig: NextConfig = {
   // Parent lockfile makes Next treat the repo as the workspace; keep src reachable.

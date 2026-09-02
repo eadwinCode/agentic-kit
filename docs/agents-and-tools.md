@@ -63,7 +63,7 @@ const lookup = tool({
 ### Tools that need a human first
 
 ```ts
-import { markRequiresConfirmation } from '@agentic-kit/core';
+import { markRequiresConfirmation } from 'agentrun';
 
 const sendEmail = markRequiresConfirmation(
   tool({
@@ -86,7 +86,7 @@ runs and for segments resumed after an approval.
 Use `agenticTool` to get it **typed**:
 
 ```ts
-import { agenticTool } from '@agentic-kit/core';
+import { agenticTool } from 'agentrun';
 
 const lookupInvoice = agenticTool({
   description: 'Find one invoice',
@@ -121,7 +121,7 @@ With a plain `tool()` the state still arrives — you just have to reach for it
 yourself:
 
 ```ts
-import type { ToolContext } from '@agentic-kit/core';
+import type { ToolContext } from 'agentrun';
 
 tool({
   parameters,

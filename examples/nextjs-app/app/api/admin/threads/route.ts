@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { runtime } from '@/lib/runtime';
-import type { ExecutionState } from '@agentic-kit/core';
+import type { ExecutionState } from 'agentrun';
 
 /** Threads with their runs rolled up (§2.9) — the dashboard's top level, since
  *  a thread is what a person recognises. */

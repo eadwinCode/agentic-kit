@@ -10,7 +10,7 @@ import {
   RedisBus,
   RedisKv,
   setupAgentCore,
-} from '@agentic-kit/core';
+} from 'agentrun';
 import { modelRegistry } from './models'; // §2.3 — models in your shape
 
 // ⚠ Next dev re-evaluates this module on every hot reload, and a fresh
@@ -26,7 +26,7 @@ const cache = globalThis as unknown as {
 };
 
 // Local Docker / self-hosted Redis — no Upstash required.
-// (Using Upstash instead? Swap in UpstashKv/UpstashBus from '@agentic-kit/core/adapters/upstash'.)
+// (Using Upstash instead? Swap in UpstashKv/UpstashBus from 'agentrun/adapters/upstash'.)
 const redis =
   cache.agentRedis ??
   createClient({ url: process.env.REDIS_URL ?? 'redis://localhost:6379' });

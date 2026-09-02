@@ -1,7 +1,7 @@
 # HTTP API
 
 The runtime is a library, not a server. You expose it. This page is the contract
-that [`use-agentkit`](./react.md) expects by default — change the paths freely
+that [`use-agentrun`](./react.md) expects by default — change the paths freely
 and tell the hook where they moved.
 
 Every handler is a few lines over the runtime. The examples are Next.js App
@@ -178,7 +178,7 @@ Node has no `Response`, so use the event iterator and write frames yourself.
 `sseFrame` is the same encoder the stream uses.
 
 ```ts
-import { SSE_HEADERS, sseFrame } from '@agentic-kit/core';
+import { SSE_HEADERS, sseFrame } from 'agentrun';
 
 app.get('/api/agent/stream', async (req, res) => {
   const raw = (req.headers['last-event-id'] as string) ?? (req.query.since as string);

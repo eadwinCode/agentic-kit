@@ -1,5 +1,5 @@
 {
-  "name": "@agentic-kit/core",
+  "name": "agentrun",
   "version": "0.1.0",
   "description": "Durable runtime for AI agent runs \u2014 a platform-owned loop, queue-dispatched execution that outlives the request, HITL suspension, nested runs, and context compaction. Bring your own storage, queue, bus and kv via four ports.",
   "license": "MIT",
