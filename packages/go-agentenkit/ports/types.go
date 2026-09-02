@@ -301,6 +301,8 @@ type RunJob struct {
 	State           AgentRunState   `json:"state,omitempty"`
 	TokenBudget     int             `json:"tokenBudget,omitempty"`
 	ProviderOptions ProviderOptions `json:"providerOptions,omitempty"`
+	// MaxSteps is the run's own step cap, when the caller set one (§2.1).
+	MaxSteps int `json:"maxSteps,omitempty"`
 }
 
 // NestedDescriptor identifies a nested run well enough to re-enter its loop
@@ -321,6 +323,7 @@ type ResumeInfo struct {
 	TokenBudget     int             `json:"tokenBudget,omitempty"`
 	ProviderOptions ProviderOptions `json:"providerOptions,omitempty"`
 	State           AgentRunState   `json:"state,omitempty"`
+	MaxSteps        int             `json:"maxSteps,omitempty"`
 }
 
 // ResolvedModel is a model identity after resolution: the real provider
@@ -361,6 +364,28 @@ type SubagentsConfig struct {
 	// Tools are merged into every spawned subagent's toolset (HITL-wrapped
 	// identically to the parent's tools).
 	Tools []Tool
+	// Profiles are named specialists (§2.7). When set, spawnSubagent must
+	// name one of them: the child takes the profile's persona, model, tools
+	// and step cap instead of the shared defaults above. The model still
+	// writes the brief; the profile says who reads it.
+	Profiles map[string]SubagentProfile
+}
+
+// SubagentProfile is one named specialist a run may delegate to.
+type SubagentProfile struct {
+	// Description is shown to the model beside the name, so it can choose.
+	Description string
+	// System is the child's static persona; SystemFn wins when set.
+	System   string
+	SystemFn SystemFunc
+	// Model is the registry key; empty falls back to the config's Model,
+	// then the parent's.
+	Model string
+	// Tools are the child's own set, HITL-wrapped like the parent's. They
+	// replace the shared Tools above.
+	Tools []Tool
+	// MaxSteps caps the child's round trips; zero keeps SubagentMaxSteps.
+	MaxSteps int
 }
 
 // BillingCheck is what BillingPreCheck receives: the thread about to run,

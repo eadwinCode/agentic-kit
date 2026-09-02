@@ -68,6 +68,10 @@ type (
 	GenerateTextAgentSpec = ports.GenerateTextAgentSpec
 	RunFinishInfo         = ports.RunFinishInfo
 	SubagentsConfig       = ports.SubagentsConfig
+	SubagentProfile       = ports.SubagentProfile
+	Attachment            = ports.Attachment
+	SystemFunc            = ports.SystemFunc
+	SettleFunc            = ports.SettleFunc
 
 	AgentRunState  = ports.AgentRunState
 	StorageContext = ports.StorageContext
@@ -213,6 +217,8 @@ var (
 	SSEHeaders   = core.SSEHeaders
 
 	ClaimRun     = core.ClaimRun
+	ClaimRunAs   = core.ClaimRunAs
+	UserContent  = core.UserContent
 	CurrentRunID = core.CurrentRunID
 	RunIDKey     = core.RunIDKey
 	RedriveKey   = core.RedriveKey

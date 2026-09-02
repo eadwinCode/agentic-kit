@@ -64,6 +64,7 @@ func ReclaimIfOrphaned(ctx context.Context, deps ports.RuntimePorts, threadID st
 		job.TokenBudget = r.TokenBudget
 		job.ProviderOptions = r.ProviderOptions
 		job.State = r.State
+		job.MaxSteps = r.MaxSteps
 	}
 	if err := deps.Queue.Enqueue(ctx, job, nil); err != nil {
 		return false, err

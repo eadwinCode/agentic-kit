@@ -21,7 +21,8 @@ import (
 //	 {"type":"reasoning","text":"...","signature":"..."},
 //	 {"type":"redacted-reasoning","data":"..."},
 //	 {"type":"tool-call","toolCallId":"c1","toolName":"lookup","args":{...}},
-//	 {"type":"tool-result","toolCallId":"c1","toolName":"lookup","result":{...}}]
+//	 {"type":"tool-result","toolCallId":"c1","toolName":"lookup","result":{...}},
+//	 {"type":"image","image":"https://…","mimeType":"image/png"}]
 
 // ContextSummaryType marks a compaction summary envelope (§2.6).
 const ContextSummaryType = "CONTEXT_SUMMARY"
@@ -40,6 +41,28 @@ type ContentPart struct {
 	ToolName   string          `json:"toolName,omitempty"`
 	Args       json.RawMessage `json:"args,omitempty"`
 	Result     json.RawMessage `json:"result,omitempty"`
+	// Image is an image part's URL (or data: URL), the AI SDK field name.
+	Image    string `json:"image,omitempty"`
+	MimeType string `json:"mimeType,omitempty"`
+}
+
+// UserContent encodes a user turn: plain text alone, or text plus the
+// images attached to it (§5.1).
+func UserContent(text string, attachments []ports.Attachment) json.RawMessage {
+	if len(attachments) == 0 {
+		return TextContent(text)
+	}
+	parts := make([]ContentPart, 0, 1+len(attachments))
+	if text != "" {
+		parts = append(parts, ContentPart{Type: "text", Text: text})
+	}
+	for _, a := range attachments {
+		if a.URL == "" {
+			continue
+		}
+		parts = append(parts, ContentPart{Type: "image", Image: a.URL, MimeType: a.MediaType})
+	}
+	return PartsContent(parts)
 }
 
 // TextContent encodes plain text as stored content.
@@ -109,9 +132,11 @@ func ContentFromMessage(m provider.Message) json.RawMessage {
 				Type: "tool-result", ToolCallID: p.ToolCallID, ToolName: p.ToolName,
 				Result: jsonOrString(p.ToolOutput),
 			})
+		case provider.PartImage:
+			parts = append(parts, ContentPart{Type: "image", Image: p.URL, MimeType: p.MediaType})
 		default:
-			// Images and files are not something a run's text loop produces;
-			// keep the text so the row is never empty.
+			// Files are not something a run's text loop produces; keep the
+			// text so the row is never empty.
 			if p.Text != "" {
 				parts = append(parts, ContentPart{Type: "text", Text: p.Text})
 			}
@@ -199,6 +224,10 @@ func MessageFromDTO(m ports.MessageDTO) provider.Message {
 				Type: provider.PartToolResult, ToolCallID: p.ToolCallID, ToolName: p.ToolName,
 				ToolOutput: toolOutputString(p.Result),
 			})
+		case "image":
+			if p.Image != "" {
+				out.Content = append(out.Content, provider.Part{Type: provider.PartImage, URL: p.Image, MediaType: p.MimeType})
+			}
 		}
 	}
 	return out

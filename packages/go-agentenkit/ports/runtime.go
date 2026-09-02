@@ -1,6 +1,8 @@
 package ports
 
 import (
+	"context"
+
 	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/provider"
 )
@@ -56,7 +58,41 @@ type RunInput struct {
 	TokenBudget int
 	// ProviderOptions merge over the spec default, per provider namespace.
 	ProviderOptions ProviderOptions
+	// RunID lets the caller name the run (§2.1). Empty mints one. A caller
+	// that keys its own records (a workspace, a billing line) by run id can
+	// open them before dispatch and know the worker will see the same id.
+	// Reusing an id is refused, not silently re-run.
+	RunID string
+	// MaxSteps caps this run's round trips below the config's MaxSteps. Zero
+	// keeps the config value; a larger value is clamped to it.
+	MaxSteps int
+	// Attachments are images the user sent with the prompt. They are stored
+	// as image parts on the user message and reach the model natively.
+	Attachments []Attachment
 }
+
+// Attachment is one image on a user turn: a URL the provider can fetch, or
+// a data: URL.
+type Attachment struct {
+	URL       string `json:"url"`
+	MediaType string `json:"mediaType,omitempty"`
+}
+
+// SystemFunc builds the system prompt for one step, with the run's state in
+// hand (§3.1). Called once per step, so a prompt can read the project it is
+// acting on. Keep the stable part first: a cached prefix is only a prefix
+// while it does not move.
+type SystemFunc func(ctx context.Context, threadID string, state AgentRunState) (string, error)
+
+// SettleFunc runs after a run's last step and BEFORE its terminal
+// STATE_CHANGE is written (§5.6): the place to commit what the run produced
+// so every client sees it settled the moment the state flips. An error fails
+// the run. A user stop reaches it with a cancelled ctx and Cancelled set;
+// storage work in the hook should use context.WithoutCancel.
+//
+// It may run more than once for one run: a worker that dies inside it is
+// redelivered. Keep it idempotent on RunID.
+type SettleFunc func(ctx context.Context, info RunFinishInfo) error
 
 // RunResult is what Run answers. Accepted false carries a reason in Error.
 type RunResult struct {
@@ -127,6 +163,10 @@ type RunFinishInfo struct {
 	TokensUsed  int
 	Attribution UsageTotals
 	Steps       int
+	// Cancelled is a user stop (§2.1).
+	Cancelled bool
+	// Error is why the run failed, when it did.
+	Error string
 }
 
 // StreamTextAgentSpec describes a stream-text agent (§3.1). The platform
@@ -145,14 +185,20 @@ type StreamTextAgentSpec struct {
 	TokenBudget int
 	// ProviderOptions are this agent's defaults; the run input wins.
 	ProviderOptions ProviderOptions
-	// System is the static persona. Per-run system prompts are not a thing.
+	// System is the static persona.
 	System string
-	Tools  []Tool
+	// SystemFn builds the persona per step, with the run's state (§3.1). It
+	// wins over System when set.
+	SystemFn SystemFunc
+	Tools    []Tool
 	// Options are extra goai options (temperature, hooks, retries, ...).
 	// Platform-owned options are applied after these and win.
 	Options []goai.Option
 	// OnChunk fires per stream chunk, after the platform persisted it.
 	OnChunk func(chunk provider.StreamChunk)
+	// OnSettle runs after the last step and before the terminal state is
+	// written; an error fails the run. See SettleFunc.
+	OnSettle SettleFunc
 	// OnFinish fires once, after the platform finalized the run.
 	OnFinish func(info RunFinishInfo)
 }
@@ -165,7 +211,9 @@ type GenerateTextAgentSpec struct {
 	TokenBudget     int
 	ProviderOptions ProviderOptions
 	System          string
+	SystemFn        SystemFunc
 	Tools           []Tool
 	Options         []goai.Option
+	OnSettle        SettleFunc
 	OnFinish        func(info RunFinishInfo)
 }

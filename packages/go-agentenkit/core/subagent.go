@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/zendev-sh/goai"
@@ -85,9 +87,37 @@ func jsonString(v any) string {
 	return string(b)
 }
 
-func nestedModelName(sctx *SubagentCtx, requested string) string {
+// profileFor resolves a named specialist (§2.7), or nil when the config
+// has no profiles or none by that name.
+func profileFor(sctx *SubagentCtx, name string) *ports.SubagentProfile {
+	if sctx == nil || len(sctx.Sub.Profiles) == 0 {
+		return nil
+	}
+	p, ok := sctx.Sub.Profiles[name]
+	if !ok {
+		return nil
+	}
+	return &p
+}
+
+// nestedRawTools is the unwrapped toolset a nested run owns: its profile's
+// when it has one, the shared delegation tools otherwise. The resolved park
+// executes the approved tool from here.
+func nestedRawTools(sctx *SubagentCtx, d *ports.NestedDescriptor) []ports.Tool {
+	if d != nil {
+		if p := profileFor(sctx, d.Name); p != nil {
+			return p.Tools
+		}
+	}
+	return sctx.Sub.Tools
+}
+
+func nestedModelName(sctx *SubagentCtx, profile *ports.SubagentProfile, requested string) string {
 	if requested != "" {
 		return requested
+	}
+	if profile != nil && profile.Model != "" {
+		return profile.Model
 	}
 	if sctx.Sub.Model != "" {
 		return sctx.Sub.Model
@@ -95,15 +125,57 @@ func nestedModelName(sctx *SubagentCtx, requested string) string {
 	return DefaultModel
 }
 
+// profileNames lists the specialists, sorted, for the tool's description and
+// its error messages.
+func profileNames(sctx *SubagentCtx) []string {
+	names := make([]string, 0, len(sctx.Sub.Profiles))
+	for name := range sctx.Sub.Profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// spawnDescription is the delegation tool's description. With profiles, the
+// model is told exactly who it can delegate to.
+func spawnDescription(sctx *SubagentCtx) string {
+	desc := "Delegates a self-contained task to a subagent with an isolated context"
+	if len(sctx.Sub.Profiles) == 0 {
+		return desc
+	}
+	var b strings.Builder
+	b.WriteString(desc)
+	b.WriteString(". name MUST be one of the available subagents: ")
+	for i, name := range profileNames(sctx) {
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString(name)
+		if d := sctx.Sub.Profiles[name].Description; d != "" {
+			b.WriteString(" (")
+			b.WriteString(d)
+			b.WriteString(")")
+		}
+	}
+	return b.String()
+}
+
 // SpawnSubagentTool builds the run-scoped delegation tool (§2.7).
 func SpawnSubagentTool(sctx *SubagentCtx) ports.Tool {
 	return ports.WrapTool(goai.NewTool("spawnSubagent",
-		"Delegates a self-contained task to a subagent with an isolated context",
+		spawnDescription(sctx),
 		func(ctx context.Context, in spawnInput) (string, error) {
 			cfg := sctx.Ports.Config
 			depth := sctx.Depth + 1
 			if depth > cfg.SubagentMaxDepth {
 				return jsonString(map[string]any{"error": fmt.Sprintf("Max subagent depth (%d) reached", cfg.SubagentMaxDepth)}), nil
+			}
+			// With profiles, an unknown name is ordinary bad input reported
+			// to the model, never a crash (§2.7).
+			profile := profileFor(sctx, in.Name)
+			if len(sctx.Sub.Profiles) > 0 && profile == nil {
+				return jsonString(map[string]any{"error": fmt.Sprintf(
+					"Unknown subagent %q; use one of: %s", in.Name, strings.Join(profileNames(sctx), ", "))}), nil
 			}
 			release, err := sctx.Sem.Acquire(ctx)
 			if err != nil {
@@ -121,7 +193,7 @@ func SpawnSubagentTool(sctx *SubagentCtx) ports.Tool {
 			}
 			rec := ports.NewRunRecord{
 				ID: NewID(), ThreadID: sctx.ThreadID, ParentRunID: parent, Depth: depth,
-				Agent: in.Name, Model: nestedModelName(sctx, in.Model),
+				Agent: in.Name, Model: nestedModelName(sctx, profile, in.Model),
 			}
 			if cfg.RecordPayloads {
 				// A nested run's "prompt" is the brief it was delegated (§2.7).
@@ -232,7 +304,7 @@ func nestedTools(sctx *SubagentCtx, d ports.NestedDescriptor, frames []HitlFrame
 	child.Frames = frames
 	desc := d
 	child.Descriptor = &desc
-	raw := append([]ports.Tool{}, sctx.Sub.Tools...)
+	raw := append([]ports.Tool{}, nestedRawTools(sctx, &d)...)
 	raw = append(raw, SpawnSubagentTool(&child))
 	// A nested run's tools see the same state as its parent's (§2.10), and
 	// publish on the same thread.
@@ -302,6 +374,20 @@ func RunNestedAgent(genCtx context.Context, sctx *SubagentCtx, d ports.NestedDes
 		// brief and history on every step, exactly the shape caching is for.
 		messages = MarkPromptCaching(messages)
 	}
+	// A profile brings its own persona and step cap (§2.7); the descriptor
+	// carries the name, so a re-entry after an approval finds the same one.
+	system := fmt.Sprintf("You are the %q subagent. Complete the task, then stop.", d.Name)
+	var systemFn ports.SystemFunc
+	maxSteps := deps.Config.SubagentMaxSteps
+	if p := profileFor(sctx, d.Name); p != nil {
+		if p.System != "" {
+			system = p.System
+		}
+		systemFn = p.SystemFn
+		if p.MaxSteps > 0 && p.MaxSteps < maxSteps {
+			maxSteps = p.MaxSteps
+		}
+	}
 	outcome, err := RunLoop(io, deps, sctx.Agent, threadID, LoopInput{
 		AgentID: d.AgentID,
 		// Its OWN run id, not its parent's: a nested run is a run (§2.7, §2.9).
@@ -310,11 +396,13 @@ func RunNestedAgent(genCtx context.Context, sctx *SubagentCtx, d ports.NestedDes
 		Model:    model.Instance(),
 		Messages: messages,
 		Tools:    nestedTools(sctx, d, frames),
-		MaxSteps: deps.Config.SubagentMaxSteps,
+		MaxSteps: maxSteps,
 		GenCtx:   genCtx, Aborted: sctx.Aborted,
 		ProviderOptions:   sctx.ProviderOptions,
 		TokenBudget:       sctx.TokenBudget,
-		System:            fmt.Sprintf("You are the %q subagent. Complete the task, then stop.", d.Name),
+		System:            system,
+		SystemFn:          systemFn,
+		State:             sctx.State,
 		CacheSystemPrompt: deps.Config.PromptCaching,
 		OnChunk: func(chunk provider.StreamChunk) {
 			// Namespaced into the shared thread event log → same multi-user pipeline (§2.2)

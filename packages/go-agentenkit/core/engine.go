@@ -194,7 +194,16 @@ func accrueRunRecord(ctx context.Context, deps ports.RuntimePorts, runID string,
 }
 
 // failRun finalises a run as FAILED on both homes AND keeps why (§2.9).
-func failRun(ctx context.Context, deps ports.RuntimePorts, threadID, runID, reason string) error {
+//
+// The spec's OnSettle still runs (§5.6): a caller that opened records for
+// this run must get to close them as failed. Its own error cannot change
+// the outcome, which is already a failure.
+func failRun(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, threadID, runID, reason string) error {
+	if agent != nil && agent.Args.OnSettle != nil {
+		_ = agent.Args.OnSettle(ctx, ports.RunFinishInfo{
+			ThreadID: threadID, RunID: runID, State: ports.StateFailed, StopReason: "failed", Error: reason,
+		})
+	}
 	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateFailed), ports.SetOptions{}); err != nil {
 		return err
 	}
@@ -243,7 +252,7 @@ func resumePendingHitl(ctx, genCtx context.Context, deps ports.RuntimePorts, thr
 		if pending.AgentID == "" {
 			target = findTool(rawTools, pending.ToolName)
 		} else if subCtx != nil {
-			target = findTool(subCtx.Sub.Tools, pending.ToolName)
+			target = findTool(nestedRawTools(subCtx, pending.Nested), pending.ToolName)
 		}
 		result, _, err := settleVerdict(ctx, genCtx, deps, threadID, pending, target, state)
 		if err != nil {
@@ -279,6 +288,8 @@ type ExecuteInput struct {
 	State           ports.AgentRunState
 	TokenBudget     int
 	ProviderOptions ports.ProviderOptions
+	// MaxSteps is the run's own step cap; zero keeps the config's (§2.1).
+	MaxSteps int
 }
 
 // ExecuteOutcome says what Execute did.
@@ -407,11 +418,17 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		return OutcomeExecuted, nil
 	}
 
+	// Step ceiling (§2.1): the run's own cap when it set one, the config's
+	// otherwise, and never above the config's.
+	maxSteps := deps.Config.MaxSteps
+	if input.MaxSteps > 0 && input.MaxSteps < maxSteps {
+		maxSteps = input.MaxSteps
+	}
 	resume := ports.ResumeInfo{
 		Agent: agent.Name, Model: input.Model, RunID: runID,
 		TokenBudget: input.TokenBudget, ProviderOptions: providerOptions,
 		// Carried so the resumed segment scopes its storage the same way (§2.10).
-		State: input.State,
+		State: input.State, MaxSteps: input.MaxSteps,
 	}
 	// One ledger for the whole run: a nested run's spend counts against the
 	// same safety cap the main agent is checked against (§2.7).
@@ -483,9 +500,10 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 
 	loop, err := RunLoop(ctx, deps, agent, threadID, LoopInput{
 		AgentID: "", RunID: runID, Kind: agent.Kind, Model: model.Instance(),
-		Messages: messages, Tools: tools, MaxSteps: deps.Config.MaxSteps,
+		Messages: messages, Tools: tools, MaxSteps: maxSteps,
 		GenCtx: genCtx, Aborted: aborted,
 		ProviderOptions: providerOptions, TokenBudget: tokenBudget,
+		SystemFn: agent.Args.SystemFn, State: input.State,
 		CacheSystemPrompt: deps.Config.PromptCaching,
 		OnChunk: func(chunk provider.StreamChunk) {
 			// One canonical path for every client: durable log + live bus (§2.1, §2.2)
@@ -528,6 +546,22 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		text := loop.Text
 		f.OneShotText = &text
 	}
+	// The caller settles BEFORE the terminal state lands (§5.6): what the run
+	// produced is committed by the time any client sees it end. A settle
+	// failure is a run failure; a stop reaches the hook cancelled, on the
+	// generation context, so it can tell the two apart.
+	if agent.Args.OnSettle != nil {
+		info := ports.RunFinishInfo{
+			ThreadID: threadID, RunID: runID, State: state, StopReason: stopReason,
+			TokensUsed: f.TokensUsed, Attribution: f.Attribution, Steps: f.Steps,
+			Cancelled: state == ports.StateCancelled,
+		}
+		if err := agent.Args.OnSettle(genCtx, info); err != nil && state != ports.StateCancelled {
+			state = ports.StateFailed
+			f.State = state
+			f.Error = err.Error()
+		}
+	}
 	if err := Finalize(ctx, deps, agent, threadID, f); err != nil {
 		return "", err
 	}
@@ -535,6 +569,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		agent.Args.OnFinish(ports.RunFinishInfo{
 			ThreadID: threadID, RunID: runID, State: state, StopReason: stopReason,
 			TokensUsed: f.TokensUsed, Attribution: f.Attribution, Steps: f.Steps,
+			Cancelled: state == ports.StateCancelled, Error: f.Error,
 		})
 	}
 	return OutcomeExecuted, nil
@@ -604,9 +639,13 @@ func Finalize(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAge
 	if err := SetThreadState(ctx, deps, threadID, f.State, ""); err != nil {
 		return err
 	}
-	_, err := Publish(ctx, deps, threadID, "STATE_CHANGE", map[string]any{
+	terminal := map[string]any{
 		"state": f.State, "stopReason": f.StopReason, "tokensUsed": f.TokensUsed, "usage": f.Attribution,
-	})
+	}
+	if f.Error != "" {
+		terminal["error"] = f.Error
+	}
+	_, err := Publish(ctx, deps, threadID, "STATE_CHANGE", terminal)
 	return err
 }
 
@@ -640,13 +679,13 @@ func redriveOnLockConflict(ctx context.Context, deps ports.RuntimePorts, agent *
 		return deps.Queue.Enqueue(ctx, ports.RunJob{
 			ThreadID: input.ThreadID, RunID: input.RunID, EnqueuedAt: time.Now().UnixMilli(),
 			Model: input.Model, Agent: agent.Name, TokenBudget: input.TokenBudget,
-			ProviderOptions: input.ProviderOptions, State: input.State,
+			ProviderOptions: input.ProviderOptions, State: input.State, MaxSteps: input.MaxSteps,
 		}, &ports.EnqueueOptions{Delay: deps.Config.RunRedriveDelay})
 	}
 	if err := deps.Kv.Del(ctx, RedriveKey(input.ThreadID)); err != nil {
 		return err
 	}
-	return failRun(ctx, deps, input.ThreadID, input.RunID, "the run lock never cleared")
+	return failRun(ctx, deps, agent, input.ThreadID, input.RunID, "the run lock never cleared")
 }
 
 // ExecuteFunc is the signature of Execute, an injection seam for tests.
@@ -710,12 +749,12 @@ func ExecuteWithPolicy(ctx context.Context, deps ports.RuntimePorts, agent *Regi
 		return deps.Queue.Enqueue(ctx, ports.RunJob{
 			ThreadID: input.ThreadID, RunID: input.RunID, EnqueuedAt: time.Now().UnixMilli(),
 			Model: input.Model, Agent: agent.Name, TokenBudget: input.TokenBudget,
-			ProviderOptions: input.ProviderOptions, State: input.State,
+			ProviderOptions: input.ProviderOptions, State: input.State, MaxSteps: input.MaxSteps,
 		}, nil)
 	}
 	// Attempts exhausted: finalize FAILED on BOTH the hot cache and durable
 	// truth, or subsequent runs would still treat the thread as active (§2.1)
-	if failErr := failRun(ctx, deps, input.ThreadID, input.RunID, err.Error()); failErr != nil {
+	if failErr := failRun(ctx, deps, agent, input.ThreadID, input.RunID, err.Error()); failErr != nil {
 		return errors.Join(err, failErr)
 	}
 	return deps.Kv.Del(ctx, AttemptsKey(input.ThreadID))

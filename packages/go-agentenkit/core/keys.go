@@ -47,7 +47,12 @@ func CurrentRunID(ctx context.Context, deps ports.RuntimePorts, threadID string)
 // ClaimRun claims the thread for a brand new run and returns its id (§2.1).
 // Always called BEFORE the state key is written.
 func ClaimRun(ctx context.Context, deps ports.RuntimePorts, threadID string) (string, error) {
-	runID := NewID()
+	return ClaimRunAs(ctx, deps, threadID, NewID())
+}
+
+// ClaimRunAs is ClaimRun with a caller-chosen id (§2.1). The caller has
+// already checked the id is unused.
+func ClaimRunAs(ctx context.Context, deps ports.RuntimePorts, threadID, runID string) (string, error) {
 	if _, err := deps.Kv.Set(ctx, RunIDKey(threadID), runID, ports.SetOptions{}); err != nil {
 		return "", err
 	}

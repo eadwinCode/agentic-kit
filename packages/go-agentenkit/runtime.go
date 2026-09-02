@@ -379,6 +379,7 @@ func (w *WorkerAPI) HandleJob(ctx context.Context, job RunJob) (HandleJobResult,
 		EnqueuedAt: job.EnqueuedAt,
 		// Rehydrated from the ticket: this worker never saw the caller (§2.10).
 		State: job.State, Model: job.Model, TokenBudget: job.TokenBudget, ProviderOptions: job.ProviderOptions,
+		MaxSteps: job.MaxSteps,
 	}, nil)
 	if err != nil {
 		return HandleJobResult{Accepted: true}, err

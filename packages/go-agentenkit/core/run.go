@@ -73,6 +73,26 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 		}
 	}
 
+	// A caller-named run (§2.1) is checked before anything is written: a
+	// reused id must refuse, never resend.
+	if input.RunID != "" {
+		existing, err := deps.Admin.Runs().Get(ctx, input.RunID)
+		if err != nil {
+			return ports.RunResult{}, err
+		}
+		if existing != nil {
+			return refuse("Run id already used")
+		}
+	}
+	if input.MaxSteps < 0 {
+		return refuse("maxSteps must be zero or a positive number")
+	}
+	// A run may cap itself below the config, never above it.
+	maxSteps := input.MaxSteps
+	if maxSteps > deps.Config.MaxSteps {
+		maxSteps = deps.Config.MaxSteps
+	}
+
 	// Edit + resend (§5.1): the edited turn and everything it led to are
 	// dropped, then the new text is appended in its place. Only a user turn
 	// may be edited: cutting from anywhere else can strip a tool result off
@@ -106,7 +126,7 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 	}
 
 	userMessage, err := deps.Storage.Messages.Append(ctx, threadID, ports.NewMessage{
-		Role: ports.RoleUser, Content: TextContent(input.Prompt),
+		Role: ports.RoleUser, Content: UserContent(input.Prompt, input.Attachments),
 	})
 	if err != nil {
 		return ports.RunResult{}, err
@@ -122,8 +142,11 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 	}
 
 	// Claim the thread for THIS run before the state key is touched (§2.1).
-	runID, err := ClaimRun(ctx, deps, threadID)
-	if err != nil {
+	runID := input.RunID
+	if runID == "" {
+		runID = NewID()
+	}
+	if _, err := ClaimRunAs(ctx, deps, threadID, runID); err != nil {
 		return ports.RunResult{}, err
 	}
 	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateRunning), ports.SetOptions{}); err != nil {
@@ -164,6 +187,7 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 		// Persisted on the ticket so a worker, or a resume after an approval,
 		// hours later, in another process, rehydrates the same state (§2.10).
 		State: input.State, TokenBudget: input.TokenBudget, ProviderOptions: input.ProviderOptions,
+		MaxSteps: maxSteps,
 	}, nil); err != nil {
 		return ports.RunResult{}, err
 	}

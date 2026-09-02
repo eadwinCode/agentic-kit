@@ -242,7 +242,12 @@ type LoopInput struct {
 	TokenBudget int
 	OnChunk     func(provider.StreamChunk)
 	// System is the persona for a nested run; empty keeps the spec's.
-	System            string
+	System string
+	// SystemFn builds the persona per step (§3.1); it wins over System and
+	// over the spec's.
+	SystemFn ports.SystemFunc
+	// State is the run's state, handed to SystemFn (§2.10).
+	State             ports.AgentRunState
 	CacheSystemPrompt bool
 }
 
@@ -316,10 +321,20 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		if input.Kind == ports.KindStreamText {
 			onChunk = input.OnChunk
 		}
+		system := input.System
+		if input.SystemFn != nil {
+			// Built per step with the run's state (§3.1): what the agent is
+			// acting on may have changed since the last step.
+			built, err := input.SystemFn(ctx, threadID, input.State)
+			if err != nil {
+				return out, err
+			}
+			system = built
+		}
 		step, err := ExecuteStep(genCtx, agent, StepCall{
 			Kind: input.Kind, Model: input.Model, Messages: messages, Tools: input.Tools,
 			ProviderOptions: input.ProviderOptions, OnChunk: onChunk,
-			System: input.System, CacheSystemPrompt: input.CacheSystemPrompt,
+			System: system, CacheSystemPrompt: input.CacheSystemPrompt,
 		})
 		if err != nil {
 			if aborted() {
