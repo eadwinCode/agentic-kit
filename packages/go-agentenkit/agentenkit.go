@@ -216,15 +216,17 @@ var (
 	SSEFrame     = core.SSEFrame
 	SSEHeaders   = core.SSEHeaders
 
-	ClaimRun     = core.ClaimRun
-	ClaimRunAs   = core.ClaimRunAs
-	UserContent  = core.UserContent
-	CurrentRunID = core.CurrentRunID
-	RunIDKey     = core.RunIDKey
-	RedriveKey   = core.RedriveKey
-	StateKey     = core.StateKey
-	RunLockKey   = core.RunLockKey
-	NewID        = core.NewID
+	ContextWithRunID = core.ContextWithRunID
+	RunIDFromContext = core.RunIDFromContext
+	ClaimRun         = core.ClaimRun
+	ClaimRunAs       = core.ClaimRunAs
+	UserContent      = core.UserContent
+	CurrentRunID     = core.CurrentRunID
+	RunIDKey         = core.RunIDKey
+	RedriveKey       = core.RedriveKey
+	StateKey         = core.StateKey
+	RunLockKey       = core.RunLockKey
+	NewID            = core.NewID
 
 	CountTokens     = core.CountTokens
 	AttributeTokens = core.AttributeTokens

@@ -320,6 +320,9 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	if err := ValidateTokenBudget(input.TokenBudget, "tokenBudget"); err != nil {
 		return "", err
 	}
+	// The run's identity and state ride the context from here, so the model
+	// calls (and anything wrapping a model) can see whose run they serve.
+	ctx = ContextWithRunState(ContextWithRunID(ctx, runID), input.State)
 
 	// True once the thread has started a NEWER run than this one (§2.1).
 	stale := func() (bool, error) {

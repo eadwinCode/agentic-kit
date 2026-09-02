@@ -353,3 +353,56 @@ func TestSubagents_AProfileToolParksAndResumesWithTheProfilesTool(t *testing.T) 
 	mustStrings(t, sent, []string{"a@b.c"}, "the profile's tool ran on approval")
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "state")
 }
+
+// ctxModel records the run id and state its calls were made under.
+type ctxModel struct {
+	*scriptedModel
+	mu   sync.Mutex
+	seen []string
+}
+
+func (m *ctxModel) note(ctx context.Context) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.seen = append(m.seen, agentenkit.RunIDFromContext(ctx)+"|"+fmt.Sprint(agentenkit.RunStateFromContext(ctx)["orgId"]))
+}
+
+func (m *ctxModel) DoGenerate(ctx context.Context, p provider.GenerateParams) (*provider.GenerateResult, error) {
+	m.note(ctx)
+	return m.scriptedModel.DoGenerate(ctx, p)
+}
+
+func (m *ctxModel) DoStream(ctx context.Context, p provider.GenerateParams) (*provider.StreamResult, error) {
+	m.note(ctx)
+	return m.scriptedModel.DoStream(ctx, p)
+}
+
+func TestModelCalls_CarryTheRunIDAndStateOnTheirContext(t *testing.T) {
+	inner := scripted(
+		step{calls: []call{{"s1", "spawnSubagent", spawnArgs}}},
+		step{text: "child"},
+		step{text: "parent"},
+	)
+	h := makeRuntime(t, inner)
+	model := &ctxModel{scriptedModel: inner}
+	rt, err := agentenkit.SetupAgentCore(h.ctx, agentenkit.RuntimeOptions{
+		Storage: h.storage, Admin: h.admin, Bus: h.bus, Kv: h.kv, Queue: h.queue,
+		ResolveModel: func(string) (agentenkit.ResolvedModel, error) {
+			return agentenkit.ResolvedModel{Instance: func() provider.LanguageModel { return model }, ContextWindow: 128_000}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat := rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat", Subagents: &agentenkit.SubagentsConfig{}})
+	ran, err := chat.Run(h.ctx, agentenkit.RunInput{Prompt: "go", RunID: "run-x", State: agentenkit.AgentRunState{"orgId": "acme"}})
+	if err != nil || !ran.Accepted {
+		t.Fatalf("run: %v %+v", err, ran)
+	}
+	job, _ := h.queue.Shift()
+	if _, err := rt.Worker.HandleJob(h.ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	childID := payload(h.events(ran.ThreadID, "SUBAGENT_STARTED")[0])["agentId"].(string)
+	mustStrings(t, model.seen, []string{"run-x|acme", childID + "|acme", "run-x|acme"}, "run id and state per model call")
+}

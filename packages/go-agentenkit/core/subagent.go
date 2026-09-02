@@ -340,6 +340,8 @@ func RunNestedAgent(genCtx context.Context, sctx *SubagentCtx, d ports.NestedDes
 	if io == nil {
 		io = context.WithoutCancel(genCtx)
 	}
+	// A nested run is a run: its model calls carry its own id (§2.9).
+	genCtx = ContextWithRunID(genCtx, d.AgentID)
 
 	persisted, err := deps.Storage.Messages.List(io, threadID, ports.AgentScope(d.AgentID))
 	if err != nil {
