@@ -163,9 +163,18 @@ func ExecuteStep(ctx context.Context, agent *RegisteredAgent, call StepCall) (*S
 		// The text is accumulated as it goes, so a call cut off half way still
 		// knows how much it produced and can be billed for it (§4).
 		var streamed strings.Builder
+		var finished bool
 		drainErr := drainStream(stream, func(chunk provider.StreamChunk) {
 			if chunk.Type == provider.ChunkText {
 				streamed.WriteString(chunk.Text)
+			}
+			// Whether the call ran to its end is decided by what this loop
+			// SAW, not by whether the stream reported an error: a stop that
+			// tears the provider down mid-call does not always surface as one
+			// (§4). The finish chunk arriving is the only reliable "this
+			// completed".
+			if chunk.Type == provider.ChunkFinish {
+				finished = true
 			}
 			if call.OnChunk != nil {
 				call.OnChunk(chunk)
@@ -175,15 +184,22 @@ func ExecuteStep(ctx context.Context, agent *RegisteredAgent, call StepCall) (*S
 			}
 		})
 		release()
-		result = stream.Result()
 		streamedText = streamed.String()
-		if drainErr != nil {
-			// Partial, not empty: whatever the provider already streamed was
-			// billed, so the caller still gets a step to record (§4).
-			step := stepFrom(result)
-			step.StreamedText, step.Finished = streamedText, false
-			return step, drainErr
+		if drainErr != nil || !finished {
+			// The call ended without finishing: a provider failure, or a stop
+			// that tore it down mid-stream. goai ends every other path with a
+			// finish chunk, and drops that chunk exactly when its own context
+			// is already cancelled, so its absence is the reliable signal.
+			// The platform's own context is NOT: goai cancels its side first,
+			// and the run's cancellation can still be a poll behind.
+			//
+			// Result() must not be read here. goai writes the result up to the
+			// moment it sends that chunk, so a stream that never sent one may
+			// still have a goroutine writing, and reading it races.
+			return &StepResult{StreamedText: streamedText}, drainErr
 		}
+		// Safe now: the finish chunk arrived, so goai has stopped writing.
+		result = stream.Result()
 	} else {
 		var err error
 		result, err = goai.GenerateText(ctx, call.Model, opts...)

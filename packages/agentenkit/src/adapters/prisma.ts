@@ -69,7 +69,10 @@ export interface TokenUsageRow {
   totalTokens: number;
   outcome: string;
   estimated: boolean;
-  providerMetadata: unknown;
+  /** Typed loosely on purpose: Prisma's JSON input is a recursive generated
+   *  union (`InputJsonValue`) that no hand-written interface can mirror, so a
+   *  precise type here makes the real PrismaClient fail to satisfy this. */
+  providerMetadata: any;
   /** Millionths of `costCurrency`; null is an unpriced call. Declare the
    *  column as BigInt: a thread's summed spend outgrows a 4-byte Int. */
   costMicros: number | null;
