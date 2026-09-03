@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import {
+  formatCost,
   useAgentThread,
   type PendingInput,
   type StreamEvent,
@@ -428,13 +429,28 @@ function UsageBar({ usage }: { usage: ThreadUsage }) {
   const { tokens, context } = usage;
   const pct = context.budgetTokens ? (context.usedTokens / context.budgetTokens) * 100 : 0;
   const triggerPct = context.budgetTokens ? (context.compactAtTokens / context.budgetTokens) * 100 : 0;
+  // What the thread has spent (§4). The runtime prices every model call before
+  // it stores the usage row, so this comes off the same store the token counts
+  // do. Null when nothing was priced — a server with no pricer configured
+  // leaves the slot empty rather than claiming $0.00.
+  const cost = formatCost(tokens);
   return (
-    <section className="usage" aria-label="Token and context usage">
+    <section className="usage" aria-label="Token, cost and context usage">
       <div className="usage-item">
         <span className="usage-label">Tokens</span>
         <strong>{formatTokens(tokens.totalTokens)}</strong>
         <span className="usage-detail">{formatTokens(tokens.inputTokens)} in · {formatTokens(tokens.cachedInputTokens)} cached · {formatTokens(tokens.outputTokens)} out</span>
       </div>
+      {cost && (
+        <div className="usage-item">
+          <span className="usage-label">Cost</span>
+          <strong>{cost}</strong>
+          <span className="usage-detail">
+            {tokens.lines?.map((l) => `${l.agentName ?? 'agent'} · ${l.calls} call${l.calls === 1 ? '' : 's'}`).join(' · ') || 'across every model call'}
+            {tokens.unpriced ? ` · ${tokens.unpriced} unpriced` : ''}
+          </span>
+        </div>
+      )}
       <div className={`usage-item ${context.usedTokens >= context.compactAtTokens ? 'near' : ''}`}>
         <span className="usage-label">Context</span>
         <strong>{pct < 1 && pct > 0 ? '<1' : Math.round(pct)}%</strong>

@@ -91,8 +91,6 @@ async function makeRuntime(model: any, config: Partial<AgentConfig> = {}) {
 
 const states = (bus: MemoryBus) =>
   bus.published.filter((e) => e.type === 'STATE_CHANGE').map((e) => (e.payload as any).state);
-const stripThread = (rows: Array<any>) =>
-  rows.map(({ threadId: _t, ...rest }) => rest);
 const lastTerminal = (bus: MemoryBus) =>
   bus.published.filter((e) => e.type === 'STATE_CHANGE').at(-1)!;
 const roles = (storage: MemoryStorage, threadId: string) =>
@@ -341,10 +339,26 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
       result: { ok: true },
     });
 
-    // §4 attribution: both steps recorded as one segment row
-    expect(stripThread(storage.usage.recorded)).toEqual([
-      { agentId: 'chat', inputTokens: 20, cachedInputTokens: 0, outputTokens: 10, totalTokens: 30 },
-    ]);
+    // §4 attribution: ONE row per model call, not one per segment. The main
+    // run's rows carry no agentId; the name that bills is agentName.
+    const rows = storage.usage.recorded;
+    expect(rows.length).toBe(2);
+    rows.forEach((r, i) => {
+      expect(r).toMatchObject({
+        agentId: null,
+        agentName: 'chat',
+        runId: ran.runId,
+        kind: 'step',
+        step: i + 1,
+        outcome: 'finished',
+        model: 'gpt-4o',
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+      });
+      // Nothing priced this runtime, so the row is stored without a cost.
+      expect(r.cost).toBeFalsy();
+    });
   });
 
   it('checks the budget BETWEEN steps: the step that crosses the line is kept in full', async () => {
@@ -489,10 +503,12 @@ describe('HITL run-segment park (§2.5)', () => {
       resume: { agent: 'chat', model: 'gpt-4o' },
     });
 
-    // §4: the steps up to the park are billed
-    expect(stripThread(r.storage.usage.recorded)).toEqual([
-      { agentId: 'chat', inputTokens: 10, cachedInputTokens: 0, outputTokens: 5, totalTokens: 15 },
-    ]);
+    // §4: the calls up to the park are billed, one row each
+    expect(r.storage.usage.recorded.length).toBe(1);
+    expect(r.storage.usage.recorded[0]).toMatchObject({
+      agentId: null, agentName: 'chat', kind: 'step', step: 1,
+      inputTokens: 10, outputTokens: 5, totalTokens: 15,
+    });
   });
 
   it('a redelivered job while parked is a no-op — the thread stays parked', async () => {

@@ -9,11 +9,13 @@ import {
   type ResolvedConfig,
 } from './config.js';
 import { mergeConfig, useAgentRunConfig } from './context.js';
-import { messageToEntries, messageToEntry, stateActivity } from './format.js';
+import { answeredToolCalls, messageToEntries, messageToEntry, stateActivity } from './format.js';
 import type {
   AgentActivity,
   AgentState,
+  Attachment,
   ChatEntry,
+  EntryPart,
   MessageRole,
   PendingInput,
   RunResult,
@@ -55,8 +57,35 @@ export interface RunOptions {
   model?: string;
   /** Replace this user turn and everything it led to, then answer again. */
   editMessageId?: string;
+  /** Images sent with the prompt; they become image parts on the user turn. */
+  attachments?: Attachment[];
+  /** Name the run yourself, so your own records can be keyed by it before
+   *  the server answers. Reusing an id is refused. */
+  runId?: string;
+  /** Cap this run's round trips below the server's configured ceiling. */
+  maxSteps?: number;
   /** Anything else the run route accepts — merged into the request body. */
   [key: string]: unknown;
+}
+
+/** Mark the call a result belongs to as done (or failed) on the entry that
+ *  announced it, so a tool card can flip state in place. */
+function settleToolCall(entries: ChatEntry[], toolCallId: string, result: unknown): ChatEntry[] {
+  const failed = !!result && typeof result === 'object' && 'error' in (result as object);
+  let touched = false;
+  const next = entries.map((entry) => {
+    if (!entry.parts.some((p) => p.type === 'tool-call' && p.toolCallId === toolCallId)) return entry;
+    touched = true;
+    return {
+      ...entry,
+      parts: entry.parts.map((p): EntryPart =>
+        p.type === 'tool-call' && p.toolCallId === toolCallId
+          ? { ...p, state: failed ? 'error' : 'done', result }
+          : p,
+      ),
+    };
+  });
+  return touched ? next : entries;
 }
 
 /** Hydrates durable messages first, then resumes the canonical event stream at
@@ -99,6 +128,9 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
    *  activeEvents can replay the same step's chunks, so without this a
    *  reconnect renders a finished tool call twice. */
   const seenToolCalls = useRef<Set<string>>(new Set());
+  /** Results already visible from the durable messages, kept apart from the
+   *  calls: a live result must still render after its live call did. */
+  const seenToolResults = useRef<Set<string>>(new Set());
 
   /** One place where the caller's headers and fetch are applied. */
   const request = useCallback(async (url: string, init: RequestInit = {}) => {
@@ -307,7 +339,8 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
             setEntries((prev) => {
               const last = prev.at(-1);
               if (last?.kind === 'text' && last.id.startsWith('live:assistant:') && !last.agentId) {
-                return [...prev.slice(0, -1), { ...last, text: last.text + p.textDelta }];
+                const text = last.text + p.textDelta;
+                return [...prev.slice(0, -1), { ...last, text, parts: [{ type: 'text', text }] }];
               }
               return [
                 ...prev,
@@ -316,6 +349,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
                   kind: 'text',
                   role: 'assistant',
                   text: p.textDelta,
+                  parts: [{ type: 'text', text: p.textDelta }],
                 },
               ];
             });
@@ -328,7 +362,8 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
               setEntries((prev) => {
                 const last = prev.at(-1);
                 if (last?.kind === 'reasoning' && last.id.startsWith('live:reasoning:')) {
-                  return [...prev.slice(0, -1), { ...last, text: last.text + p.textDelta }];
+                  const text = last.text + p.textDelta;
+                  return [...prev.slice(0, -1), { ...last, text, parts: [{ type: 'reasoning', text }] }];
                 }
                 return [
                   ...prev,
@@ -337,6 +372,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
                     kind: 'reasoning',
                     role: 'assistant',
                     text: p.textDelta,
+                    parts: [{ type: 'reasoning', text: p.textDelta }],
                   },
                 ];
               });
@@ -360,22 +396,34 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
                 kind: 'tool',
                 role: 'tool',
                 text: format.toolCall(p.toolName, p.args ?? {}),
+                parts: [
+                  {
+                    type: 'tool-call',
+                    toolCallId: p.toolCallId,
+                    toolName: p.toolName,
+                    args: p.args ?? {},
+                    state: 'running',
+                  },
+                ],
               },
             ]);
           } else if (p?.type === 'tool-result') {
             // The park sentinel is an internal marker, not a result — it is
             // never persisted and must never be shown.
             if (p.result && typeof p.result === 'object' && '__hitl_parked__' in p.result) break;
-            if (p.toolCallId && seenToolCalls.current.has(p.toolCallId)) break; // already durable
-            if (p.toolCallId) seenToolCalls.current.add(p.toolCallId);
+            if (p.toolCallId && seenToolResults.current.has(p.toolCallId)) break; // already durable
+            if (p.toolCallId) seenToolResults.current.add(p.toolCallId);
             setActivity({ phase: 'tool-result', label: labels.toolCompleted, detail: p.toolName });
             setEntries((prev) => [
-              ...prev,
+              ...settleToolCall(prev, p.toolCallId, p.result),
               {
                 id: `live:tool-result:${data.seq}`,
                 kind: 'tool',
                 role: 'tool',
                 text: format.toolResult(p.toolName, p.result),
+                parts: [
+                  { type: 'tool-result', toolCallId: p.toolCallId, toolName: p.toolName, result: p.result },
+                ],
               },
             ]);
           }
@@ -429,6 +477,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
               kind: 'tool',
               role: 'tool',
               text: format.subagentStarted(p.name),
+              parts: [{ type: 'text', text: format.subagentStarted(p.name) }],
             },
           ]);
           setSubagents((prev) =>
@@ -510,17 +559,21 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
         // A nested run's turns live in the same log under its own agentId.
         // They are its transcript, not the main conversation's.
         const mainMessages = snapshot.messages.filter((m) => (m.agentId ?? null) === null);
-        setEntries(mainMessages.flatMap((m) => messageToEntries(m, cfg.format)));
+        const answered = answeredToolCalls(snapshot.messages);
+        setEntries(mainMessages.flatMap((m) => messageToEntries(m, cfg.format, answered)));
 
         // Rebuild each child's card from what it actually wrote, so a reload
         // does not lose a subagent's output.
-        seenToolCalls.current = new Set(
-          snapshot.messages.flatMap((m) =>
-            (Array.isArray(m.content) ? m.content : [])
-              .map((part: any) => part?.toolCallId)
-              .filter((id: unknown): id is string => typeof id === 'string'),
-          ),
+        const durableParts = snapshot.messages.flatMap((m) =>
+          Array.isArray(m.content) ? (m.content as any[]) : [],
         );
+        seenToolCalls.current = new Set(
+          durableParts
+            .filter((part) => part?.type === 'tool-call')
+            .map((part) => part.toolCallId)
+            .filter((id: unknown): id is string => typeof id === 'string'),
+        );
+        seenToolResults.current = new Set(answered);
 
         // Name, depth and final state come from the durable run rows; the
         // SUBAGENT_* events only replay while a run is unfinished, so on a
@@ -594,16 +647,20 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
   const run = useCallback(
     async (prompt: string, options: RunOptions = {}): Promise<RunResult> => {
       const cfg = cfgRef.current;
-      const { model = cfg.defaultModel, editMessageId, ...rest } = options;
+      const { model = cfg.defaultModel, editMessageId, attachments, ...rest } = options;
 
       setEntries((prev) => {
         // An edit replaces that turn and everything it led to, mirroring what
         // the server is about to do to the durable history.
         const at = editMessageId ? prev.findIndex((e) => e.id === editMessageId) : -1;
         const kept = at === -1 ? prev : prev.slice(0, at);
+        const parts: EntryPart[] = prompt ? [{ type: 'text', text: prompt }] : [];
+        for (const a of attachments ?? []) {
+          parts.push({ type: 'image', image: a.url, mimeType: a.mediaType });
+        }
         return [
           ...kept,
-          { id: `optimistic:user:${Date.now()}`, kind: 'text', role: 'user', text: prompt },
+          { id: `optimistic:user:${Date.now()}`, kind: 'text', role: 'user', text: prompt, parts },
         ];
       });
       setSubagents([]);
@@ -617,6 +674,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
           prompt,
           model,
           editMessageId,
+          attachments,
           ...rest,
         });
         const data = (await response.json()) as RunResult;

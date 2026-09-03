@@ -10,10 +10,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/admin/migrate"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
 
@@ -31,57 +33,32 @@ func Open(url string) (*sql.DB, error) {
 		"or construct the store with your own *sql.DB")
 }
 
-// Schema is the DDL, split per statement. Safe to run twice.
-var Schema = []string{
-	`CREATE TABLE IF NOT EXISTS agentic_threads (
-	   id TEXT PRIMARY KEY, state TEXT NOT NULL, model TEXT NOT NULL,
-	   "firstSeenAt" TIMESTAMPTZ NOT NULL DEFAULT now(),
-	   "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT now(), "startedWith" JSONB)`,
-	`ALTER TABLE agentic_threads ADD COLUMN IF NOT EXISTS "startedWith" JSONB`,
-	`CREATE INDEX IF NOT EXISTS agentic_threads_state ON agentic_threads(state, "updatedAt")`,
-	`CREATE TABLE IF NOT EXISTS agentic_runs (
-	   id TEXT PRIMARY KEY, "threadId" TEXT NOT NULL, "parentRunId" TEXT,
-	   depth INT NOT NULL DEFAULT 0, agent TEXT NOT NULL, model TEXT NOT NULL,
-	   state TEXT NOT NULL DEFAULT 'RUNNING', "stopReason" TEXT, error TEXT,
-	   "startedAt" TIMESTAMPTZ NOT NULL DEFAULT now(), "endedAt" TIMESTAMPTZ,
-	   "durationMs" INT, "queuedMs" INT,
-	   attempts INT NOT NULL DEFAULT 0, steps INT NOT NULL DEFAULT 0,
-	   "inputTokens" INT NOT NULL DEFAULT 0, "cachedInputTokens" INT NOT NULL DEFAULT 0,
-	   "outputTokens" INT NOT NULL DEFAULT 0, "totalTokens" INT NOT NULL DEFAULT 0,
-	   result JSONB, prompt TEXT, "tokenBudget" INT, "runState" JSONB, "providerOptions" JSONB)`,
-	`ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS "providerOptions" JSONB`,
-	`ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS prompt TEXT`,
-	`ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS "tokenBudget" INT`,
-	`ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS "runState" JSONB`,
-	`CREATE INDEX IF NOT EXISTS agentic_runs_thread ON agentic_runs("threadId", "startedAt" DESC)`,
-	`CREATE INDEX IF NOT EXISTS agentic_runs_state ON agentic_runs(state, "startedAt" DESC)`,
-	`CREATE INDEX IF NOT EXISTS agentic_runs_parent ON agentic_runs("parentRunId")`,
-	`CREATE TABLE IF NOT EXISTS agentic_steps (
-	   "runId" TEXT NOT NULL, "threadId" TEXT, "agentId" TEXT, "index" INT NOT NULL,
-	   "durationMs" INT NOT NULL, "finishReason" TEXT NOT NULL,
-	   "inputTokens" INT NOT NULL DEFAULT 0, "cachedInputTokens" INT NOT NULL DEFAULT 0,
-	   "outputTokens" INT NOT NULL DEFAULT 0, "totalTokens" INT NOT NULL DEFAULT 0,
-	   tools JSONB, text TEXT, "toolCalls" JSONB,
-	   at TIMESTAMPTZ NOT NULL DEFAULT now())`,
-	`ALTER TABLE agentic_steps ADD COLUMN IF NOT EXISTS text TEXT`,
-	`ALTER TABLE agentic_steps ADD COLUMN IF NOT EXISTS "threadId" TEXT`,
-	`CREATE INDEX IF NOT EXISTS agentic_steps_thread ON agentic_steps("threadId", at)`,
-	`ALTER TABLE agentic_steps ADD COLUMN IF NOT EXISTS "toolCalls" JSONB`,
-	`CREATE INDEX IF NOT EXISTS agentic_steps_run ON agentic_steps("runId", "index")`,
-}
-
 // Store is an AdminStore over Postgres.
 type Store struct{ db *sql.DB }
 
-// Connect creates the tables if they are missing, then returns the store.
-// SetupAgentCore awaits its store precisely so this can fail at startup.
-func Connect(ctx context.Context, db *sql.DB) (*Store, error) {
-	for _, stmt := range Schema {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return nil, fmt.Errorf("postgres admin schema: %w", err)
-		}
+// Connect returns the store with its schema migration already running behind
+// it (§2.9).
+//
+// The returned store waits for that migration before its first call, so a
+// caller never sees a half-built schema — but SetupAgentCore is not held up by
+// it. Connecting is still synchronous: a URL that cannot be reached is a
+// configuration problem worth failing on at startup.
+//
+// Several workers starting at once is expected and safe: each migration runs
+// under a transaction-scoped advisory lock, so they queue rather than race.
+func Connect(ctx context.Context, db *sql.DB) (ports.AdminStore, error) {
+	return ConnectWithLogger(ctx, db, nil)
+}
+
+// ConnectWithLogger is Connect with somewhere to report a migration that
+// failed.
+func ConnectWithLogger(ctx context.Context, db *sql.DB, log *slog.Logger) (ports.AdminStore, error) {
+	ms, err := migrate.PostgresMigrations()
+	if err != nil {
+		return nil, err
 	}
-	return &Store{db: db}, nil
+	gate := migrate.Start(ctx, db, migrate.Postgres, ms, log)
+	return migrate.Gated(&Store{db: db}, gate), nil
 }
 
 func (s *Store) Threads() ports.AdminThreadStore { return threadStore{s.db} }

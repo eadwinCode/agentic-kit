@@ -12,6 +12,25 @@ export type AgentState =
 
 export type MessageRole = 'user' | 'assistant' | 'system' | 'tool';
 
+/** One structured piece of an entry, for a UI that renders more than text:
+ *  a tool card with its state, an image the user attached, the thinking.
+ *  Filled the same way from the durable snapshot and from the live stream,
+ *  so a reload and a live run produce the same shape. */
+export type EntryPart =
+  | { type: 'text'; text: string }
+  | { type: 'reasoning'; text: string }
+  | { type: 'image'; image: string; mimeType?: string }
+  | {
+      type: 'tool-call';
+      toolCallId: string;
+      toolName: string;
+      args: unknown;
+      /** `running` until its result lands; `done` or `error` after. */
+      state: 'streaming' | 'running' | 'done' | 'error';
+      result?: unknown;
+    }
+  | { type: 'tool-result'; toolCallId: string; toolName?: string; result: unknown };
+
 export interface ChatEntry {
   id: string;
   /** `reasoning` is the model's thinking, which arrives as its own stream and
@@ -20,6 +39,14 @@ export interface ChatEntry {
   role: MessageRole;
   text: string;
   agentId?: string | null;
+  /** The entry's structured parts. `text` stays the flat rendering. */
+  parts: EntryPart[];
+}
+
+/** An image sent with a prompt: a URL the provider can fetch, or a data: URL. */
+export interface Attachment {
+  url: string;
+  mediaType?: string;
 }
 
 export type ActivityPhase =
@@ -63,6 +90,36 @@ export interface UsageTotals {
   cachedInputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  /** What the thread cost so far, in millionths of `currency`: 1_000_000 is
+   *  one dollar when the currency is USD. Zero when the server has no pricer
+   *  configured — check `unpriced` to tell that apart from a free thread. */
+  costMicros?: number;
+  /** The unit `costMicros` is in, absent when nothing was priced. */
+  currency?: string;
+  /** How many model calls had no cost on them. Above zero, `costMicros` is a
+   *  floor and not the whole bill. */
+  unpriced?: number;
+  /** The same spend grouped by agent and model — one line per pair, the shape
+   *  a bill or a per-agent breakdown wants. */
+  lines?: UsageLine[];
+}
+
+/** One agent's spend on one model, summed over its calls. */
+export interface UsageLine {
+  agentId?: string | null;
+  agentName?: string | null;
+  model?: string | null;
+  modelId?: string | null;
+  inputTokens: number;
+  cacheReadInputTokens: number;
+  cacheWriteInputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  calls: number;
+  /** How many of those calls had estimated tokens, because they were cut off
+   *  before the provider reported real ones. */
+  estimated: number;
+  costMicros: number;
 }
 
 export interface ContextUsage {

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import {
   contentToText,
   defaultFormat,
+  formatCost,
   messageToEntries,
   messageToEntry,
   reasoningText,
@@ -91,5 +92,67 @@ describe('messageToEntry', () => {
         defaultFormat,
       )!.kind,
     ).toBe('text');
+  });
+});
+
+describe('structured parts', () => {
+  it('mirrors the stored parts on the entry, with tool calls settled by their results', () => {
+    const answered = new Set(['c1']);
+    const entries = messageToEntries(
+      msg([
+        { type: 'text', text: 'Looking it up.' },
+        { type: 'tool-call', toolCallId: 'c1', toolName: 'lookup', args: { q: 'x' } },
+        { type: 'tool-call', toolCallId: 'c2', toolName: 'lookup', args: { q: 'y' } },
+      ]),
+      defaultFormat,
+      answered,
+    );
+    expect(entries).toHaveLength(1);
+    const parts = entries[0]!.parts;
+    expect(parts.map((p) => p.type)).toEqual(['text', 'tool-call', 'tool-call']);
+    expect(parts[1]).toMatchObject({ toolCallId: 'c1', state: 'done' });
+    expect(parts[2]).toMatchObject({ toolCallId: 'c2', state: 'running' });
+  });
+
+  it('keeps an image-only user turn as an entry', () => {
+    const entry = messageToEntry(
+      msg([{ type: 'image', image: 'https://cdn/x.png', mimeType: 'image/png' }], { role: 'user' }),
+      defaultFormat,
+    );
+    expect(entry).not.toBeNull();
+    expect(entry!.text).toBe('');
+    expect(entry!.parts).toEqual([{ type: 'image', image: 'https://cdn/x.png', mimeType: 'image/png' }]);
+  });
+
+  it('gives a plain string message one text part and thinking its own part', () => {
+    expect(messageToEntry(msg('hello', { role: 'user' }), defaultFormat)!.parts).toEqual([
+      { type: 'text', text: 'hello' },
+    ]);
+    const [thought] = messageToEntries(msg([{ type: 'reasoning', text: 'hm' }, { type: 'text', text: 'ok' }]), defaultFormat);
+    expect(thought!.parts).toEqual([{ type: 'reasoning', text: 'hm' }]);
+  });
+});
+
+describe('formatCost', () => {
+  it('renders what a thread spent', () => {
+    expect(formatCost({ costMicros: 12_500, currency: 'USD', unpriced: 0 })).toBe('$0.0125');
+  });
+
+  it('marks a floor when some calls went unpriced', () => {
+    // Some calls had no price, so the figure is a floor and says so rather
+    // than passing itself off as the whole bill.
+    expect(formatCost({ costMicros: 12_500, currency: 'USD', unpriced: 3 })).toBe('≥ $0.0125');
+  });
+
+  it('shows nothing when there is nothing to show', () => {
+    // A server with no pricer configured: a header leaves the slot empty
+    // rather than claiming the thread was free.
+    expect(formatCost({ costMicros: 0, unpriced: 2 })).toBeNull();
+    expect(formatCost(null)).toBeNull();
+  });
+
+  it('falls back to a plain number for an unknown currency code', () => {
+    expect(formatCost({ costMicros: 250_000, currency: 'CREDITS', unpriced: 0 }))
+      .toBe('0.2500 CREDITS');
   });
 });

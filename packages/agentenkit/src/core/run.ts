@@ -143,6 +143,7 @@ export async function run(
     // hours later, in another process — rehydrates the same state (§2.10).
     ...(input.state ? { state: input.state } : {}),
     tokenBudget: input.tokenBudget,
+    costBudgetMicros: input.costBudgetMicros,
     providerOptions: input.providerOptions,
   });
 

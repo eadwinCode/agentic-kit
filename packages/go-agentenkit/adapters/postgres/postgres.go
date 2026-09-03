@@ -62,11 +62,34 @@ func (s *Storage) schema() []string {
 		   seq BIGINT NOT NULL, type TEXT NOT NULL, payload JSONB, "createdAt" TIMESTAMPTZ NOT NULL DEFAULT now())`,
 		`CREATE INDEX IF NOT EXISTS ` + p + `events_thread_seq ON ` + p + `events("threadId", seq)`,
 		`CREATE INDEX IF NOT EXISTS ` + p + `events_thread_type ON ` + p + `events("threadId", type, seq)`,
+		// One row per MODEL CALL (§4), not per run segment. "cachedInputTokens"
+		// holds cache READS, keeping the column that was already there meaning
+		// what it always meant; cache writes are their own column beside it. A
+		// NULL "costMicros" is an unpriced call, which is not the same as one
+		// that cost nothing.
 		`CREATE TABLE IF NOT EXISTS ` + p + `usage (
 		   id TEXT PRIMARY KEY, "threadId" TEXT NOT NULL REFERENCES ` + p + `threads(id) ON DELETE CASCADE,
 		   "agentId" TEXT, "inputTokens" INT NOT NULL, "cachedInputTokens" INT NOT NULL,
 		   "outputTokens" INT NOT NULL, "totalTokens" INT NOT NULL, "createdAt" TIMESTAMPTZ NOT NULL DEFAULT now())`,
 		`CREATE INDEX IF NOT EXISTS ` + p + `usage_thread ON ` + p + `usage("threadId")`,
+		// Added after the first release. CREATE TABLE IF NOT EXISTS never adds
+		// a column to a table that already exists, so these go on separately
+		// and a store upgraded in place picks them up.
+		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS "runId" TEXT`,
+		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS "agentName" TEXT`,
+		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'step'`,
+		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS step INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS model TEXT`,
+		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS "modelId" TEXT`,
+		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS "cacheWriteInputTokens" INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS "reasoningTokens" INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS outcome TEXT NOT NULL DEFAULT 'finished'`,
+		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS estimated BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS "providerMetadata" JSONB`,
+		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS "costMicros" BIGINT`,
+		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS "costCurrency" TEXT`,
+		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS "costSource" TEXT`,
+		`CREATE INDEX IF NOT EXISTS ` + p + `usage_run ON ` + p + `usage("runId", "createdAt")`,
 	}
 }
 
@@ -270,20 +293,81 @@ func (e events) ListByType(ctx context.Context, threadID, typ string, _ ports.St
 
 type usage struct{ s *Storage }
 
+// usageGroup is the grouped read Total does: one row per agent and model,
+// which is exactly one UsageLine plus the two figures that only make sense on
+// the whole total.
+func (u usage) group() string {
+	return `SELECT COALESCE("agentId",''), COALESCE("agentName",''), COALESCE(model,''), COALESCE("modelId",''),
+	  COALESCE(SUM("inputTokens"),0)::int, COALESCE(SUM("cachedInputTokens"),0)::int,
+	  COALESCE(SUM("cacheWriteInputTokens"),0)::int, COALESCE(SUM("outputTokens"),0)::int,
+	  COALESCE(SUM("reasoningTokens"),0)::int, COALESCE(SUM("totalTokens"),0)::int,
+	  COUNT(*)::int, COALESCE(SUM(CASE WHEN estimated THEN 1 ELSE 0 END),0)::int,
+	  COALESCE(SUM("costMicros"),0)::bigint, COALESCE("costCurrency",''),
+	  COALESCE(SUM(CASE WHEN "costMicros" IS NULL THEN 1 ELSE 0 END),0)::int
+	FROM ` + u.s.t("usage") + ` WHERE "threadId" = $1`
+}
+
 func (u usage) Record(ctx context.Context, threadID string, n ports.NewUsage, _ ports.StorageContext) error {
+	var meta any
+	if len(n.ProviderMetadata) > 0 {
+		raw, err := json.Marshal(n.ProviderMetadata)
+		if err != nil {
+			return fmt.Errorf("usage provider metadata: %w", err)
+		}
+		meta = string(raw)
+	}
+	var micros, currency, source any
+	if n.Cost != nil {
+		micros, currency, source = n.Cost.Micros, n.Cost.Currency, n.Cost.Source
+	}
+	kind := n.Kind
+	if kind == "" {
+		kind = ports.KindStep
+	}
+	outcome := n.Outcome
+	if outcome == "" {
+		outcome = ports.UsageFinished
+	}
 	_, err := u.s.db.ExecContext(ctx,
-		`INSERT INTO `+u.s.t("usage")+` (id, "threadId", "agentId", "inputTokens", "cachedInputTokens", "outputTokens", "totalTokens")
-		 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-		core.NewID(), threadID, nullStr(n.AgentID), n.InputTokens, n.CachedInputTokens, n.OutputTokens, n.TotalTokens)
+		`INSERT INTO `+u.s.t("usage")+` (id, "threadId", "runId", "agentId", "agentName", kind, step,
+		   model, "modelId", "inputTokens", "cachedInputTokens", "cacheWriteInputTokens",
+		   "outputTokens", "reasoningTokens", "totalTokens", outcome, estimated,
+		   "providerMetadata", "costMicros", "costCurrency", "costSource")
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
+		core.NewID(), threadID, nullStr(n.RunID), nullStr(n.AgentID), nullStr(n.AgentName),
+		string(kind), n.Step, nullStr(n.Model), nullStr(n.ModelID),
+		n.InputTokens, n.CacheReadInputTokens, n.CacheWriteInputTokens, n.OutputTokens, n.ReasoningTokens,
+		n.TotalTokens(), string(outcome), n.Estimated, meta, micros, currency, source)
 	return err
 }
 
-func (u usage) Total(ctx context.Context, threadID string, _ ports.StorageContext) (ports.UsageTotals, error) {
-	var t ports.UsageTotals
-	err := u.s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM("inputTokens"),0)::int, COALESCE(SUM("cachedInputTokens"),0)::int,
-		        COALESCE(SUM("outputTokens"),0)::int, COALESCE(SUM("totalTokens"),0)::int
-		 FROM `+u.s.t("usage")+` WHERE "threadId" = $1`, threadID).
-		Scan(&t.InputTokens, &t.CachedInputTokens, &t.OutputTokens, &t.TotalTokens)
-	return t, err
+func (u usage) Total(ctx context.Context, threadID string, f ports.UsageFilter, _ ports.StorageContext) (ports.UsageTotals, error) {
+	q, args := u.group(), []any{threadID}
+	if f.RunID != "" {
+		q += ` AND "runId" = $2`
+		args = append(args, f.RunID)
+	}
+	// Grouped by currency as well, so a group never sums two units; the
+	// groups of one agent and model are merged back into one line below.
+	q += ` GROUP BY "agentId", "agentName", model, "modelId", "costCurrency" ORDER BY MIN("createdAt")`
+	rows, err := u.s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return ports.UsageTotals{}, err
+	}
+	defer rows.Close()
+
+	var merge ports.UsageLineMerger
+	for rows.Next() {
+		var l ports.UsageLine
+		var currency string
+		var totalTokens, unpriced int
+		if err := rows.Scan(&l.AgentID, &l.AgentName, &l.Model, &l.ModelID,
+			&l.InputTokens, &l.CacheReadInputTokens, &l.CacheWriteInputTokens,
+			&l.OutputTokens, &l.ReasoningTokens, &totalTokens,
+			&l.Calls, &l.Estimated, &l.CostMicros, &currency, &unpriced); err != nil {
+			return ports.UsageTotals{}, err
+		}
+		merge.Add(l, currency, totalTokens, unpriced)
+	}
+	return merge.Totals(), rows.Err()
 }

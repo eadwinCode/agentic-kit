@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,6 +40,43 @@ type StepResult struct {
 	ResponseMessages []provider.Message
 	ToolCalls        []provider.ToolCall
 	ToolResults      []provider.ToolResult
+	// ProviderMetadata is what the provider attached to the finish, one entry
+	// per provider namespace, plus two reserved keys: "responseId" and
+	// "responseHeaders". Gateways put a call's real cost in a header, so a
+	// receipt pricer reads it from there (§4).
+	ProviderMetadata map[string]any
+	// StreamedText is what actually reached the client before the call ended.
+	// Set even when the call failed or was stopped mid-stream, so the tokens
+	// of a cut-off call can still be estimated and billed.
+	StreamedText string
+	// Finished is false when no finish ever arrived: the stream was cut off
+	// by a stop or a provider failure, and the counters are not the
+	// provider's own.
+	Finished bool
+}
+
+// providerMeta flattens what goai reports into the single map a Pricer
+// reads. Provider namespaces keep their names; the response id and headers
+// get reserved keys, because an AI gateway bills through a header and a
+// receipt pricer has to be able to find it.
+func providerMeta(pm map[string]map[string]any, resp provider.ResponseMetadata) map[string]any {
+	out := make(map[string]any, len(pm)+len(resp.ProviderMetadata)+2)
+	for ns, v := range pm {
+		out[ns] = v
+	}
+	for k, v := range resp.ProviderMetadata {
+		out[k] = v
+	}
+	if resp.ID != "" {
+		out["responseId"] = resp.ID
+	}
+	if len(resp.Headers) > 0 {
+		out["responseHeaders"] = resp.Headers
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // StepCall is what ExecuteStep needs.
@@ -97,6 +135,7 @@ func ExecuteStep(ctx context.Context, agent *RegisteredAgent, call StepCall) (*S
 	}
 
 	var result *goai.TextResult
+	var streamedText string
 	if call.Kind == ports.KindStreamText {
 		// goai runs a step's tools on its own goroutine as soon as it has sent
 		// the step's chunks, without waiting for anyone to read them. The tools
@@ -116,11 +155,40 @@ func ExecuteStep(ctx context.Context, agent *RegisteredAgent, call StepCall) (*S
 
 		stream, err := goai.StreamText(ctx, call.Model, opts...)
 		if err != nil {
-			return nil, err
+			// Nothing streamed and nothing was spent: no usage row to keep.
+			return &StepResult{}, err
 		}
 		// Drain the full stream so OnChunk fires per part, and let a provider
 		// failure surface here rather than hang on a result that never comes.
+		// The text is accumulated as it goes, so a call cut off half way still
+		// knows how much it produced and can be billed for it (§4).
+		var streamed strings.Builder
+		var finished, sawToolDelta bool
 		drainErr := drainStream(stream, func(chunk provider.StreamChunk) {
+			// Everything the model produced counts as output when a call is
+			// cut off: the answer, its thinking, and the tool arguments,
+			// which for a code-writing agent are most of the tokens. Tool
+			// input arrives as deltas when the provider streams it, or as
+			// one complete call when it does not; never both for one call.
+			switch chunk.Type {
+			case provider.ChunkText, provider.ChunkReasoning:
+				streamed.WriteString(chunk.Text)
+			case provider.ChunkToolCallDelta:
+				sawToolDelta = true
+				streamed.WriteString(chunk.ToolInput)
+			case provider.ChunkToolCall:
+				if !sawToolDelta {
+					streamed.WriteString(chunk.ToolInput)
+				}
+			}
+			// Whether the call ran to its end is decided by what this loop
+			// SAW, not by whether the stream reported an error: a stop that
+			// tears the provider down mid-call does not always surface as one
+			// (§4). The finish chunk arriving is the only reliable "this
+			// completed".
+			if chunk.Type == provider.ChunkFinish {
+				finished = true
+			}
 			if call.OnChunk != nil {
 				call.OnChunk(chunk)
 			}
@@ -129,23 +197,51 @@ func ExecuteStep(ctx context.Context, agent *RegisteredAgent, call StepCall) (*S
 			}
 		})
 		release()
-		result = stream.Result()
-		if drainErr != nil {
-			return nil, drainErr
+		streamedText = streamed.String()
+		if drainErr != nil || !finished {
+			// The call ended without finishing: a provider failure, or a stop
+			// that tore it down mid-stream. goai ends every other path with a
+			// finish chunk, and drops that chunk exactly when its own context
+			// is already cancelled, so its absence is the reliable signal.
+			// The platform's own context is NOT: goai cancels its side first,
+			// and the run's cancellation can still be a poll behind.
+			//
+			// Result() must not be read here. goai writes the result up to the
+			// moment it sends that chunk, so a stream that never sent one may
+			// still have a goroutine writing, and reading it races.
+			return &StepResult{StreamedText: streamedText}, drainErr
 		}
+		// Safe now: the finish chunk arrived, so goai has stopped writing.
+		result = stream.Result()
 	} else {
 		var err error
 		result, err = goai.GenerateText(ctx, call.Model, opts...)
 		if err != nil {
-			return nil, err
+			return &StepResult{}, err
 		}
 	}
 
+	step := stepFrom(result)
+	step.StreamedText, step.Finished = streamedText, true
+	if step.StreamedText == "" {
+		step.StreamedText = step.Text
+	}
+	return step, nil
+}
+
+// stepFrom reduces a goai result to the platform's one-round-trip step. The
+// last goai step is the authority when there is one; otherwise the totals
+// are all there is, which is the shape a cut-off stream comes back in.
+func stepFrom(result *goai.TextResult) *StepResult {
+	if result == nil {
+		return &StepResult{}
+	}
 	step := &StepResult{
 		Text:             result.Text,
 		FinishReason:     result.FinishReason,
 		Usage:            result.TotalUsage,
 		ResponseMessages: result.ResponseMessages,
+		ProviderMetadata: providerMeta(result.ProviderMetadata, result.Response),
 	}
 	if n := len(result.Steps); n > 0 {
 		last := result.Steps[n-1]
@@ -154,11 +250,14 @@ func ExecuteStep(ctx context.Context, agent *RegisteredAgent, call StepCall) (*S
 		step.Usage = last.Usage
 		step.ToolCalls = last.ToolCalls
 		step.ToolResults = last.ToolResults
+		if meta := providerMeta(last.ProviderMetadata, last.Response); meta != nil {
+			step.ProviderMetadata = meta
+		}
 	}
 	if step.FinishReason == "" {
 		step.FinishReason = provider.FinishStop
 	}
-	return step, nil
+	return step
 }
 
 // gateTool delays a tool's Execute until the step's chunks are drained.
@@ -240,9 +339,32 @@ type LoopInput struct {
 	// TokenBudget is the cumulative cap for the whole run, checked against
 	// the shared ledger.
 	TokenBudget int
-	OnChunk     func(provider.StreamChunk)
+	// CostBudgetMicros is the money cap for the whole run (§4), checked
+	// against the same shared ledger and between the same steps.
+	CostBudgetMicros int64
+	// BillingRunID is the DISPATCHED run every call here is billed to (§4).
+	// A nested loop's RunID is its own; this stays the parent's, so one
+	// run's whole bill, delegated work included, is a single query.
+	BillingRunID string
+	// ModelKey is the registry key the model was resolved from — what a
+	// price list is usually keyed by.
+	ModelKey string
+	// ModelID is the wire id that key resolved to (ResolvedModel.WireID),
+	// for a price list keyed by wire ids instead.
+	ModelID string
+	// AgentName is the name that goes on the bill line: the registered
+	// handle for the main run, the delegation's name for a nested one.
+	AgentName string
+	OnChunk   func(provider.StreamChunk)
 	// System is the persona for a nested run; empty keeps the spec's.
-	System            string
+	System string
+	// SystemFn builds the persona per step (§3.1); it wins over System and
+	// over the spec's.
+	SystemFn ports.SystemFunc
+	// PrepareStep edits the prompt per step; what it adds is never persisted.
+	PrepareStep ports.PrepareStepFunc
+	// State is the run's state, handed to SystemFn (§2.10).
+	State             ports.AgentRunState
 	CacheSystemPrompt bool
 }
 
@@ -261,6 +383,8 @@ type LoopOutcome struct {
 	Aborted bool
 	// Steps is the iterations this loop completed (§2.9).
 	Steps int
+	// CostExhausted: the run hit its money cap and stopped between steps (§4).
+	CostExhausted bool
 }
 
 // stripParked drops the park sentinels from a tool message. Unlike the
@@ -308,6 +432,10 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	}
 	messages := input.Messages
 	stepsLeft := input.MaxSteps
+	// The input count of the last finished call. A call cut off before its
+	// finish never reports one, and its prompt was the same size as the
+	// previous step's plus a little, so this is the honest floor to bill.
+	lastInput := 0
 
 	for stepsLeft > 0 && !aborted() {
 		stepsLeft--
@@ -316,13 +444,50 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		if input.Kind == ports.KindStreamText {
 			onChunk = input.OnChunk
 		}
+		system := input.System
+		if input.SystemFn != nil {
+			// Built per step with the run's state (§3.1): what the agent is
+			// acting on may have changed since the last step.
+			built, err := input.SystemFn(ctx, threadID, input.State)
+			if err != nil {
+				return out, err
+			}
+			system = built
+		}
+		prompt := messages
+		if input.PrepareStep != nil {
+			prepared, err := input.PrepareStep(ctx, threadID, input.State, messages)
+			if err != nil {
+				return out, err
+			}
+			prompt = prepared
+		}
 		step, err := ExecuteStep(genCtx, agent, StepCall{
-			Kind: input.Kind, Model: input.Model, Messages: messages, Tools: input.Tools,
+			Kind: input.Kind, Model: input.Model, Messages: prompt, Tools: input.Tools,
 			ProviderOptions: input.ProviderOptions, OnChunk: onChunk,
-			System: input.System, CacheSystemPrompt: input.CacheSystemPrompt,
+			System: system, CacheSystemPrompt: input.CacheSystemPrompt,
 		})
-		if err != nil {
+		if err != nil || !step.Finished {
+			// The call ended without a finish: a user stop, or the provider
+			// failing part way. Either way the provider billed for what it had
+			// already produced, so the call is recorded rather than dropped —
+			// with estimated counters where it never reported real ones (§4).
+			outcome := ports.UsageErrored
 			if aborted() {
+				outcome = ports.UsageAborted
+			}
+			if lastInput == 0 {
+				// Nothing finished on this run yet, so estimate the prompt that
+				// was certainly sent rather than billing the call as free.
+				lastInput = EstimateMessages(messages)
+			}
+			if u := unfinishedUsage(input, out.Steps+1, step, outcome, lastInput); u.TotalTokens() > 0 {
+				u = RecordCall(ctx, deps, threadID, u)
+				out.Attribution.Add(u.Totals())
+				out.TokensUsed += u.TotalTokens()
+				ledger.Add(u.TotalTokens())
+			}
+			if err == nil || aborted() {
 				break // user stop mid-step
 			}
 			return out, err // real failure → §2.8 redrive policy
@@ -353,9 +518,12 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			return out, err
 		}
 
-		// Token attribution (§4), accumulated across the segment's steps and
-		// into the run-wide ledger the safety cap is checked against (§2.7).
-		a := AttributeTokens(step.Usage)
+		// One priced usage row per model call (§4), then the same counters
+		// accumulated across the segment's steps and into the run-wide ledger
+		// the safety caps are checked against (§2.7).
+		u := RecordCall(ctx, deps, threadID, usageOf(input, out.Steps+1, ports.KindStep, step, ports.UsageFinished))
+		a := u.Totals()
+		lastInput = u.InputTokens
 		out.Attribution.Add(a)
 		out.TokensUsed += a.TotalTokens
 		ledger.Add(a.TotalTokens)
@@ -419,6 +587,28 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			break
 		}
 
+		// The money cap (§4), checked in the same place and the same way. It
+		// reads the run's spend back from the store rather than from a
+		// counter in this process: a run that parked and resumed in another
+		// worker must not get its cap reset, and a nested run's calls have to
+		// count against the same cap.
+		//
+		// It only ever sees priced calls: with no Pricer configured nothing is
+		// ever spent and the cap never fires.
+		if input.CostBudgetMicros > 0 {
+			spent, err := deps.Storage.Usage.Total(ctx, threadID, ports.UsageFilter{RunID: input.BillingRunID})
+			if err != nil {
+				Logger(deps).Error("cost budget not checked", "run", input.BillingRunID, "err", err)
+			} else if spent.CostMicros >= input.CostBudgetMicros {
+				_, _ = Publish(ctx, deps, threadID, "COST_BUDGET_EXHAUSTED", map[string]any{
+					"agentId": nullable(input.AgentID), "costMicros": spent.CostMicros,
+					"costBudgetMicros": input.CostBudgetMicros, "currency": spent.Currency,
+				})
+				out.CostExhausted = true
+				break
+			}
+		}
+
 		// tool-calls → goai executed the step's tools; the loop feeds the
 		// results back. Anything else (stop, length, …) ends the run.
 		if step.FinishReason != provider.FinishToolCalls {
@@ -428,4 +618,37 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 
 	out.Aborted = aborted()
 	return out, nil
+}
+
+// usageOf is one finished model call as a usage row, ready to be priced (§4).
+func usageOf(input LoopInput, step int, kind ports.UsageKind, s *StepResult, outcome ports.UsageOutcome) ports.NewUsage {
+	u := ports.NewUsage{
+		RunID: input.BillingRunID, AgentID: input.AgentID, AgentName: input.AgentName,
+		Kind: kind, Step: step,
+		Model: input.ModelKey, ModelID: input.ModelID,
+		Outcome: outcome, ProviderMetadata: s.ProviderMetadata,
+	}
+	FillTokens(&u, s.Usage)
+	return u
+}
+
+// unfinishedUsage is the row for a call that never reported a finish: a user
+// stop, or the provider failing mid-stream (§4).
+//
+// The provider still billed for it, so the counters are filled in from what
+// IS known: whatever partial usage came back, the previous call's input
+// count for the prompt that was certainly sent, and the configured estimator
+// over the text that actually streamed. Estimated marks the row, so a bill
+// built from these rows can say which lines are guesses.
+func unfinishedUsage(input LoopInput, step int, s *StepResult, outcome ports.UsageOutcome, lastInput int) ports.NewUsage {
+	u := usageOf(input, step, ports.KindStep, s, outcome)
+	if u.InputTokens == 0 {
+		u.InputTokens, u.Estimated = lastInput, true
+	}
+	if u.OutputTokens == 0 && s.StreamedText != "" {
+		// The same estimator compaction measures context fill with, so the
+		// context budget and the cost of a cut-off step follow one rule.
+		u.OutputTokens, u.Estimated = estimateTokens([]byte(s.StreamedText)), true
+	}
+	return u
 }

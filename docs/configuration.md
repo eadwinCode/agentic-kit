@@ -8,8 +8,10 @@ const runtime = await setupAgentCore({
   queue,            // required — durable dispatch
   bus,              // required — live fan-out
   kv,               // required — hot state
-  resolveModel,     // required — registry key → { instance, contextWindow }
+  resolveModel,     // required — registry key → { instance, contextWindow, modelId }
   admin,            // optional — defaults to SQLite, or Postgres via env
+  pricer,           // optional — prices every model call (§4)
+  log,              // optional — defaults to console
   config,           // optional — everything below
 });
 ```
@@ -32,6 +34,7 @@ be opened should be a startup error.
 | :--- | ---: | :--- |
 | `maxSteps` | `25` | Model round trips per run. The safety cap against runaway loops. |
 | `tokenBudget` | `undefined` | Default per-run token budget. Unbounded apart from `maxSteps`. |
+| `costBudgetMicros` | `undefined` | Default per-run money cap, in millionths of the pricer's currency. Needs a `pricer`. See [Cost and pricing](./cost-and-pricing.md). |
 | `runMaxAttempts` | `3` | Queue redrive attempts before a run finalizes `FAILED`. |
 | `stopPollMs` | `500` | How often a running worker re-reads the stop signal. Also the window in which it notices a newer run replaced it. |
 | `runRedriveDelaySeconds` | `2` | Delay before re-dispatching a job that found the run lock held by an older run. |
@@ -54,6 +57,7 @@ be opened should be a startup error.
 | `contextOutputReserveTokens` | `16000` | Held back for the completion. |
 | `compactionTrigger` | `0.8` | Compact past this share of budget. |
 | `contextTailShare` | `0.25` | Share of budget kept verbatim. |
+| `compactionModel` | `'gpt-4o-mini'` | Registry key of the cheap model that writes the summary. Resolved through your own `resolveModel`, so a registry without that key must name its own. |
 | `promptCaching` | `true` | Stamp cache breakpoints on the stable prefix. |
 | `nativeWindows` | — | Per-model windows below the ceiling. A `contextWindow` from `resolveModel` wins. |
 
@@ -75,6 +79,10 @@ be opened should be a startup error.
 | Setting | Default | Meaning |
 | :--- | ---: | :--- |
 | `billingPreCheck` | — | `({ threadId, state, publishEvent }) => { ok, error? }`. Reject a run before it costs anything; the check can publish on the thread, and the platform publishes `RUN_REFUSED`. |
+
+Pricing is not a `config` setting — `pricer` sits on `setupAgentCore` beside the
+ports, because it decides what goes into the store rather than how the loop
+behaves. See [Cost and pricing](./cost-and-pricing.md).
 
 ## Environment variables
 

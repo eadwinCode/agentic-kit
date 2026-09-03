@@ -47,7 +47,7 @@ const queue = new InlineQueue();
 
 export const runtime = await setupAgentCore({
   storage: new SqliteStorage(db),
-  admin: new SqliteAdminStore(db),
+  admin: SqliteAdminStore.open(db),
   bus: new MemoryBus(),
   kv: new MemoryKv(),
   queue,

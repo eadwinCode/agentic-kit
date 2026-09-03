@@ -68,11 +68,16 @@ func TestNested_DelegatesInAnIsolatedStreamAndReportsBack(t *testing.T) {
 	parentSteps, _ := h.admin.Steps().ListByRun(h.ctx, ran.RunID)
 	mustEqual(t, len(childSteps), 1, "child step rows")
 	mustEqual(t, len(parentSteps), 2, "parent step rows")
-	// Billing attribution per subagent (§4)
+	// Billing attribution per model call (§4): the child's calls are tagged
+	// with its AgentID, but billed to the PARENT's run, so one run's bill is
+	// one query however deep the delegation went.
 	rows := h.storage.UsageRows()
-	mustEqual(t, len(rows), 2, "usage rows")
+	mustEqual(t, len(rows), 3, "usage rows")
 	mustEqual(t, rows[0].AgentID, childID, "child usage first")
-	mustEqual(t, rows[0].TotalTokens, 30, "child usage")
+	mustEqual(t, rows[0].AgentName, "researcher", "child usage name")
+	mustEqual(t, rows[0].RunID, ran.RunID, "child usage billed to the parent run")
+	mustEqual(t, rows[0].TotalTokens(), 30, "child usage")
+	mustEqual(t, rows[1].AgentID, "", "parent usage")
 	// The snapshot carries nested runs
 	snap, _ := h.rt.GetThreadSnapshot(h.ctx, ran.ThreadID, nil)
 	mustEqual(t, len(snap.Runs), 2, "runs in snapshot")

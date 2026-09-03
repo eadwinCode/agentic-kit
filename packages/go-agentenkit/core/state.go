@@ -12,7 +12,24 @@ import (
 // half of core/state.ts: giving every tool the run's state.
 
 type runStateKey struct{}
+type runIDKey struct{}
 type publisherKey struct{}
+
+// ContextWithRunID names the run a context serves. Execute stamps it on the
+// model-call context, so a model wrapper (a cost recorder, a rate limiter)
+// can tell which run it is working for.
+func ContextWithRunID(ctx context.Context, runID string) context.Context {
+	return context.WithValue(ctx, runIDKey{}, runID)
+}
+
+// RunIDFromContext reads the run a context serves: the dispatched run for
+// the main agent, the nested run's own id inside a subagent. Empty outside
+// a run.
+func RunIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(runIDKey{}).(string)
+	return id
+}
+
 type approvalKey struct{}
 type toolCallIDKey struct{}
 

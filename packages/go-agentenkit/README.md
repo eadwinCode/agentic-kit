@@ -15,8 +15,8 @@ shows the Go shape of each piece.
 
 `BillingPreCheck` receives a `BillingCheck` with the thread, the run state
 and `PublishEvent`, so a refusal can carry its reason to every client; the
-platform publishes `RUN_REFUSED` as well, and `TOKEN_BUDGET_EXHAUSTED` when a
-run spends its budget between steps.
+platform publishes `RUN_REFUSED` as well, and `TOKEN_BUDGET_EXHAUSTED` or
+`COST_BUDGET_EXHAUSTED` when a run spends its budget between steps.
 
 A complete, runnable example, a Go server serving a React SPA with tools,
 approvals, subagents and custom events, lives in
@@ -126,6 +126,22 @@ rt, err := agentenkit.SetupAgentCore(ctx, agentenkit.RuntimeOptions{
 })
 ```
 
+Or one Postgres for all four, no Redis and no queue service:
+
+```go
+pg, _ := sql.Open("pgx", url)
+storage, _ := postgres.New(ctx, pg)
+kv, _ := postgres.NewKv(ctx, pg)
+queue, _ := postgres.NewQueue(ctx, pg, postgres.QueueOptions{})
+bus := postgres.NewBus(pg, pgxlisten.New(url), storage.Events(), kv, postgres.BusOptions{})
+rt, err := agentenkit.SetupAgentCore(ctx, agentenkit.RuntimeOptions{Storage: storage, Kv: kv, Bus: bus, Queue: queue, ResolveModel: resolve})
+queue.Bind(rt.Worker.Handler())
+```
+
+The bus rides LISTEN/NOTIFY and routes an event past the 8000-byte cap by
+reference; the queue claims with `SKIP LOCKED` and renews its lease while a job
+runs. Both are in `adapters/postgres`; the listener is `adapters/postgres/pgxlisten`.
+
 ## Operations
 
 Runs belong to an agent handle; reads belong to the runtime.
@@ -189,6 +205,34 @@ chat := rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
 The platform owns the model, the messages, the step ceiling and the stop handling. Every
 other goai option is yours, passed through `Options`.
 
+## The spec's hooks
+
+```go
+rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
+	Name: "designer",
+	// Built per step with the run's state; wins over System.
+	SystemFn: func(ctx context.Context, threadID string, state agentenkit.AgentRunState) (string, error) {
+		return persona + projectBrief(ctx, state), nil
+	},
+	// Runs after the last step and BEFORE the terminal state is written: commit
+	// what the run produced, bill it. An error fails the run; a stop arrives
+	// with Cancelled set on a cancelled ctx. Idempotent on RunID, please.
+	OnSettle: func(ctx context.Context, info agentenkit.RunFinishInfo) error {
+		return repo.Commit(context.WithoutCancel(ctx), info.RunID)
+	},
+	OnFinish: func(info agentenkit.RunFinishInfo) { log.Println("done", info.RunID, info.State) },
+	Subagents: &agentenkit.SubagentsConfig{Profiles: map[string]agentenkit.SubagentProfile{
+		"page-manager": {Description: "edits pages", SystemFn: pagePrompt, Tools: pageTools, MaxSteps: 20},
+	}},
+})
+
+// A run can name itself, cap its own steps, and carry images.
+chat.Run(ctx, agentenkit.RunInput{
+	Prompt: "make the hero bolder", RunID: myRunID, MaxSteps: 8,
+	Attachments: []agentenkit.Attachment{{URL: "https://cdn.example/ref.png", MediaType: "image/png"}},
+})
+```
+
 ## Run state
 
 Whatever you attach to a run reaches **every** storage call it makes, every tool, and every
@@ -222,6 +266,41 @@ Implement any of them for your own stack; `core/` imports nothing else. The
 [memory adapters](./adapters/memory/memory.go) are a complete implementation used by the
 test suite and double as a template.
 
+## Cost
+
+Give the runtime a `Pricer` and every usage row carries the money as well as the
+tokens, so spend is read from the store the engine already fills:
+
+```go
+import "github.com/eadwinCode/agentic-kit/packages/go-agentenkit/pricing"
+
+rt, err := agentenkit.SetupAgentCore(ctx, agentenkit.RuntimeOptions{
+    // ... ports ...
+    Pricer: pricing.Table{
+        // dollars per MILLION tokens, typed off the provider's pricing page
+        "gpt-4o": {InputPerMillion: 2.5, CacheReadPerMillion: 1.25, OutputPerMillion: 10},
+    },
+})
+```
+
+One row per model call: main run, nested run or compaction, streamed or not,
+finished or cut short. Reading it back:
+
+```go
+rt.GetThreadUsage(ctx, threadID, nil)                        // the thread header
+storage.Usage().Total(ctx, threadID, ports.UsageFilter{RunID: runID}, sc) // one run's bill
+```
+
+Every total carries `CostMicros`, `Currency`, `Unpriced` and `Lines` — the same
+spend grouped by agent and model, which is what a credit system charges for. A
+spec's `OnFinish` receives it ready-made as `info.Usage`, and
+`RunInput.CostBudgetMicros` caps a run by money the way `TokenBudget` caps it by
+tokens.
+
+`pricing` also ships `Receipt`, for the figure a gateway already computed, and
+`Chain`, to try one then the other. See
+[Cost and pricing](https://eadwincode.github.io/agentic-kit/cost-and-pricing).
+
 ## The admin store: not yours
 
 Run records, step timings and a thread index are the **platform's** data, in the platform's
@@ -231,8 +310,16 @@ own tables. You do not implement `AdminStore`; you read it back:
 rt.Admin.Overview(ctx, nil)                     // threads and runs by state, plus what's in flight
 rt.Admin.ListRuns(ctx, agentenkit.RunFilter{State: []agentenkit.ExecutionState{agentenkit.StateFailed}})
 rt.Admin.Stats(ctx, agentenkit.StatsRange{})   // p50/p95 duration and queue wait, tokens, failures
-rt.Admin.GetRun(ctx, runID)                     // one run: steps, nested runs, timeline
+rt.Admin.GetRun(ctx, runID)                     // one run: steps, nested runs, timeline, spend
 ```
+
+Its schema migrates itself, from numbered `.sql` files embedded in the binary
+(`admin/migrate/sql`). `SetupAgentCore` opens the connection and returns; the
+schema is brought up to date on a goroutine behind it, and every admin call
+waits for that before its first query. Several workers starting at once queue on
+a Postgres advisory lock rather than racing. An existing database needs nothing:
+migration `0001` is the schema as it stood before the migrator. Your own
+`Storage` is never touched by any of this.
 
 Configure nothing and it is SQLite on disk (`AGENTIC_KIT_ADMIN_DB` moves the file). Set
 `AGENTIC_KIT_ADMIN_DATABASE_URL` and it is Postgres. Either way the platform uses whichever

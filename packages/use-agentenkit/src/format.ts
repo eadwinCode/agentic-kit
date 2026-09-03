@@ -1,5 +1,12 @@
 import type { ActivityLabels, EntryFormat } from './config.js';
-import type { AgentActivity, AgentState, ChatEntry, SnapshotMessage } from './types.js';
+import type {
+  AgentActivity,
+  AgentState,
+  ChatEntry,
+  EntryPart,
+  SnapshotMessage,
+  UsageTotals,
+} from './types.js';
 
 const json = (value: unknown) => {
   try {
@@ -29,15 +36,57 @@ export function contentToText(content: unknown, format: EntryFormat): string {
     .join('\n');
 }
 
+/** The structured parts of a stored message, thinking left out (it becomes
+ *  its own entry). `answered` names the tool calls whose result is durable,
+ *  which is how a call knows it is done. */
+export function contentToParts(content: unknown, answered: ReadonlySet<string> = new Set()): EntryPart[] {
+  if (typeof content === 'string') return content ? [{ type: 'text', text: content }] : [];
+  if (!Array.isArray(content)) {
+    const text = json(content);
+    return text ? [{ type: 'text', text }] : [];
+  }
+  const out: EntryPart[] = [];
+  for (const part of content as any[]) {
+    switch (part?.type) {
+      case 'text':
+        if (part.text) out.push({ type: 'text', text: part.text });
+        break;
+      case 'image':
+        if (part.image) out.push({ type: 'image', image: part.image, mimeType: part.mimeType });
+        break;
+      case 'tool-call':
+        out.push({
+          type: 'tool-call',
+          toolCallId: part.toolCallId,
+          toolName: part.toolName ?? 'tool',
+          args: part.args ?? {},
+          state: answered.has(part.toolCallId) ? 'done' : 'running',
+        });
+        break;
+      case 'tool-result':
+        out.push({
+          type: 'tool-result',
+          toolCallId: part.toolCallId,
+          toolName: part.toolName,
+          result: part.result,
+        });
+        break;
+    }
+  }
+  return out;
+}
+
 /** One durable message → one entry, or null when it carries nothing to show.
  *  A message that is only tool activity is marked `kind: 'tool'` so a UI can
  *  style it apart from conversation. */
 export function messageToEntry(
   message: SnapshotMessage,
   format: EntryFormat,
+  answered: ReadonlySet<string> = new Set(),
 ): ChatEntry | null {
   const text = contentToText(message.content, format);
-  if (!text) return null;
+  const structured = contentToParts(message.content, answered);
+  if (!text && structured.length === 0) return null;
   const parts = Array.isArray(message.content) ? message.content : [];
   const containsText = parts.some((part: any) => part?.type === 'text' && part.text);
   const containsToolActivity = parts.some(
@@ -54,6 +103,7 @@ export function messageToEntry(
     role: message.role,
     text,
     agentId: message.agentId ?? null,
+    parts: structured,
   };
 }
 
@@ -71,7 +121,11 @@ export function reasoningText(content: unknown): string {
  *  the answer. Split because they stream separately and a UI folds thinking
  *  away, so keeping them in one bubble would make a reload look different from
  *  the live run. */
-export function messageToEntries(message: SnapshotMessage, format: EntryFormat): ChatEntry[] {
+export function messageToEntries(
+  message: SnapshotMessage,
+  format: EntryFormat,
+  answered: ReadonlySet<string> = new Set(),
+): ChatEntry[] {
   const out: ChatEntry[] = [];
   const thought = reasoningText(message.content);
   if (thought) {
@@ -81,11 +135,26 @@ export function messageToEntries(message: SnapshotMessage, format: EntryFormat):
       role: message.role,
       text: thought,
       agentId: message.agentId ?? null,
+      parts: [{ type: 'reasoning', text: thought }],
     });
   }
-  const entry = messageToEntry(message, format);
+  const entry = messageToEntry(message, format, answered);
   if (entry) out.push(entry);
   return out;
+}
+
+/** Every tool call a stored history has a result for. */
+export function answeredToolCalls(messages: readonly SnapshotMessage[]): Set<string> {
+  const answered = new Set<string>();
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const part of m.content as any[]) {
+      if (part?.type === 'tool-result' && typeof part.toolCallId === 'string') {
+        answered.add(part.toolCallId);
+      }
+    }
+  }
+  return answered;
 }
 
 /** The activity a thread state implies when nothing more specific is happening. */
@@ -104,4 +173,36 @@ export function stateActivity(state: AgentState, labels: ActivityLabels): AgentA
     default:
       return { phase: 'idle', label: labels.idle };
   }
+}
+
+/** Render a cost for a thread header: `formatCost(usage.tokens)` gives
+ *  "$0.0125", or "≥ $0.0125" when some calls went unpriced and the figure is
+ *  a floor rather than the whole bill. Returns null when there is nothing to
+ *  show, so a header can leave the slot empty instead of printing "$0.00" for
+ *  a server with no pricer configured.
+ *
+ *  Display only — never do arithmetic on the string. */
+export function formatCost(
+  usage: Pick<UsageTotals, 'costMicros' | 'currency' | 'unpriced'> | null | undefined,
+  locale?: string,
+): string | null {
+  if (!usage) return null;
+  const micros = usage.costMicros ?? 0;
+  if (micros === 0 && !usage.unpriced) return null;
+  if (micros === 0) return null; // priced nothing at all: no figure to show
+  const currency = usage.currency || 'USD';
+  let text: string;
+  try {
+    text = new Intl.NumberFormat(locale, {
+      style: 'currency',
+      currency,
+      // Agent runs are cheap: two decimals would round most of them to $0.00.
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 4,
+    }).format(micros / 1_000_000);
+  } catch {
+    // An unknown currency code: show the number and the code plainly.
+    text = `${(micros / 1_000_000).toFixed(4)} ${currency}`;
+  }
+  return usage.unpriced ? `≥ ${text}` : text;
 }

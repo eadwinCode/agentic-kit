@@ -31,6 +31,7 @@ import (
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/redis"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/sqlite"
 	sqliteadmin "github.com/eadwinCode/agentic-kit/packages/go-agentenkit/admin/sqlite"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/pricing"
 )
 
 func main() {
@@ -101,17 +102,27 @@ func main() {
 		Kv:      kv,
 		Queue:   queue,
 		Config:  &cfg,
+		// Money (§4): every model call is priced before its usage row is
+		// stored, so spend is read back from the same store the tokens come
+		// from — no second table, no wrapper around the model. Swap this for
+		// pricing.Chain(pricing.Receipt(...), modelPrices) if your gateway
+		// sends the real figure back and you want that over a price list.
+		Pricer: modelPrices,
 		// Models come in any shape; the platform only sees ResolvedModel.
 		ResolveModel: func(name string) (agentenkit.ResolvedModel, error) {
 			if apiKey == "" || name == "mock" {
 				return agentenkit.ResolvedModel{
 					Instance:      func() provider.LanguageModel { return &mockModel{id: name} },
 					ContextWindow: 128_000,
+					ModelID:       name,
 				}, nil
 			}
 			return agentenkit.ResolvedModel{
 				Instance:      func() provider.LanguageModel { return openai.Chat(name, openai.WithAPIKey(apiKey)) },
 				ContextWindow: 128_000,
+				// The wire id this key resolves to, recorded on every usage
+				// row (§4). A key with no entry here is its own id.
+				ModelID: modelIDs[name],
 			}, nil
 		},
 	})
@@ -155,4 +166,27 @@ func defaultModel(apiKey string) string {
 		return "mock"
 	}
 	return "gpt-4o-mini"
+}
+
+// modelIDs is the wire id each registry key resolves to (§4). It goes onto
+// every usage row, so a price list keyed by wire ids still matches when the
+// key is an alias.
+var modelIDs = map[string]string{
+	"gpt-4o":      "gpt-4o-2024-11-20",
+	"gpt-4o-mini": "gpt-4o-mini-2024-07-18",
+}
+
+// modelPrices is the price list (§4), in dollars per MILLION tokens — typed
+// straight off the provider's pricing page. The runtime prices every model
+// call against it before the usage row is stored, so GetThreadUsage returns
+// money as well as counters.
+//
+// Keys can be the registry key or the wire id; both are tried. A model that is
+// not here is stored UNPRICED rather than priced at zero, so a missing price
+// shows up as a gap in the bill rather than as free work — which is why the
+// "mock" model below is priced too.
+var modelPrices = pricing.Table{
+	"gpt-4o":      {InputPerMillion: 2.5, CacheReadPerMillion: 1.25, OutputPerMillion: 10},
+	"gpt-4o-mini": {InputPerMillion: 0.15, CacheReadPerMillion: 0.075, OutputPerMillion: 0.6},
+	"mock":        {InputPerMillion: 1, OutputPerMillion: 2},
 }

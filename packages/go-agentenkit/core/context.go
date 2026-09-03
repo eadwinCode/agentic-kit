@@ -2,10 +2,12 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
 	"github.com/zendev-sh/goai"
+	"github.com/zendev-sh/goai/provider"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
@@ -41,6 +43,18 @@ func ContextBudget(deps ports.RuntimePorts, model string) int {
 
 // estimateTokens is the same rough estimate the TypeScript engine uses.
 func estimateTokens(content []byte) int { return (len(content) + 3) / 4 }
+
+// EstimateMessages is estimateTokens over a prompt. The platform uses it in
+// the two places no real count exists: how full the context is (§2.6), and
+// the prompt of a call that was cut off before the provider reported one
+// (§4). One rule for both, so the two can never disagree.
+func EstimateMessages(messages []provider.Message) int {
+	raw, err := json.Marshal(messages)
+	if err != nil {
+		return 0
+	}
+	return estimateTokens(raw)
+}
 
 // ContextUsage is the read-only view of the §2.6 budget math: what
 // CompactContext would see on the next run, without summarizing anything.
@@ -120,13 +134,21 @@ func CompactContext(ctx context.Context, deps ports.RuntimePorts, threadID, mode
 	if err != nil {
 		return nil, err
 	}
-	a := AttributeTokens(res.TotalUsage)
-	if err := deps.Storage.Usage.Record(ctx, threadID, ports.NewUsage{
-		InputTokens: a.InputTokens, CachedInputTokens: a.CachedInputTokens,
-		OutputTokens: a.OutputTokens, TotalTokens: a.TotalTokens,
-	}); err != nil {
-		return nil, err
-	}
+	// Compaction is a model call the platform made on its own account (§2.6),
+	// so it gets its own priced row like any other (§4). Kind "compaction"
+	// keeps it separable: nobody asked for this call, and it is worth being
+	// able to see what the platform's own housekeeping costs.
+	RecordCall(ctx, deps, threadID, ports.NewUsage{
+		Kind: ports.KindCompaction, Model: deps.Config.CompactionModel,
+		ModelID:               resolved.WireID(deps.Config.CompactionModel),
+		Outcome:               ports.UsageFinished,
+		ProviderMetadata:      providerMeta(res.ProviderMetadata, res.Response),
+		InputTokens:           max(res.TotalUsage.InputTokens, 0),
+		CacheReadInputTokens:  max(res.TotalUsage.CacheReadTokens, 0),
+		CacheWriteInputTokens: max(res.TotalUsage.CacheWriteTokens, 0),
+		OutputTokens:          max(res.TotalUsage.OutputTokens, 0),
+		ReasoningTokens:       max(res.TotalUsage.ReasoningTokens, 0),
+	})
 	if _, err := Publish(ctx, deps, threadID, "CONTEXT_COMPACTED", map[string]any{"summarizedMessages": len(older)}); err != nil {
 		return nil, err
 	}

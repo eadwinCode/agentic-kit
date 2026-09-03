@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import {
+  formatCost,
   useAgentThread,
   type PendingInput,
   type SubagentStatus,
@@ -364,8 +365,14 @@ function UsageBar({ usage }: { usage: ThreadUsage }) {
     : 0;
   const near = context.usedTokens >= context.compactAtTokens;
 
+  // What the thread has spent (§4). The runtime prices every model call before
+  // it stores the usage row, so this is read straight off the same store the
+  // token counts come from. Null when nothing was priced — a server with no
+  // pricer configured leaves the slot empty rather than claiming $0.00.
+  const cost = formatCost(tokens);
+
   return (
-    <section className="usage" aria-label="Token and context usage">
+    <section className="usage" aria-label="Token, cost and context usage">
       <div className="usage-item">
         <span className="usage-label">Tokens</span>
         <strong>{formatTokens(tokens.totalTokens)}</strong>
@@ -374,6 +381,21 @@ function UsageBar({ usage }: { usage: ThreadUsage }) {
           · {formatTokens(tokens.outputTokens)} out
         </span>
       </div>
+
+      {cost && (
+        <div className="usage-item">
+          <span className="usage-label">Cost</span>
+          <strong>{cost}</strong>
+          <span className="usage-detail">
+            {tokens.lines?.length
+              ? tokens.lines
+                  .map((l) => `${l.agentName ?? 'agent'} · ${l.calls} call${l.calls === 1 ? '' : 's'}`)
+                  .join(' · ')
+              : 'across every model call'}
+            {tokens.unpriced ? ` · ${tokens.unpriced} unpriced` : ''}
+          </span>
+        </div>
+      )}
 
       <div className={`usage-item ${near ? 'near' : ''}`}>
         <span className="usage-label">Context</span>

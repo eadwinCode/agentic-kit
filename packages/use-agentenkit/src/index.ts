@@ -30,7 +30,10 @@ export type {
 } from './config.js';
 
 export {
+  answeredToolCalls,
+  contentToParts,
   contentToText,
+  formatCost,
   messageToEntry,
   messageToEntries,
   reasoningText,
@@ -41,7 +44,9 @@ export type {
   AgentState,
   AgentActivity,
   ActivityPhase,
+  Attachment,
   ChatEntry,
+  EntryPart,
   MessageRole,
   PendingInput,
   RunResult,
@@ -54,5 +59,6 @@ export type {
   ThreadSnapshot,
   ThreadUsage,
   UsageTotals,
+  UsageLine,
   ContextUsage,
 } from './types.js';

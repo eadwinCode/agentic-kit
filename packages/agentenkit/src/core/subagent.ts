@@ -4,17 +4,19 @@ import { z } from 'zod';
 import type {
   NestedDescriptor,
   ProviderOptions,
+  ResolvedModel,
   ResumeInfo,
   RunRecord,
   SubagentsConfig,
 } from './types.js';
+import { wireId } from './types.js';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { RegisteredAgent } from './agent.js';
 import { publish, withPublishEvent } from './publish.js';
 import { HITL_PARKED, withHitl, type HitlFrame } from './hitl.js';
 import { withRunState, type AgentRunState } from './state.js';
 import { markPromptCaching } from './cache.js';
-import { repairDanglingToolCalls } from './messages.js';
+import { promptMessages, repairDanglingToolCalls } from './messages.js';
 import { runLoop, type LoopOutcome, type RunLedger } from './loop.js';
 
 /** Everything a nested run needs from the run that spawned it (§2.7). The
@@ -44,6 +46,11 @@ export interface SubagentCtx {
    *  onto the frame it pushes, so an unwind can re-enter it (§2.7). */
   descriptor?: NestedDescriptor;
   tokenBudget?: number;
+  /** The run's money cap, shared with the parent (§4). */
+  costBudgetMicros?: number;
+  /** The DISPATCHED run every call beneath here is billed to, so one run's
+   *  bill is one query however deep the delegation went (§4). */
+  billingRunId?: string;
   providerOptions?: ProviderOptions;
   abortSignal?: AbortSignal;
   /** The run's state, handed down unchanged (§2.10). */
@@ -274,11 +281,16 @@ function nestedTools(
  *  throws on one (§3.3) — a `||` fallback can never catch that — so the child
  *  falls back to the model its parent is already running on, which is
  *  resolvable by construction. */
-function resolveNestedModel(ctx: SubagentCtx, name: string) {
+/** The registry key comes back with the model: pricing is keyed by the key
+ *  that was actually resolved, not the one the delegation asked for. */
+function resolveNestedModel(
+  ctx: SubagentCtx,
+  name: string,
+): { resolved: ResolvedModel; modelKey: string } {
   try {
-    return ctx.ports.resolveModel(name);
+    return { resolved: ctx.ports.resolveModel(name), modelKey: name };
   } catch {
-    return ctx.ports.resolveModel(ctx.resume.model);
+    return { resolved: ctx.ports.resolveModel(ctx.resume.model), modelKey: ctx.resume.model };
   }
 }
 
@@ -315,6 +327,7 @@ export async function runNestedAgent(
     );
   }
 
+  const { resolved, modelKey } = resolveNestedModel(ctx, d.model);
   const outcome = await runLoop(
     ports,
     ctx.agent,
@@ -326,19 +339,27 @@ export async function runNestedAgent(
       // two agents' steps into one timeline and made the indexes collide.
       runId: d.agentId,
       kind: ctx.sub.kind ?? 'stream-text',
-      model: resolveNestedModel(ctx, d.model).instance(),
+      model: resolved.instance(),
       // Stamped like the parent's (§2.6). A nested run re-sends its whole
       // brief and history on every step, so it is exactly the shape caching
       // is for — it was the one prompt in the system going out unstamped.
       messages: maybeCache(
         ports,
-        repairDanglingToolCalls(persisted.map((m) => ({ role: m.role, content: m.content }) as any)),
+        repairDanglingToolCalls(promptMessages(persisted) as any[]),
       ),
       tools: nestedTools(ctx, d, frames, abortSignal),
       maxSteps: ports.config.subagentMaxSteps,
       abortSignal: abortSignal ?? new AbortController().signal,
       providerOptions: ctx.providerOptions,
       tokenBudget: ctx.tokenBudget,
+      // Money is capped and billed at the RUN, not per child (§2.7, §4): the
+      // cap is the parent's, and every call a child makes lands on the
+      // parent's bill under its own agentId.
+      costBudgetMicros: ctx.costBudgetMicros,
+      billingRunId: ctx.billingRunId,
+      modelKey,
+      modelId: wireId(resolved, modelKey),
+      agentName: d.name,
       system: `You are the "${d.name}" subagent. Complete the task, then stop.`,
       cacheSystemPrompt: ports.config.promptCaching,
       onChunk: async (chunk) => {
@@ -349,9 +370,8 @@ export async function runNestedAgent(
     ctx.ledger,
   );
 
-  // Billing attribution per subagent (§4); the run-wide ledger was already
-  // advanced inside the loop.
-  await ports.storage.usage.record(threadId, { agentId: d.agentId, ...outcome.attribution });
-
+  // Nothing to bill here: every call the child made recorded and priced its
+  // own row as it happened, tagged with this child's agentId (§4). The
+  // run-wide ledger was advanced inside the loop too.
   return outcome;
 }

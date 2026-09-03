@@ -36,6 +36,10 @@ export async function POST(req: NextRequest) {
 `202`, not `200`: the run has been accepted, not completed. A `409` means the
 thread already has an active run — stop it first, or wait.
 
+The Go runtime also accepts `runId` (name the run yourself; a reused id is a
+`409`), `maxSteps` (cap the run below the config's ceiling) and `attachments`
+(`[{url, mediaType}]`, images on the user turn).
+
 `editMessageId` replaces that user turn and drops everything after it, then
 answers again. Only a user turn may be edited: cutting from anywhere else can
 strip a tool result off the assistant tool-call that produced it, and a dangling

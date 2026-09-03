@@ -55,7 +55,7 @@ is assumed.
 | `pendingInputs` | approvals waiting on a human |
 | `subagents` | nested runs, with status and text |
 | `threads`, `threadsLoading` | the thread list, for a sidebar |
-| `usage` | tokens spent and context load |
+| `usage` | tokens spent, money spent, and context load |
 
 **Actions**
 
@@ -65,8 +65,25 @@ is assumed.
 ## Entries
 
 ```ts
-{ id, kind: 'text' | 'tool' | 'reasoning', role, text, agentId }
+{ id, kind: 'text' | 'tool' | 'reasoning', role, text, agentId, parts }
 ```
+
+`text` is the flat rendering. `parts` is the structure behind it, for a UI
+that draws tool cards, thumbnails, or a foldable thought:
+
+```ts
+type EntryPart =
+  | { type: 'text'; text }
+  | { type: 'reasoning'; text }
+  | { type: 'image'; image; mimeType? }
+  | { type: 'tool-call'; toolCallId; toolName; args; state: 'running' | 'done' | 'error'; result? }
+  | { type: 'tool-result'; toolCallId; toolName?; result };
+```
+
+A tool call's `state` flips to `done` (or `error`) in place when its result
+arrives, live or on reload, so a card can settle without a second lookup.
+Parts are filled the same way from the durable snapshot and from the stream:
+a reload renders what the live run did.
 
 `kind` is what a UI branches on:
 
@@ -100,7 +117,14 @@ await run('…', { model: 'gpt-4o-mini' });
 await run('corrected text', { editMessageId: someUserMessageId });
 await run('…', { providerOptions: { openai: { serviceTier: 'flex' } } });
 await run('…', { orgId: 'acme' });   // extra fields merge into the request body
+await run('what is this?', { attachments: [{ url: 'https://cdn/cat.png', mediaType: 'image/png' }] });
+await run('…', { runId: myRunId, maxSteps: 8 });
 ```
+
+`attachments` show on the optimistic turn as image parts and reach the model
+natively. `runId` names the run so your own records can be keyed by it before
+the server answers; `maxSteps` caps the run below the server's ceiling. Both
+need a server that accepts them (the Go runtime does).
 
 The hook adds the user's turn locally before the request goes out, then replaces
 it with the durable one when the server confirms — so the id is real and the

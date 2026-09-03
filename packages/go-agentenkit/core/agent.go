@@ -11,20 +11,24 @@ import (
 
 // SpecDefaults are the spec-level defaults the engine reads.
 type SpecDefaults struct {
-	Model           string
-	Subagents       *ports.SubagentsConfig
-	TokenBudget     int
-	ProviderOptions ports.ProviderOptions
+	Model            string
+	Subagents        *ports.SubagentsConfig
+	TokenBudget      int
+	CostBudgetMicros int64
+	ProviderOptions  ports.ProviderOptions
 }
 
 // AgentArgs are the user's generation args: applied first, platform keys
 // last (§3.1).
 type AgentArgs struct {
-	System   string
-	Tools    []ports.Tool
-	Options  []goai.Option
-	OnChunk  func(provider.StreamChunk)
-	OnFinish func(ports.RunFinishInfo)
+	System      string
+	SystemFn    ports.SystemFunc
+	PrepareStep ports.PrepareStepFunc
+	Tools       []ports.Tool
+	Options     []goai.Option
+	OnChunk     func(provider.StreamChunk)
+	OnSettle    ports.SettleFunc
+	OnFinish    func(ports.RunFinishInfo)
 }
 
 // RegisteredAgent is the registry entry behind a handle: the bound
@@ -92,8 +96,9 @@ func newHandle(scope ScopeFn, agent *RegisteredAgent) *Handle {
 func NewStreamTextAgent(scope ScopeFn, spec ports.StreamTextAgentSpec) *Handle {
 	return newHandle(scope, &RegisteredAgent{
 		Name: spec.Name, Kind: ports.KindStreamText,
-		Spec: SpecDefaults{Model: spec.Model, Subagents: spec.Subagents, TokenBudget: spec.TokenBudget, ProviderOptions: spec.ProviderOptions},
-		Args: AgentArgs{System: spec.System, Tools: spec.Tools, Options: spec.Options, OnChunk: spec.OnChunk, OnFinish: spec.OnFinish},
+		Spec: SpecDefaults{Model: spec.Model, Subagents: spec.Subagents, TokenBudget: spec.TokenBudget,
+			CostBudgetMicros: spec.CostBudgetMicros, ProviderOptions: spec.ProviderOptions},
+		Args: AgentArgs{System: spec.System, SystemFn: spec.SystemFn, PrepareStep: spec.PrepareStep, Tools: spec.Tools, Options: spec.Options, OnChunk: spec.OnChunk, OnSettle: spec.OnSettle, OnFinish: spec.OnFinish},
 	})
 }
 
@@ -101,7 +106,8 @@ func NewStreamTextAgent(scope ScopeFn, spec ports.StreamTextAgentSpec) *Handle {
 func NewGenerateTextAgent(scope ScopeFn, spec ports.GenerateTextAgentSpec) *Handle {
 	return newHandle(scope, &RegisteredAgent{
 		Name: spec.Name, Kind: ports.KindGenerateText,
-		Spec: SpecDefaults{Model: spec.Model, Subagents: spec.Subagents, TokenBudget: spec.TokenBudget, ProviderOptions: spec.ProviderOptions},
-		Args: AgentArgs{System: spec.System, Tools: spec.Tools, Options: spec.Options, OnFinish: spec.OnFinish},
+		Spec: SpecDefaults{Model: spec.Model, Subagents: spec.Subagents, TokenBudget: spec.TokenBudget,
+			CostBudgetMicros: spec.CostBudgetMicros, ProviderOptions: spec.ProviderOptions},
+		Args: AgentArgs{System: spec.System, SystemFn: spec.SystemFn, PrepareStep: spec.PrepareStep, Tools: spec.Tools, Options: spec.Options, OnSettle: spec.OnSettle, OnFinish: spec.OnFinish},
 	})
 }

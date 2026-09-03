@@ -40,6 +40,36 @@ Tools listed under `subagents` are merged into every child and wrapped exactly
 as the parent's are — so a child that calls a marked tool parks for approval,
 and is resumed where it stopped rather than restarted.
 
+## Named profiles
+
+> Go runtime.
+
+The default child is a generalist with one persona and the shared tools.
+When delegation should go to specialists — a page manager, a copywriter, an
+analyst — name them:
+
+```go
+Subagents: &agentenkit.SubagentsConfig{
+	Profiles: map[string]agentenkit.SubagentProfile{
+		"page-manager": {
+			Description: "edits and reorders the pages of the site",
+			SystemFn:    pageManagerPrompt,
+			Model:       "gpt-4o-mini",
+			Tools:       pageTools,
+			MaxSteps:    20,
+		},
+		"copywriter": {Description: "writes headings and body copy", System: "You write clean copy."},
+	},
+},
+```
+
+With profiles set, `spawnSubagent`'s description lists the names and what
+each one does, and `name` must be one of them; an unknown name comes back to
+the model as a tool error, not a crash. The child takes the profile's
+persona (`SystemFn` wins over `System`), model, tools and step cap. Everything
+else is unchanged: it is still a run, it still parks for approval, and it is
+re-entered under the same profile after one.
+
 ## What a child gets
 
 A child receives its **brief**, not the parent's transcript. Its turns are

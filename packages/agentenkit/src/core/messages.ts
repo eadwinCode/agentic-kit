@@ -22,6 +22,32 @@ interface MessageLike {
 
 const parts = (content: unknown): PartLike[] => (Array.isArray(content) ? (content as PartLike[]) : []);
 
+/** Turn one stored message into the shape the SDK accepts as a prompt turn.
+ *
+ *  Everything the platform stores is already SDK-shaped except one thing: the
+ *  compaction summary, which is persisted as a `{ type, text }` envelope so a
+ *  client can tell it apart from something a person wrote (§2.6). Fed back
+ *  verbatim, that object fails the SDK's prompt validation and takes the whole
+ *  run with it — on the very run that compacted, and on every run after, since
+ *  the summary is durable. Unwrapped to its text, it is an ordinary system
+ *  turn again.
+ *
+ *  Prompt-side only; nothing is written back. */
+export function promptMessage(m: { role: string; content: unknown }): { role: string; content: unknown } {
+  const c = m.content;
+  if (c && typeof c === 'object' && !Array.isArray(c)) {
+    const envelope = c as { type?: unknown; text?: unknown };
+    if (typeof envelope.type === 'string' && typeof envelope.text === 'string') {
+      return { role: m.role, content: envelope.text };
+    }
+  }
+  return { role: m.role, content: c };
+}
+
+/** `promptMessage` over a whole history. */
+export const promptMessages = (messages: Array<{ role: string; content: unknown }>) =>
+  messages.map(promptMessage);
+
 export const DANGLING_CALL_RESULT = {
   cancelled: true,
   reason: 'no result was recorded for this call',

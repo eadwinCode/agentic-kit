@@ -183,7 +183,9 @@ func ParkForApproval(ctx context.Context, deps ports.RuntimePorts, i ParkInput) 
 	runID, _ := CurrentRunID(ctx, deps, i.ThreadID)
 	_ = deps.Queue.Enqueue(ctx, ports.RunJob{
 		ThreadID: i.ThreadID, RunID: runID, Model: i.Resume.Model, Agent: i.Resume.Agent,
-		TokenBudget: i.Resume.TokenBudget, ProviderOptions: i.Resume.ProviderOptions, State: i.Resume.State,
+		TokenBudget: i.Resume.TokenBudget, CostBudgetMicros: i.Resume.CostBudgetMicros,
+		ProviderOptions: i.Resume.ProviderOptions, State: i.Resume.State,
+		MaxSteps: i.Resume.MaxSteps,
 	}, &ports.EnqueueOptions{Delay: ReclaimGraceAfter(deps)})
 	return nil
 }
@@ -345,10 +347,12 @@ func Respond(ctx context.Context, deps ports.RuntimePorts, input ports.RespondIn
 		job.Model = r.Model
 		job.Agent = r.Agent
 		job.TokenBudget = r.TokenBudget
+		job.CostBudgetMicros = r.CostBudgetMicros
 		job.ProviderOptions = r.ProviderOptions
 		// The answer resumes the SAME run, so it scopes storage the same way
 		// the parked segment did (§2.10).
 		job.State = r.State
+		job.MaxSteps = r.MaxSteps
 	}
 	if err := deps.Queue.Enqueue(ctx, job, nil); err != nil {
 		return ports.RespondResult{}, fmt.Errorf("resume dispatch: %w", err)

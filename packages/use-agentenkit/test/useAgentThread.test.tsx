@@ -397,3 +397,59 @@ describe('thread persistence', () => {
     expect(window.localStorage.getItem('use-agentenkit:last-thread')).toBeNull();
   });
 });
+
+describe('structured parts (live)', () => {
+  it('flips a tool card from running to done when its result lands', async () => {
+    const { view, emit } = await mount();
+    await act(async () => {
+      emit({ seq: 8, type: 'CHUNK', payload: { type: 'tool-call', toolCallId: 'c9', toolName: 'lookup', args: { q: 'x' } } });
+    });
+    const call = view.result.current.entries.at(-1)!;
+    expect(call.parts).toEqual([
+      { type: 'tool-call', toolCallId: 'c9', toolName: 'lookup', args: { q: 'x' }, state: 'running' },
+    ]);
+    await act(async () => {
+      emit({ seq: 9, type: 'CHUNK', payload: { type: 'tool-result', toolCallId: 'c9', toolName: 'lookup', result: { found: true } } });
+    });
+    const entries = view.result.current.entries;
+    const settled = entries.find((e) => e.id === call.id)!;
+    expect(settled.parts[0]).toMatchObject({ state: 'done', result: { found: true } });
+    expect(entries.at(-1)!.parts).toEqual([
+      { type: 'tool-result', toolCallId: 'c9', toolName: 'lookup', result: { found: true } },
+    ]);
+  });
+
+  it('streams text and thinking into parts', async () => {
+    const { view, emit } = await mount();
+    await act(async () => {
+      emit({ seq: 8, type: 'CHUNK', payload: { type: 'reasoning', textDelta: 'hm ' } });
+      emit({ seq: 9, type: 'CHUNK', payload: { type: 'reasoning', textDelta: 'ok' } });
+      emit({ seq: 10, type: 'CHUNK', payload: { type: 'text-delta', textDelta: 'an' } });
+      emit({ seq: 11, type: 'CHUNK', payload: { type: 'text-delta', textDelta: 'swer' } });
+    });
+    const [thought, answer] = view.result.current.entries.slice(-2);
+    expect(thought!.parts).toEqual([{ type: 'reasoning', text: 'hm ok' }]);
+    expect(answer!.parts).toEqual([{ type: 'text', text: 'answer' }]);
+  });
+
+  it('sends attachments and shows them on the optimistic turn', async () => {
+    const { view, calls } = await mount();
+    await act(async () => {
+      await view.result.current.run('what is this?', {
+        attachments: [{ url: 'https://cdn/cat.png', mediaType: 'image/png' }],
+        runId: 'run-1',
+        maxSteps: 3,
+      });
+    });
+    const optimistic = view.result.current.entries.find((e) => e.id.startsWith('optimistic:user:'))!;
+    expect(optimistic.parts).toEqual([
+      { type: 'text', text: 'what is this?' },
+      { type: 'image', image: 'https://cdn/cat.png', mimeType: 'image/png' },
+    ]);
+    const runCall = calls.find((c) => c.url.includes('/api/agent/run'))!;
+    const body = JSON.parse(String(runCall.init?.body));
+    expect(body.attachments).toEqual([{ url: 'https://cdn/cat.png', mediaType: 'image/png' }]);
+    expect(body.runId).toBe('run-1');
+    expect(body.maxSteps).toBe(3);
+  });
+});

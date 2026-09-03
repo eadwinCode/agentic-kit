@@ -68,6 +68,11 @@ type (
 	GenerateTextAgentSpec = ports.GenerateTextAgentSpec
 	RunFinishInfo         = ports.RunFinishInfo
 	SubagentsConfig       = ports.SubagentsConfig
+	SubagentProfile       = ports.SubagentProfile
+	Attachment            = ports.Attachment
+	SystemFunc            = ports.SystemFunc
+	PrepareStepFunc       = ports.PrepareStepFunc
+	SettleFunc            = ports.SettleFunc
 
 	AgentRunState  = ports.AgentRunState
 	StorageContext = ports.StorageContext
@@ -89,6 +94,13 @@ type (
 	UsageTotals      = ports.UsageTotals
 	ContextUsage     = ports.ContextUsage
 	NewUsage         = ports.NewUsage
+	UsageLine        = ports.UsageLine
+	UsageFilter      = ports.UsageFilter
+	UsageKind        = ports.UsageKind
+	UsageOutcome     = ports.UsageOutcome
+	Cost             = ports.Cost
+	Pricer           = ports.Pricer
+	PricerFunc       = ports.PricerFunc
 	ProviderOptions  = ports.ProviderOptions
 	RunJob           = ports.RunJob
 	NestedDescriptor = ports.NestedDescriptor
@@ -100,6 +112,13 @@ type (
 )
 
 const (
+	KindStep       = ports.KindStep
+	KindCompaction = ports.KindCompaction
+
+	UsageFinished = ports.UsageFinished
+	UsageAborted  = ports.UsageAborted
+	UsageErrored  = ports.UsageErrored
+
 	StateIdle            = ports.StateIdle
 	StateRunning         = ports.StateRunning
 	StateWaitingForInput = ports.StateWaitingForInput
@@ -212,13 +231,17 @@ var (
 	SSEFrame     = core.SSEFrame
 	SSEHeaders   = core.SSEHeaders
 
-	ClaimRun     = core.ClaimRun
-	CurrentRunID = core.CurrentRunID
-	RunIDKey     = core.RunIDKey
-	RedriveKey   = core.RedriveKey
-	StateKey     = core.StateKey
-	RunLockKey   = core.RunLockKey
-	NewID        = core.NewID
+	ContextWithRunID = core.ContextWithRunID
+	RunIDFromContext = core.RunIDFromContext
+	ClaimRun         = core.ClaimRun
+	ClaimRunAs       = core.ClaimRunAs
+	UserContent      = core.UserContent
+	CurrentRunID     = core.CurrentRunID
+	RunIDKey         = core.RunIDKey
+	RedriveKey       = core.RedriveKey
+	StateKey         = core.StateKey
+	RunLockKey       = core.RunLockKey
+	NewID            = core.NewID
 
 	CountTokens     = core.CountTokens
 	AttributeTokens = core.AttributeTokens
