@@ -100,7 +100,11 @@ describe('SqliteStorage', () => {
     const t = await s.threads.create({ model: 'gpt-4o' });
     await s.messages.append(t.id, { role: 'user', content: 'a' });
     await s.events.append(t.id, { threadId: t.id, seq: 1, type: 'CHUNK', payload: {}, createdAt: new Date() } as any);
-    await s.usage.record(t.id, { agentId: null, inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, totalTokens: 2 });
+    await s.usage.record(t.id, {
+      agentId: null, kind: 'step', step: 1, outcome: 'finished',
+      inputTokens: 1, cacheReadInputTokens: 0, cacheWriteInputTokens: 0,
+      outputTokens: 1, reasoningTokens: 0, totalTokens: 2,
+    });
     await s.threads.delete(t.id);
 
     expect(await s.threads.get(t.id)).toBeNull();

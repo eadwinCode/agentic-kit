@@ -81,10 +81,21 @@ type EventStore interface {
 	ListByType(ctx context.Context, threadID, typ string, sc StorageContext) ([]AgentEvent, error)
 }
 
-// UsageStore is the usage section of Storage.
+// UsageStore is the usage section of Storage: one row per model call (§4).
+//
+// The platform writes a row after EVERY call it makes on a thread, priced by
+// the runtime's Pricer before it gets here. An implementation stores the row
+// as given; it never prices anything itself.
 type UsageStore interface {
 	Record(ctx context.Context, threadID string, u NewUsage, sc StorageContext) error
-	// Total sums every recorded segment for the thread (§4). A thread with
-	// no usage rows returns zeroes.
-	Total(ctx context.Context, threadID string, sc StorageContext) (UsageTotals, error)
+	// Total sums recorded calls: tokens and money (§4). An empty filter sums
+	// the whole thread; UsageFilter{RunID: id} sums one dispatched run,
+	// nested runs included, which is what a settle hook bills from.
+	//
+	// The result also carries Lines: the same spend grouped by agent and
+	// model, so one call serves the thread header, the settle hook and the
+	// admin reads alike. A thread with no usage rows returns zeroes.
+	// Unpriced counts the calls with no cost on them, so a reader can tell
+	// "nothing was spent" apart from "nothing was priced".
+	Total(ctx context.Context, threadID string, filter UsageFilter, sc StorageContext) (UsageTotals, error)
 }

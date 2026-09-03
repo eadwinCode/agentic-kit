@@ -65,6 +65,7 @@ knows the moment:
 | :--- | :--- | :--- |
 | `RUN_REFUSED` | `billingPreCheck` said no | `{ reason: 'billing', error }` |
 | `TOKEN_BUDGET_EXHAUSTED` | the run's spend crossed `tokenBudget` between steps, just before it stops | `{ agentId, tokensUsed, tokenBudget }` |
+| `COST_BUDGET_EXHAUSTED` | the run's spend crossed `costBudgetMicros` between steps, just before it stops | `{ agentId, costMicros, costBudgetMicros, currency }` |
 
 Both are durable. The pre-check also receives `publishEvent`, so it can say
 it in your own terms first: a reset date, a plan name, a link.
@@ -135,7 +136,7 @@ run out of credits. Each piece of UI state has a home:
 | The preview URL | `publishEvent('DESIGN_PREVIEW', { url })` from the tool |
 | Questions for the user | mark the tool with `markRequiresConfirmation`: the run parks, the questions land in `pendingInputs`, the answers come back through `respondToInput(toolCallId, true, answers)` |
 | Out of credits | `billingPreCheck` refuses the run when the user sends; it publishes your `CREDIT_LIMIT` (with the reset date) and the platform publishes `RUN_REFUSED`, so the chat shows the refusal in place |
-| Budget spent mid-run | pass the remaining credit as the run's `tokenBudget`; the platform publishes `TOKEN_BUDGET_EXHAUSTED` between steps, then finalizes |
+| Budget spent mid-run | pass the remaining credit as the run's `tokenBudget` — or as `costBudgetMicros` with a pricer configured; the platform publishes `TOKEN_BUDGET_EXHAUSTED` / `COST_BUDGET_EXHAUSTED` between steps, then finalizes |
 | An error | `STATE_CHANGE` with `state: 'FAILED'` carries the reason |
 | Context usage | the hook's `usage.context`, loaded after every run |
 

@@ -61,6 +61,7 @@ var Schema = []string{
 	   "durationMs" INT NOT NULL, "finishReason" TEXT NOT NULL,
 	   "inputTokens" INT NOT NULL DEFAULT 0, "cachedInputTokens" INT NOT NULL DEFAULT 0,
 	   "outputTokens" INT NOT NULL DEFAULT 0, "totalTokens" INT NOT NULL DEFAULT 0,
+	   "costMicros" BIGINT NOT NULL DEFAULT 0, currency TEXT,
 	   tools JSONB, text TEXT, "toolCalls" JSONB,
 	   at TIMESTAMPTZ NOT NULL DEFAULT now())`,
 	`ALTER TABLE agentic_steps ADD COLUMN IF NOT EXISTS text TEXT`,

@@ -42,8 +42,11 @@ interface Storage {
     listByType(threadId, type, ctx): Promise<AgentEvent[]>;
   };
   usage: {
+    // One row per MODEL CALL, priced before it reaches you (§4).
     record(threadId, usage, ctx): Promise<void>;
-    total(threadId, ctx): Promise<UsageTotals>;
+    // An empty filter sums the thread; { runId } sums one run. The result
+    // carries `lines`, grouped by agent and model.
+    total(threadId, filter, ctx): Promise<UsageTotals>;
   };
 }
 ```

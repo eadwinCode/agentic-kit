@@ -33,6 +33,7 @@ export {
   answeredToolCalls,
   contentToParts,
   contentToText,
+  formatCost,
   messageToEntry,
   messageToEntries,
   reasoningText,
@@ -58,5 +59,6 @@ export type {
   ThreadSnapshot,
   ThreadUsage,
   UsageTotals,
+  UsageLine,
   ContextUsage,
 } from './types.js';

@@ -2,6 +2,7 @@ package ports
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/provider"
@@ -21,8 +22,34 @@ type RuntimePorts struct {
 	// ResolveModel is user-provided model resolution (§3.3): models can live
 	// in any shape on the consumer side; the platform only sees ResolvedModel.
 	ResolveModel func(modelName string) (ResolvedModel, error)
-	Config       AgentConfig
+	// Pricer puts a price on every model call before its usage row is
+	// stored (§4). Nil stores every row unpriced.
+	Pricer Pricer
+	// Log is where the platform reports what it could not do without
+	// failing the run, such as a usage row it failed to store.
+	Log    *slog.Logger
+	Config AgentConfig
 }
+
+// Pricer turns one model call into money (§4). The runtime calls it after
+// every call, before the usage row is stored, so cost is part of the row
+// rather than something a reader has to work out later.
+//
+// It runs on the run's own path: keep it fast and side-effect free. A price
+// list lookup is the intended shape; a network call is not.
+type Pricer interface {
+	// Price returns nil, nil when it cannot price this call. The row is then
+	// stored unpriced, and in a Chain the next pricer gets its turn. An
+	// error is logged and treated the same way: an unpriceable call must
+	// never fail a run.
+	Price(ctx context.Context, usage NewUsage) (*Cost, error)
+}
+
+// PricerFunc adapts a plain function into a Pricer.
+type PricerFunc func(ctx context.Context, usage NewUsage) (*Cost, error)
+
+// Price implements Pricer.
+func (f PricerFunc) Price(ctx context.Context, u NewUsage) (*Cost, error) { return f(ctx, u) }
 
 // RuntimeOptions is what SetupAgentCore takes.
 type RuntimeOptions struct {
@@ -37,6 +64,14 @@ type RuntimeOptions struct {
 	// ResolveModel turns a registry key into a provider instance and a
 	// context window.
 	ResolveModel func(modelName string) (ResolvedModel, error)
+	// Pricer prices every model call (§4). Nil records tokens only, and
+	// every UsageTotals comes back with Unpriced above zero. See the
+	// pricing package for the three that ship: a price table, a provider
+	// receipt reader, and a chain of both.
+	Pricer Pricer
+	// Log is where the platform reports what it could not do without
+	// failing the run. Nil uses slog.Default().
+	Log *slog.Logger
 	// Config is nil for the defaults.
 	Config *AgentConfig
 }
@@ -56,6 +91,11 @@ type RunInput struct {
 	Model string
 	// TokenBudget overrides the spec / config default (§2.1 safety cap).
 	TokenBudget int
+	// CostBudgetMicros overrides the spec / config money cap (§4), in
+	// millionths of the pricer's currency: 250_000 stops the run after
+	// roughly $0.25. Needs a Pricer; without one nothing is ever priced and
+	// the cap can never be reached.
+	CostBudgetMicros int64
 	// ProviderOptions merge over the spec default, per provider namespace.
 	ProviderOptions ProviderOptions
 	// RunID lets the caller name the run (§2.1). Empty mints one. A caller
@@ -164,17 +204,31 @@ type ThreadSnapshot struct {
 // RunFinishInfo is handed to a spec's OnFinish after the platform finalized
 // the run.
 type RunFinishInfo struct {
-	ThreadID    string
-	RunID       string
-	State       ExecutionState
-	StopReason  string
-	TokensUsed  int
+	ThreadID   string
+	RunID      string
+	State      ExecutionState
+	StopReason string
+	TokensUsed int
+	// Attribution is what THIS segment spent. A run that parked and resumed
+	// finishes once, so this is the last segment, not the whole run.
 	Attribution UsageTotals
 	Steps       int
 	// Cancelled is a user stop (§2.1).
 	Cancelled bool
 	// Error is why the run failed, when it did.
 	Error string
+	// Usage is the whole run's tokens AND money: every segment and every
+	// nested run, read back with Total(threadID, UsageFilter{RunID: runID}).
+	// Its Lines are the bill, one per agent and model, so a settle hook
+	// charges in one pass without keeping its own tally (§4). Zero-valued
+	// when the storage read failed; Unpriced above zero means some calls went
+	// unpriced and CostMicros is a floor.
+	Usage UsageTotals
+	// UsageErr is set when the platform could not read the run's rows back.
+	// Usage is then zero-valued, and a hook that bills from it should refuse
+	// to settle rather than charge nothing: return the error from OnSettle
+	// and the run fails instead of going free.
+	UsageErr error
 }
 
 // StreamTextAgentSpec describes a stream-text agent (§3.1). The platform
@@ -191,6 +245,10 @@ type StreamTextAgentSpec struct {
 	// TokenBudget is the default per-run budget (input + output). Zero is
 	// unbounded apart from MaxSteps.
 	TokenBudget int
+	// CostBudgetMicros is the default per-run money cap (§4), in millionths
+	// of the pricer's currency. Zero is unbounded. Needs a Pricer: an
+	// unpriced call spends no money and so can never exhaust it.
+	CostBudgetMicros int64
 	// ProviderOptions are this agent's defaults; the run input wins.
 	ProviderOptions ProviderOptions
 	// System is the static persona.
@@ -216,16 +274,17 @@ type StreamTextAgentSpec struct {
 
 // GenerateTextAgentSpec describes a generate-text agent (§3.1).
 type GenerateTextAgentSpec struct {
-	Name            string
-	Model           string
-	Subagents       *SubagentsConfig
-	TokenBudget     int
-	ProviderOptions ProviderOptions
-	System          string
-	SystemFn        SystemFunc
-	PrepareStep     PrepareStepFunc
-	Tools           []Tool
-	Options         []goai.Option
-	OnSettle        SettleFunc
-	OnFinish        func(info RunFinishInfo)
+	Name             string
+	Model            string
+	Subagents        *SubagentsConfig
+	TokenBudget      int
+	CostBudgetMicros int64
+	ProviderOptions  ProviderOptions
+	System           string
+	SystemFn         SystemFunc
+	PrepareStep      PrepareStepFunc
+	Tools            []Tool
+	Options          []goai.Option
+	OnSettle         SettleFunc
+	OnFinish         func(info RunFinishInfo)
 }

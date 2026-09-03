@@ -221,9 +221,9 @@ type RunPatch struct {
 // Ptr is a small helper for building a RunPatch.
 func Ptr[T any](v T) *T { return &v }
 
-// UsageTotals is cumulative token attribution across every run on a thread
-// (§4). The platform records the counters; USD/credit pricing is a
-// downstream concern computed over them.
+// UsageTotals is cumulative token AND money attribution across every run on
+// a thread (§4). Tokens are what the provider reported; the money is what
+// the Pricer put on each row as it was stored.
 type UsageTotals struct {
 	// InputTokens are fresh (uncached) prompt tokens.
 	InputTokens int `json:"inputTokens"`
@@ -232,14 +232,112 @@ type UsageTotals struct {
 	OutputTokens      int `json:"outputTokens"`
 	// TotalTokens is input + cached + output.
 	TotalTokens int `json:"totalTokens"`
+	// CostMicros is the summed cost, in millionths of one Currency unit.
+	// 1_000_000 is one dollar when Currency is "USD".
+	CostMicros int64 `json:"costMicros"`
+	// Currency is the unit CostMicros is in, empty when nothing was priced.
+	// One deployment should price in ONE currency: these are summed, not
+	// converted.
+	Currency string `json:"currency,omitempty"`
+	// Unpriced is how many calls had no cost, because no pricer answered for
+	// them. Above zero, CostMicros is a floor and not the whole bill.
+	Unpriced int `json:"unpriced"`
+	// Lines is the same spend grouped by agent and model: one line per pair,
+	// which is the shape a bill wants. Summing the lines gives the totals
+	// above.
+	Lines []UsageLine `json:"lines,omitempty"`
 }
 
-// Add sums another set of totals into this one.
+// UsageLine is one agent's spend on one model, summed over its calls (§4).
+// This is the bill line a credit system charges for.
+type UsageLine struct {
+	// AgentID is empty for the main run, the nested run's id otherwise.
+	AgentID   string `json:"agentId,omitempty"`
+	AgentName string `json:"agentName,omitempty"`
+	// Model is the registry key; ModelID the wire id the provider reported.
+	Model                 string `json:"model,omitempty"`
+	ModelID               string `json:"modelId,omitempty"`
+	InputTokens           int    `json:"inputTokens"`
+	CacheReadInputTokens  int    `json:"cacheReadInputTokens"`
+	CacheWriteInputTokens int    `json:"cacheWriteInputTokens"`
+	OutputTokens          int    `json:"outputTokens"`
+	ReasoningTokens       int    `json:"reasoningTokens"`
+	// Calls is how many model calls this line covers.
+	Calls int `json:"calls"`
+	// Estimated is how many of those had estimated tokens, because they were
+	// cut off before the provider reported real ones.
+	Estimated  int   `json:"estimated"`
+	CostMicros int64 `json:"costMicros"`
+}
+
+// UsageAggregator sums usage rows into the shape Total must return: the four
+// counters, the money, and one Line per agent and model.
+//
+// A storage adapter that can group in the database should do that instead.
+// This is for the ones that cannot, and for anyone writing their own adapter:
+// feed every matching row through Add and Totals gives back exactly what the
+// port promises, lines in first-seen order.
+type UsageAggregator struct {
+	total UsageTotals
+	index map[usageLineKey]int
+}
+
+type usageLineKey struct{ agentID, agentName, model, modelID string }
+
+// Add books one call.
+func (a *UsageAggregator) Add(u NewUsage) {
+	if a.index == nil {
+		a.index = map[usageLineKey]int{}
+	}
+	a.total.Add(u.Totals())
+
+	key := usageLineKey{u.AgentID, u.AgentName, u.Model, u.ModelID}
+	i, ok := a.index[key]
+	if !ok {
+		i = len(a.total.Lines)
+		a.index[key] = i
+		a.total.Lines = append(a.total.Lines, UsageLine{
+			AgentID: u.AgentID, AgentName: u.AgentName, Model: u.Model, ModelID: u.ModelID,
+		})
+	}
+	line := &a.total.Lines[i]
+	line.InputTokens += u.InputTokens
+	line.CacheReadInputTokens += u.CacheReadInputTokens
+	line.CacheWriteInputTokens += u.CacheWriteInputTokens
+	line.OutputTokens += u.OutputTokens
+	line.ReasoningTokens += u.ReasoningTokens
+	line.Calls++
+	if u.Estimated {
+		line.Estimated++
+	}
+	if u.Cost != nil {
+		line.CostMicros += u.Cost.Micros
+	}
+}
+
+// Totals is everything added so far.
+func (a *UsageAggregator) Totals() UsageTotals { return a.total }
+
+// UsageFilter narrows a usage read (§4).
+type UsageFilter struct {
+	// RunID limits the read to one dispatched run, nested runs included.
+	// Empty reads the whole thread.
+	RunID string
+}
+
+// Add sums another set of totals into this one. The currency is taken from
+// whichever side has one; mixing two is a pricing misconfiguration, not
+// something to convert here.
 func (u *UsageTotals) Add(o UsageTotals) {
 	u.InputTokens += o.InputTokens
 	u.CachedInputTokens += o.CachedInputTokens
 	u.OutputTokens += o.OutputTokens
 	u.TotalTokens += o.TotalTokens
+	u.CostMicros += o.CostMicros
+	u.Unpriced += o.Unpriced
+	if u.Currency == "" {
+		u.Currency = o.Currency
+	}
 }
 
 // ContextUsage is how full the next run's prompt would be (§2.6). Token
@@ -251,13 +349,122 @@ type ContextUsage struct {
 	Messages        int `json:"messages"`
 }
 
-// NewUsage is one recorded segment of spend.
+// UsageOutcome is how the model call that produced a usage row ended.
+type UsageOutcome string
+
+const (
+	// UsageFinished: the call ran to its finish and the provider reported
+	// the counters itself.
+	UsageFinished UsageOutcome = "finished"
+	// UsageAborted: a user stop cut the call mid-stream, so no finish ever
+	// arrived and the tokens are estimated.
+	UsageAborted UsageOutcome = "aborted"
+	// UsageErrored: the provider failed mid-call. Whatever it had already
+	// streamed was still billed, so the row is kept.
+	UsageErrored UsageOutcome = "error"
+)
+
+// UsageKind says which part of the platform made the call.
+type UsageKind string
+
+const (
+	// KindStep is a step of an agent loop, main run or nested (§2.1, §2.7).
+	KindStep UsageKind = "step"
+	// KindCompaction is the summary the platform writes to keep the prompt
+	// inside the model's window (§2.6). Nobody asked for it, so it is worth
+	// being able to see what it costs on its own.
+	KindCompaction UsageKind = "compaction"
+)
+
+// Cost is the money one model call cost.
+type Cost struct {
+	// Micros is millionths of one Currency unit: 1_000_000 is one dollar
+	// when Currency is "USD". Integers, because money summed as float64
+	// drifts.
+	Micros int64 `json:"micros"`
+	// Currency is an ISO-4217 code, "USD" for the shipped table pricer.
+	Currency string `json:"currency"`
+	// Source is where the number came from: "receipt" when the provider
+	// computed it, "table" from a price list, "estimate" for anything a
+	// pricer worked out itself. It rides along so a bill can be audited.
+	Source string `json:"source"`
+}
+
+// NewUsage is ONE model call, recorded by the engine after every call: a
+// step of the main run, a step of a nested run, a compaction pass, streamed
+// or not, finished or cut short.
+//
+// It carries everything a Pricer needs to put a price on the call, so
+// pricing never has to reach back into the run to find out what happened.
 type NewUsage struct {
-	AgentID           string
-	InputTokens       int
-	CachedInputTokens int
-	OutputTokens      int
-	TotalTokens       int
+	// RunID is the DISPATCHED run this call belongs to (§2.9). A nested run's
+	// calls carry their parent's run id, so one run's bill is one query.
+	RunID string `json:"runId,omitempty"`
+	// AgentID is whose stream made the call (§2.7): empty is the main run,
+	// otherwise the nested run's id.
+	AgentID string `json:"agentId,omitempty"`
+	// AgentName is the registered handle for the main run, the delegation's
+	// name for a nested one. What a bill line should say.
+	AgentName string    `json:"agentName,omitempty"`
+	Kind      UsageKind `json:"kind"`
+	// Step is the 1-based iteration inside its loop; 0 for a compaction.
+	Step int `json:"step"`
+
+	// Model is the registry key the call was made with, e.g.
+	// "claude-sonnet-4@high" — what a price list is usually keyed by.
+	Model string `json:"model,omitempty"`
+	// ModelID is the wire id the provider reported back, which can differ
+	// from the key that asked for it (an alias, a dated snapshot).
+	ModelID string `json:"modelId,omitempty"`
+
+	InputTokens           int `json:"inputTokens"`
+	CacheReadInputTokens  int `json:"cacheReadInputTokens"`
+	CacheWriteInputTokens int `json:"cacheWriteInputTokens"`
+	OutputTokens          int `json:"outputTokens"`
+	// ReasoningTokens are thinking tokens. Most providers already count
+	// these inside OutputTokens, so price them at zero unless yours bills
+	// them separately (see the pricing package).
+	ReasoningTokens int `json:"reasoningTokens"`
+
+	Outcome UsageOutcome `json:"outcome"`
+	// Estimated is true when no finish chunk arrived and the counters are the
+	// platform's own estimate over what it does know: the prompt it sent and
+	// the text that did stream, measured the same way compaction measures
+	// context fill.
+	Estimated bool `json:"estimated,omitempty"`
+
+	// ProviderMetadata is whatever the provider attached to the finish: a
+	// gateway receipt, a generation id, anything a Pricer wants to read.
+	ProviderMetadata map[string]any `json:"providerMetadata,omitempty"`
+
+	// Cost is filled by the Pricer before the row is stored. Nil means the
+	// call went unpriced and any total over it is a floor.
+	Cost *Cost `json:"cost,omitempty"`
+}
+
+// TotalTokens is input + cache reads + output: the counter the token budget
+// is measured against, and the one UsageTotals carries.
+//
+// Cache WRITES and reasoning tokens are deliberately outside it. Cache
+// writes are a separate line on the provider's bill, and reasoning tokens
+// are usually already inside OutputTokens; adding either here would move a
+// budget that callers have already tuned.
+func (u NewUsage) TotalTokens() int {
+	return u.InputTokens + u.CacheReadInputTokens + u.OutputTokens
+}
+
+// Totals is this one call as a UsageTotals, cost included.
+func (u NewUsage) Totals() UsageTotals {
+	t := UsageTotals{
+		InputTokens: u.InputTokens, CachedInputTokens: u.CacheReadInputTokens,
+		OutputTokens: u.OutputTokens, TotalTokens: u.TotalTokens(),
+	}
+	if u.Cost == nil {
+		t.Unpriced = 1
+		return t
+	}
+	t.CostMicros, t.Currency = u.Cost.Micros, u.Cost.Currency
+	return t
 }
 
 // ProviderOptions are provider-specific options passed through to the
@@ -298,9 +505,12 @@ type RunJob struct {
 	EnqueuedAt int64 `json:"enqueuedAt,omitempty"`
 	// State is the run's state (§2.10), so a worker rehydrates exactly what
 	// the caller attached.
-	State           AgentRunState   `json:"state,omitempty"`
-	TokenBudget     int             `json:"tokenBudget,omitempty"`
-	ProviderOptions ProviderOptions `json:"providerOptions,omitempty"`
+	State       AgentRunState `json:"state,omitempty"`
+	TokenBudget int           `json:"tokenBudget,omitempty"`
+	// CostBudgetMicros is the money cap for this run (§4), carried so the
+	// worker enforces the same cap the caller asked for.
+	CostBudgetMicros int64           `json:"costBudgetMicros,omitempty"`
+	ProviderOptions  ProviderOptions `json:"providerOptions,omitempty"`
 	// MaxSteps is the run's own step cap, when the caller set one (§2.1).
 	MaxSteps int `json:"maxSteps,omitempty"`
 }
@@ -317,13 +527,14 @@ type NestedDescriptor struct {
 // ResumeInfo is everything needed to resume a parked HITL run segment (§2.5).
 // Persisted inside the INPUT_REQUIRED event payload.
 type ResumeInfo struct {
-	Agent           string          `json:"agent"`
-	Model           string          `json:"model"`
-	RunID           string          `json:"runId,omitempty"`
-	TokenBudget     int             `json:"tokenBudget,omitempty"`
-	ProviderOptions ProviderOptions `json:"providerOptions,omitempty"`
-	State           AgentRunState   `json:"state,omitempty"`
-	MaxSteps        int             `json:"maxSteps,omitempty"`
+	Agent            string          `json:"agent"`
+	Model            string          `json:"model"`
+	RunID            string          `json:"runId,omitempty"`
+	TokenBudget      int             `json:"tokenBudget,omitempty"`
+	CostBudgetMicros int64           `json:"costBudgetMicros,omitempty"`
+	ProviderOptions  ProviderOptions `json:"providerOptions,omitempty"`
+	State            AgentRunState   `json:"state,omitempty"`
+	MaxSteps         int             `json:"maxSteps,omitempty"`
 }
 
 // ResolvedModel is a model identity after resolution: the real provider
@@ -332,6 +543,20 @@ type ResumeInfo struct {
 type ResolvedModel struct {
 	Instance      func() provider.LanguageModel
 	ContextWindow int
+	// ModelID is the wire id this key resolves to, e.g.
+	// "claude-sonnet-4-20250514" for the key "claude-sonnet-4@high". It goes
+	// onto every usage row, so a price list keyed by wire ids can match one
+	// (§4). Empty means the key IS the id.
+	ModelID string
+}
+
+// WireID is the model id to record for a registry key: what ResolveModel
+// declared, or the key itself when it declared nothing.
+func (m ResolvedModel) WireID(key string) string {
+	if m.ModelID != "" {
+		return m.ModelID
+	}
+	return key
 }
 
 // Tool is a goai tool plus the platform's own flags. RequiresConfirmation
@@ -422,6 +647,12 @@ type AgentConfig struct {
 	// TokenBudget is the default per-run token budget (input + output). Zero
 	// means unbounded apart from MaxSteps.
 	TokenBudget int
+	// CostBudgetMicros is the default per-run money cap (§4), in millionths
+	// of the pricer's currency: 250_000 is roughly a quarter of a dollar
+	// when the pricer works in USD. Zero means unbounded. Checked between
+	// steps, exactly like TokenBudget, so the step that crossed the line is
+	// always kept in full.
+	CostBudgetMicros int64
 	// SubagentMaxDepth caps nesting (§2.7).
 	SubagentMaxDepth int
 	// SubagentMaxConcurrent caps concurrent subagents per run (§2.7).

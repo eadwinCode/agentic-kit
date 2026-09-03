@@ -163,6 +163,41 @@ Implement any of them for your own stack — `core/` imports nothing else. The
 [`Memory*` adapters](./src/adapters/memory.ts) are a complete implementation used by the
 test suite and double as a template.
 
+## Cost (§4)
+
+Give the runtime a `pricer` and every usage row carries the money as well as the
+tokens, so spend is read from the store the engine already fills:
+
+```ts
+import { pricing, setupAgentCore } from 'agentenkit';
+
+const runtime = await setupAgentCore({
+  // ... ports ...
+  pricer: pricing.table({
+    // dollars per MILLION tokens, typed off the provider's pricing page
+    'gpt-4o': { inputPerMillion: 2.5, cacheReadPerMillion: 1.25, outputPerMillion: 10 },
+  }),
+});
+```
+
+One row per model call: main run, nested run or compaction, streamed or not,
+finished or cut short. Reading it back:
+
+```ts
+await runtime.getThreadUsage(threadId);           // the thread header
+await storage.usage.total(threadId, { runId });   // one run's bill
+```
+
+Every total carries `costMicros`, `currency`, `unpriced` and `lines` — the same
+spend grouped by agent and model, which is what a credit system charges for. A
+spec's `onFinish` receives it ready-made as `info.usage`, and
+`run({ costBudgetMicros })` caps a run by money the way `tokenBudget` caps it by
+tokens.
+
+`pricing` also ships `receipt`, for the figure a gateway already computed, and
+`chain`, to try one then the other. See
+[Cost and pricing](https://eadwincode.github.io/agentic-kit/cost-and-pricing).
+
 ## The admin store (§2.9) — not yours
 
 Run records, step timings and a thread index are the **platform's** data, in the
@@ -172,7 +207,7 @@ platform's own tables. You do not implement `AdminStore`; you read it back:
 await runtime.admin.overview();          // threads and runs by state, plus what's in flight
 await runtime.admin.listRuns({ state: ['FAILED'], since });
 await runtime.admin.stats({ since });    // p50/p95 duration and queue wait, tokens, failures
-await runtime.admin.getRun(runId);       // one run: steps, nested runs, timeline
+await runtime.admin.getRun(runId);       // one run: steps, nested runs, timeline, spend
 ```
 
 Configure nothing and it is SQLite on disk (`AGENTIC_KIT_ADMIN_DB` moves the file).

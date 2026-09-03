@@ -95,7 +95,7 @@ func TestSqliteStorage_DeleteFromAndClaimStateAndCascade(t *testing.T) {
 
 	_ = s.Events().Append(ctx, th.ID, ports.AgentEvent{ThreadID: th.ID, Seq: 1, Type: "X", Payload: []byte(`{"a":1}`), CreatedAt: time.Now()}, sc)
 	_ = s.Events().Append(ctx, th.ID, ports.AgentEvent{ThreadID: th.ID, Seq: 2, Type: "Y", CreatedAt: time.Now()}, sc)
-	_ = s.Usage().Record(ctx, th.ID, ports.NewUsage{InputTokens: 1, OutputTokens: 2, TotalTokens: 3}, sc)
+	_ = s.Usage().Record(ctx, th.ID, ports.NewUsage{InputTokens: 1, OutputTokens: 2}, sc)
 	latest, _ := s.Events().Latest(ctx, th.ID, "X", sc)
 	mustEqual(t, string(latest.Payload), `{"a":1}`, "payload")
 	since, _ := s.Events().ListSince(ctx, th.ID, 1, sc)
@@ -103,7 +103,7 @@ func TestSqliteStorage_DeleteFromAndClaimStateAndCascade(t *testing.T) {
 	mustEqual(t, string(since[0].Payload), "null", "empty payload reads as null")
 	byType, _ := s.Events().ListByType(ctx, th.ID, "Y", sc)
 	mustEqual(t, len(byType), 1, "by type")
-	total, _ := s.Usage().Total(ctx, th.ID, sc)
+	total, _ := s.Usage().Total(ctx, th.ID, ports.UsageFilter{}, sc)
 	mustEqual(t, total.TotalTokens, 3, "usage")
 	list, _ := s.Threads().List(ctx, sc)
 	mustEqual(t, len(list), 1, "list")
@@ -119,7 +119,7 @@ func TestSqliteStorage_DeleteFromAndClaimStateAndCascade(t *testing.T) {
 	mustEqual(t, len(rows), 0, "messages gone")
 	evs, _ := s.Events().ListSince(ctx, th.ID, -1, sc)
 	mustEqual(t, len(evs), 0, "events gone")
-	total, _ = s.Usage().Total(ctx, th.ID, sc)
+	total, _ = s.Usage().Total(ctx, th.ID, ports.UsageFilter{}, sc)
 	mustEqual(t, total.TotalTokens, 0, "usage gone")
 	if err := s.Threads().Delete(ctx, th.ID, sc); err == nil {
 		t.Fatal("deleting twice must fail")

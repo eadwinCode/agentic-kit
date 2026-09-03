@@ -113,6 +113,8 @@ type BoundUsage struct {
 func (b BoundUsage) Record(ctx context.Context, threadID string, u NewUsage) error {
 	return b.s.Record(ctx, threadID, u, b.sc)
 }
-func (b BoundUsage) Total(ctx context.Context, threadID string) (UsageTotals, error) {
-	return b.s.Total(ctx, threadID, b.sc)
+
+// Total sums the thread's calls. Pass UsageFilter{RunID: id} for one run.
+func (b BoundUsage) Total(ctx context.Context, threadID string, filter UsageFilter) (UsageTotals, error) {
+	return b.s.Total(ctx, threadID, filter, b.sc)
 }

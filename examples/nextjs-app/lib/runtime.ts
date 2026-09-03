@@ -5,13 +5,14 @@ import { z } from 'zod';
 import { tool } from 'ai';
 import {
   markRequiresConfirmation,
+  pricing,
   PrismaStorage,
   QStashQueue,
   RedisBus,
   RedisKv,
   setupAgentCore,
 } from 'agentenkit';
-import { modelRegistry } from './models'; // §2.3 — models in your shape
+import { modelIds, modelPrices, modelRegistry } from './models'; // §2.3 — models in your shape
 
 // ⚠ Next dev re-evaluates this module on every hot reload, and a fresh
 // evaluation would open its own Prisma pool and Redis connection that nothing
@@ -59,14 +60,23 @@ export const runtime = await setupAgentCore({
     reclaimGraceMs: 15_000,
   },
 
+  // Money (§4): every model call is priced before its usage row is stored, so
+  // spend is read back from the same store the tokens come from — no second
+  // table, no wrapper around the model. Swap `pricing.table` for
+  // `pricing.chain(pricing.receipt(...), pricing.table(...))` if your gateway
+  // sends the real figure back and you want that instead of a price list.
+  pricer: pricing.table(modelPrices),
+
   // Models can come in any shape — the platform only ever sees
-  // ResolvedModel { instance, contextWindow } (§3.3).
+  // ResolvedModel { instance, contextWindow, modelId } (§3.3).
   resolveModel: (modelName) => {
     const m = modelRegistry[modelName as keyof typeof modelRegistry];
     if (!m) throw new Error(`Unknown model: ${modelName}`);
     return {
       instance: () => m,
       contextWindow: 265_000,
+      // The wire id this key resolves to, recorded on every usage row (§4).
+      modelId: modelIds[modelName],
     };
   },
 });

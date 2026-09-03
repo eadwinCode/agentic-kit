@@ -121,11 +121,9 @@ export interface NewRunRecord {
 
 export type RunPatch = Partial<Omit<RunRecord, 'id' | 'threadId'>>;
 
-/** Token attribution only (§4): total tokens used. USD/credit pricing is a
- *  downstream concern computed over the recorded counters. */
-/** Token attribution (§4): the platform records the counters; USD/credit
- *  pricing is a downstream concern computed over them. */
-/** Cumulative token attribution across every run on a thread (§4). */
+/** Cumulative token AND money attribution across every run on a thread (§4).
+ *  Tokens are what the provider reported; the money is what the Pricer put on
+ *  each row as it was stored. */
 export interface UsageTotals {
   /** Fresh (uncached) prompt tokens. */
   inputTokens: number;
@@ -134,6 +132,81 @@ export interface UsageTotals {
   outputTokens: number;
   /** input + cached + output. */
   totalTokens: number;
+  /** Summed cost in millionths of one `currency` unit: 1_000_000 is one
+   *  dollar when the currency is USD. */
+  costMicros: number;
+  /** The unit `costMicros` is in, absent when nothing was priced. One
+   *  deployment should price in ONE currency: these are summed, not
+   *  converted. */
+  currency?: string;
+  /** How many calls had no cost, because no pricer answered for them. Above
+   *  zero, `costMicros` is a floor and not the whole bill. */
+  unpriced: number;
+  /** The same spend grouped by agent and model: one line per pair, which is
+   *  the shape a bill wants. Summing the lines gives the totals above. */
+  lines: UsageLine[];
+}
+
+/** One agent's spend on one model, summed over its calls (§4). This is the
+ *  bill line a credit system charges for. */
+export interface UsageLine {
+  /** null for the main run, the nested run's id otherwise. */
+  agentId?: string | null;
+  agentName?: string | null;
+  /** The registry key; `modelId` is the wire id it resolved to. */
+  model?: string | null;
+  modelId?: string | null;
+  inputTokens: number;
+  cacheReadInputTokens: number;
+  cacheWriteInputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  /** How many model calls this line covers. */
+  calls: number;
+  /** How many of those had estimated tokens, because they were cut off
+   *  before the provider reported real ones. */
+  estimated: number;
+  costMicros: number;
+}
+
+/** Narrows a usage read (§4). */
+export interface UsageFilter {
+  /** Limit the read to one dispatched run, nested runs included. Omitted
+   *  reads the whole thread. */
+  runId?: string;
+}
+
+/** How the model call that produced a usage row ended. */
+export type UsageOutcome =
+  /** Ran to its finish; the provider reported the counters itself. */
+  | 'finished'
+  /** A user stop cut the call mid-stream, so no finish arrived and the
+   *  tokens are estimated. */
+  | 'aborted'
+  /** The provider failed mid-call. What it had already streamed was still
+   *  billed, so the row is kept. */
+  | 'error';
+
+/** Which part of the platform made the call. */
+export type UsageKind =
+  /** A step of an agent loop, main run or nested (§2.1, §2.7). */
+  | 'step'
+  /** The summary the platform writes to keep the prompt inside the model's
+   *  window (§2.6). Nobody asked for it, so it is worth being able to see
+   *  what it costs on its own. */
+  | 'compaction';
+
+/** The money one model call cost. */
+export interface Cost {
+  /** Millionths of one `currency` unit: 1_000_000 is one dollar when the
+   *  currency is USD. Integers, because money summed as a float drifts. */
+  micros: number;
+  /** ISO-4217 code — 'USD' for the shipped table pricer. */
+  currency: string;
+  /** Where the number came from: 'receipt' when the provider computed it,
+   *  'table' from a price list, 'estimate' for anything a pricer worked out
+   *  itself. It rides along so a bill can be audited. */
+  source: 'receipt' | 'table' | 'estimate';
 }
 
 /** How full the next run's prompt would be (§2.6). Token counts are the same
@@ -150,16 +223,63 @@ export interface ContextUsage {
   messages: number;
 }
 
+/** ONE model call, recorded by the engine after every call it makes: a step
+ *  of the main run, a step of a nested run, a compaction pass, streamed or
+ *  not, finished or cut short.
+ *
+ *  It carries everything a Pricer needs to put a price on the call, so pricing
+ *  never has to reach back into the run to find out what happened. */
 export interface NewUsage {
+  /** The DISPATCHED run this call belongs to (§2.9). A nested run's calls
+   *  carry their parent's run id, so one run's bill is one query. */
+  runId?: string | null;
+  /** Whose stream made the call (§2.7): null is the main run, otherwise the
+   *  nested run's id. */
   agentId?: string | null;
+  /** The registered handle for the main run, the delegation's name for a
+   *  nested one. What a bill line should say. */
+  agentName?: string | null;
+  kind: UsageKind;
+  /** 1-based iteration inside its loop; 0 for a compaction. */
+  step: number;
+  /** The registry key the call was made with, e.g. 'claude-sonnet-4@high' —
+   *  what a price list is usually keyed by. */
+  model?: string | null;
+  /** The wire id the provider reported back, which can differ from the key
+   *  that asked for it (an alias, a dated snapshot). */
+  modelId?: string | null;
   /** Fresh (uncached) prompt tokens. */
   inputTokens: number;
   /** Prompt tokens served from the provider's prompt cache (§2.6 caching). */
-  cachedInputTokens: number;
+  cacheReadInputTokens: number;
+  /** Prompt tokens WRITTEN into that cache — a separate line on the
+   *  provider's bill, and not part of `totalTokens`. */
+  cacheWriteInputTokens: number;
   outputTokens: number;
-  /** input + cached + output. */
+  /** Thinking tokens. Most providers already count these inside
+   *  `outputTokens`, so price them at zero unless yours bills them
+   *  separately (see the pricing module). */
+  reasoningTokens: number;
+  /** input + cache reads + output: the counter the token budget is measured
+   *  against. Cache writes and reasoning are deliberately outside it — cache
+   *  writes are their own bill line, and reasoning tokens are usually already
+   *  inside the output count. */
   totalTokens: number;
+  outcome: UsageOutcome;
+  /** True when no finish arrived and the counters are the platform's own
+   *  estimate over what it does know: the prompt it sent and the text that did
+   *  stream, measured the same way compaction measures context fill. */
+  estimated?: boolean;
+  /** Whatever the provider attached to the finish: a gateway receipt, a
+   *  generation id, anything a Pricer wants to read. Two reserved keys are
+   *  added by the platform: `responseId` and `responseHeaders`, because a
+   *  gateway bills through a header. */
+  providerMetadata?: Record<string, unknown> | null;
+  /** Filled by the Pricer before the row is stored. Absent means the call
+   *  went unpriced, and any total over it is a floor. */
+  cost?: Cost | null;
 }
+
 
 /** Additional provider-specific options, passed through to the provider from
  *  the AI SDK. Namespaced per provider — the platform never inspects them. */
@@ -196,6 +316,9 @@ export interface RunJob {
    *  attached — hours later, in another process, after an approval. */
   state?: AgentRunState;
   tokenBudget?: number;
+  /** The money cap for this run (§4), carried so the worker enforces the same
+   *  cap the caller asked for. */
+  costBudgetMicros?: number;
   providerOptions?: ProviderOptions;
 }
 
@@ -217,6 +340,7 @@ export interface ResumeInfo {
   /** The run these segments belong to (§2.9). */
   runId?: string;
   tokenBudget?: number;
+  costBudgetMicros?: number;
   providerOptions?: ProviderOptions;
   /** The run's state (§2.10). A park can outlive the process that made it, so
    *  the state has to travel on the ticket — rebuilt from here, not from a
@@ -231,7 +355,16 @@ export interface ResumeInfo {
 export interface ResolvedModel {
   instance: () => LanguageModel;
   contextWindow?: number;
+  /** The wire id this key resolves to, e.g. 'gpt-4o-2024-11-20' for the key
+   *  'gpt-4o'. It goes onto every usage row, so a price list keyed by wire
+   *  ids can match one (§4). Omitted means the key IS the id. */
+  modelId?: string;
 }
+
+/** The model id to record for a registry key: what `resolveModel` declared,
+ *  or the key itself when it declared nothing. */
+export const wireId = (model: ResolvedModel, key: string): string =>
+  model.modelId && model.modelId.length > 0 ? model.modelId : key;
 
 /** Opt-in subagent delegation config (§2.7): the platform constructs the
  *  run-scoped spawnSubagent tool — users cannot build it themselves. */
@@ -270,6 +403,13 @@ export interface AgentConfig {
    *  input nor the agent spec declares one. `undefined` = unbounded apart
    *  from `maxSteps` (§2.1 safety cap). */
   tokenBudget?: number;
+  /** Default per-run money cap (§4), in millionths of the pricer's currency:
+   *  250_000 is roughly a quarter of a dollar when the pricer works in USD.
+   *  `undefined` = unbounded. Checked between steps, exactly like
+   *  `tokenBudget`, so the step that crossed the line is always kept in full.
+   *  Needs a pricer: an unpriced call spends no money and so can never
+   *  exhaust it. */
+  costBudgetMicros?: number;
   /** Subagent nesting cap (§2.7) */
   subagentMaxDepth: number;
   /** Concurrent subagents per run (§2.7) */

@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import type {
-  AgentEvent, ExecutionState, MessageDTO, NewMessage, NewUsage, ThreadDTO, UsageTotals,
+  AgentEvent, ExecutionState, MessageDTO, NewMessage, NewUsage, ThreadDTO, UsageFilter, UsageTotals,
 } from '../core/types.js';
+import { emptyTotals } from '../core/usage.js';
 import type { Storage } from '../ports/storage.js';
 
 /** Minimal structural type over a synchronous SQLite handle — `bun:sqlite`'s
@@ -74,12 +75,27 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_thread_seq ON events(threadId, seq);
 CREATE INDEX IF NOT EXISTS events_thread_type ON events(threadId, type, seq);
+-- One row per MODEL CALL, not per run segment. cachedInputTokens holds cache
+-- READS, so the column that was already there still means what it always
+-- meant, and cache writes get their own column beside it. A NULL costMicros
+-- is an unpriced call, which is not the same as one that cost nothing.
+-- (Statements here are split on the semicolon, so never write one in a
+-- comment.)
 CREATE TABLE IF NOT EXISTS usage (
-  id TEXT PRIMARY KEY, threadId TEXT NOT NULL, agentId TEXT,
+  id TEXT PRIMARY KEY, threadId TEXT NOT NULL, runId TEXT, agentId TEXT, agentName TEXT,
+  kind TEXT NOT NULL DEFAULT 'step', step INTEGER NOT NULL DEFAULT 0,
+  model TEXT, modelId TEXT,
   inputTokens INTEGER NOT NULL, cachedInputTokens INTEGER NOT NULL,
-  outputTokens INTEGER NOT NULL, totalTokens INTEGER NOT NULL, createdAt INTEGER NOT NULL
+  cacheWriteInputTokens INTEGER NOT NULL DEFAULT 0,
+  outputTokens INTEGER NOT NULL, reasoningTokens INTEGER NOT NULL DEFAULT 0,
+  totalTokens INTEGER NOT NULL,
+  outcome TEXT NOT NULL DEFAULT 'finished', estimated INTEGER NOT NULL DEFAULT 0,
+  providerMetadata TEXT,
+  costMicros INTEGER, costCurrency TEXT, costSource TEXT,
+  createdAt INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS usage_thread ON usage(threadId);
+CREATE INDEX IF NOT EXISTS usage_run ON usage(runId, createdAt);
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY, threadId TEXT NOT NULL, parentRunId TEXT,
   depth INTEGER NOT NULL DEFAULT 0, agent TEXT NOT NULL, model TEXT NOT NULL,
@@ -233,20 +249,56 @@ export class SqliteStorage implements Storage {
   usage = {
     record: async (threadId: string, u: NewUsage) => {
       this.write(
-        'INSERT INTO usage (id,threadId,agentId,inputTokens,cachedInputTokens,outputTokens,totalTokens,createdAt) VALUES (?,?,?,?,?,?,?,?)',
-        randomUUID(), threadId, u.agentId ?? null,
-        u.inputTokens, u.cachedInputTokens, u.outputTokens, u.totalTokens, Date.now(),
+        `INSERT INTO usage (id,threadId,runId,agentId,agentName,kind,step,model,modelId,
+           inputTokens,cachedInputTokens,cacheWriteInputTokens,outputTokens,reasoningTokens,
+           totalTokens,outcome,estimated,providerMetadata,costMicros,costCurrency,costSource,createdAt)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        randomUUID(), threadId, u.runId ?? null, u.agentId ?? null, u.agentName ?? null,
+        u.kind, u.step, u.model ?? null, u.modelId ?? null,
+        u.inputTokens, u.cacheReadInputTokens, u.cacheWriteInputTokens,
+        u.outputTokens, u.reasoningTokens, u.totalTokens,
+        u.outcome, u.estimated ? 1 : 0,
+        u.providerMetadata ? JSON.stringify(u.providerMetadata) : null,
+        u.cost?.micros ?? null, u.cost?.currency ?? null, u.cost?.source ?? null,
+        Date.now(),
       );
     },
-    total: async (threadId: string): Promise<UsageTotals> => {
-      const r = this.one(
-        `SELECT COALESCE(SUM(inputTokens),0) AS i, COALESCE(SUM(cachedInputTokens),0) AS c,
-                COALESCE(SUM(outputTokens),0) AS o, COALESCE(SUM(totalTokens),0) AS t
-         FROM usage WHERE threadId = ?`, threadId);
-      return {
-        inputTokens: r?.i ?? 0, cachedInputTokens: r?.c ?? 0,
-        outputTokens: r?.o ?? 0, totalTokens: r?.t ?? 0,
-      };
+    // One grouped read rather than every row: a long thread holds a usage row
+    // per model call (§4), and the bill only ever wants them by agent and
+    // model. Summing the groups gives the totals, so the two always agree.
+    total: async (threadId: string, filter: UsageFilter = {}): Promise<UsageTotals> => {
+      const rows = this.all(
+        `SELECT COALESCE(agentId,'') AS agentId, COALESCE(agentName,'') AS agentName,
+                COALESCE(model,'') AS model, COALESCE(modelId,'') AS modelId,
+                COALESCE(SUM(inputTokens),0) AS i, COALESCE(SUM(cachedInputTokens),0) AS cr,
+                COALESCE(SUM(cacheWriteInputTokens),0) AS cw, COALESCE(SUM(outputTokens),0) AS o,
+                COALESCE(SUM(reasoningTokens),0) AS rt, COALESCE(SUM(totalTokens),0) AS t,
+                COUNT(*) AS calls, COALESCE(SUM(estimated),0) AS est,
+                COALESCE(SUM(costMicros),0) AS cost, MAX(costCurrency) AS currency,
+                COALESCE(SUM(CASE WHEN costMicros IS NULL THEN 1 ELSE 0 END),0) AS unpriced
+         FROM usage WHERE threadId = ?${filter.runId ? ' AND runId = ?' : ''}
+         GROUP BY agentId, agentName, model, modelId
+         ORDER BY MIN(createdAt)`,
+        ...(filter.runId ? [threadId, filter.runId] : [threadId]),
+      );
+      const out = emptyTotals();
+      for (const r of rows) {
+        out.inputTokens += r.i;
+        out.cachedInputTokens += r.cr;
+        out.outputTokens += r.o;
+        out.totalTokens += r.t;
+        out.costMicros += r.cost;
+        out.unpriced += r.unpriced;
+        out.currency ??= r.currency ?? undefined;
+        out.lines.push({
+          agentId: r.agentId || null, agentName: r.agentName || null,
+          model: r.model || null, modelId: r.modelId || null,
+          inputTokens: r.i, cacheReadInputTokens: r.cr, cacheWriteInputTokens: r.cw,
+          outputTokens: r.o, reasoningTokens: r.rt,
+          calls: r.calls, estimated: r.est, costMicros: r.cost,
+        });
+      }
+      return out;
     },
   };
 

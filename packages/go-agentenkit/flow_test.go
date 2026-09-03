@@ -207,7 +207,7 @@ func TestDeleteThread_DeletesEverythingThatFollowsIt(t *testing.T) {
 	mustEqual(t, len(h.storage.MessageRows(ran.ThreadID)), 0, "messages")
 	evs, _ := h.storage.Events().ListSince(h.ctx, ran.ThreadID, -1, agentenkit.StorageContext{})
 	mustEqual(t, len(evs), 0, "events")
-	total, _ := h.storage.Usage().Total(h.ctx, ran.ThreadID, agentenkit.StorageContext{})
+	total, _ := h.storage.Usage().Total(h.ctx, ran.ThreadID, agentenkit.UsageFilter{}, agentenkit.StorageContext{})
 	mustEqual(t, total.TotalTokens, 0, "usage")
 	for _, key := range []string{agentenkit.StateKey(ran.ThreadID), agentenkit.RunIDKey(ran.ThreadID), agentenkit.RunLockKey(ran.ThreadID)} {
 		mustEqual(t, h.kvGet(key), "", "kv "+key)

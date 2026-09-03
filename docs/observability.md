@@ -120,6 +120,11 @@ little. **Turn it off when prompts or tool payloads carry anything that should
 not sit in an operational database** — health data, credentials, personal
 details. With it off you still get timings, token counts and tool names.
 
+`getRun` also returns `usage`: what that run spent, nested runs included, with
+a line per agent and model. It comes from the usage rows in **your** store, not
+from the operational one — money lives in one place. See
+[Cost and pricing](./cost-and-pricing.md).
+
 The cap stops one large prompt or tool result from bloating the store.
 
 ## Building a dashboard

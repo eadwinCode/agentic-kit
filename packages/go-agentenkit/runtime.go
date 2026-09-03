@@ -74,6 +74,8 @@ func (c *AgentCore) scope(state AgentRunState, runID string) ports.RuntimePorts 
 		Queue:        c.opts.Queue,
 		Kv:           c.opts.Kv,
 		ResolveModel: c.opts.ResolveModel,
+		Pricer:       c.opts.Pricer,
+		Log:          c.opts.Log,
 		Config:       c.config,
 	}
 }
@@ -185,7 +187,7 @@ func (c *AgentCore) GetThreadUsage(ctx context.Context, threadID string, state A
 	if err != nil || thread == nil {
 		return nil, err
 	}
-	tokens, err := deps.Storage.Usage.Total(ctx, threadID)
+	tokens, err := deps.Storage.Usage.Total(ctx, threadID, ports.UsageFilter{})
 	if err != nil {
 		return nil, err
 	}
@@ -378,7 +380,8 @@ func (w *WorkerAPI) HandleJob(ctx context.Context, job RunJob) (HandleJobResult,
 		// Carries the queue wait through to the run record (§2.9).
 		EnqueuedAt: job.EnqueuedAt,
 		// Rehydrated from the ticket: this worker never saw the caller (§2.10).
-		State: job.State, Model: job.Model, TokenBudget: job.TokenBudget, ProviderOptions: job.ProviderOptions,
+		State: job.State, Model: job.Model, TokenBudget: job.TokenBudget,
+		CostBudgetMicros: job.CostBudgetMicros, ProviderOptions: job.ProviderOptions,
 		MaxSteps: job.MaxSteps,
 	}, nil)
 	if err != nil {

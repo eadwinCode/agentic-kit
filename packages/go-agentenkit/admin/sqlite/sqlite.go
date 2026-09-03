@@ -57,10 +57,14 @@ func New(db *sql.DB) (*Store, error) {
 	}
 	// CREATE TABLE IF NOT EXISTS never adds a column to a database that
 	// already exists, so newer fields are added separately.
-	if err := addMissing(db, "agentic_steps", map[string]string{"text": "TEXT", "toolCalls": "TEXT", "threadId": "TEXT"}); err != nil {
+	if err := addMissing(db, "agentic_steps", map[string]string{
+		"text": "TEXT", "toolCalls": "TEXT", "threadId": "TEXT",
+	}); err != nil {
 		return nil, err
 	}
-	if err := addMissing(db, "agentic_runs", map[string]string{"prompt": "TEXT", "tokenBudget": "INTEGER", "runState": "TEXT", "providerOptions": "TEXT"}); err != nil {
+	if err := addMissing(db, "agentic_runs", map[string]string{
+		"prompt": "TEXT", "tokenBudget": "INTEGER", "runState": "TEXT", "providerOptions": "TEXT",
+	}); err != nil {
 		return nil, err
 	}
 	if err := addMissing(db, "agentic_threads", map[string]string{"startedWith": "TEXT"}); err != nil {

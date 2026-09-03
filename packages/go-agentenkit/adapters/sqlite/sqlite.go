@@ -60,11 +60,71 @@ var Schema = []string{
 	  type TEXT NOT NULL, payload TEXT, createdAt INTEGER NOT NULL)`,
 	`CREATE INDEX IF NOT EXISTS events_thread_seq ON events(threadId, seq)`,
 	`CREATE INDEX IF NOT EXISTS events_thread_type ON events(threadId, type, seq)`,
+	// One row per MODEL CALL (§4), not per run segment. cachedInputTokens
+	// holds cache READS, keeping the column that was already there meaning
+	// what it always meant; cache writes are their own column beside it.
+	// A NULL costMicros is an unpriced call, which is not the same as one
+	// that cost nothing.
 	`CREATE TABLE IF NOT EXISTS usage (
-	  id TEXT PRIMARY KEY, threadId TEXT NOT NULL, agentId TEXT,
+	  id TEXT PRIMARY KEY, threadId TEXT NOT NULL, runId TEXT, agentId TEXT, agentName TEXT,
+	  kind TEXT NOT NULL DEFAULT 'step', step INTEGER NOT NULL DEFAULT 0,
+	  model TEXT, modelId TEXT,
 	  inputTokens INTEGER NOT NULL, cachedInputTokens INTEGER NOT NULL,
-	  outputTokens INTEGER NOT NULL, totalTokens INTEGER NOT NULL, createdAt INTEGER NOT NULL)`,
+	  cacheWriteInputTokens INTEGER NOT NULL DEFAULT 0,
+	  outputTokens INTEGER NOT NULL, reasoningTokens INTEGER NOT NULL DEFAULT 0,
+	  totalTokens INTEGER NOT NULL,
+	  outcome TEXT NOT NULL DEFAULT 'finished', estimated INTEGER NOT NULL DEFAULT 0,
+	  providerMetadata TEXT,
+	  costMicros INTEGER, costCurrency TEXT, costSource TEXT,
+	  createdAt INTEGER NOT NULL)`,
 	`CREATE INDEX IF NOT EXISTS usage_thread ON usage(threadId)`,
+	`CREATE INDEX IF NOT EXISTS usage_run ON usage(runId, createdAt)`,
+}
+
+// usageColumns are the columns added after the first release. CREATE TABLE
+// IF NOT EXISTS never adds a column to a database that already exists, so a
+// store upgraded in place gets them here instead (§4).
+var usageColumns = map[string]string{
+	"runId": "TEXT", "agentName": "TEXT", "kind": "TEXT NOT NULL DEFAULT 'step'",
+	"step": "INTEGER NOT NULL DEFAULT 0", "model": "TEXT", "modelId": "TEXT",
+	"cacheWriteInputTokens": "INTEGER NOT NULL DEFAULT 0",
+	"reasoningTokens":       "INTEGER NOT NULL DEFAULT 0",
+	"outcome":               "TEXT NOT NULL DEFAULT 'finished'",
+	"estimated":             "INTEGER NOT NULL DEFAULT 0",
+	"providerMetadata":      "TEXT",
+	"costMicros":            "INTEGER", "costCurrency": "TEXT", "costSource": "TEXT",
+}
+
+// addMissing adds any of cols the table does not have yet.
+func addMissing(db *sql.DB, table string, cols map[string]string) error {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		have[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for col, typ := range cols {
+		if have[col] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + col + ` ` + typ); err != nil {
+			return fmt.Errorf("sqlite storage schema: add %s.%s: %w", table, col, err)
+		}
+	}
+	return nil
 }
 
 // Storage is a Storage over SQLite.
@@ -76,6 +136,12 @@ func New(db *sql.DB) (*Storage, error) {
 		if _, err := db.Exec(stmt); err != nil {
 			return nil, fmt.Errorf("sqlite storage schema: %w", err)
 		}
+	}
+	if err := addMissing(db, "usage", usageColumns); err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS usage_run ON usage(runId, createdAt)`); err != nil {
+		return nil, fmt.Errorf("sqlite storage schema: %w", err)
 	}
 	return &Storage{db: db}, nil
 }
@@ -313,18 +379,84 @@ func (e events) ListByType(ctx context.Context, threadID, typ string, _ ports.St
 
 type usage struct{ db *sql.DB }
 
+// usageGroup is the grouped read Total does: one row per agent and model,
+// which is exactly one UsageLine plus the two figures that only make sense
+// on the whole total.
+const usageGroup = `SELECT COALESCE(agentId,''), COALESCE(agentName,''), COALESCE(model,''), COALESCE(modelId,''),
+	  COALESCE(SUM(inputTokens),0), COALESCE(SUM(cachedInputTokens),0), COALESCE(SUM(cacheWriteInputTokens),0),
+	  COALESCE(SUM(outputTokens),0), COALESCE(SUM(reasoningTokens),0), COALESCE(SUM(totalTokens),0),
+	  COUNT(*), COALESCE(SUM(estimated),0),
+	  COALESCE(SUM(costMicros),0), MAX(costCurrency),
+	  COALESCE(SUM(CASE WHEN costMicros IS NULL THEN 1 ELSE 0 END),0)
+	FROM usage WHERE threadId = ?`
+
 func (u usage) Record(ctx context.Context, threadID string, n ports.NewUsage, _ ports.StorageContext) error {
+	var meta any
+	if len(n.ProviderMetadata) > 0 {
+		raw, err := json.Marshal(n.ProviderMetadata)
+		if err != nil {
+			return fmt.Errorf("usage provider metadata: %w", err)
+		}
+		meta = string(raw)
+	}
+	var micros, currency, source any
+	if n.Cost != nil {
+		micros, currency, source = n.Cost.Micros, n.Cost.Currency, n.Cost.Source
+	}
+	kind := n.Kind
+	if kind == "" {
+		kind = ports.KindStep
+	}
+	outcome := n.Outcome
+	if outcome == "" {
+		outcome = ports.UsageFinished
+	}
 	_, err := u.db.ExecContext(ctx,
-		`INSERT INTO usage (id,threadId,agentId,inputTokens,cachedInputTokens,outputTokens,totalTokens,createdAt) VALUES (?,?,?,?,?,?,?,?)`,
-		core.NewID(), threadID, nullStr(n.AgentID), n.InputTokens, n.CachedInputTokens, n.OutputTokens, n.TotalTokens, ms(time.Now()))
+		`INSERT INTO usage (id,threadId,runId,agentId,agentName,kind,step,model,modelId,
+		  inputTokens,cachedInputTokens,cacheWriteInputTokens,outputTokens,reasoningTokens,
+		  totalTokens,outcome,estimated,providerMetadata,costMicros,costCurrency,costSource,createdAt)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		core.NewID(), threadID, nullStr(n.RunID), nullStr(n.AgentID), nullStr(n.AgentName),
+		string(kind), n.Step, nullStr(n.Model), nullStr(n.ModelID),
+		n.InputTokens, n.CacheReadInputTokens, n.CacheWriteInputTokens, n.OutputTokens, n.ReasoningTokens,
+		n.TotalTokens(), string(outcome), n.Estimated, meta, micros, currency, source, ms(time.Now()))
 	return err
 }
 
-func (u usage) Total(ctx context.Context, threadID string, _ ports.StorageContext) (ports.UsageTotals, error) {
+func (u usage) Total(ctx context.Context, threadID string, f ports.UsageFilter, _ ports.StorageContext) (ports.UsageTotals, error) {
+	q, args := usageGroup, []any{threadID}
+	if f.RunID != "" {
+		q += ` AND runId = ?`
+		args = append(args, f.RunID)
+	}
+	q += ` GROUP BY agentId, agentName, model, modelId ORDER BY MIN(createdAt)`
+	rows, err := u.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return ports.UsageTotals{}, err
+	}
+	defer rows.Close()
+
 	var t ports.UsageTotals
-	err := u.db.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(inputTokens),0), COALESCE(SUM(cachedInputTokens),0),
-		        COALESCE(SUM(outputTokens),0), COALESCE(SUM(totalTokens),0) FROM usage WHERE threadId = ?`, threadID).
-		Scan(&t.InputTokens, &t.CachedInputTokens, &t.OutputTokens, &t.TotalTokens)
-	return t, err
+	for rows.Next() {
+		var l ports.UsageLine
+		var currency sql.NullString
+		var totalTokens, unpriced int
+		if err := rows.Scan(&l.AgentID, &l.AgentName, &l.Model, &l.ModelID,
+			&l.InputTokens, &l.CacheReadInputTokens, &l.CacheWriteInputTokens,
+			&l.OutputTokens, &l.ReasoningTokens, &totalTokens,
+			&l.Calls, &l.Estimated, &l.CostMicros, &currency, &unpriced); err != nil {
+			return ports.UsageTotals{}, err
+		}
+		t.InputTokens += l.InputTokens
+		t.CachedInputTokens += l.CacheReadInputTokens
+		t.OutputTokens += l.OutputTokens
+		t.TotalTokens += totalTokens
+		t.CostMicros += l.CostMicros
+		t.Unpriced += unpriced
+		if t.Currency == "" {
+			t.Currency = currency.String
+		}
+		t.Lines = append(t.Lines, l)
+	}
+	return t, rows.Err()
 }

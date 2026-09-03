@@ -172,20 +172,43 @@ describe('cached prompt tokens (§4)', () => {
 });
 
 describe('thread usage (§4)', () => {
-  it('sums every run segment, per thread', async () => {
+  it('sums every model call, per thread', async () => {
     const storage = new MemoryStorage();
-    const row = { agentId: null, inputTokens: 10, cachedInputTokens: 4, outputTokens: 6, totalTokens: 20 };
+    const row = {
+      runId: 'r1', agentId: null, agentName: 'chat', model: 'gpt-4o', modelId: 'gpt-4o',
+      kind: 'step' as const, step: 1, outcome: 'finished' as const,
+      inputTokens: 10, cacheReadInputTokens: 4, cacheWriteInputTokens: 0,
+      outputTokens: 6, reasoningTokens: 0, totalTokens: 20,
+      cost: { micros: 25, currency: 'USD', source: 'table' as const },
+    };
     await storage.usage.record('t1', row);
-    await storage.usage.record('t1', row);
+    await storage.usage.record('t1', { ...row, step: 2 });
     await storage.usage.record('t2', row);
 
-    expect(await storage.usage.total('t1')).toEqual({
-      inputTokens: 20, cachedInputTokens: 8, outputTokens: 12, totalTokens: 40,
-    });
+    const t1 = await storage.usage.total('t1', {});
+    expect(t1.inputTokens).toBe(20);
+    expect(t1.cachedInputTokens).toBe(8);
+    expect(t1.totalTokens).toBe(40);
+    // Money is summed alongside the tokens (§4).
+    expect(t1.costMicros).toBe(50);
+    expect(t1.currency).toBe('USD');
+    expect(t1.unpriced).toBe(0);
+    // And grouped into the lines a bill is made of: one agent, one model.
+    expect(t1.lines).toEqual([
+      {
+        agentId: null, agentName: 'chat', model: 'gpt-4o', modelId: 'gpt-4o',
+        inputTokens: 20, cacheReadInputTokens: 8, cacheWriteInputTokens: 0,
+        outputTokens: 12, reasoningTokens: 0, calls: 2, estimated: 0, costMicros: 50,
+      },
+    ]);
+    // The run filter narrows to one dispatched run.
+    expect((await storage.usage.total('t1', { runId: 'r1' })).totalTokens).toBe(40);
+    expect((await storage.usage.total('t1', { runId: 'other' })).totalTokens).toBe(0);
     // A thread with nothing recorded reads as zeroes, never null.
-    expect(await storage.usage.total('unknown')).toEqual({
-      inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0,
-    });
+    const none = await storage.usage.total('unknown', {});
+    expect(none.totalTokens).toBe(0);
+    expect(none.costMicros).toBe(0);
+    expect(none.lines).toEqual([]);
   });
 
   it('getThreadUsage reports what a finished run actually spent', async () => {
@@ -196,9 +219,14 @@ describe('thread usage (§4)', () => {
     await runtime.worker.handleJob(queue.items[0]!);
 
     const usage = (await runtime.getThreadUsage(ran.threadId))!;
-    expect(usage.tokens).toEqual({
-      inputTokens: 120, cachedInputTokens: 0, outputTokens: 30, totalTokens: 150,
-    });
+    expect(usage.tokens.inputTokens).toBe(120);
+    expect(usage.tokens.cachedInputTokens).toBe(0);
+    expect(usage.tokens.outputTokens).toBe(30);
+    expect(usage.tokens.totalTokens).toBe(150);
+    // Nothing priced it, so the money is zero AND the call is counted as
+    // unpriced — the two are not the same thing (§4).
+    expect(usage.tokens.costMicros).toBe(0);
+    expect(usage.tokens.unpriced).toBe(1);
     expect(usage.model).toBe('gpt-4o');
     expect(usage.context.messages).toBe(2); // the prompt and the reply
   });

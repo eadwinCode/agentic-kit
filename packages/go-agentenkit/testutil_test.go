@@ -149,6 +149,13 @@ type harness struct {
 
 func makeRuntime(t *testing.T, model *scriptedModel, tune ...func(*agentenkit.AgentConfig)) *harness {
 	t.Helper()
+	return makeRuntimeOpts(t, model, nil, tune...)
+}
+
+// makeRuntimeOpts is makeRuntime with a hook onto the runtime options, for a
+// test that needs a Pricer or another port swapped out.
+func makeRuntimeOpts(t *testing.T, model *scriptedModel, opt func(*agentenkit.RuntimeOptions), tune ...func(*agentenkit.AgentConfig)) *harness {
+	t.Helper()
 	cfg := agentenkit.DefaultConfig()
 	cfg.StopPoll = 5 * time.Millisecond
 	for _, f := range tune {
@@ -158,16 +165,25 @@ func makeRuntime(t *testing.T, model *scriptedModel, tune ...func(*agentenkit.Ag
 		storage: memory.NewStorage(), bus: memory.NewBus(), queue: memory.NewQueue(), kv: memory.NewKv(),
 		admin: memoryadmin.New(), model: model, ctx: context.Background(),
 	}
-	rt, err := agentenkit.SetupAgentCore(h.ctx, agentenkit.RuntimeOptions{
+	opts := agentenkit.RuntimeOptions{
 		Storage: h.storage, Admin: h.admin, Bus: h.bus, Queue: h.queue, Kv: h.kv,
 		ResolveModel: func(name string) (agentenkit.ResolvedModel, error) {
 			if len(name) >= 8 && name[:8] == "unknown-" {
 				return agentenkit.ResolvedModel{}, fmt.Errorf("unknown model %q", name)
 			}
-			return agentenkit.ResolvedModel{Instance: func() provider.LanguageModel { return model }, ContextWindow: 128_000}, nil
+			return agentenkit.ResolvedModel{
+				Instance: func() provider.LanguageModel { return model }, ContextWindow: 128_000,
+				// The wire id a key resolves to, recorded on every usage row
+				// (§4). A resolver that declares none falls back to the key.
+				ModelID: map[string]string{"gpt-4o": "gpt-4o-2024-11-20"}[name],
+			}, nil
 		},
 		Config: &cfg,
-	})
+	}
+	if opt != nil {
+		opt(&opts)
+	}
+	rt, err := agentenkit.SetupAgentCore(h.ctx, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,3 +313,16 @@ func tool(name string, exec func(ctx context.Context, args map[string]any) (stri
 }
 
 var errBoom = errors.New("boom")
+
+// waitFor blocks until cond holds, or fails the test after two seconds.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("condition never held")
+}

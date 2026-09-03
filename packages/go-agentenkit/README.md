@@ -15,8 +15,8 @@ shows the Go shape of each piece.
 
 `BillingPreCheck` receives a `BillingCheck` with the thread, the run state
 and `PublishEvent`, so a refusal can carry its reason to every client; the
-platform publishes `RUN_REFUSED` as well, and `TOKEN_BUDGET_EXHAUSTED` when a
-run spends its budget between steps.
+platform publishes `RUN_REFUSED` as well, and `TOKEN_BUDGET_EXHAUSTED` or
+`COST_BUDGET_EXHAUSTED` when a run spends its budget between steps.
 
 A complete, runnable example, a Go server serving a React SPA with tools,
 approvals, subagents and custom events, lives in
@@ -266,6 +266,41 @@ Implement any of them for your own stack; `core/` imports nothing else. The
 [memory adapters](./adapters/memory/memory.go) are a complete implementation used by the
 test suite and double as a template.
 
+## Cost
+
+Give the runtime a `Pricer` and every usage row carries the money as well as the
+tokens, so spend is read from the store the engine already fills:
+
+```go
+import "github.com/eadwinCode/agentic-kit/packages/go-agentenkit/pricing"
+
+rt, err := agentenkit.SetupAgentCore(ctx, agentenkit.RuntimeOptions{
+    // ... ports ...
+    Pricer: pricing.Table{
+        // dollars per MILLION tokens, typed off the provider's pricing page
+        "gpt-4o": {InputPerMillion: 2.5, CacheReadPerMillion: 1.25, OutputPerMillion: 10},
+    },
+})
+```
+
+One row per model call: main run, nested run or compaction, streamed or not,
+finished or cut short. Reading it back:
+
+```go
+rt.GetThreadUsage(ctx, threadID, nil)                        // the thread header
+storage.Usage().Total(ctx, threadID, ports.UsageFilter{RunID: runID}, sc) // one run's bill
+```
+
+Every total carries `CostMicros`, `Currency`, `Unpriced` and `Lines` — the same
+spend grouped by agent and model, which is what a credit system charges for. A
+spec's `OnFinish` receives it ready-made as `info.Usage`, and
+`RunInput.CostBudgetMicros` caps a run by money the way `TokenBudget` caps it by
+tokens.
+
+`pricing` also ships `Receipt`, for the figure a gateway already computed, and
+`Chain`, to try one then the other. See
+[Cost and pricing](https://eadwincode.github.io/agentic-kit/cost-and-pricing).
+
 ## The admin store: not yours
 
 Run records, step timings and a thread index are the **platform's** data, in the platform's
@@ -275,7 +310,7 @@ own tables. You do not implement `AdminStore`; you read it back:
 rt.Admin.Overview(ctx, nil)                     // threads and runs by state, plus what's in flight
 rt.Admin.ListRuns(ctx, agentenkit.RunFilter{State: []agentenkit.ExecutionState{agentenkit.StateFailed}})
 rt.Admin.Stats(ctx, agentenkit.StatsRange{})   // p50/p95 duration and queue wait, tokens, failures
-rt.Admin.GetRun(ctx, runID)                     // one run: steps, nested runs, timeline
+rt.Admin.GetRun(ctx, runID)                     // one run: steps, nested runs, timeline, spend
 ```
 
 Configure nothing and it is SQLite on disk (`AGENTIC_KIT_ADMIN_DB` moves the file). Set

@@ -44,13 +44,21 @@ func TestEngineLoop_FeedsToolResultsBackAndPersistsPerStep(t *testing.T) {
 	mustEqual(t, parts[0].ToolName, "lookup", "toolName")
 	mustEqual(t, string(parts[0].Result), `{"ok":true}`, "result")
 
-	// §4 attribution: both steps recorded as one segment row
+	// §4 attribution: ONE row per model call, not one per segment. The main
+	// run's rows carry no AgentID; the name that bills is AgentName.
 	rows := h.storage.UsageRows()
-	mustEqual(t, len(rows), 1, "usage rows")
-	mustEqual(t, rows[0].AgentID, "chat", "usage agent")
-	mustEqual(t, rows[0].InputTokens, 20, "input")
-	mustEqual(t, rows[0].OutputTokens, 10, "output")
-	mustEqual(t, rows[0].TotalTokens, 30, "total")
+	mustEqual(t, len(rows), 2, "usage rows")
+	for i, r := range rows {
+		mustEqual(t, r.AgentID, "", "usage agentId")
+		mustEqual(t, r.AgentName, "chat", "usage agent name")
+		mustEqual(t, r.RunID, ran.RunID, "usage run")
+		mustEqual(t, string(r.Kind), "step", "usage kind")
+		mustEqual(t, r.Step, i+1, "usage step index")
+		mustEqual(t, string(r.Outcome), "finished", "usage outcome")
+		mustEqual(t, r.InputTokens, 10, "input")
+		mustEqual(t, r.OutputTokens, 5, "output")
+		mustEqual(t, r.TotalTokens(), 15, "total")
+	}
 }
 
 func TestEngineLoop_BudgetIsCheckedBetweenSteps(t *testing.T) {

@@ -55,12 +55,17 @@ Turning it off (`promptCaching: false`) restores the plain `system:` parameter.
 
 ## Token attribution
 
-Four counters per run, recorded per step and totalled per thread:
+One usage row per **model call** — a step of the main run, a step of a nested
+run, a compaction pass — totalled per thread:
 
 ```ts
 const { tokens } = await runtime.getThreadUsage(threadId);
-// { inputTokens, cachedInputTokens, outputTokens, totalTokens }
+// { inputTokens, cachedInputTokens, outputTokens, totalTokens,
+//   costMicros, currency, unpriced, lines }
 ```
+
+The money is there too once a pricer is configured, and `lines` breaks the
+same spend down by agent and model. See [Cost and pricing](./cost-and-pricing.md).
 
 ### The part that bites
 
@@ -89,6 +94,15 @@ Order: run input → agent spec → `config.tokenBudget`. Undefined means unboun
 apart from `maxSteps`. Spend is checked between steps against a ledger shared
 with nested runs.
 
+There is a money cap in the same shape, once a pricer is configured:
+
+```ts
+await chat.run({ prompt: 'hi', costBudgetMicros: 250_000 }); // about $0.25
+```
+
+Same rules, same place, and `COST_BUDGET_EXHAUSTED` in place of
+`TOKEN_BUDGET_EXHAUSTED`. See [Cost and pricing](./cost-and-pricing.md).
+
 ## Billing gates
 
 Reject a run before it costs anything:
@@ -109,8 +123,12 @@ error. It does publish: your own event, if the check sent one, and the
 platform's `RUN_REFUSED` with the error, so the chat can show the refusal
 where the user is looking rather than only in an HTTP response.
 
-Mid-run, the token budget is the credit check. When the run's cumulative
-spend crosses `tokenBudget` between steps, the platform publishes
+Mid-run, the budget is the credit check. When the run's cumulative spend
+crosses `tokenBudget` between steps, the platform publishes
 `TOKEN_BUDGET_EXHAUSTED` (`tokensUsed`, `tokenBudget`, `agentId`) and then
-finalizes with `stopReason: 'token_budget'`. Passing the account's remaining
-credit as the run's `tokenBudget` is how a run is kept from overspending.
+finalizes with `stopReason: 'token_budget'`.
+
+With a pricer configured you can cap the number the account actually cares
+about instead of deriving a token budget from it: pass the remaining credit as
+`costBudgetMicros` and the run stops on `COST_BUDGET_EXHAUSTED` /
+`stopReason: 'cost_budget'`.

@@ -59,17 +59,39 @@ model AgentEvent {
   @@index([threadId, type, createdAt])
 }
 
+// One row per MODEL CALL (§4), not per run segment: the runtime writes one
+// after every call it makes, priced by the configured pricer before it gets
+// here. cachedInputTokens holds cache READS; cache writes are their own column
+// beside it, because a cache write costs more than a fresh input token. A NULL
+// costMicros is an unpriced call, which is not the same as one that cost
+// nothing.
 model TokenUsage {
-  id                String   @id @default(cuid())
-  threadId          String
-  agentId           String?  // subagent attribution; null = main agent (§2.7)
-  inputTokens       Int      @default(0) // fresh (uncached) prompt tokens (§4)
-  cachedInputTokens Int      @default(0) // prompt tokens served from provider cache (§2.6)
-  outputTokens      Int      @default(0)
-  totalTokens       Int      // input + cached + output — pricing is downstream
-  createdAt         DateTime @default(now())
+  id                    String   @id @default(cuid())
+  threadId              String
+  runId                 String?  // the DISPATCHED run this call is billed to
+  agentId               String?  // subagent attribution; null = main run (§2.7)
+  agentName             String?  // the name a bill line should say
+  kind                  String   @default("step") // "step" | "compaction"
+  step                  Int      @default(0) // 1-based iteration; 0 for compaction
+  model                 String?  // registry key the call was made with
+  modelId               String?  // wire id it resolved to
+  inputTokens           Int      @default(0) // fresh (uncached) prompt tokens
+  cachedInputTokens     Int      @default(0) // prompt tokens read from the cache (§2.6)
+  cacheWriteInputTokens Int      @default(0) // prompt tokens written into it
+  outputTokens          Int      @default(0)
+  reasoningTokens       Int      @default(0) // usually already inside outputTokens
+  totalTokens           Int      // input + cache reads + output
+  outcome               String   @default("finished") // "finished" | "aborted" | "error"
+  estimated             Boolean  @default(false) // tokens were estimated, not reported
+  providerMetadata      Json?    // what the provider attached to the finish
+  costMicros            BigInt?  // millionths of costCurrency; NULL = unpriced
+  costCurrency          String?
+  costSource            String? // "receipt" | "table" | "estimate"
+  createdAt             DateTime @default(now())
 
   thread Thread @relation(fields: [threadId], references: [id], onDelete: Cascade)
 
   @@index([threadId, agentId])
+  // One run's whole bill, nested runs included, is one indexed read.
+  @@index([runId, createdAt])
 }

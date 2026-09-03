@@ -60,6 +60,7 @@ export default defineConfig({
           { text: 'Human in the loop', link: '/human-in-the-loop' },
           { text: 'Subagents', link: '/subagents' },
           { text: 'Context and tokens', link: '/context-and-tokens' },
+          { text: 'Cost and pricing', link: '/cost-and-pricing' },
           { text: 'Provider options', link: '/provider-options' },
           { text: 'Custom events', link: '/custom-events' },
         ],
