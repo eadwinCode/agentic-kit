@@ -90,6 +90,36 @@ export interface UsageTotals {
   cachedInputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  /** What the thread cost so far, in millionths of `currency`: 1_000_000 is
+   *  one dollar when the currency is USD. Zero when the server has no pricer
+   *  configured — check `unpriced` to tell that apart from a free thread. */
+  costMicros?: number;
+  /** The unit `costMicros` is in, absent when nothing was priced. */
+  currency?: string;
+  /** How many model calls had no cost on them. Above zero, `costMicros` is a
+   *  floor and not the whole bill. */
+  unpriced?: number;
+  /** The same spend grouped by agent and model — one line per pair, the shape
+   *  a bill or a per-agent breakdown wants. */
+  lines?: UsageLine[];
+}
+
+/** One agent's spend on one model, summed over its calls. */
+export interface UsageLine {
+  agentId?: string | null;
+  agentName?: string | null;
+  model?: string | null;
+  modelId?: string | null;
+  inputTokens: number;
+  cacheReadInputTokens: number;
+  cacheWriteInputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  calls: number;
+  /** How many of those calls had estimated tokens, because they were cut off
+   *  before the provider reported real ones. */
+  estimated: number;
+  costMicros: number;
 }
 
 export interface ContextUsage {

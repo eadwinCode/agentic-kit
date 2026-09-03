@@ -254,7 +254,9 @@ describe('runtime.deleteThread (§3.2)', () => {
       threadId: thread.id, seq: 1, type: 'CHUNK', payload: {}, createdAt: new Date(),
     });
     await store.usage.record(thread.id, {
-      agentId: null, inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, totalTokens: 2,
+      agentId: null, kind: 'step', step: 1, outcome: 'finished',
+      inputTokens: 1, cacheReadInputTokens: 0, cacheWriteInputTokens: 0,
+      outputTokens: 1, reasoningTokens: 0, totalTokens: 2,
     });
     
     await kv.set(`agent:state:${thread.id}`, 'COMPLETED');

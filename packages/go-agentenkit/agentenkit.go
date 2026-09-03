@@ -94,6 +94,13 @@ type (
 	UsageTotals      = ports.UsageTotals
 	ContextUsage     = ports.ContextUsage
 	NewUsage         = ports.NewUsage
+	UsageLine        = ports.UsageLine
+	UsageFilter      = ports.UsageFilter
+	UsageKind        = ports.UsageKind
+	UsageOutcome     = ports.UsageOutcome
+	Cost             = ports.Cost
+	Pricer           = ports.Pricer
+	PricerFunc       = ports.PricerFunc
 	ProviderOptions  = ports.ProviderOptions
 	RunJob           = ports.RunJob
 	NestedDescriptor = ports.NestedDescriptor
@@ -105,6 +112,13 @@ type (
 )
 
 const (
+	KindStep       = ports.KindStep
+	KindCompaction = ports.KindCompaction
+
+	UsageFinished = ports.UsageFinished
+	UsageAborted  = ports.UsageAborted
+	UsageErrored  = ports.UsageErrored
+
 	StateIdle            = ports.StateIdle
 	StateRunning         = ports.StateRunning
 	StateWaitingForInput = ports.StateWaitingForInput

@@ -34,7 +34,7 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
   // cannot be opened is a startup error you see immediately, rather than a
   // surprise on the first run — and losing run history silently looks exactly
   // like having no traffic.
-  const admin = opts.admin ?? (await openDefaultAdminStore());
+  const admin = opts.admin ?? (await openDefaultAdminStore(opts.log));
 
   const shared = {
     admin,
@@ -42,6 +42,8 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
     queue: opts.queue,
     kv: opts.kv,
     resolveModel: (modelName: string) => opts.resolveModel(modelName),
+    pricer: opts.pricer,
+    log: opts.log,
     config: resolveConfig(opts.config),
   };
 
@@ -155,7 +157,7 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
       const thread = await deps.storage.threads.get(threadId);
       if (!thread) return null;
       const [tokens, context] = await Promise.all([
-        deps.storage.usage.total(threadId),
+        deps.storage.usage.total(threadId, {}),
         contextUsage(deps, threadId, thread.model),
       ]);
       return { tokens, context, model: thread.model };
@@ -225,6 +227,7 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
           state: job.state,
           model: job.model,
           tokenBudget: job.tokenBudget,
+          costBudgetMicros: job.costBudgetMicros,
           providerOptions: job.providerOptions,
         });
         return { accepted: true };

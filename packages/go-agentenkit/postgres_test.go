@@ -109,8 +109,8 @@ func TestPostgresStorage_BehavesLikeTheOthers(t *testing.T) {
 	mustEqual(t, len(since), 1, "since")
 	byType, _ := s.Events().ListByType(ctx, th.ID, "X", sc)
 	mustEqual(t, len(byType), 2, "by type")
-	_ = s.Usage().Record(ctx, th.ID, ports.NewUsage{AgentID: "chat", InputTokens: 1, CachedInputTokens: 1, OutputTokens: 1, TotalTokens: 3}, sc)
-	total, _ := s.Usage().Total(ctx, th.ID, sc)
+	_ = s.Usage().Record(ctx, th.ID, ports.NewUsage{AgentID: "chat", InputTokens: 1, CacheReadInputTokens: 1, OutputTokens: 1}, sc)
+	total, _ := s.Usage().Total(ctx, th.ID, ports.UsageFilter{}, sc)
 	mustEqual(t, total.TotalTokens, 3, "usage")
 	list, _ := s.Threads().List(ctx, sc)
 	mustEqual(t, len(list), 1, "list")
@@ -120,7 +120,7 @@ func TestPostgresStorage_BehavesLikeTheOthers(t *testing.T) {
 	}
 	rows, _ := s.Messages().List(ctx, th.ID, nil, sc)
 	mustEqual(t, len(rows), 0, "cascade")
-	total, _ = s.Usage().Total(ctx, th.ID, sc)
+	total, _ = s.Usage().Total(ctx, th.ID, ports.UsageFilter{}, sc)
 	mustEqual(t, total.TotalTokens, 0, "usage cascade")
 	if err := s.Threads().Delete(ctx, th.ID, sc); err == nil {
 		t.Fatal("deleting twice must fail")

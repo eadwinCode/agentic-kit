@@ -326,10 +326,14 @@ describe('the run-wide token ledger (§2.7)', () => {
     expect(r.state.childCalls).toBe(1);
     expect(terminal(r.bus).tokensUsed).toBe(45);
 
-    // Still attributed per agent for billing (§4)
+    // Still attributed per agent for billing (§4): the main run's calls carry
+    // no agentId and the child's carry its own, but all three are billed to
+    // the parent's run, so one run's bill is one query.
     const rows = r.storage.usage.recorded.filter((u) => u.threadId === ran.threadId);
-    expect(rows.some((u) => u.agentId === 'chat')).toBe(true);
-    expect(rows.some((u) => u.agentId !== 'chat' && u.totalTokens === 15)).toBe(true);
+    expect(rows.length).toBe(3);
+    expect(rows.filter((u) => u.agentId === null).length).toBe(2);
+    expect(rows.some((u) => u.agentId !== null && u.totalTokens === 15)).toBe(true);
+    expect(rows.every((u) => u.runId === ran.runId)).toBe(true);
   });
 
   it("stops the run when the CHILD's spend crosses the budget", async () => {

@@ -66,7 +66,7 @@ const queue = new InlineQueue();
 
 export const runtime = await setupAgentCore({
   storage: new SqliteStorage(db),    // ← later: PrismaStorage, or your own
-  admin: new SqliteAdminStore(db),   // ← later: Postgres, via one env var
+  admin: SqliteAdminStore.open(db),   // ← later: Postgres, via one env var
   bus: new MemoryBus(),              // ← later: RedisBus
   kv: new MemoryKv(),                // ← later: RedisKv
   queue,                             // ← later: QStashQueue
@@ -118,6 +118,7 @@ export function Chat() {
 | **Context compaction** | History always fits the model's budget. You never prune by hand. |
 | **Prompt caching** | Breakpoints on the stable prefix, with provider-correct token attribution. |
 | **Operational history** | Runs, steps, timings and token splits in the platform's own tables, so a dashboard never touches your database. |
+| **Cost on the row** | One usage row per model call, priced before it is stored. Read spend per thread or per run from the store the engine already fills — no second table, and a budget in money as well as tokens. |
 | **Your database** | Four interfaces. Postgres, Mongo, Dynamo, SQLite — the engine does not know. |
 
 ## Documentation
@@ -135,7 +136,8 @@ them here.
 | [Agents and tools](./docs/agents-and-tools.md) | Registering what runs |
 | [Human in the loop](./docs/human-in-the-loop.md) | Approvals |
 | [Subagents](./docs/subagents.md) | Nested runs |
-| [Context and tokens](./docs/context-and-tokens.md) | Compaction, caching, spend |
+| [Context and tokens](./docs/context-and-tokens.md) | Compaction, caching, token attribution |
+| [Cost and pricing](./docs/cost-and-pricing.md) | Money on the usage rows |
 | [Provider options](./docs/provider-options.md) | Provider-specific settings |
 | [Run state](./docs/run-state.md) | Carrying context through a run |
 | [Multi-tenancy](./docs/multi-tenancy.md) | A worked isolation story |

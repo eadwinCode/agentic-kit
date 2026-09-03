@@ -5,6 +5,7 @@ import type {
   MessageDTO,
   NewMessage,
   NewUsage,
+  UsageFilter,
   UsageTotals,
   ThreadDTO,
 } from '../core/types.js';
@@ -76,10 +77,22 @@ export interface Storage {
      *  CHUNK on the thread through memory. */
     listByType(threadId: string, type: string, ctx: StorageContext): Promise<AgentEvent[]>;
   };
+  /** One row per model call (§4).
+   *
+   *  The platform writes a row after EVERY call it makes on a thread, priced
+   *  by the runtime's pricer before it gets here. An implementation stores the
+   *  row as given; it never prices anything itself. */
   usage: {
     record(threadId: string, usage: NewUsage, ctx: StorageContext): Promise<void>;
-    /** Every recorded segment for the thread, summed (§4). A thread with no
-     *  usage rows yet returns zeroes, never null. */
-    total(threadId: string, ctx: StorageContext): Promise<UsageTotals>;
+    /** Recorded calls, summed: tokens and money (§4). An empty filter sums
+     *  the whole thread; `{ runId }` sums one dispatched run, nested runs
+     *  included, which is what a settle hook bills from.
+     *
+     *  The result also carries `lines`: the same spend grouped by agent and
+     *  model, so one call serves the thread header, the settle hook and the
+     *  admin reads alike. A thread with no usage rows yet returns zeroes,
+     *  never null. `unpriced` counts the calls with no cost on them, so a
+     *  reader can tell "nothing was spent" apart from "nothing was priced". */
+    total(threadId: string, filter: UsageFilter, ctx: StorageContext): Promise<UsageTotals>;
   };
 }

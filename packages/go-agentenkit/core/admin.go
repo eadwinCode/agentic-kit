@@ -76,6 +76,10 @@ type RunDetail struct {
 	Subagents []ports.RunRecord `json:"subagents"`
 	// Events are the run's events with CHUNKs stripped: the readable spine.
 	Events []ports.AgentEvent `json:"events"`
+	// Usage is what this run spent, nested runs included (§4): tokens, money,
+	// and a line per agent and model. Read from the usage rows, so it is the
+	// same number a bill is built from.
+	Usage ports.UsageTotals `json:"usage"`
 }
 
 func percentiles(values []int64) *Percentiles {
@@ -290,7 +294,14 @@ func GetRun(ctx context.Context, deps ports.RuntimePorts, runID string) (*RunDet
 	if err != nil {
 		return nil, err
 	}
-	detail := &RunDetail{Run: *run, Steps: steps, Subagents: []ports.RunRecord{}, Events: []ports.AgentEvent{}}
+	// Spend per run, from the one place money lives (§4). Best effort: a run
+	// view must still render when the usage read fails.
+	usage, err := deps.Storage.Usage.Total(ctx, run.ThreadID, ports.UsageFilter{RunID: runID})
+	if err != nil {
+		Logger(deps).Error("run usage not read", "run", runID, "err", err)
+		usage = ports.UsageTotals{}
+	}
+	detail := &RunDetail{Run: *run, Steps: steps, Subagents: []ports.RunRecord{}, Events: []ports.AgentEvent{}, Usage: usage}
 	for _, c := range siblings {
 		if c.ParentRunID == runID {
 			detail.Subagents = append(detail.Subagents, c) // its children: same table, by depth (§2.7)

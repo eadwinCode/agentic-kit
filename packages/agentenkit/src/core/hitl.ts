@@ -139,6 +139,9 @@ export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise
         model: i.resume.model,
         agent: i.resume.agent,
         ...(i.resume.tokenBudget !== undefined ? { tokenBudget: i.resume.tokenBudget } : {}),
+        ...(i.resume.costBudgetMicros !== undefined
+          ? { costBudgetMicros: i.resume.costBudgetMicros }
+          : {}),
         ...(i.resume.providerOptions ? { providerOptions: i.resume.providerOptions } : {}),
         ...(i.resume.state ? { state: i.resume.state } : {}),
       },
@@ -287,6 +290,9 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
       ? {
           agent: resume.agent,
           ...(resume.tokenBudget !== undefined ? { tokenBudget: resume.tokenBudget } : {}),
+          ...(resume.costBudgetMicros !== undefined
+            ? { costBudgetMicros: resume.costBudgetMicros }
+            : {}),
           ...(resume.providerOptions ? { providerOptions: resume.providerOptions } : {}),
           // The answer resumes the SAME run, so it must scope storage the same
           // way the parked segment did (§2.10).

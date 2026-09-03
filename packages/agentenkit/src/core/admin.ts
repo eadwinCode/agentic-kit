@@ -75,10 +75,15 @@ export interface RunDetail {
   /** The run's events with CHUNKs stripped — the readable spine, not the
    *  token-by-token firehose. */
   events: AgentEvent[];
+  /** What this run spent, nested runs included (§4): tokens, money, and a
+   *  line per agent and model. Read from the usage rows, so it is the same
+   *  number a bill is built from. */
+  usage: UsageTotals;
 }
 
 const EMPTY: UsageTotals = {
   inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0,
+  costMicros: 0, unpriced: 0, lines: [],
 };
 
 function percentiles(values: number[]): Percentiles | null {
@@ -158,7 +163,7 @@ export async function listSteps(deps: RuntimePorts, runId: string): Promise<Step
   return deps.admin.steps.listByRun(runId);
 }
 
-const addTokens = (into: UsageTotals, from: UsageTotals) => {
+const addTokens = (into: UsageTotals, from: Omit<UsageTotals, 'costMicros' | 'unpriced' | 'lines'>) => {
   into.inputTokens += from.inputTokens;
   into.cachedInputTokens += from.cachedInputTokens;
   into.outputTokens += from.outputTokens;
@@ -243,10 +248,16 @@ export async function getRun(deps: RuntimePorts, runId: string): Promise<RunDeta
   const run = await deps.admin.runs.get(runId);
   if (!run) return null;
 
-  const [steps, siblings, events] = await Promise.all([
+  const [steps, siblings, events, usage] = await Promise.all([
     listSteps(deps, runId),
     deps.admin.runs.listByThread(run.threadId),
     deps.storage.events.listSince(run.threadId, -1),
+    // Spend per run, from the one place money lives (§4). Best effort: a run
+    // view must still render when the usage read fails.
+    deps.storage.usage.total(run.threadId, { runId }).catch((err) => {
+      (deps.log ?? console).error('run usage not read', { run: runId, err });
+      return { ...EMPTY };
+    }),
   ]);
 
   const from = new Date(run.startedAt).getTime();
@@ -262,5 +273,6 @@ export async function getRun(deps: RuntimePorts, runId: string): Promise<RunDeta
       const at = new Date(e.createdAt).getTime();
       return at >= from && at <= to;
     }),
+    usage,
   };
 }

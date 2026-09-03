@@ -2,7 +2,8 @@ import { generateText } from 'ai';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { ContextUsage, MessageDTO } from './types.js';
 import { publish } from './publish.js';
-import { attributeTokens } from './usage.js';
+import { fillTokens, providerMeta, recordCall } from './usage.js';
+import { wireId } from './types.js';
 
 /** Universal context ceiling across all models (§2.6) */
 export const CONTEXT_TOKEN_CEILING = 265_000;
@@ -32,7 +33,12 @@ export function contextBudget(deps: RuntimePorts, model: string): number {
   return Math.min(native, deps.config.contextCeilingTokens);
 }
 
-const estimateTokens = (content: unknown) => Math.ceil(JSON.stringify(content).length / 4);
+/** The one token estimate the platform uses where a real count is
+ *  unavailable: how full the context is (§2.6), and the output of a call that
+ *  was cut off before the provider could report one (§4). One rule for both,
+ *  so the two never disagree. */
+export const estimateTokens = (content: unknown) =>
+  Math.ceil(JSON.stringify(content).length / 4);
 
 /** Read-only view of the §2.6 budget math — what compactContext would see on
  *  the next run, without summarizing anything. */
@@ -79,9 +85,23 @@ export async function compactContext(
   const older = history.slice(0, history.length - tail.length);
   if (older.length === 0) return history; // single oversized turn — blocked by the input guards above
 
-  // ... and summarize everything before it with a cheap model
+  // ... and summarize everything before it with a cheap model, named in config
+  // so a registry that has never heard of 'gpt-4o-mini' can point this at its
+  // own (§2.6). Naming the key in the error matters: resolveModel throws from
+  // deep inside compaction, on a run that never mentioned this model, so the
+  // bare "Unknown model" says nothing about where it came from.
+  const compactionModel = deps.config.compactionModel;
+  let compactor;
+  try {
+    compactor = deps.resolveModel(compactionModel);
+  } catch (err) {
+    throw new Error(
+      `compactionModel ${JSON.stringify(compactionModel)} could not be resolved: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   const { text, usage, ...rest } = await generateText({
-    model: deps.resolveModel('gpt-4o-mini').instance(),
+    model: compactor.instance(),
     prompt:
       'Summarize the following conversation history into a dense context brief ' +
       '(decisions, open threads, key facts) for an AI agent:\n\n' +
@@ -93,15 +113,24 @@ export async function compactContext(
     content: { type: 'CONTEXT_SUMMARY', text },
   });
 
-  // Token attribution (§4): input + cached + output. The cache hit is reported
-  // in provider metadata, never in `usage` — attributing without it books every
-  // cached prompt at the full input price.
-  await deps.storage.usage.record(threadId, {
+  // Compaction is a model call the platform made on its own account (§2.6),
+  // so it gets its own priced row like any other (§4). Kind 'compaction' keeps
+  // it separable: nobody asked for this call, and it is worth being able to
+  // see what the platform's own housekeeping costs.
+  //
+  // The cache hit is reported in provider metadata, never in `usage` —
+  // attributing without it books every cached prompt at the full input price.
+  const meta =
+    (rest as any).providerMetadata ?? (rest as any).experimental_providerMetadata;
+  await recordCall(deps, threadId, {
     agentId: null,
-    ...attributeTokens(
-      usage,
-      (rest as any).providerMetadata ?? (rest as any).experimental_providerMetadata,
-    ),
+    kind: 'compaction',
+    step: 0,
+    model: compactionModel,
+    modelId: wireId(compactor, compactionModel),
+    outcome: 'finished',
+    providerMetadata: providerMeta(meta, (rest as any).response),
+    ...fillTokens(usage, meta),
   });
   await publish(deps, threadId, 'CONTEXT_COMPACTED', { summarizedMessages: older.length });
 

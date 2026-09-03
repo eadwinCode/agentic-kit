@@ -5,6 +5,7 @@ import type {
   ChatEntry,
   EntryPart,
   SnapshotMessage,
+  UsageTotals,
 } from './types.js';
 
 const json = (value: unknown) => {
@@ -172,4 +173,36 @@ export function stateActivity(state: AgentState, labels: ActivityLabels): AgentA
     default:
       return { phase: 'idle', label: labels.idle };
   }
+}
+
+/** Render a cost for a thread header: `formatCost(usage.tokens)` gives
+ *  "$0.0125", or "≥ $0.0125" when some calls went unpriced and the figure is
+ *  a floor rather than the whole bill. Returns null when there is nothing to
+ *  show, so a header can leave the slot empty instead of printing "$0.00" for
+ *  a server with no pricer configured.
+ *
+ *  Display only — never do arithmetic on the string. */
+export function formatCost(
+  usage: Pick<UsageTotals, 'costMicros' | 'currency' | 'unpriced'> | null | undefined,
+  locale?: string,
+): string | null {
+  if (!usage) return null;
+  const micros = usage.costMicros ?? 0;
+  if (micros === 0 && !usage.unpriced) return null;
+  if (micros === 0) return null; // priced nothing at all: no figure to show
+  const currency = usage.currency || 'USD';
+  let text: string;
+  try {
+    text = new Intl.NumberFormat(locale, {
+      style: 'currency',
+      currency,
+      // Agent runs are cheap: two decimals would round most of them to $0.00.
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 4,
+    }).format(micros / 1_000_000);
+  } catch {
+    // An unknown currency code: show the number and the code plainly.
+    text = `${(micros / 1_000_000).toFixed(4)} ${currency}`;
+  }
+  return usage.unpriced ? `≥ ${text}` : text;
 }

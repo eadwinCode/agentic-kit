@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import {
   contentToText,
   defaultFormat,
+  formatCost,
   messageToEntries,
   messageToEntry,
   reasoningText,
@@ -129,5 +130,29 @@ describe('structured parts', () => {
     ]);
     const [thought] = messageToEntries(msg([{ type: 'reasoning', text: 'hm' }, { type: 'text', text: 'ok' }]), defaultFormat);
     expect(thought!.parts).toEqual([{ type: 'reasoning', text: 'hm' }]);
+  });
+});
+
+describe('formatCost', () => {
+  it('renders what a thread spent', () => {
+    expect(formatCost({ costMicros: 12_500, currency: 'USD', unpriced: 0 })).toBe('$0.0125');
+  });
+
+  it('marks a floor when some calls went unpriced', () => {
+    // Some calls had no price, so the figure is a floor and says so rather
+    // than passing itself off as the whole bill.
+    expect(formatCost({ costMicros: 12_500, currency: 'USD', unpriced: 3 })).toBe('≥ $0.0125');
+  });
+
+  it('shows nothing when there is nothing to show', () => {
+    // A server with no pricer configured: a header leaves the slot empty
+    // rather than claiming the thread was free.
+    expect(formatCost({ costMicros: 0, unpriced: 2 })).toBeNull();
+    expect(formatCost(null)).toBeNull();
+  });
+
+  it('falls back to a plain number for an unknown currency code', () => {
+    expect(formatCost({ costMicros: 250_000, currency: 'CREDITS', unpriced: 0 }))
+      .toBe('0.2500 CREDITS');
   });
 });

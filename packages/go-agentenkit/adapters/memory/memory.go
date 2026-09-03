@@ -244,6 +244,8 @@ type Storage struct {
 type usageRow struct {
 	threadID string
 	u        ports.NewUsage
+	id       string
+	at       time.Time
 }
 
 // NewStorage makes an empty Storage.
@@ -482,22 +484,25 @@ func (u usage) Record(_ context.Context, threadID string, n ports.NewUsage, sc p
 	u.s.mu.Lock()
 	defer u.s.mu.Unlock()
 	u.s.saw(sc)
-	u.s.usage = append(u.s.usage, usageRow{threadID: threadID, u: n})
+	u.s.usage = append(u.s.usage, usageRow{
+		threadID: threadID, u: n, id: newID(), at: time.Now(),
+	})
 	return nil
 }
 
-func (u usage) Total(_ context.Context, threadID string, sc ports.StorageContext) (ports.UsageTotals, error) {
+func (u usage) Total(_ context.Context, threadID string, f ports.UsageFilter, sc ports.StorageContext) (ports.UsageTotals, error) {
 	u.s.mu.Lock()
 	defer u.s.mu.Unlock()
 	u.s.saw(sc)
-	var out ports.UsageTotals
+	var agg ports.UsageAggregator
 	for _, r := range u.s.usage {
-		if r.threadID == threadID {
-			out.Add(ports.UsageTotals{
-				InputTokens: r.u.InputTokens, CachedInputTokens: r.u.CachedInputTokens,
-				OutputTokens: r.u.OutputTokens, TotalTokens: r.u.TotalTokens,
-			})
+		if r.threadID != threadID {
+			continue
 		}
+		if f.RunID != "" && r.u.RunID != f.RunID {
+			continue
+		}
+		agg.Add(r.u)
 	}
-	return out, nil
+	return agg.Totals(), nil
 }

@@ -1,4 +1,5 @@
-import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewUsage, RunJob, ThreadDTO, UsageTotals } from '../core/types.js';
+import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewUsage, RunJob, ThreadDTO, UsageFilter, UsageTotals } from '../core/types.js';
+import { sumUsage } from '../core/usage.js';
 import type { Storage } from '../ports/storage.js';
 import type { EventBus } from '../ports/bus.js';
 import type { EnqueueOptions, Queue } from '../ports/queue.js';
@@ -170,18 +171,12 @@ export class MemoryStorage implements Storage {
   usage = {
     recorded: [] as (NewUsage & { threadId: string })[],
     async record(t: string, u: NewUsage) { this.recorded.push({ threadId: t, ...u }); },
-    async total(t: string): Promise<UsageTotals> {
-      return this.recorded
-        .filter((u) => u.threadId === t)
-        .reduce<UsageTotals>(
-          (sum, u) => ({
-            inputTokens: sum.inputTokens + u.inputTokens,
-            cachedInputTokens: sum.cachedInputTokens + u.cachedInputTokens,
-            outputTokens: sum.outputTokens + u.outputTokens,
-            totalTokens: sum.totalTokens + u.totalTokens,
-          }),
-          { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 },
-        );
+    async total(t: string, filter: UsageFilter = {}): Promise<UsageTotals> {
+      return sumUsage(
+        this.recorded.filter(
+          (u) => u.threadId === t && (!filter.runId || u.runId === filter.runId),
+        ),
+      );
     },
   };
 

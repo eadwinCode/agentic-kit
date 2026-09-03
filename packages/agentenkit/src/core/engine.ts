@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import type { RuntimePorts } from '../ports/runtime.js';
-import type { ExecutionState, ProviderOptions, ResumeInfo } from './types.js';
+import type { RunFinishInfo, RuntimePorts } from '../ports/runtime.js';
+import type { ExecutionState, ProviderOptions, ResumeInfo, UsageTotals } from './types.js';
+import { wireId } from './types.js';
 import { compactContext } from './context.js';
 import type { TokenAttribution } from './usage.js';
 import { markPromptCaching } from './cache.js';
-import { repairDanglingToolCalls } from './messages.js';
+import { promptMessages, repairDanglingToolCalls } from './messages.js';
 import { mergeProviderOptions } from './types.js';
 import type { RegisteredAgent } from './agent.js';
 import {
@@ -283,6 +284,9 @@ export interface ExecuteInput {
   /** The run's state (§2.10) — carried so a redrive keeps it. */
   state?: AgentRunState;
   tokenBudget?: number;
+  /** The run's money cap (§4), carried on the dispatch so the worker enforces
+   *  what the caller asked for. */
+  costBudgetMicros?: number;
   providerOptions?: ProviderOptions;
 }
 
@@ -317,6 +321,9 @@ export async function execute(
   // config. Checked BETWEEN steps: the finished step is always kept in full,
   // nothing is aborted mid-generation. This is NOT a user stop.
   const tokenBudget = input.tokenBudget ?? agent.spec.tokenBudget ?? deps.config.tokenBudget;
+  // The money cap (§4) resolves the same way, widest last.
+  const costBudget =
+    input.costBudgetMicros ?? agent.spec.costBudgetMicros ?? deps.config.costBudgetMicros;
 
   // Provider-specific options (§3.1): spec default <- execute input,
   // shallow per-provider namespace; the execute input wins.
@@ -365,6 +372,9 @@ export async function execute(
       model: input.model,
       ...(runId ? { runId } : {}),
       ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
+      ...(input.costBudgetMicros !== undefined
+        ? { costBudgetMicros: input.costBudgetMicros }
+        : {}),
       ...(providerOptions ? { providerOptions } : {}),
       // Carried so the resumed segment scopes its storage the same way this
       // one does (§2.10).
@@ -403,6 +413,8 @@ export async function execute(
           agentId: null, // spawned by the main agent
           frames: [],
           tokenBudget,
+          costBudgetMicros: costBudget,
+          billingRunId: runId,
           providerOptions,
           abortSignal: abort.signal,
           state: input.state,
@@ -449,9 +461,7 @@ export async function execute(
 
     // Prompt caching (§2.6): stamp the stable prefix once — appended step
     // messages extend the prompt without invalidating the breakpoints.
-    let messages = repairDanglingToolCalls(
-      history.map((m) => ({ role: m.role, content: m.content }) as any),
-    );
+    let messages = repairDanglingToolCalls(promptMessages(history) as any[]);
     if (deps.config.promptCaching) {
       messages = markPromptCaching(messages);
     }
@@ -473,6 +483,11 @@ export async function execute(
         abortSignal: abort.signal,
         providerOptions,
         tokenBudget,
+        costBudgetMicros: costBudget,
+        billingRunId: runId,
+        modelKey: input.model,
+        modelId: wireId(model, input.model),
+        agentName: agent.name,
         cacheSystemPrompt: deps.config.promptCaching,
         onChunk: async (chunk) => {
           // One canonical path for every client: durable log + live Pub/Sub (§2.1, §2.2)
@@ -489,23 +504,26 @@ export async function execute(
     const lastFinishReason = loop.finishReason;
 
     if (parked) {
-      // The segment ends holding the park: bill the steps up to the park
-      // (§4) — the resumed segment records its own usage. NO state flip:
-      // WAITING_FOR_INPUT (or CANCELLED if the user stopped meanwhile) stands.
-      await deps.storage.usage.record(threadId, { agentId: agent.name, ...attribution });
+      // The segment ends holding the park. Every call it made was already
+      // recorded and priced as it happened (§4), so there is nothing left to
+      // bill here. NO state flip: WAITING_FOR_INPUT (or CANCELLED if the user
+      // stopped meanwhile) stands.
       return 'executed';
     }
 
     const stopReason = abort.signal.aborted
       ? 'cancelled'
-      : tokenBudget && tokensUsed >= tokenBudget
-        ? 'token_budget'
-        : lastFinishReason === 'tool-calls'
-          ? 'max_steps' // step ceiling hit (§2.1)
-          : 'completed';
+      : loop.costExhausted
+        ? 'cost_budget' // the money cap (§4)
+        : tokenBudget && tokensUsed >= tokenBudget
+          ? 'token_budget'
+          : lastFinishReason === 'tool-calls'
+            ? 'max_steps' // step ceiling hit (§2.1)
+            : 'completed';
 
+    const state = abort.signal.aborted ? 'CANCELLED' : 'COMPLETED';
     await finalize(deps, agent, threadId, {
-      state: abort.signal.aborted ? 'CANCELLED' : 'COMPLETED',
+      state,
       stopReason,
       tokensUsed,
       attribution,
@@ -513,6 +531,28 @@ export async function execute(
       runId,
       steps: loop.steps,
     });
+
+    if (typeof userArgs.onFinish === 'function') {
+      // The whole run's bill, read back from the rows the loop wrote (§4):
+      // every segment and every nested run, priced and grouped into lines, so
+      // a settle hook charges in one pass without keeping its own tally.
+      // The run is already finalized: a callback that throws is the
+      // caller's bug to see in the log, not a reason to fail a finished run.
+      try {
+        await userArgs.onFinish({
+          threadId,
+          runId,
+          state,
+          stopReason,
+          tokensUsed,
+          attribution,
+          steps: loop.steps,
+          usage: await runBill(deps, threadId, runId),
+        } satisfies RunFinishInfo);
+      } catch (err) {
+        (deps.log ?? console).error('onFinish threw', { runId, err: String(err) });
+      }
+    }
 
     return 'executed';
   } finally {
@@ -523,7 +563,7 @@ export async function execute(
 
 export interface FinalizeInput {
   state: ExecutionState;
-  stopReason: 'completed' | 'token_budget' | 'max_steps' | 'cancelled';
+  stopReason: 'completed' | 'token_budget' | 'cost_budget' | 'max_steps' | 'cancelled';
   tokensUsed: number;
   attribution: TokenAttribution;
   /** generate-text flavor only: publish the final text as one TEXT_RESULT. */
@@ -550,10 +590,10 @@ export async function finalize(
   threadId: string,
   f: FinalizeInput,
 ): Promise<void> {
-  // Tokens this segment actually spent are always ours to record (§4), even
-  // when the run was replaced part-way through.
-  await deps.storage.usage.record(threadId, { agentId: agent.name, ...f.attribution });
-
+  // Nothing to bill here: every model call recorded and priced its own row as
+  // it happened, inside the loop (§4). Even a run that was replaced part-way
+  // through has already had its calls written.
+  //
   // Close the run's durable record (§2.9). Additive: a run that parked and
   // resumed finalises once, but its steps and tokens accrued over several
   // segments, so they are summed onto what is already there. The run lock
@@ -610,6 +650,9 @@ async function redriveOnLockConflict(
         model: input.model,
         agent: agent.name,
         tokenBudget: input.tokenBudget,
+        // A redrive is the SAME run trying again, so it keeps the caps it was
+        // dispatched with — a retry that lost its money cap would be unbounded.
+        costBudgetMicros: input.costBudgetMicros,
         providerOptions: input.providerOptions,
       },
       { delaySeconds: deps.config.runRedriveDelaySeconds },
@@ -664,6 +707,9 @@ export async function executeWithPolicy(
         model: input.model,
         agent: agent.name,
         tokenBudget: input.tokenBudget,
+        // A redrive is the SAME run trying again, so it keeps the caps it was
+        // dispatched with — a retry that lost its money cap would be unbounded.
+        costBudgetMicros: input.costBudgetMicros,
         providerOptions: input.providerOptions,
       });
     }
@@ -677,5 +723,28 @@ export async function executeWithPolicy(
       err instanceof Error ? err.message : String(err),
     );
     await deps.kv.del(`agent:attempts:${input.threadId}`);
+  }
+}
+
+
+/** Sum every model call a run made, nested runs included (§4). Best effort
+ *  like every other read on the finish path: a storage hiccup must not turn a
+ *  finished run into a failed one, so a failure comes back as zero totals and
+ *  the error is logged. */
+async function runBill(
+  deps: RuntimePorts,
+  threadId: string,
+  runId?: string,
+): Promise<UsageTotals> {
+  const empty: UsageTotals = {
+    inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0,
+    costMicros: 0, unpriced: 0, lines: [],
+  };
+  if (!runId) return empty;
+  try {
+    return await deps.storage.usage.total(threadId, { runId });
+  } catch (err) {
+    (deps.log ?? console).error('run bill not read', { run: runId, err });
+    return empty;
   }
 }

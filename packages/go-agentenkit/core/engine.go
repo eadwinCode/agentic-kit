@@ -184,13 +184,14 @@ func accrueRunRecord(ctx context.Context, deps ports.RuntimePorts, runID string,
 	if err != nil || prior == nil {
 		return
 	}
-	_ = deps.Admin.Runs().Patch(ctx, runID, ports.RunPatch{
+	patch := ports.RunPatch{
 		Steps:             ports.Ptr(prior.Steps + loop.Steps),
 		InputTokens:       ports.Ptr(prior.InputTokens + loop.Attribution.InputTokens),
 		CachedInputTokens: ports.Ptr(prior.CachedInputTokens + loop.Attribution.CachedInputTokens),
 		OutputTokens:      ports.Ptr(prior.OutputTokens + loop.Attribution.OutputTokens),
 		TotalTokens:       ports.Ptr(prior.TotalTokens + loop.Attribution.TotalTokens),
-	})
+	}
+	_ = deps.Admin.Runs().Patch(ctx, runID, patch)
 }
 
 // failRun finalises a run as FAILED on both homes AND keeps why (§2.9).
@@ -200,8 +201,11 @@ func accrueRunRecord(ctx context.Context, deps ports.RuntimePorts, runID string,
 // the outcome, which is already a failure.
 func failRun(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, threadID, runID, reason string) error {
 	if agent != nil && agent.Args.OnSettle != nil {
+		// A failed run still spent money on the steps it did make (§4).
+		bill, billErr := runBill(ctx, deps, threadID, runID)
 		_ = agent.Args.OnSettle(ctx, ports.RunFinishInfo{
 			ThreadID: threadID, RunID: runID, State: ports.StateFailed, StopReason: "failed", Error: reason,
+			Usage: bill, UsageErr: billErr,
 		})
 	}
 	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateFailed), ports.SetOptions{}); err != nil {
@@ -285,9 +289,12 @@ type ExecuteInput struct {
 	// EnqueuedAt is epoch ms at enqueue, for the queue-wait measurement (§2.9).
 	EnqueuedAt int64
 	// State is the run's state (§2.10), carried so a redrive keeps it.
-	State           ports.AgentRunState
-	TokenBudget     int
-	ProviderOptions ports.ProviderOptions
+	State       ports.AgentRunState
+	TokenBudget int
+	// CostBudgetMicros is the run's money cap (§4), carried on the dispatch
+	// so the worker enforces what the caller asked for.
+	CostBudgetMicros int64
+	ProviderOptions  ports.ProviderOptions
 	// MaxSteps is the run's own step cap; zero keeps the config's (§2.1).
 	MaxSteps int
 }
@@ -319,6 +326,9 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	threadID, runID := input.ThreadID, input.RunID
 	if err := ValidateTokenBudget(input.TokenBudget, "tokenBudget"); err != nil {
 		return "", err
+	}
+	if input.CostBudgetMicros < 0 {
+		return "", fmt.Errorf("costBudgetMicros must be zero or a positive number")
 	}
 	// The run's identity and state ride the context from here, so the model
 	// calls (and anything wrapping a model) can see whose run they serve.
@@ -359,6 +369,14 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	}
 	if tokenBudget == 0 {
 		tokenBudget = deps.Config.TokenBudget
+	}
+	// The money cap (§4) resolves the same way, widest last.
+	costBudget := input.CostBudgetMicros
+	if costBudget == 0 {
+		costBudget = agent.Spec.CostBudgetMicros
+	}
+	if costBudget == 0 {
+		costBudget = deps.Config.CostBudgetMicros
 	}
 	// Provider-specific options (§3.1), widest first: runtime config → agent
 	// spec → this run. Each wins over the one before it, per namespace.
@@ -429,7 +447,8 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	}
 	resume := ports.ResumeInfo{
 		Agent: agent.Name, Model: input.Model, RunID: runID,
-		TokenBudget: input.TokenBudget, ProviderOptions: providerOptions,
+		TokenBudget: input.TokenBudget, CostBudgetMicros: input.CostBudgetMicros,
+		ProviderOptions: providerOptions,
 		// Carried so the resumed segment scopes its storage the same way (§2.10).
 		State: input.State, MaxSteps: input.MaxSteps,
 	}
@@ -452,7 +471,8 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		subCtx = &SubagentCtx{
 			IOCtx: ctx, ThreadID: threadID, Depth: 0, Sem: agent.Sem, Ports: deps,
 			Sub: *agent.Spec.Subagents, Agent: agent, Ledger: ledger, Resume: resume,
-			TokenBudget: tokenBudget, ProviderOptions: providerOptions, Aborted: aborted, State: input.State,
+			TokenBudget: tokenBudget, CostBudgetMicros: costBudget, BillingRunID: runID,
+			ProviderOptions: providerOptions, Aborted: aborted, State: input.State,
 		}
 	}
 	rawTools := slices.Clone(agent.Args.Tools)
@@ -507,6 +527,8 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		GenCtx: genCtx, Aborted: aborted,
 		ProviderOptions: providerOptions, TokenBudget: tokenBudget,
 		SystemFn: agent.Args.SystemFn, PrepareStep: agent.Args.PrepareStep, State: input.State,
+		CostBudgetMicros: costBudget, BillingRunID: runID,
+		ModelKey: input.Model, ModelID: model.WireID(input.Model), AgentName: agent.Name,
 		CacheSystemPrompt: deps.Config.PromptCaching,
 		OnChunk: func(chunk provider.StreamChunk) {
 			// One canonical path for every client: durable log + live bus (§2.1, §2.2)
@@ -521,14 +543,15 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	}
 
 	if loop.Parked {
-		// The segment ends holding the park: bill the steps up to the park
-		// (§4); the resumed segment records its own usage. NO state flip.
-		// The run record accrues this segment's steps and tokens now, so the
-		// close after the resume sums every segment rather than the last.
+		// The segment ends holding the park. Every call it made was already
+		// recorded and priced as it happened (§4), so there is nothing left to
+		// bill here. NO state flip. The run record accrues this segment's
+		// steps, tokens and cost now, so the close after the resume sums every
+		// segment rather than the last.
 		if runID != "" {
 			accrueRunRecord(ctx, deps, runID, loop)
 		}
-		return OutcomeExecuted, deps.Storage.Usage.Record(ctx, threadID, usageOf(agent.Name, loop.Attribution))
+		return OutcomeExecuted, nil
 	}
 
 	stopReason := "completed"
@@ -536,6 +559,8 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	switch {
 	case aborted():
 		stopReason, state = "cancelled", ports.StateCancelled
+	case loop.CostExhausted:
+		stopReason = "cost_budget" // the money cap (§4)
 	case tokenBudget > 0 && ledger.TokensUsed() >= tokenBudget:
 		stopReason = "token_budget"
 	case loop.FinishReason == provider.FinishToolCalls:
@@ -553,11 +578,17 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	// produced is committed by the time any client sees it end. A settle
 	// failure is a run failure; a stop reaches the hook cancelled, on the
 	// generation context, so it can tell the two apart.
+	// The whole run's bill, read back from the rows the loop wrote (§4):
+	// every segment and every nested run, priced and grouped into lines, so a
+	// settle hook charges in one pass without keeping its own tally. Read
+	// once, handed to both hooks; a failed read is reported, not hidden.
+	bill, billErr := runBill(ctx, deps, threadID, runID)
 	if agent.Args.OnSettle != nil {
 		info := ports.RunFinishInfo{
 			ThreadID: threadID, RunID: runID, State: state, StopReason: stopReason,
 			TokensUsed: f.TokensUsed, Attribution: f.Attribution, Steps: f.Steps,
 			Cancelled: state == ports.StateCancelled,
+			Usage:     bill, UsageErr: billErr,
 		}
 		if err := agent.Args.OnSettle(genCtx, info); err != nil && state != ports.StateCancelled {
 			state = ports.StateFailed
@@ -573,16 +604,10 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			ThreadID: threadID, RunID: runID, State: state, StopReason: stopReason,
 			TokensUsed: f.TokensUsed, Attribution: f.Attribution, Steps: f.Steps,
 			Cancelled: state == ports.StateCancelled, Error: f.Error,
+			Usage: bill, UsageErr: billErr,
 		})
 	}
 	return OutcomeExecuted, nil
-}
-
-func usageOf(agentID string, a TokenAttribution) ports.NewUsage {
-	return ports.NewUsage{
-		AgentID: agentID, InputTokens: a.InputTokens, CachedInputTokens: a.CachedInputTokens,
-		OutputTokens: a.OutputTokens, TotalTokens: a.TotalTokens,
-	}
 }
 
 // FinalizeInput is how a run ended.
@@ -610,11 +635,10 @@ type FinalizeInput struct {
 // A budget break is NOT a user stop: the run completes with stopReason
 // 'token_budget' and the usage it actually spent.
 func Finalize(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, threadID string, f FinalizeInput) error {
-	// Tokens this segment actually spent are always ours to record (§4), even
-	// when the run was replaced part-way through.
-	if err := deps.Storage.Usage.Record(ctx, threadID, usageOf(agent.Name, f.Attribution)); err != nil {
-		return err
-	}
+	// Nothing to bill here: every model call recorded and priced its own row
+	// as it happened, inside the loop (§4). Even a run that was replaced
+	// part-way through has already had its calls written.
+	//
 	// Close the run's durable record (§2.9). Additive: a run that parked and
 	// resumed finalises once, but its steps and tokens accrued over several
 	// segments. The run lock (§3.4) makes this read-modify-write single-writer.
@@ -696,7 +720,11 @@ func redriveOnLockConflict(ctx context.Context, deps ports.RuntimePorts, agent *
 		return deps.Queue.Enqueue(ctx, ports.RunJob{
 			ThreadID: input.ThreadID, RunID: input.RunID, EnqueuedAt: time.Now().UnixMilli(),
 			Model: input.Model, Agent: agent.Name, TokenBudget: input.TokenBudget,
-			ProviderOptions: input.ProviderOptions, State: input.State, MaxSteps: input.MaxSteps,
+			// A redrive is the SAME run trying again, so it keeps the caps it
+			// was dispatched with: a retry that lost its money cap would be
+			// unbounded (§4).
+			CostBudgetMicros: input.CostBudgetMicros,
+			ProviderOptions:  input.ProviderOptions, State: input.State, MaxSteps: input.MaxSteps,
 		}, &ports.EnqueueOptions{Delay: deps.Config.RunRedriveDelay})
 	}
 	if err := deps.Kv.Del(ctx, RedriveKey(input.ThreadID)); err != nil {
@@ -766,7 +794,11 @@ func ExecuteWithPolicy(ctx context.Context, deps ports.RuntimePorts, agent *Regi
 		return deps.Queue.Enqueue(ctx, ports.RunJob{
 			ThreadID: input.ThreadID, RunID: input.RunID, EnqueuedAt: time.Now().UnixMilli(),
 			Model: input.Model, Agent: agent.Name, TokenBudget: input.TokenBudget,
-			ProviderOptions: input.ProviderOptions, State: input.State, MaxSteps: input.MaxSteps,
+			// A redrive is the SAME run trying again, so it keeps the caps it
+			// was dispatched with: a retry that lost its money cap would be
+			// unbounded (§4).
+			CostBudgetMicros: input.CostBudgetMicros,
+			ProviderOptions:  input.ProviderOptions, State: input.State, MaxSteps: input.MaxSteps,
 		}, nil)
 	}
 	// Attempts exhausted: finalize FAILED on BOTH the hot cache and durable
@@ -775,4 +807,21 @@ func ExecuteWithPolicy(ctx context.Context, deps ports.RuntimePorts, agent *Regi
 		return errors.Join(err, failErr)
 	}
 	return deps.Kv.Del(ctx, AttemptsKey(input.ThreadID))
+}
+
+// runBill sums every model call a run made, nested runs included (§4). A
+// storage hiccup must not turn a finished run into a failed one, so the
+// read never fails the caller; but a hook that bills from these totals must
+// be able to tell "spent nothing" from "could not read", so the error is
+// returned beside the zero totals rather than swallowed.
+func runBill(ctx context.Context, deps ports.RuntimePorts, threadID, runID string) (ports.UsageTotals, error) {
+	if runID == "" {
+		return ports.UsageTotals{}, nil
+	}
+	total, err := deps.Storage.Usage.Total(context.WithoutCancel(ctx), threadID, ports.UsageFilter{RunID: runID})
+	if err != nil {
+		Logger(deps).Error("run bill not read", "run", runID, "err", err)
+		return ports.UsageTotals{}, err
+	}
+	return total, nil
 }

@@ -10,10 +10,13 @@ import type {
   ResolvedModel,
   RunJob,
   RunRecord,
+  Cost,
+  NewUsage,
   SubagentsConfig,
   ThreadDTO,
   UsageTotals,
 } from '../core/types.js';
+import type { TokenAttribution } from '../core/usage.js';
 import type { Storage } from './storage.js';
 import type { AdminStore, RunFilter, StepRecord } from './admin.js';
 import type { AgentRunState, BoundStorage } from '../core/state.js';
@@ -59,7 +62,32 @@ export interface RuntimePorts {
   /** User-provided model resolution (§3.3): models can live in any shape on
    *  the consumer side — the platform only ever sees `ResolvedModel`. */
   resolveModel(modelName: string): ResolvedModel;
+  /** Puts a price on every model call before its usage row is stored (§4).
+   *  Omitted, every row is stored unpriced. */
+  pricer?: Pricer;
+  /** Where the platform reports what it could not do without failing the
+   *  run, such as a usage row it failed to store. Defaults to `console`. */
+  log?: Logger;
   config: AgentConfig;
+}
+
+/** The little the platform needs from a logger. `console` satisfies it. */
+export interface Logger {
+  error(message: string, ...rest: unknown[]): void;
+}
+
+/** Turns one model call into money (§4). The runtime calls it after every
+ *  call, before the usage row is stored, so cost is part of the row rather
+ *  than something a reader has to work out later.
+ *
+ *  It runs on the run's own path: keep it fast and side-effect free. A price
+ *  list lookup is the intended shape; a network call is not. */
+export interface Pricer {
+  /** Returns null when it cannot price this call. The row is then stored
+   *  unpriced, and in a chain the next pricer gets its turn. A throw is
+   *  logged and treated the same way: an unpriceable call must never fail a
+   *  run. */
+  price(usage: NewUsage): Cost | null | Promise<Cost | null>;
 }
 
 export interface RuntimeOptions {
@@ -74,6 +102,14 @@ export interface RuntimeOptions {
   /** Models can come in any shape — config files, a database, provider SDKs.
    *  The platform only ever sees the resolved `ResolvedModel`. */
   resolveModel(modelName: string): ResolvedModel;
+  /** Prices every model call (§4). Omitted records tokens only, and every
+   *  `UsageTotals` comes back with `unpriced` above zero. See the `pricing`
+   *  module for the three that ship: a price table, a provider receipt
+   *  reader, and a chain of both. */
+  pricer?: Pricer;
+  /** Where the platform reports what it could not do without failing the
+   *  run. Defaults to `console`. */
+  log?: Logger;
   config?: Partial<AgentConfig>;
 }
 
@@ -97,6 +133,11 @@ export interface RunInput {
    *  spec.tokenBudget / config (§2.1 safety cap). Flows to the worker
    *  via RunJob.tokenBudget. */
   tokenBudget?: number;
+  /** Max spend for this run (§4), in millionths of the pricer's currency:
+   *  250_000 stops the run after roughly $0.25. Overrides
+   *  spec.costBudgetMicros / config. Needs a pricer; without one nothing is
+   *  ever priced and the cap can never be reached. */
+  costBudgetMicros?: number;
   /** Additional provider-specific options, passed through to the provider
    *  from the AI SDK (§3.1). Merged over the spec default: the execute
    *  input wins per provider namespace. */
@@ -149,6 +190,27 @@ export interface ThreadUsage {
   model: string;
 }
 
+/** What the platform hands a spec's `onFinish` once the run is finalized. */
+export interface RunFinishInfo {
+  threadId: string;
+  runId?: string;
+  state: ExecutionState;
+  stopReason: string;
+  tokensUsed: number;
+  /** The tokens THIS segment spent. A run that parked and resumed finishes
+   *  once, so this is the last segment, not the whole run — and it is tokens
+   *  only; the money is in `usage`. */
+  attribution: TokenAttribution;
+  steps: number;
+  /** The whole run's tokens AND money: every segment and every nested run,
+   *  read back with `usage.total(threadId, { runId })`. Its `lines` are the
+   *  bill, one per agent and model, so a settle hook charges in one pass
+   *  without keeping its own tally (§4). Zeroed when the storage read failed;
+   *  `unpriced` above zero means some calls went unpriced and `costMicros` is
+   *  a floor. */
+  usage: UsageTotals;
+}
+
 /** Durable state used to hydrate a client before it starts live event replay. */
 export interface ThreadSnapshot {
   thread: ThreadDTO;
@@ -176,17 +238,23 @@ export type StreamTextAgentSpec = {
   /** Default per-run token budget (input + output). Per-run
    *  `input.tokenBudget` wins; `undefined` = unbounded apart from `maxSteps`. */
   tokenBudget?: number;
+  /** Default per-run money cap (§4), in millionths of the pricer's currency.
+   *  Per-run `input.costBudgetMicros` wins; `undefined` = unbounded. Needs a
+   *  pricer: an unpriced call spends no money and so can never exhaust it. */
+  costBudgetMicros?: number;
   /** Additional provider-specific options, passed through to the provider
    *  from the AI SDK. Per-provider namespace; the execute input wins. */
   providerOptions?: ProviderOptions;
 } & Omit<Parameters<typeof import('ai').streamText>[0],
     'model' | 'messages' | 'prompt' | 'system' | 'abortSignal'
-    | 'maxSteps' | 'onStepFinish' | 'onError'> & {
+    | 'maxSteps' | 'onStepFinish' | 'onError' | 'onFinish' | 'onChunk'> & {
   /** `system` is allowed here (static persona); per-run system is not. */
   system?: string;
   tools?: ToolSet;
   onChunk?: (para: any) => void | Promise<void>;   // chained after platform persistence
-  onFinish?: (finishParams: any) => void | Promise<void>; // chained after platform finalize
+  /** Fires once, after the platform finalized the run, with what the run did
+   *  and what it spent (§4). */
+  onFinish?: (info: RunFinishInfo) => void | Promise<void>;
 };
 
 export type GenerateTextAgentSpec = {
@@ -195,11 +263,13 @@ export type GenerateTextAgentSpec = {
   model?: string;
   subagents?: boolean | SubagentsConfig;
   tokenBudget?: number;
+  costBudgetMicros?: number;
   providerOptions?: ProviderOptions;
 } & Omit<Parameters<typeof import('ai').generateText>[0],
     'model' | 'messages' | 'prompt' | 'abortSignal' | 'onFinish' | 'onStepFinish'> & {
   tools?: ToolSet;
-  onFinish?: (finishParams: any) => void | Promise<void>; // chained after platform finalize
+  /** Fires once, after the platform finalized the run (§4). */
+  onFinish?: (info: RunFinishInfo) => void | Promise<void>;
 };
 
 /** An executor bound to a generation flavor and to the user's generation

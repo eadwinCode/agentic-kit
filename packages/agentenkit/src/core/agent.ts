@@ -25,6 +25,9 @@ export interface RegisteredAgent {
     model?: string;
     subagents?: boolean | SubagentsConfig;
     tokenBudget?: number;
+    /** Default per-run money cap (§4), in millionths of the pricer's
+     *  currency. */
+    costBudgetMicros?: number;
     /** Additional provider-specific options (§3.1) — merged per run. */
     providerOptions?: ProviderOptions;
   };
@@ -61,11 +64,11 @@ export function createStreamTextAgent(
   scope: ScopeFn,
   spec: StreamTextAgentSpec,
 ): AgentHandle {
-  const { name, model, subagents, tokenBudget, providerOptions, ...args } = spec;
+  const { name, model, subagents, tokenBudget, costBudgetMicros, providerOptions, ...args } = spec;
   return createHandle(scope, {
     name,
     kind: 'stream-text',
-    spec: { model, subagents, tokenBudget, providerOptions },
+    spec: { model, subagents, tokenBudget, costBudgetMicros, providerOptions },
     args: args as Record<string, any>,
     sem: new Semaphore(scope().config.subagentMaxConcurrent),
   });
@@ -75,11 +78,11 @@ export function createGenerateTextAgent(
   scope: ScopeFn,
   spec: GenerateTextAgentSpec,
 ): AgentHandle {
-  const { name, model, subagents, tokenBudget, providerOptions, ...args } = spec;
+  const { name, model, subagents, tokenBudget, costBudgetMicros, providerOptions, ...args } = spec;
   return createHandle(scope, {
     name,
     kind: 'generate-text',
-    spec: { model, subagents, tokenBudget, providerOptions },
+    spec: { model, subagents, tokenBudget, costBudgetMicros, providerOptions },
     args: args as Record<string, any>,
     sem: new Semaphore(scope().config.subagentMaxConcurrent),
   });

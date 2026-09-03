@@ -55,7 +55,7 @@ is assumed.
 | `pendingInputs` | approvals waiting on a human |
 | `subagents` | nested runs, with status and text |
 | `threads`, `threadsLoading` | the thread list, for a sidebar |
-| `usage` | tokens spent and context load |
+| `usage` | tokens spent, money spent, and context load |
 
 **Actions**
 

@@ -35,7 +35,7 @@ async function localRuntime(model: any = echo(), config: Partial<AgentConfig> = 
   const queue = new InlineQueue();
   const runtime = await setupAgentCore({
     storage: new SqliteStorage(db),
-    admin: new SqliteAdminStore(db),
+    admin: SqliteAdminStore.open(db),
     bus: new MemoryBus(),
     kv: new MemoryKv(),
     queue,
@@ -100,7 +100,11 @@ describe('SqliteStorage', () => {
     const t = await s.threads.create({ model: 'gpt-4o' });
     await s.messages.append(t.id, { role: 'user', content: 'a' });
     await s.events.append(t.id, { threadId: t.id, seq: 1, type: 'CHUNK', payload: {}, createdAt: new Date() } as any);
-    await s.usage.record(t.id, { agentId: null, inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, totalTokens: 2 });
+    await s.usage.record(t.id, {
+      agentId: null, kind: 'step', step: 1, outcome: 'finished',
+      inputTokens: 1, cacheReadInputTokens: 0, cacheWriteInputTokens: 0,
+      outputTokens: 1, reasoningTokens: 0, totalTokens: 2,
+    });
     await s.threads.delete(t.id);
 
     expect(await s.threads.get(t.id)).toBeNull();
@@ -112,7 +116,7 @@ describe('SqliteStorage', () => {
 
 describe('SqliteAdminStore', () => {
   it('round-trips a run and its steps', async () => {
-    const a = new SqliteAdminStore(new Database(':memory:'));
+    const a = SqliteAdminStore.open(new Database(':memory:'));
     const run = await a.runs.start({ id: 'r1', threadId: 't1', agent: 'chat', model: 'gpt-4o' });
     expect(run).toMatchObject({ id: 'r1', depth: 0, parentRunId: null, state: 'RUNNING' });
 

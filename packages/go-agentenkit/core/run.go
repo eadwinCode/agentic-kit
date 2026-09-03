@@ -186,7 +186,8 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 		EnqueuedAt: time.Now().UnixMilli(),
 		// Persisted on the ticket so a worker, or a resume after an approval,
 		// hours later, in another process, rehydrates the same state (§2.10).
-		State: input.State, TokenBudget: input.TokenBudget, ProviderOptions: input.ProviderOptions,
+		State: input.State, TokenBudget: input.TokenBudget,
+		CostBudgetMicros: input.CostBudgetMicros, ProviderOptions: input.ProviderOptions,
 		MaxSteps: maxSteps,
 	}, nil); err != nil {
 		return ports.RunResult{}, err

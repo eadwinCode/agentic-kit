@@ -142,7 +142,7 @@ Omit it and it is chosen from the environment:
 Pass one to decide for yourself:
 
 ```ts
-admin: new SqliteAdminStore(db)         // same file as your data, if you like
+admin: SqliteAdminStore.open(db)         // same file as your data, if you like
 admin: new PostgresAdminStore(pool)     // explicit
 admin: new MemoryAdminStore()           // tests — nothing touches the disk
 ```
@@ -213,7 +213,7 @@ const queue = new InlineQueue();
 
 export const runtime = await setupAgentCore({
   storage: new SqliteStorage(db),
-  admin: new SqliteAdminStore(db),
+  admin: SqliteAdminStore.open(db),
   bus: new MemoryBus(),
   kv: new MemoryKv(),
   queue,

@@ -1,5 +1,7 @@
 import { describe, expect, it, beforeAll, afterAll } from 'bun:test';
 import { PostgresAdminStore, type PgLike } from '../src/admin/postgres.js';
+import type { AdminStore } from '../src/ports/admin.js';
+import type { RunRecord } from '../src/core/types.js';
 
 // A real database, because a store that only satisfies a mock proves nothing
 // about the SQL.
@@ -10,7 +12,7 @@ import { PostgresAdminStore, type PgLike } from '../src/admin/postgres.js';
 const URL = process.env.TEST_ADMIN_PG ?? 'postgresql://postgres:password@localhost:5433/agentic_admin_test';
 
 let pool: any;
-let store: PostgresAdminStore;
+let store: AdminStore;
 let reachable = true;
 let reason = '';
 
@@ -20,8 +22,12 @@ beforeAll(async () => {
     pool = new Pool({ connectionString: URL, connectionTimeoutMillis: 2_000 });
     await pool.query('SELECT 1');
     // A clean slate each run, so counts are assertions and not accumulations.
-    await pool.query('DROP TABLE IF EXISTS agentic_steps, agentic_runs, agentic_threads');
-    store = await PostgresAdminStore.connect(pool as PgLike);
+    // A clean slate means the ledger too, or the migrator would think the
+    // tables it just dropped are still there.
+    await pool.query(
+      'DROP TABLE IF EXISTS agentic_steps, agentic_runs, agentic_threads, agentic_migrations',
+    );
+    store = PostgresAdminStore.connect(pool as PgLike);
   } catch (err) {
     reachable = false;
     reason = err instanceof Error ? err.message : String(err);
@@ -47,11 +53,24 @@ afterAll(async () => {
 });
 
 describe('PostgresAdminStore (§2.9)', () => {
-  it('creates its schema and is safe to connect twice', async () => {
+  it('migrates once however many workers start at the same time', async () => {
     if (!requireDb()) return;
-    // CREATE TABLE IF NOT EXISTS everywhere: a second process starting up must
-    // not race the first into an error.
-    await expect(PostgresAdminStore.connect(pool as PgLike)).resolves.toBeDefined();
+    // Several workers starting together is the normal case, and each of them
+    // migrates. The advisory lock is what turns that into a queue rather than
+    // a race, so all three must come back usable and the ledger must hold one
+    // row per migration, not three.
+    const stores = [
+      PostgresAdminStore.connect(pool as PgLike),
+      PostgresAdminStore.connect(pool as PgLike),
+      PostgresAdminStore.connect(pool as PgLike),
+    ];
+    await Promise.all(stores.map((s) => s.runs.countByState()));
+
+    const { rows } = await pool.query(
+      'SELECT version, COUNT(*)::int AS n FROM agentic_migrations GROUP BY version',
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    for (const r of rows) expect(r.n).toBe(1);
   });
 
   it('round-trips a run through its lifecycle', async () => {

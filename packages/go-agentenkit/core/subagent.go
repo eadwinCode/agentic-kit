@@ -38,8 +38,13 @@ type SubagentCtx struct {
 	// Frames are calls already waiting on an approval above this level.
 	Frames []HitlFrame
 	// Descriptor is this spawner's own; nil when it is the main agent.
-	Descriptor      *ports.NestedDescriptor
-	TokenBudget     int
+	Descriptor  *ports.NestedDescriptor
+	TokenBudget int
+	// CostBudgetMicros is the run's money cap, shared with the parent (§4).
+	CostBudgetMicros int64
+	// BillingRunID is the DISPATCHED run every call beneath here is billed
+	// to, so one run's bill is one query however deep the delegation went.
+	BillingRunID    string
 	ProviderOptions ports.ProviderOptions
 	// Aborted reports a user stop (§2.1).
 	Aborted func() bool
@@ -317,11 +322,14 @@ func nestedTools(sctx *SubagentCtx, d ports.NestedDescriptor, frames []HitlFrame
 // model, so an unknown registry key is ordinary bad input rather than a
 // failure. The child falls back to the model its parent is already running
 // on, which is resolvable by construction.
-func resolveNestedModel(sctx *SubagentCtx, name string) (ports.ResolvedModel, error) {
+// The registry key comes back with the model: pricing is keyed by the key
+// that was actually resolved, not the one the delegation asked for.
+func resolveNestedModel(sctx *SubagentCtx, name string) (ports.ResolvedModel, string, error) {
 	if m, err := sctx.Ports.ResolveModel(name); err == nil {
-		return m, nil
+		return m, name, nil
 	}
-	return sctx.Ports.ResolveModel(sctx.Resume.Model)
+	m, err := sctx.Ports.ResolveModel(sctx.Resume.Model)
+	return m, sctx.Resume.Model, err
 }
 
 // RunNestedAgent runs, or RE-ENTERS, a nested agent (§2.7).
@@ -362,7 +370,7 @@ func RunNestedAgent(genCtx context.Context, sctx *SubagentCtx, d ports.NestedDes
 		persisted = append(persisted, *seed)
 	}
 
-	model, err := resolveNestedModel(sctx, d.Model)
+	model, modelKey, err := resolveNestedModel(sctx, d.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -402,8 +410,16 @@ func RunNestedAgent(genCtx context.Context, sctx *SubagentCtx, d ports.NestedDes
 		Tools:    nestedTools(sctx, d, frames),
 		MaxSteps: maxSteps,
 		GenCtx:   genCtx, Aborted: sctx.Aborted,
-		ProviderOptions:   sctx.ProviderOptions,
-		TokenBudget:       sctx.TokenBudget,
+		ProviderOptions: sctx.ProviderOptions,
+		TokenBudget:     sctx.TokenBudget,
+		// Money is capped and billed at the RUN, not per child (§2.7, §4):
+		// the cap is the parent's, and every call a child makes lands on the
+		// parent's bill under its own AgentID.
+		CostBudgetMicros:  sctx.CostBudgetMicros,
+		BillingRunID:      sctx.BillingRunID,
+		ModelKey:          modelKey,
+		ModelID:           model.WireID(modelKey),
+		AgentName:         d.Name,
 		System:            system,
 		SystemFn:          systemFn,
 		PrepareStep:       prepareStep,
@@ -419,14 +435,8 @@ func RunNestedAgent(genCtx context.Context, sctx *SubagentCtx, d ports.NestedDes
 	if err != nil {
 		return nil, err
 	}
-	// Billing attribution per subagent (§4); the run-wide ledger was already
-	// advanced inside the loop.
-	if err := deps.Storage.Usage.Record(io, threadID, ports.NewUsage{
-		AgentID: d.AgentID, InputTokens: outcome.Attribution.InputTokens,
-		CachedInputTokens: outcome.Attribution.CachedInputTokens,
-		OutputTokens:      outcome.Attribution.OutputTokens, TotalTokens: outcome.Attribution.TotalTokens,
-	}); err != nil {
-		return nil, err
-	}
+	// Nothing to bill here: every call the child made recorded and priced its
+	// own row as it happened, tagged with this child's AgentID (§4). The
+	// run-wide ledger was advanced inside the loop too.
 	return outcome, nil
 }

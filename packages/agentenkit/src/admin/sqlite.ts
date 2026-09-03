@@ -4,6 +4,8 @@ import type {
   NewStepRecord, RunFilter, StepRecord, ThreadStart,
 } from '../ports/admin.js';
 import type { SqliteLike } from '../adapters/sqlite.js';
+import { gatedAdminStore, runMigrations, type MigrationDriver } from './migrations/runner.js';
+import { dialect, migrations } from './migrations/sqlite/index.js';
 
 const date = (n: number | null | undefined) => (n == null ? null : new Date(n));
 /** The stored ThreadStart, with its `at` back as a Date. */
@@ -14,69 +16,47 @@ const parseStart = (v: unknown): ThreadStart | null => {
 const json = (v: unknown) => (v === undefined ? null : JSON.stringify(v));
 const parse = (v: unknown) => (typeof v === 'string' ? JSON.parse(v) : (v ?? null));
 
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS agentic_runs (
-  id TEXT PRIMARY KEY, threadId TEXT NOT NULL, parentRunId TEXT,
-  depth INTEGER NOT NULL DEFAULT 0, agent TEXT NOT NULL, model TEXT NOT NULL,
-  state TEXT NOT NULL DEFAULT 'RUNNING', stopReason TEXT, error TEXT,
-  startedAt INTEGER NOT NULL, endedAt INTEGER, durationMs INTEGER, queuedMs INTEGER,
-  attempts INTEGER NOT NULL DEFAULT 0, steps INTEGER NOT NULL DEFAULT 0,
-  inputTokens INTEGER NOT NULL DEFAULT 0, cachedInputTokens INTEGER NOT NULL DEFAULT 0,
-  outputTokens INTEGER NOT NULL DEFAULT 0, totalTokens INTEGER NOT NULL DEFAULT 0,
-  result TEXT, prompt TEXT, tokenBudget INTEGER, runState TEXT, providerOptions TEXT
-);
-CREATE INDEX IF NOT EXISTS agentic_runs_thread ON agentic_runs(threadId, startedAt);
-CREATE INDEX IF NOT EXISTS agentic_runs_state ON agentic_runs(state, startedAt);
-CREATE INDEX IF NOT EXISTS agentic_runs_parent ON agentic_runs(parentRunId);
-CREATE TABLE IF NOT EXISTS agentic_threads (
-  id TEXT PRIMARY KEY, state TEXT NOT NULL, model TEXT NOT NULL,
-  firstSeenAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL, startedWith TEXT
-);
-CREATE INDEX IF NOT EXISTS agentic_threads_state ON agentic_threads(state, updatedAt);
-CREATE TABLE IF NOT EXISTS agentic_steps (
-  runId TEXT NOT NULL, threadId TEXT, agentId TEXT, "index" INTEGER NOT NULL,
-  durationMs INTEGER NOT NULL, finishReason TEXT NOT NULL,
-  inputTokens INTEGER NOT NULL DEFAULT 0, cachedInputTokens INTEGER NOT NULL DEFAULT 0,
-  outputTokens INTEGER NOT NULL DEFAULT 0, totalTokens INTEGER NOT NULL DEFAULT 0,
-  tools TEXT, text TEXT, toolCalls TEXT, at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS agentic_steps_run ON agentic_steps(runId, "index");
-CREATE INDEX IF NOT EXISTS agentic_steps_thread ON agentic_steps(threadId, at);
-`;
-
 /** Operational history in SQLite — what `dev: true` uses (§2.9).
  *
  *  Tables are prefixed `agentic_` because this may well share a database with
- *  the caller's own schema; nothing here should collide with a table they own. */
+ *  the caller's own schema; nothing here should collide with a table they own.
+ *
+ *  The schema is applied by the migrator, not here. Use `SqliteAdminStore.open`
+ *  unless you are driving migrations yourself: it returns a store that waits
+ *  for the schema before its first call. */
 export class SqliteAdminStore implements AdminStore {
-  constructor(private readonly db: SqliteLike) {
-    for (const stmt of SCHEMA.split(';')) {
-      const sql = stmt.trim();
-      if (sql) this.db.prepare(sql).run();
-    }
-    // CREATE TABLE IF NOT EXISTS never adds a column to a database that already
-    // exists, so newer fields are added separately. SQLite has no
-    // ADD COLUMN IF NOT EXISTS, hence the check.
-    const have = new Set(
-      (this.db.prepare('PRAGMA table_info(agentic_steps)').all() as any[]).map((c) => c.name),
-    );
-    for (const col of ['text', 'toolCalls', 'threadId']) {
-      if (!have.has(col)) this.db.prepare(`ALTER TABLE agentic_steps ADD COLUMN ${col} TEXT`).run();
-    }
-    const runCols = new Set(
-      (this.db.prepare('PRAGMA table_info(agentic_runs)').all() as any[]).map((c) => c.name),
-    );
-    for (const [col, type] of [['prompt', 'TEXT'], ['tokenBudget', 'INTEGER'], ['runState', 'TEXT'], ['providerOptions', 'TEXT']]) {
-      if (!runCols.has(col)) {
-        this.db.prepare(`ALTER TABLE agentic_runs ADD COLUMN ${col} ${type}`).run();
-      }
-    }
-    const threadCols = new Set(
-      (this.db.prepare('PRAGMA table_info(agentic_threads)').all() as any[]).map((c) => c.name),
-    );
-    if (!threadCols.has('startedWith')) {
-      this.db.prepare('ALTER TABLE agentic_threads ADD COLUMN startedWith TEXT').run();
-    }
+  // Private: a store built without its migration would answer every query
+  // with "no such table". `open` is the only way in.
+  private constructor(private readonly db: SqliteLike) {}
+
+  /** The store `setupAgentCore` uses: schema migration running behind it, and
+   *  every call gated on it (§2.9).
+   *
+   *  Opening the database stays synchronous — a file that cannot be opened is
+   *  a configuration problem worth failing on at startup. Only the schema
+   *  moves to the background, so a service starts at the same speed whether or
+   *  not it has migrating to do. */
+  static open(db: SqliteLike, log?: { error(message: string, ...rest: unknown[]): void }): AdminStore {
+    const store = new SqliteAdminStore(db);
+    const ready = runMigrations(store.driver(), dialect, migrations).catch((err) => {
+      // Loud, because everything downstream of this is silent: admin writes
+      // are best effort, so a failed migration shows up as a dashboard with
+      // nothing in it rather than as an error.
+      (log ?? console).error('admin migrations failed', err);
+      throw err;
+    });
+    return gatedAdminStore(store, ready);
+  }
+
+  /** The two calls the migrator needs, over this store's handle. */
+  private driver(): MigrationDriver {
+    return {
+      exec: async (sql, params = []) => {
+        this.db.prepare(sql).run(...(params as unknown[]));
+      },
+      rows: async (sql, params = []) =>
+        this.db.prepare(sql).all(...(params as unknown[])) as Array<Record<string, unknown>>,
+    };
   }
 
   private all(sql: string, ...p: unknown[]): any[] {
