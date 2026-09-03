@@ -138,6 +138,13 @@ export interface ThreadUsage {
 export interface PendingInput {
   toolCallId: string;
   toolName: string;
+  /** `approval` when a person decides; anything else is a tool that parked
+   *  itself on work it started (a job, a build) and is resumed by whoever
+   *  finishes it. A UI shows a card for the first and a status for the rest. */
+  reason: string;
+  /** When the request stops being answerable, ISO time; absent on a park
+   *  recorded before per-park deadlines. */
+  expiresAt?: string;
   /** The stream that asked — null when the main agent did. */
   agentId?: string | null;
   /** The nested run's own name and depth, straight off the park, so a card can

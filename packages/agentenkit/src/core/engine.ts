@@ -12,6 +12,7 @@ import {
   hitlKey,
   loadOpenHitls,
   withHitl,
+  hitlDeadline,
   type PendingHitl,
 } from './hitl.js';
 import { publish, publishEvent, setThreadState, withPublishEvent } from './publish.js';
@@ -51,7 +52,7 @@ async function verdictReady(
   pending: PendingHitl,
 ): Promise<'answered' | 'expired' | 'open'> {
   if (await deps.kv.get(hitlKey(pending.toolCallId))) return 'answered';
-  return Date.now() - pending.requestedAt >= deps.config.hitlTtlMs ? 'expired' : 'open';
+  return Date.now() >= hitlDeadline(pending, deps.config) ? 'expired' : 'open';
 }
 
 /** Turn a settled approval into the tool result the conversation will carry

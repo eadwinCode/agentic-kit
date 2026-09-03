@@ -70,6 +70,56 @@ before the expiry timer existed, or one whose queue adapter ignored the delay.
 It is cheap to call on connect and costs one call per connection rather than a
 poll per viewer.
 
+## A tool that parks itself
+
+An approval parks a tool *before* it runs, so a person can decide. A tool can
+also park *after* it has started work it must not wait for in-process: a
+build, a render, a job on another system. Same machinery, no human.
+
+```ts
+const render = agentTool({
+  description: 'Render the scene',
+  parameters: z.object({ scene: z.string() }),
+  execute: async ({ scene }, { approval }) => {
+    if (approval) return approval.payload;          // second call: the job finished
+    const job = await renders.start(scene);         // first call: start it
+    throw parkForInput({ reason: 'job', payload: { jobId: job.id }, ttlMs: 30 * 60_000 });
+  },
+});
+```
+
+```go
+Execute: func(ctx context.Context, input json.RawMessage) (string, error) {
+    if a := agentenkit.ApprovalFromContext(ctx); a != nil {
+        return string(a.Payload), nil                // second call: the job finished
+    }
+    job := renders.Start(ctx, input)                 // first call: start it
+    return "", agentenkit.ParkForInput(agentenkit.ParkRequest{
+        Reason: "job", Payload: map[string]any{"jobId": job.ID}, TTL: 30 * time.Minute,
+    })
+},
+```
+
+What happens: the tool's first call returns the park; the run parks exactly
+like an approval, worker and run lock released, `INPUT_REQUIRED` written with
+`reason: "job"`, the payload as its `arguments`, and the park's own
+`expiresAt`. Whoever finishes the job, a webhook, a queue consumer, a cron,
+calls `respond(threadId, toolCallId, true, result)`. The run resumes, the
+**same tool call runs again** with `approval.payload` set to that result, and
+what it returns is the tool result the model sees.
+
+Three things to know:
+
+- **`reason` is how a UI tells the two apart.** `useAgentThread` puts it on
+  every `pendingInputs` entry; render a card for `approval`, a status line for
+  anything else. The platform itself does not treat them differently.
+- **`ttlMs` / `TTL` is per park.** A job that outlives it resumes as expired,
+  the same timeout result an unanswered approval gets, so the tool sees no
+  `approval` and returns what it can. Leave it unset to use `hitlTtlMs`.
+- **A resumed call must return.** Parking again from the resumed call is
+  reported to the model as a tool error; if a job needs a second wait, start a
+  new tool call.
+
 ## Several approvals at once
 
 A single step can park more than one request — most often when a step spawns two

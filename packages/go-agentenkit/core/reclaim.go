@@ -44,9 +44,8 @@ func ReclaimIfOrphaned(ctx context.Context, deps ports.RuntimePorts, threadID st
 	}
 	// Every open request must be past its window. One that is still
 	// answerable would make the resumed segment a no-op anyway (§2.7).
-	deadline := ReclaimGraceAfter(deps)
 	for _, p := range open {
-		if time.Since(p.RequestedAt) < deadline {
+		if time.Now().Before(p.Deadline(deps.Config).Add(deps.Config.ReclaimGrace)) {
 			return false, nil
 		}
 	}

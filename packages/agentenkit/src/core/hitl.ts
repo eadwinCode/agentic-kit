@@ -4,7 +4,7 @@ import type { RespondInput, RespondResult } from '../ports/runtime.js';
 import type { AgentEvent, NestedDescriptor, ResumeInfo } from './types.js';
 import { publish, setThreadState } from './publish.js';
 import { currentRunId } from './keys.js';
-import { reclaimGraceAfterMs, reclaimIfOrphaned } from './reclaim.js';
+import { reclaimIfOrphaned } from './reclaim.js';
 
 export const HITL_TTL_MS = 15 * 60_000;
 
@@ -33,12 +33,58 @@ export interface HitlFrame {
   nested?: NestedDescriptor;
 }
 
+/** Marks a park raised by a `requiresConfirmation` tool: a human decides.
+ *  Any other reason is a tool that parked itself (§2.5). */
+export const REASON_APPROVAL = 'approval';
+
+/** A tool's own park (§2.5). The tool has started something it must not wait
+ *  for in-process (a build, a render, a long job) and asks to be resumed when
+ *  it is done: the run lock and the worker are released, the request is
+ *  durable, and `respond(toolCallId, payload)` runs the SAME tool call again
+ *  with the payload on its `approval`. Nothing waits meanwhile. */
+export interface ParkRequest {
+  /** Names what the run is waiting on ("job", say). It rides the
+   *  INPUT_REQUIRED event, so a UI can tell it from an approval and skip the
+   *  card. Empty means REASON_APPROVAL. */
+  reason?: string;
+  /** Published as the request's arguments: the job id, a URL, whatever the
+   *  responder needs to find the work. */
+  payload?: unknown;
+  /** How long the park stays answerable; absent keeps `config.hitlTtlMs`. A
+   *  job that outlives it resumes as expired, like an unanswered approval. */
+  ttlMs?: number;
+}
+
+/** What a tool throws to park itself:
+ *
+ * ```ts
+ * throw parkForInput({ reason: 'job', payload: { jobId }, ttlMs: 30 * 60_000 });
+ * ```
+ *
+ *  The engine turns it into a durable park. A resumed call sees
+ *  `ctx.approval` set and must return a result; a resumed call that parks
+ *  again is reported to the model as a tool error. */
+export class ToolParkedError extends Error {
+  constructor(public readonly request: ParkRequest) {
+    super(`tool parked: ${request.reason ?? REASON_APPROVAL}`);
+    this.name = 'ToolParkedError';
+  }
+}
+
+export function parkForInput(request: ParkRequest = {}): ToolParkedError {
+  return new ToolParkedError(request);
+}
+
 export interface ParkInput {
   threadId: string;
   toolCallId: string;
   toolName: string;
   args: unknown;
   agentId?: string | null;
+  /** REASON_APPROVAL, or what a self-parking tool said (§2.5). */
+  reason?: string;
+  /** Overrides `config.hitlTtlMs` for this park; absent keeps it. */
+  ttlMs?: number;
   /** The calls waiting on this answer, innermost first (§2.7). Empty for a
    *  main-agent park, which reduces this to the plain §2.5 flow. */
   frames?: HitlFrame[];
@@ -48,10 +94,13 @@ export interface ParkInput {
   resume: ResumeInfo;
 }
 
-/** Wrap every marked tool so a call parks (§2.5) instead of executing: the
- *  request is persisted as INPUT_REQUIRED and the wrapper returns the park
- *  sentinel — nothing blocks. The real tool runs when the park is resolved
- *  (see resumePendingHitl), in whichever stream owns it.
+/** Wrap every tool so a call can park (§2.5) instead of blocking. A marked
+ *  tool parks BEFORE it runs: the request is persisted as INPUT_REQUIRED and
+ *  the wrapper returns the park sentinel; the real tool runs when a human
+ *  answers (see resumePendingHitl), in whichever stream owns it. Any other
+ *  tool may park ITSELF by throwing `parkForInput(...)` after starting work
+ *  it cannot wait for; the same machinery resumes it with the responder's
+ *  payload. Nothing blocks either way.
  *
  *  Shared by the main agent and every nested run (§2.7): the only difference
  *  is the `agentId` asking and the `frames` waiting on the answer. */
@@ -68,25 +117,50 @@ export function withHitl(
 ): Record<string, any> {
   const out: Record<string, any> = {};
   for (const [name, t] of Object.entries(tools)) {
-    if (!(t as any)?.requiresConfirmation) {
+    const park = async (toolCallId: string, args: unknown, request: ParkRequest) => {
+      await parkForApproval(deps, {
+        threadId,
+        toolCallId,
+        toolName: name,
+        args,
+        agentId: ctx.agentId ?? null,
+        frames: ctx.frames ?? [],
+        ...(ctx.nested ? { nested: ctx.nested } : {}),
+        resume: ctx.resume,
+        ...(request.reason ? { reason: request.reason } : {}),
+        ...(request.ttlMs !== undefined ? { ttlMs: request.ttlMs } : {}),
+      });
+      return { [HITL_PARKED]: toolCallId };
+    };
+    if ((t as any)?.requiresConfirmation) {
+      out[name] = {
+        ...t,
+        execute: (args: unknown, opts: { toolCallId?: string }) =>
+          park(opts?.toolCallId ?? randomUUID(), args, { reason: REASON_APPROVAL }),
+      };
+      continue;
+    }
+    const execute = (t as any)?.execute as
+      | ((args: unknown, opts: any) => Promise<unknown>)
+      | undefined;
+    if (!execute) {
       out[name] = t;
       continue;
     }
     out[name] = {
       ...t,
-      execute: async (args: unknown, opts: { toolCallId?: string }) => {
-        const toolCallId = opts?.toolCallId ?? randomUUID();
-        await parkForApproval(deps, {
-          threadId,
-          toolCallId,
-          toolName: name,
-          args,
-          agentId: ctx.agentId ?? null,
-          frames: ctx.frames ?? [],
-          ...(ctx.nested ? { nested: ctx.nested } : {}),
-          resume: ctx.resume,
-        });
-        return { [HITL_PARKED]: toolCallId };
+      execute: async (args: unknown, opts: { toolCallId?: string; approval?: unknown }) => {
+        try {
+          return await execute(args, opts);
+        } catch (err) {
+          if (!(err instanceof ToolParkedError)) throw err;
+          // A resumed call that parks again has nowhere to go: the verdict
+          // for this call is being consumed right now.
+          if (opts?.approval) {
+            throw new Error(`tool ${name} parked again on resume; a resumed call must return`);
+          }
+          return park(opts?.toolCallId ?? randomUUID(), err.request.payload ?? null, err.request);
+        }
       },
     };
   }
@@ -109,6 +183,8 @@ export function withHitl(
  *  deliveries of one run: whichever resolves the park first wins, and the
  *  run lock makes the other a no-op. */
 export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise<void> {
+  const ttlMs = i.ttlMs && i.ttlMs > 0 ? i.ttlMs : deps.config.hitlTtlMs;
+  const expiresAt = new Date(Date.now() + ttlMs).toISOString();
   await deps.kv.set(`agent:state:${i.threadId}`, 'WAITING_FOR_INPUT');
   await setThreadState(deps, i.threadId, 'WAITING_FOR_INPUT', i.resume.model);
   await publish(deps, i.threadId, 'INPUT_REQUIRED', {
@@ -121,6 +197,11 @@ export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise
     frames: i.frames ?? [],
     ...(i.nested ? { nested: i.nested } : {}),
     resume: i.resume,
+    // REASON_APPROVAL, or the self-parking tool's own word, and the park's
+    // own deadline (§2.5). A park recorded before these existed reads as
+    // an approval on the config's TTL.
+    reason: i.reason ?? REASON_APPROVAL,
+    expiresAt,
   });
   await publish(deps, i.threadId, 'STATE_CHANGE', { state: 'WAITING_FOR_INPUT' });
 
@@ -145,7 +226,7 @@ export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise
         ...(i.resume.providerOptions ? { providerOptions: i.resume.providerOptions } : {}),
         ...(i.resume.state ? { state: i.resume.state } : {}),
       },
-      { delaySeconds: Math.ceil(reclaimGraceAfterMs(deps) / 1000) },
+      { delaySeconds: Math.ceil((ttlMs + deps.config.reclaimGraceMs) / 1000) },
     );
   } catch {
     // No expiry scheduled — the thread still heals on first touch (§2.5).
@@ -165,6 +246,21 @@ export interface PendingHitl {
   nested?: NestedDescriptor;
   /** Epoch ms of the INPUT_REQUIRED event — the TTL clock (§2.5) */
   requestedAt: number;
+  /** The park's own deadline, epoch ms; absent on a park recorded before
+   *  per-park TTLs, which `hitlDeadline` reads as requestedAt + hitlTtlMs. */
+  expiresAt?: number;
+  /** REASON_APPROVAL, or the self-parking tool's word (§2.5). */
+  reason?: string;
+}
+
+/** When a park stops being answerable, epoch ms. */
+export function hitlDeadline(p: PendingHitl, config: { hitlTtlMs: number }): number {
+  return p.expiresAt ?? p.requestedAt + config.hitlTtlMs;
+}
+
+/** Whether a human is the responder. */
+export function isApprovalPark(p: Pick<PendingHitl, 'reason'>): boolean {
+  return !p.reason || p.reason === REASON_APPROVAL;
 }
 
 export async function loadPendingHitl(
@@ -184,7 +280,10 @@ function fromInputRequired(pending: AgentEvent): PendingHitl {
     arguments?: unknown;
     frames?: HitlFrame[];
     nested?: NestedDescriptor;
+    reason?: string;
+    expiresAt?: string;
   };
+  const expiresAt = p.expiresAt ? new Date(p.expiresAt).getTime() : NaN;
   return {
     toolCallId: p.toolCallId,
     toolName: p.toolName,
@@ -194,6 +293,8 @@ function fromInputRequired(pending: AgentEvent): PendingHitl {
     frames: p.frames ?? [],
     ...(p.nested ? { nested: p.nested } : {}),
     requestedAt: new Date(pending.createdAt).getTime(),
+    ...(Number.isFinite(expiresAt) ? { expiresAt } : {}),
+    ...(p.reason ? { reason: p.reason } : {}),
   };
 }
 
@@ -254,7 +355,7 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
   // unanswered (§2.5)
   const remainingSec = Math.max(
     60,
-    Math.floor((deps.config.hitlTtlMs - (Date.now() - match.requestedAt)) / 1000),
+    Math.floor((hitlDeadline(match, deps.config) - Date.now()) / 1000),
   );
   await deps.kv.set(
     hitlKey(input.toolCallId),

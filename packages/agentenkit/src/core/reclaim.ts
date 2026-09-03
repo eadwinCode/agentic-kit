@@ -1,7 +1,7 @@
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { ResumeInfo } from './types.js';
 import { currentRunId } from './keys.js';
-import { loadOpenHitls } from './hitl.js';
+import { hitlDeadline, loadOpenHitls } from './hitl.js';
 
 // Small grace so an in-flight /respond delivery always lands first —
 // reclamation only ever sees true orphans.
@@ -34,8 +34,10 @@ export async function reclaimIfOrphaned(deps: RuntimePorts, threadId: string): P
 
   // Every open request must be past its window. One that is still answerable
   // would make the resumed segment a no-op anyway (§2.7).
-  const deadline = reclaimGraceAfterMs(deps);
-  if (!open.every((p) => Date.now() - p.requestedAt >= deadline)) return false;
+  const now = Date.now();
+  if (!open.every((p) => now >= hitlDeadline(p, deps.config) + deps.config.reclaimGraceMs)) {
+    return false;
+  }
 
   // Rebuild the original dispatch from the ticket persisted in the event
   // payload; a legacy park without one falls back to the default handle.

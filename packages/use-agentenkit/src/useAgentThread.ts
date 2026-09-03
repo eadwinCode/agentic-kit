@@ -430,11 +430,12 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
           break;
         }
 
-        case 'INPUT_REQUIRED':
+        case 'INPUT_REQUIRED': {
+          const reason: string = p.reason ?? 'approval';
           setAgentState('WAITING_FOR_INPUT');
           setActivity({
             phase: 'waiting-input',
-            label: labels.waitingApproval,
+            label: reason === 'approval' ? labels.waitingApproval : labels.waitingWork,
             detail: p.toolName,
           });
           setPendingInputs((prev) =>
@@ -449,6 +450,8 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
                     agentName: p.nested?.name,
                     depth: p.nested?.depth,
                     arguments: p.arguments,
+                    reason,
+                    ...(p.expiresAt ? { expiresAt: p.expiresAt } : {}),
                   },
                 ],
           );
@@ -461,6 +464,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
             );
           }
           break;
+        }
 
         case 'INPUT_EXPIRED':
           // Only this request expired; any sibling approval is still open.

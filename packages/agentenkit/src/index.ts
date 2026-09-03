@@ -66,6 +66,12 @@ export type { ModelPrice, PriceTable, ReceiptReader } from './pricing.js';
 export {
   respond,
   parkForApproval,
+  parkForInput,
+  ToolParkedError,
+  REASON_APPROVAL,
+  hitlDeadline,
+  isApprovalPark,
+  type ParkRequest,
   loadPendingHitl,
   loadOpenHitls,
   withHitl,
