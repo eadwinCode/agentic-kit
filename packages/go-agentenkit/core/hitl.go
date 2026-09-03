@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -58,6 +59,51 @@ func nullable(s string) *string {
 	return &s
 }
 
+// ReasonApproval marks a park raised by a RequiresConfirmation tool: a
+// human decides. Any other reason is a tool that parked itself (§2.5): work
+// it started and cannot wait for, resumed by whoever finishes that work.
+const ReasonApproval = "approval"
+
+// ParkRequest is a tool's own park (§2.5). The tool has started something it
+// must not wait for in-process (a build, a render, a long job) and asks to
+// be resumed when it is done: the run lock and the worker are released, the
+// request is durable, and Respond(toolCallId, payload) runs the SAME tool
+// call again with the payload on its Approval. Nothing waits meanwhile.
+type ParkRequest struct {
+	// Reason names what the run is waiting on ("job", say). It rides the
+	// INPUT_REQUIRED event, so a UI can tell it from an approval and skip
+	// the card. Empty means ReasonApproval.
+	Reason string
+	// Payload is published as the request's arguments: the job id, a URL,
+	// whatever the responder needs to find the work.
+	Payload any
+	// TTL is how long the park stays answerable; zero keeps Config.HITLTTL.
+	// A job that outlives it resumes as expired, like an unanswered approval.
+	TTL time.Duration
+}
+
+// ParkForInput is what a tool returns to park itself:
+//
+//	return "", agentenkit.ParkForInput(agentenkit.ParkRequest{Reason: "job", Payload: started, TTL: 30 * time.Minute})
+//
+// The engine turns it into a durable park. A resumed call sees
+// ApprovalFromContext(ctx) set and must return a result; a resumed call that
+// parks again is reported to the model as a tool error.
+func ParkForInput(req ParkRequest) error { return &parkError{req: req} }
+
+type parkError struct{ req ParkRequest }
+
+func (e *parkError) Error() string { return "tool parked: " + e.req.Reason }
+
+// AsParkRequest recognises a tool's own park in the error it returned.
+func AsParkRequest(err error) (ParkRequest, bool) {
+	var pe *parkError
+	if errors.As(err, &pe) {
+		return pe.req, true
+	}
+	return ParkRequest{}, false
+}
+
 // ParkInput describes a park.
 type ParkInput struct {
 	ThreadID   string
@@ -65,6 +111,10 @@ type ParkInput struct {
 	ToolName   string
 	Args       json.RawMessage
 	AgentID    string
+	// Reason is ReasonApproval, or what a self-parking tool said (§2.5).
+	Reason string
+	// TTL overrides Config.HITLTTL for this park; zero keeps it.
+	TTL time.Duration
 	// Frames are the calls waiting on this answer, innermost first (§2.7).
 	Frames []HitlFrame
 	// Nested is the run that raised this park; nil when the main agent did.
@@ -87,40 +137,63 @@ func ParkedResult(toolCallID string) string {
 	return string(b)
 }
 
-// WithHitl wraps every marked tool so a call parks (§2.5) instead of
-// executing: the request is persisted as INPUT_REQUIRED and the wrapper
-// returns the park sentinel. Nothing blocks. The real tool runs when the park
-// is resolved (see resumePendingHitl), in whichever stream owns it.
+// WithHitl wraps every tool so a call can park (§2.5) instead of blocking.
+// A marked tool parks BEFORE it runs: the request is persisted as
+// INPUT_REQUIRED and the wrapper returns the park sentinel; the real tool
+// runs when a human answers (see resumePendingHitl), in whichever stream
+// owns it. Any other tool may park ITSELF by returning ParkForInput after
+// starting work it cannot wait for; the same machinery resumes it with the
+// responder's payload. Nothing blocks either way.
 //
 // Shared by the main agent and every nested run (§2.7): the only difference
 // is the AgentID asking and the Frames waiting on the answer.
 func WithHitl(deps ports.RuntimePorts, threadID string, tools []ports.Tool, hc HitlCtx) []ports.Tool {
 	out := make([]ports.Tool, 0, len(tools))
 	for _, t := range tools {
-		if !t.RequiresConfirmation {
-			out = append(out, t)
-			continue
-		}
 		name := t.Name
 		wrapped := t
-		wrapped.Execute = func(ctx context.Context, input json.RawMessage) (string, error) {
-			toolCallID := goai.ToolCallIDFromContext(ctx)
-			if toolCallID == "" {
-				toolCallID = NewID()
-			}
+		execute := t.Execute
+		park := func(ctx context.Context, toolCallID string, args json.RawMessage, req ParkRequest) (string, error) {
 			// The park must land even when the generation context is being
 			// torn down; it is durable state, not part of the model call.
 			if err := ParkForApproval(context.WithoutCancel(ctx), deps, ParkInput{
-				ThreadID: threadID, ToolCallID: toolCallID, ToolName: name, Args: input,
+				ThreadID: threadID, ToolCallID: toolCallID, ToolName: name, Args: args,
 				AgentID: hc.AgentID, Frames: hc.Frames, Nested: hc.Nested, Resume: hc.Resume,
+				Reason: req.Reason, TTL: req.TTL,
 			}); err != nil {
 				return "", err
 			}
 			return ParkedResult(toolCallID), nil
 		}
+		if t.RequiresConfirmation {
+			wrapped.Execute = func(ctx context.Context, input json.RawMessage) (string, error) {
+				return park(ctx, toolCallIDOr(ctx), input, ParkRequest{Reason: ReasonApproval})
+			}
+		} else if execute != nil {
+			wrapped.Execute = func(ctx context.Context, input json.RawMessage) (string, error) {
+				output, err := execute(ctx, input)
+				req, parked := AsParkRequest(err)
+				if !parked {
+					return output, err
+				}
+				// A resumed call that parks again has nowhere to go: the
+				// verdict for this call is being consumed right now.
+				if ApprovalFromContext(ctx) != nil {
+					return "", fmt.Errorf("tool %s parked again on resume; a resumed call must return", name)
+				}
+				return park(ctx, toolCallIDOr(ctx), MarshalPayload(req.Payload), req)
+			}
+		}
 		out = append(out, wrapped)
 	}
 	return out
+}
+
+func toolCallIDOr(ctx context.Context) string {
+	if id := goai.ToolCallIDFromContext(ctx); id != "" {
+		return id
+	}
+	return NewID()
 }
 
 // inputRequiredPayload is the persisted INPUT_REQUIRED payload.
@@ -133,6 +206,11 @@ type inputRequiredPayload struct {
 	Frames      []HitlFrame             `json:"frames"`
 	Nested      *ports.NestedDescriptor `json:"nested,omitempty"`
 	Resume      *ports.ResumeInfo       `json:"resume,omitempty"`
+	// Reason is ReasonApproval, or the self-parking tool's own word (§2.5).
+	Reason string `json:"reason,omitempty"`
+	// ExpiresAt is when the park stops being answerable; absent on a park
+	// recorded before per-park TTLs existed, which uses Config.HITLTTL.
+	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
 }
 
 // ParkForApproval is the §2.5 suspension as a durable state transition. NO
@@ -165,9 +243,19 @@ func ParkForApproval(ctx context.Context, deps ports.RuntimePorts, i ParkInput) 
 		frames = []HitlFrame{}
 	}
 	resume := i.Resume
+	reason := i.Reason
+	if reason == "" {
+		reason = ReasonApproval
+	}
+	ttl := i.TTL
+	if ttl <= 0 {
+		ttl = deps.Config.HITLTTL
+	}
+	expiresAt := time.Now().Add(ttl)
 	if _, err := Publish(ctx, deps, i.ThreadID, "INPUT_REQUIRED", inputRequiredPayload{
 		ToolCallID: i.ToolCallID, ToolName: i.ToolName, AgentID: nullable(i.AgentID),
 		Arguments: args, InputSchema: nil, Frames: frames, Nested: i.Nested, Resume: &resume,
+		Reason: reason, ExpiresAt: &expiresAt,
 	}); err != nil {
 		return err
 	}
@@ -186,7 +274,7 @@ func ParkForApproval(ctx context.Context, deps ports.RuntimePorts, i ParkInput) 
 		TokenBudget: i.Resume.TokenBudget, CostBudgetMicros: i.Resume.CostBudgetMicros,
 		ProviderOptions: i.Resume.ProviderOptions, State: i.Resume.State,
 		MaxSteps: i.Resume.MaxSteps,
-	}, &ports.EnqueueOptions{Delay: ReclaimGraceAfter(deps)})
+	}, &ports.EnqueueOptions{Delay: ttl + deps.Config.ReclaimGrace})
 	return nil
 }
 
@@ -203,9 +291,25 @@ type PendingHitl struct {
 	Nested *ports.NestedDescriptor
 	// RequestedAt is when INPUT_REQUIRED was published: the TTL clock (§2.5).
 	RequestedAt time.Time
+	// ExpiresAt is the park's own deadline; zero on a park recorded before
+	// per-park TTLs, which Deadline reads as RequestedAt + Config.HITLTTL.
+	ExpiresAt time.Time
+	// Reason is ReasonApproval or the self-parking tool's word (§2.5).
+	Reason string
 	// Resume is the dispatch ticket, when the park recorded one.
 	Resume *ports.ResumeInfo
 }
+
+// Deadline is when this park stops being answerable.
+func (p PendingHitl) Deadline(cfg ports.AgentConfig) time.Time {
+	if !p.ExpiresAt.IsZero() {
+		return p.ExpiresAt
+	}
+	return p.RequestedAt.Add(cfg.HITLTTL)
+}
+
+// IsApproval reports whether a human is the responder.
+func (p PendingHitl) IsApproval() bool { return p.Reason == "" || p.Reason == ReasonApproval }
 
 func fromInputRequired(e ports.AgentEvent) (PendingHitl, error) {
 	var p inputRequiredPayload
@@ -220,10 +324,14 @@ func fromInputRequired(e ports.AgentEvent) (PendingHitl, error) {
 	if frames == nil {
 		frames = []HitlFrame{} // a park recorded before frames existed unwinds as a main-agent park
 	}
-	return PendingHitl{
+	pending := PendingHitl{
 		ToolCallID: p.ToolCallID, ToolName: p.ToolName, AgentID: agentID, Arguments: p.Arguments,
-		Frames: frames, Nested: p.Nested, RequestedAt: e.CreatedAt, Resume: p.Resume,
-	}, nil
+		Frames: frames, Nested: p.Nested, RequestedAt: e.CreatedAt, Resume: p.Resume, Reason: p.Reason,
+	}
+	if p.ExpiresAt != nil {
+		pending.ExpiresAt = *p.ExpiresAt
+	}
+	return pending, nil
 }
 
 // LoadPendingHitl reads the most recent pending request.
@@ -321,7 +429,7 @@ func Respond(ctx context.Context, deps ports.RuntimePorts, input ports.RespondIn
 	// Remaining-TTL expiry so a stale answer can never outlive its request:
 	// the key vanishing is what makes the resumed segment treat the request
 	// as unanswered (§2.5).
-	remaining := deps.Config.HITLTTL - time.Since(match.RequestedAt)
+	remaining := time.Until(match.Deadline(deps.Config))
 	if remaining < time.Minute {
 		remaining = time.Minute
 	}

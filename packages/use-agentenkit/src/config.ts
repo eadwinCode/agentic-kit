@@ -57,6 +57,8 @@ export interface ActivityLabels {
   callingTool: string;
   toolCompleted: string;
   waitingApproval: string;
+  /** A tool parked itself on work in progress; no one is asked anything. */
+  waitingWork: string;
   approvalExpired: string;
   approvalSent: string;
   requestDenied: string;
@@ -79,6 +81,7 @@ export const defaultLabels: ActivityLabels = {
   callingTool: 'Calling tool',
   toolCompleted: 'Tool completed',
   waitingApproval: 'Waiting for approval',
+  waitingWork: 'Waiting for work to finish',
   approvalExpired: 'Approval expired',
   approvalSent: 'Approval sent',
   requestDenied: 'Request denied',

@@ -192,6 +192,7 @@ type (
 
 	ToolContext    = core.ToolContext
 	Approval       = core.Approval
+	ParkRequest    = core.ParkRequest
 	PublishOptions = core.PublishOptions
 	EventPublisher = core.EventPublisher
 
@@ -210,6 +211,7 @@ const (
 	OutcomeStale        = core.OutcomeStale
 
 	HITLParked          = core.HITLParked
+	ReasonApproval      = core.ReasonApproval
 	HITLTTL             = core.HITLTTL
 	ContextTokenCeiling = core.ContextTokenCeiling
 	ContextSummaryType  = core.ContextSummaryType
@@ -248,6 +250,8 @@ var (
 
 	Respond         = core.Respond
 	ParkForApproval = core.ParkForApproval
+	ParkForInput    = core.ParkForInput
+	AsParkRequest   = core.AsParkRequest
 	LoadPendingHitl = core.LoadPendingHitl
 	LoadOpenHitls   = core.LoadOpenHitls
 	WithHitl        = core.WithHitl

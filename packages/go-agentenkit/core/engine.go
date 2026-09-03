@@ -46,7 +46,7 @@ func verdictReady(ctx context.Context, deps ports.RuntimePorts, pending PendingH
 	} else if found {
 		return "answered", nil
 	}
-	if time.Since(pending.RequestedAt) >= deps.Config.HITLTTL {
+	if !time.Now().Before(pending.Deadline(deps.Config)) {
 		return "expired", nil
 	}
 	return "open", nil

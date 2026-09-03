@@ -208,6 +208,7 @@ describe('approving a nested park (§2.7)', () => {
       .get(ran.threadId)!
       .find((e) => e.type === 'INPUT_REQUIRED')!;
     (req as any).createdAt = new Date(Date.now() - 60_000);
+    (req.payload as any).expiresAt = new Date(Date.now() - 60_000).toISOString(); // the park's own deadline, too
 
     await r.runtime.worker.handleJob(r.queue.items.at(-1)!);
 

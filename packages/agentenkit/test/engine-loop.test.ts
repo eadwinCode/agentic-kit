@@ -8,6 +8,7 @@ import { MemoryAdminStore } from '../src/admin/memory.js';
 import { bindStorage } from '../src/core/state.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import { markRequiresConfirmation } from '../src/core/engine.js';
+import { parkForInput } from '../src/core/hitl.js';
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
 import type { RuntimeOptions } from '../src/ports/runtime.js';
 
@@ -567,6 +568,7 @@ describe('HITL run-segment park (§2.5)', () => {
     const events = r.storage.events.store.get(threadId)!;
     const req = events.find((e) => e.type === 'INPUT_REQUIRED')!;
     (req as any).createdAt = new Date(Date.now() - 60_000);
+    (req.payload as any).expiresAt = new Date(Date.now() - 60_000).toISOString(); // the park's own deadline, too
 
     await r.runtime.worker.handleJob({ threadId, model: 'gpt-4o', agent: 'chat' });
 
@@ -623,6 +625,7 @@ describe('HITL run-segment park (§2.5)', () => {
       .get(threadId)!
       .find((e) => e.type === 'INPUT_REQUIRED')!;
     (req as any).createdAt = new Date(Date.now() - 60_000);
+    (req.payload as any).expiresAt = new Date(Date.now() - 60_000).toISOString(); // the park's own deadline, too
 
     await r.runtime.worker.handleJob(timer);
 
@@ -683,5 +686,97 @@ describe('HITL run-segment park (§2.5)', () => {
     expect(r.sent).toEqual([1]); // approved, not denied by timeout
     // It still owned the run, so it wrote the state rather than going silent.
     expect(await r.kv.get(`agent:state:${threadId}`)).toBe('COMPLETED');
+  });
+});
+
+describe('a tool that parks itself (§2.5)', () => {
+  // A tool that starts work it cannot wait for parks ITSELF: the run lock and
+  // the worker are released, the request is durable with the tool's own
+  // reason and deadline, and whoever finishes the work resumes the same call
+  // through respond with a payload the tool then returns from.
+  it('starts the work, parks, and resumes the same call with the payload', async () => {
+    const started: string[] = [];
+    const resumedWith: unknown[] = [];
+    const r = await makeRuntime(
+      scriptedModel([
+        { toolCalls: [{ toolCallId: 'c1', toolName: 'render', args: { scene: 'intro' } }] },
+        { text: 'rendered' },
+      ]),
+      { hitlTtlMs: 60 * 60_000 },
+    );
+    const chat = r.runtime.createStreamTextAgent({
+      name: 'chat',
+      model: 'gpt-4o',
+      tools: {
+        render: tool({
+          description: 'renders',
+          parameters: z.object({ scene: z.string() }),
+          execute: async ({ scene }, opts: any) => {
+            if (opts.approval) {
+              resumedWith.push(opts.approval.payload);
+              return { url: 'https://cdn/x.mp4' };
+            }
+            started.push(scene);
+            throw parkForInput({ reason: 'job', payload: { jobId: 'job-1' }, ttlMs: 30 * 60_000 });
+          },
+        }),
+      },
+    });
+    const ran = await chat.run({ prompt: 'render the intro' });
+    await r.runtime.worker.handleJob(r.queue.items[0]!);
+
+    expect(started).toEqual(['intro']);
+    expect(states(r.bus)).toEqual(['RUNNING', 'WAITING_FOR_INPUT']);
+    expect(await r.kv.get(`agent:lock:${ran.threadId}`)).toBeNull();
+    const req = r.storage.events.store.get(ran.threadId)!.find((e) => e.type === 'INPUT_REQUIRED')!;
+    expect(req.payload).toMatchObject({ toolCallId: 'c1', toolName: 'render', reason: 'job', arguments: { jobId: 'job-1' } });
+    const expiresIn = new Date((req.payload as any).expiresAt).getTime() - Date.now();
+    expect(expiresIn).toBeGreaterThan(25 * 60_000);
+    expect(expiresIn).toBeLessThanOrEqual(30 * 60_000);
+    // The expiry job is timed to the park's own TTL, not the config's.
+    expect(r.queue.delays.at(-1)).toBe(30 * 60 + (r.deps.config?.reclaimGraceMs ?? 0) / 1000);
+
+    // The job completes: its owner responds with the outcome.
+    const res = await r.runtime.hitl.respond({
+      threadId: ran.threadId, toolCallId: 'c1', approved: true, payload: { status: 'succeeded' },
+    });
+    expect(res.delivered).toBe(true);
+    await r.runtime.worker.handleJob(r.queue.items.at(-1)!);
+
+    expect(resumedWith).toEqual([{ status: 'succeeded' }]);
+    expect(lastTerminal(r.bus).payload).toMatchObject({ state: 'COMPLETED' });
+    expect(roles(r.storage, ran.threadId)).toEqual(['user', 'assistant', 'tool', 'assistant']);
+  });
+
+  it('expires on its own deadline, not the config\'s', async () => {
+    const r = await makeRuntime(
+      scriptedModel([
+        { toolCalls: [{ toolCallId: 'c1', toolName: 'render', args: {} }] },
+        { text: 'gave up' },
+      ]),
+      { hitlTtlMs: 60 * 60_000, reclaimGraceMs: 0 },
+    );
+    const chat = r.runtime.createStreamTextAgent({
+      name: 'chat',
+      model: 'gpt-4o',
+      tools: {
+        render: tool({
+          description: 'renders',
+          parameters: z.object({}),
+          execute: async (_args, opts: any): Promise<unknown> => {
+            if (opts.approval) throw new Error('an expired park must not run the tool again');
+            throw parkForInput({ reason: 'job', ttlMs: 20 });
+          },
+        }),
+      },
+    });
+    const ran = await chat.run({ prompt: 'render' });
+    await r.runtime.worker.handleJob(r.queue.items[0]!);
+    expect(states(r.bus).at(-1)).toBe('WAITING_FOR_INPUT');
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    await r.runtime.worker.handleJob(r.queue.items.at(-1)!); // the park's own expiry job
+    expect(lastTerminal(r.bus).payload).toMatchObject({ state: 'COMPLETED' });
+    expect(r.bus.published.some((e) => e.type === 'INPUT_EXPIRED')).toBe(true);
   });
 });

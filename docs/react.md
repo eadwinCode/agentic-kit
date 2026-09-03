@@ -52,7 +52,7 @@ is assumed.
 | `agentState` | `IDLE` · `RUNNING` · `WAITING_FOR_INPUT` · `COMPLETED` · `CANCELLED` · `FAILED` |
 | `activity` | `{ phase, label, detail }` — a live status line |
 | `historyLoading` | hydration in progress |
-| `pendingInputs` | approvals waiting on a human |
+| `pendingInputs` | requests the run is parked on: `reason: 'approval'` waits on a human (show a card); any other reason is a tool waiting on work it started (show a status) |
 | `subagents` | nested runs, with status and text |
 | `threads`, `threadsLoading` | the thread list, for a sidebar |
 | `usage` | tokens spent, money spent, and context load |
