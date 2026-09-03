@@ -35,7 +35,7 @@ func openPostgres(t *testing.T) *sql.DB {
 func TestPostgresAdminStore_RoundTripsARun(t *testing.T) {
 	db := openPostgres(t)
 	ctx := context.Background()
-	for _, tbl := range []string{"agentic_steps", "agentic_runs", "agentic_threads"} {
+	for _, tbl := range []string{"agentic_steps", "agentic_runs", "agentic_threads", "agentic_migrations"} {
 		_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl)
 	}
 	store, err := pgadmin.Connect(ctx, db)

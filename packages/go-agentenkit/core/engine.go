@@ -667,7 +667,21 @@ func redriveOnLockConflict(ctx context.Context, deps ports.RuntimePorts, agent *
 	if holder, _, err := deps.Kv.Get(ctx, RunLockKey(input.ThreadID)); err != nil {
 		return err
 	} else if holder == input.RunID {
-		return nil // own duplicate
+		// The lock is held by THIS run. While its segment is running that is
+		// a duplicate delivery, and a no-op. But a park hands the same run id
+		// to two later deliveries, the approval's answer and its expiry
+		// (§2.5), and either can arrive while the parking segment is still
+		// winding down and holding the lock. Dropping that one would leave
+		// the thread waiting forever: nobody re-sends an expiry. The thread's
+		// durable state tells the two cases apart, because ParkForApproval
+		// writes WAITING_FOR_INPUT before the segment ends.
+		durable, err := deps.Storage.Threads.Get(ctx, input.ThreadID)
+		if err != nil {
+			return err
+		}
+		if durable == nil || durable.State != ports.StateWaitingForInput {
+			return nil // own duplicate
+		}
 	}
 	if current, _, err := deps.Kv.Get(ctx, RunIDKey(input.ThreadID)); err != nil {
 		return err
