@@ -310,13 +310,80 @@ func (a *UsageAggregator) Add(u NewUsage) {
 	if u.Estimated {
 		line.Estimated++
 	}
+	// Money is summed in ONE currency: the first one seen. A row priced in
+	// another currency cannot be added to it, so it counts as unpriced and
+	// the total stays a floor rather than a mix of units. Totals() above
+	// already added the row's cost; take it back out here.
 	if u.Cost != nil {
-		line.CostMicros += u.Cost.Micros
+		if a.total.Currency == "" {
+			a.total.Currency = u.Cost.Currency
+		}
+		if u.Cost.Currency == a.total.Currency {
+			line.CostMicros += u.Cost.Micros
+		} else {
+			a.total.CostMicros -= u.Cost.Micros
+			a.total.Unpriced++
+		}
 	}
 }
 
 // Totals is everything added so far.
 func (a *UsageAggregator) Totals() UsageTotals { return a.total }
+
+// UsageLineMerger rebuilds UsageTotals from grouped rows that a SQL adapter
+// read GROUP BY agent, model AND currency. Grouping by currency is what keeps
+// a sum honest; merging here is what keeps one agent's spend on one model a
+// single line. Money is summed in the first currency seen; a group priced in
+// another currency counts as unpriced instead of being added to it.
+type UsageLineMerger struct {
+	total UsageTotals
+	index map[usageLineKey]int
+}
+
+// Add books one grouped row: its line, the currency its cost is in, its
+// summed total tokens and how many of its calls were unpriced.
+func (m *UsageLineMerger) Add(l UsageLine, currency string, totalTokens, unpriced int) {
+	if m.index == nil {
+		m.index = map[usageLineKey]int{}
+	}
+	m.total.InputTokens += l.InputTokens
+	m.total.CachedInputTokens += l.CacheReadInputTokens
+	m.total.OutputTokens += l.OutputTokens
+	m.total.TotalTokens += totalTokens
+	m.total.Unpriced += unpriced
+
+	priced := l.Calls - unpriced
+	if currency != "" && m.total.Currency == "" {
+		m.total.Currency = currency
+	}
+	if currency != "" && currency != m.total.Currency {
+		// Another unit: cannot be added to the total, so its calls are
+		// reported as unpriced and the total stays a floor.
+		m.total.Unpriced += priced
+		l.CostMicros = 0
+	}
+	m.total.CostMicros += l.CostMicros
+
+	key := usageLineKey{l.AgentID, l.AgentName, l.Model, l.ModelID}
+	i, ok := m.index[key]
+	if !ok {
+		m.index[key] = len(m.total.Lines)
+		m.total.Lines = append(m.total.Lines, l)
+		return
+	}
+	line := &m.total.Lines[i]
+	line.InputTokens += l.InputTokens
+	line.CacheReadInputTokens += l.CacheReadInputTokens
+	line.CacheWriteInputTokens += l.CacheWriteInputTokens
+	line.OutputTokens += l.OutputTokens
+	line.ReasoningTokens += l.ReasoningTokens
+	line.Calls += l.Calls
+	line.Estimated += l.Estimated
+	line.CostMicros += l.CostMicros
+}
+
+// Totals is everything added so far.
+func (m *UsageLineMerger) Totals() UsageTotals { return m.total }
 
 // UsageFilter narrows a usage read (§4).
 type UsageFilter struct {

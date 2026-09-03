@@ -82,7 +82,11 @@ type StepRecord struct {
 	// Note: tool arguments and results are operational data now. If yours
 	// carry anything you would not want there, set RecordPayloads false.
 	ToolCalls []StepToolCall `json:"toolCalls,omitempty"`
-	At        time.Time      `json:"at"`
+	// CostMicros is what the step's model call cost, as the Pricer put it on
+	// the usage row (§4); zero with an empty Currency when it was unpriced.
+	CostMicros int64     `json:"costMicros"`
+	Currency   string    `json:"currency,omitempty"`
+	At         time.Time `json:"at"`
 }
 
 // NewStepRecord is a step about to be recorded. A zero At means now.

@@ -418,6 +418,7 @@ func RunNestedAgent(genCtx context.Context, sctx *SubagentCtx, d ports.NestedDes
 		CostBudgetMicros:  sctx.CostBudgetMicros,
 		BillingRunID:      sctx.BillingRunID,
 		ModelKey:          modelKey,
+		ModelID:           model.WireID(modelKey),
 		AgentName:         d.Name,
 		System:            system,
 		SystemFn:          systemFn,

@@ -68,6 +68,8 @@ var Schema = []string{
 	`ALTER TABLE agentic_steps ADD COLUMN IF NOT EXISTS "threadId" TEXT`,
 	`CREATE INDEX IF NOT EXISTS agentic_steps_thread ON agentic_steps("threadId", at)`,
 	`ALTER TABLE agentic_steps ADD COLUMN IF NOT EXISTS "toolCalls" JSONB`,
+	`ALTER TABLE agentic_steps ADD COLUMN IF NOT EXISTS "costMicros" BIGINT NOT NULL DEFAULT 0`,
+	`ALTER TABLE agentic_steps ADD COLUMN IF NOT EXISTS currency TEXT`,
 	`CREATE INDEX IF NOT EXISTS agentic_steps_run ON agentic_steps("runId", "index")`,
 }
 
@@ -384,14 +386,15 @@ func (s stepStore) Record(ctx context.Context, n ports.NewStepRecord) error {
 	}
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO agentic_steps ("runId", "threadId", "agentId", "index", "durationMs", "finishReason",
-		   "inputTokens", "cachedInputTokens", "outputTokens", "totalTokens", tools, text, "toolCalls", at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+		   "inputTokens", "cachedInputTokens", "outputTokens", "totalTokens", tools, text, "toolCalls", "costMicros", currency, at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 		n.RunID, nullStr(n.ThreadID), nullStr(n.AgentID), n.Index, n.DurationMs, n.FinishReason,
-		n.InputTokens, n.CachedInputTokens, n.OutputTokens, n.TotalTokens, string(tools), nullStr(n.Text), toolCalls, at)
+		n.InputTokens, n.CachedInputTokens, n.OutputTokens, n.TotalTokens, string(tools), nullStr(n.Text), toolCalls,
+		n.CostMicros, nullStr(n.Currency), at)
 	return err
 }
 
-const stepCols = `"runId", "threadId", "agentId", "index", "durationMs", "finishReason", "inputTokens", "cachedInputTokens", "outputTokens", "totalTokens", tools, text, "toolCalls", at`
+const stepCols = `"runId", "threadId", "agentId", "index", "durationMs", "finishReason", "inputTokens", "cachedInputTokens", "outputTokens", "totalTokens", tools, text, "toolCalls", "costMicros", currency, at`
 
 func (s stepStore) query(ctx context.Context, q string, vals ...any) ([]ports.StepRecord, error) {
 	rows, err := s.db.QueryContext(ctx, q, vals...)
@@ -402,13 +405,14 @@ func (s stepStore) query(ctx context.Context, q string, vals ...any) ([]ports.St
 	var out []ports.StepRecord
 	for rows.Next() {
 		var st ports.StepRecord
-		var threadID, agentID, text sql.NullString
+		var threadID, agentID, text, currency sql.NullString
 		var tools, toolCalls []byte
 		if err := rows.Scan(&st.RunID, &threadID, &agentID, &st.Index, &st.DurationMs, &st.FinishReason,
-			&st.InputTokens, &st.CachedInputTokens, &st.OutputTokens, &st.TotalTokens, &tools, &text, &toolCalls, &st.At); err != nil {
+			&st.InputTokens, &st.CachedInputTokens, &st.OutputTokens, &st.TotalTokens, &tools, &text, &toolCalls,
+			&st.CostMicros, &currency, &st.At); err != nil {
 			return nil, err
 		}
-		st.ThreadID, st.AgentID, st.Text = threadID.String, agentID.String, text.String
+		st.ThreadID, st.AgentID, st.Text, st.Currency = threadID.String, agentID.String, text.String, currency.String
 		st.Tools = []string{}
 		if len(tools) > 0 {
 			_ = json.Unmarshal(tools, &st.Tools)

@@ -45,6 +45,11 @@ export interface PrismaLike {
      *  precise one here would make the real PrismaClient fail to satisfy this
      *  interface. The RESULT is typed, which is the half the adapter reads. */
     groupBy(a: any): Promise<UsageGroupRow[]>;
+    /** The two figures a groupBy cannot give: how many calls were estimated
+     *  or unpriced (a conditional count), and which currency the priced
+     *  rows are in. Loosely typed for the same reason as groupBy. */
+    count(a: any): Promise<number>;
+    findFirst(a: any): Promise<{ costCurrency: string | null } | null>;
   };
 }
 
@@ -182,7 +187,30 @@ export class PrismaStorage implements Storage {
         },
         _count: true,
       });
+      const where = { threadId, ...(filter.runId ? { runId: filter.runId } : {}) };
+      // The figures a grouped sum cannot carry: which calls were guesses,
+      // which were never priced, and what unit the money is in. Read
+      // alongside the groups rather than hardcoded, so a bill can tell
+      // "spent nothing" from "nobody priced this".
+      const [estimatedByGroup, unpriced, first] = await Promise.all([
+        this.prisma.tokenUsage.groupBy({
+          by: ['agentId', 'agentName', 'model', 'modelId'],
+          where: { ...where, estimated: true },
+          _count: true,
+        }),
+        this.prisma.tokenUsage.count({ where: { ...where, costMicros: null } }),
+        this.prisma.tokenUsage.findFirst({
+          where: { ...where, costCurrency: { not: null } },
+          orderBy: { createdAt: 'asc' },
+          select: { costCurrency: true },
+        }),
+      ]);
+      const estimatedOf = new Map(
+        estimatedByGroup.map((g) => [`${g.agentId}|${g.agentName}|${g.model}|${g.modelId}`, g._count]),
+      );
       const out = emptyTotals();
+      out.unpriced = unpriced;
+      out.currency = first?.costCurrency ?? undefined;
       for (const g of groups) {
         const n = (k: string) => Number(g._sum[k] ?? 0);
         out.inputTokens += n('inputTokens');
@@ -198,9 +226,7 @@ export class PrismaStorage implements Storage {
           outputTokens: n('outputTokens'),
           reasoningTokens: n('reasoningTokens'),
           calls: g._count,
-          // Prisma cannot count a conditional in a groupBy, so these two are
-          // reported from the rows this adapter can see rather than guessed.
-          estimated: 0,
+          estimated: estimatedOf.get(`${g.agentId}|${g.agentName}|${g.model}|${g.modelId}`) ?? 0,
           costMicros: n('costMicros'),
         });
       }

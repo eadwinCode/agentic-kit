@@ -163,10 +163,23 @@ func ExecuteStep(ctx context.Context, agent *RegisteredAgent, call StepCall) (*S
 		// The text is accumulated as it goes, so a call cut off half way still
 		// knows how much it produced and can be billed for it (§4).
 		var streamed strings.Builder
-		var finished bool
+		var finished, sawToolDelta bool
 		drainErr := drainStream(stream, func(chunk provider.StreamChunk) {
-			if chunk.Type == provider.ChunkText {
+			// Everything the model produced counts as output when a call is
+			// cut off: the answer, its thinking, and the tool arguments,
+			// which for a code-writing agent are most of the tokens. Tool
+			// input arrives as deltas when the provider streams it, or as
+			// one complete call when it does not; never both for one call.
+			switch chunk.Type {
+			case provider.ChunkText, provider.ChunkReasoning:
 				streamed.WriteString(chunk.Text)
+			case provider.ChunkToolCallDelta:
+				sawToolDelta = true
+				streamed.WriteString(chunk.ToolInput)
+			case provider.ChunkToolCall:
+				if !sawToolDelta {
+					streamed.WriteString(chunk.ToolInput)
+				}
 			}
 			// Whether the call ran to its end is decided by what this loop
 			// SAW, not by whether the stream reported an error: a stop that
@@ -526,6 +539,9 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			InputTokens: a.InputTokens, CachedInputTokens: a.CachedInputTokens,
 			OutputTokens: a.OutputTokens, TotalTokens: a.TotalTokens,
 			Tools: []string{}, At: time.Now(),
+		}
+		if u.Cost != nil {
+			marker.CostMicros, marker.Currency = u.Cost.Micros, u.Cost.Currency
 		}
 		argsOf := map[string]json.RawMessage{}
 		for _, tc := range step.ToolCalls {

@@ -536,16 +536,22 @@ export async function execute(
       // The whole run's bill, read back from the rows the loop wrote (§4):
       // every segment and every nested run, priced and grouped into lines, so
       // a settle hook charges in one pass without keeping its own tally.
-      await userArgs.onFinish({
-        threadId,
-        runId,
-        state,
-        stopReason,
-        tokensUsed,
-        attribution,
-        steps: loop.steps,
-        usage: await runBill(deps, threadId, runId),
-      } satisfies RunFinishInfo);
+      // The run is already finalized: a callback that throws is the
+      // caller's bug to see in the log, not a reason to fail a finished run.
+      try {
+        await userArgs.onFinish({
+          threadId,
+          runId,
+          state,
+          stopReason,
+          tokensUsed,
+          attribution,
+          steps: loop.steps,
+          usage: await runBill(deps, threadId, runId),
+        } satisfies RunFinishInfo);
+      } catch (err) {
+        (deps.log ?? console).error('onFinish threw', { runId, err: String(err) });
+      }
     }
 
     return 'executed';

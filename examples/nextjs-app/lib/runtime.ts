@@ -12,7 +12,7 @@ import {
   RedisKv,
   setupAgentCore,
 } from 'agentenkit';
-import { modelIds, modelPrices, modelRegistry } from './models'; // §2.3 — models in your shape
+import { modelIds, modelPrices, modelRegistry, modelWindows } from './models'; // §2.3 — models in your shape
 
 // ⚠ Next dev re-evaluates this module on every hot reload, and a fresh
 // evaluation would open its own Prisma pool and Redis connection that nothing
@@ -74,7 +74,7 @@ export const runtime = await setupAgentCore({
     if (!m) throw new Error(`Unknown model: ${modelName}`);
     return {
       instance: () => m,
-      contextWindow: 265_000,
+      contextWindow: modelWindows[modelName] ?? 128_000,
       // The wire id this key resolves to, recorded on every usage row (§4).
       modelId: modelIds[modelName],
     };

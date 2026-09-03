@@ -302,7 +302,7 @@ func (u usage) group() string {
 	  COALESCE(SUM("cacheWriteInputTokens"),0)::int, COALESCE(SUM("outputTokens"),0)::int,
 	  COALESCE(SUM("reasoningTokens"),0)::int, COALESCE(SUM("totalTokens"),0)::int,
 	  COUNT(*)::int, COALESCE(SUM(CASE WHEN estimated THEN 1 ELSE 0 END),0)::int,
-	  COALESCE(SUM("costMicros"),0)::bigint, MAX("costCurrency"),
+	  COALESCE(SUM("costMicros"),0)::bigint, COALESCE("costCurrency",''),
 	  COALESCE(SUM(CASE WHEN "costMicros" IS NULL THEN 1 ELSE 0 END),0)::int
 	FROM ` + u.s.t("usage") + ` WHERE "threadId" = $1`
 }
@@ -347,17 +347,19 @@ func (u usage) Total(ctx context.Context, threadID string, f ports.UsageFilter, 
 		q += ` AND "runId" = $2`
 		args = append(args, f.RunID)
 	}
-	q += ` GROUP BY "agentId", "agentName", model, "modelId" ORDER BY MIN("createdAt")`
+	// Grouped by currency as well, so a group never sums two units; the
+	// groups of one agent and model are merged back into one line below.
+	q += ` GROUP BY "agentId", "agentName", model, "modelId", "costCurrency" ORDER BY MIN("createdAt")`
 	rows, err := u.s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return ports.UsageTotals{}, err
 	}
 	defer rows.Close()
 
-	var t ports.UsageTotals
+	var merge ports.UsageLineMerger
 	for rows.Next() {
 		var l ports.UsageLine
-		var currency sql.NullString
+		var currency string
 		var totalTokens, unpriced int
 		if err := rows.Scan(&l.AgentID, &l.AgentName, &l.Model, &l.ModelID,
 			&l.InputTokens, &l.CacheReadInputTokens, &l.CacheWriteInputTokens,
@@ -365,16 +367,7 @@ func (u usage) Total(ctx context.Context, threadID string, f ports.UsageFilter, 
 			&l.Calls, &l.Estimated, &l.CostMicros, &currency, &unpriced); err != nil {
 			return ports.UsageTotals{}, err
 		}
-		t.InputTokens += l.InputTokens
-		t.CachedInputTokens += l.CacheReadInputTokens
-		t.OutputTokens += l.OutputTokens
-		t.TotalTokens += totalTokens
-		t.CostMicros += l.CostMicros
-		t.Unpriced += unpriced
-		if t.Currency == "" {
-			t.Currency = currency.String
-		}
-		t.Lines = append(t.Lines, l)
+		merge.Add(l, currency, totalTokens, unpriced)
 	}
-	return t, rows.Err()
+	return merge.Totals(), rows.Err()
 }

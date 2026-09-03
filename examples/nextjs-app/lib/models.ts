@@ -22,6 +22,14 @@ export const modelIds: Record<string, string> = {
   'gpt-4o-mini': 'gpt-4o-mini-2024-07-18',
 };
 
+/** Each model's context window, in tokens (§2.6). The runtime's context
+ *  budget and compaction math read this per model; one shared constant would
+ *  over-fill the smaller window. */
+export const modelWindows: Record<string, number> = {
+  'gpt-4o': 128_000,
+  'gpt-4o-mini': 128_000,
+};
+
 /** The price list (§4), in dollars per MILLION tokens — typed straight off the
  *  provider's pricing page. The runtime prices every model call against this
  *  before the usage row is stored, so cost lives on the row next to the tokens

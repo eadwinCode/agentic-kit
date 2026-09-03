@@ -66,6 +66,9 @@ pricing.format(250_000) // '0.2500 USD'
 ```
 
 Price in **one currency per deployment**. Totals are summed, never converted.
+If rows in two currencies do meet on one thread, a total is reported in the
+first currency seen and the rows in any other currency count as `unpriced`,
+so the figure stays a floor in one unit rather than a sum of two.
 
 ## The three pricers that ship
 
@@ -180,6 +183,12 @@ agent and model, which is the shape a bill wants:
 
 `unpriced` is what tells "this thread spent nothing" apart from "nobody priced
 this thread". Do not read a zero cost as free work without checking it.
+
+A hook that bills from `RunFinishInfo.usage` has one more thing to check: in
+Go, `UsageErr` is set when the platform could not read the run's rows back,
+and `Usage` is then zero-valued. Refuse to settle in that case (return the
+error from `OnSettle`) rather than charging nothing; the run fails and can be
+retried instead of going free.
 
 The same totals reach you three other ways:
 

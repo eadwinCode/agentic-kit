@@ -59,6 +59,7 @@ func New(db *sql.DB) (*Store, error) {
 	// already exists, so newer fields are added separately.
 	if err := addMissing(db, "agentic_steps", map[string]string{
 		"text": "TEXT", "toolCalls": "TEXT", "threadId": "TEXT",
+		"costMicros": "INTEGER NOT NULL DEFAULT 0", "currency": "TEXT",
 	}); err != nil {
 		return nil, err
 	}
@@ -406,15 +407,15 @@ func (s stepStore) Record(ctx context.Context, n ports.NewStepRecord) error {
 		toolCalls = sql.NullString{String: string(b), Valid: true}
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO agentic_steps (runId,threadId,agentId,"index",durationMs,finishReason,inputTokens,cachedInputTokens,outputTokens,totalTokens,tools,text,toolCalls,at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO agentic_steps (runId,threadId,agentId,"index",durationMs,finishReason,inputTokens,cachedInputTokens,outputTokens,totalTokens,tools,text,toolCalls,costMicros,currency,at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		n.RunID, n.ThreadID, nullStr(n.AgentID), n.Index, n.DurationMs, n.FinishReason,
 		n.InputTokens, n.CachedInputTokens, n.OutputTokens, n.TotalTokens,
-		string(tools), nullStr(n.Text), toolCalls, ms(at))
+		string(tools), nullStr(n.Text), toolCalls, n.CostMicros, nullStr(n.Currency), ms(at))
 	return err
 }
 
-const stepCols = `runId, threadId, agentId, "index", durationMs, finishReason, inputTokens, cachedInputTokens, outputTokens, totalTokens, tools, text, toolCalls, at`
+const stepCols = `runId, threadId, agentId, "index", durationMs, finishReason, inputTokens, cachedInputTokens, outputTokens, totalTokens, tools, text, toolCalls, COALESCE(costMicros,0), currency, at`
 
 func (s stepStore) query(ctx context.Context, q string, args ...any) ([]ports.StepRecord, error) {
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -425,13 +426,14 @@ func (s stepStore) query(ctx context.Context, q string, args ...any) ([]ports.St
 	var out []ports.StepRecord
 	for rows.Next() {
 		var st ports.StepRecord
-		var threadID, agentID, tools, text, toolCalls sql.NullString
+		var threadID, agentID, tools, text, toolCalls, currency sql.NullString
 		var at int64
 		if err := rows.Scan(&st.RunID, &threadID, &agentID, &st.Index, &st.DurationMs, &st.FinishReason,
-			&st.InputTokens, &st.CachedInputTokens, &st.OutputTokens, &st.TotalTokens, &tools, &text, &toolCalls, &at); err != nil {
+			&st.InputTokens, &st.CachedInputTokens, &st.OutputTokens, &st.TotalTokens, &tools, &text, &toolCalls,
+			&st.CostMicros, &currency, &at); err != nil {
 			return nil, err
 		}
-		st.ThreadID, st.AgentID, st.Text, st.At = threadID.String, agentID.String, text.String, fromMs(at)
+		st.ThreadID, st.AgentID, st.Text, st.Currency, st.At = threadID.String, agentID.String, text.String, currency.String, fromMs(at)
 		st.Tools = []string{}
 		if tools.Valid {
 			_ = json.Unmarshal([]byte(tools.String), &st.Tools)

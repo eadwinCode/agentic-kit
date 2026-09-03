@@ -337,7 +337,7 @@ describe('the pricers that ship (§4)', () => {
     ))!.micros).toBe(3_000_000);
     // Nobody could price it: the error comes back, so a caller can see that
     // pricing is broken rather than that the call was free.
-    expect(pricing.chain(boom, silent).price(call())).rejects.toThrow('price service down');
+    await expect(pricing.chain(boom, silent).price(call())).rejects.toThrow('price service down');
     // Nothing to say and nothing wrong is not an error.
     expect(await pricing.chain(silent).price(call())).toBeNull();
   });

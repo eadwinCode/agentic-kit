@@ -120,6 +120,35 @@ export class SqliteStorage implements Storage {
       const sql = stmt.trim();
       if (sql) this.db.prepare(sql).run();
     }
+    // CREATE TABLE IF NOT EXISTS leaves an existing table as it was, so a
+    // usage table from before cost moved onto it (§4) gets its new columns
+    // here. Idempotent: a column that exists is skipped.
+    this.addMissing('usage', {
+      runId: 'TEXT',
+      agentName: 'TEXT',
+      kind: "TEXT NOT NULL DEFAULT 'step'",
+      step: 'INTEGER NOT NULL DEFAULT 0',
+      model: 'TEXT',
+      modelId: 'TEXT',
+      cacheWriteInputTokens: 'INTEGER NOT NULL DEFAULT 0',
+      reasoningTokens: 'INTEGER NOT NULL DEFAULT 0',
+      outcome: "TEXT NOT NULL DEFAULT 'finished'",
+      estimated: 'INTEGER NOT NULL DEFAULT 0',
+      providerMetadata: 'TEXT',
+      costMicros: 'INTEGER',
+      costCurrency: 'TEXT',
+      costSource: 'TEXT',
+    });
+    this.db.prepare('CREATE INDEX IF NOT EXISTS usage_run ON usage(runId, createdAt)').run();
+  }
+
+  private addMissing(table: string, cols: Record<string, string>) {
+    const have = new Set(
+      (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    for (const [col, type] of Object.entries(cols)) {
+      if (!have.has(col)) this.db.prepare(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`).run();
+    }
   }
 
   private all(sql: string, ...p: unknown[]): any[] {
