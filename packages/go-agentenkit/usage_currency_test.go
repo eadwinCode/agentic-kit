@@ -34,7 +34,7 @@ func TestUsageLineMergerFoldsGroupsAndKeepsOneCurrency(t *testing.T) {
 		return ports.UsageLine{AgentName: "a", Model: "m", InputTokens: 5, Calls: calls, CostMicros: cost}
 	}
 	m.Add(line(100, 2), "USD", 5, 0)
-	m.Add(line(0, 1), "", 5, 1)     // the unpriced rows of the same agent and model
+	m.Add(line(0, 1), "", 5, 1)      // the unpriced rows of the same agent and model
 	m.Add(line(700, 1), "EUR", 5, 0) // priced in another unit
 	total := m.Totals()
 	if total.Currency != "USD" || total.CostMicros != 100 {

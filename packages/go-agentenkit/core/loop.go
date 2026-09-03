@@ -540,9 +540,6 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			OutputTokens: a.OutputTokens, TotalTokens: a.TotalTokens,
 			Tools: []string{}, At: time.Now(),
 		}
-		if u.Cost != nil {
-			marker.CostMicros, marker.Currency = u.Cost.Micros, u.Cost.Currency
-		}
 		argsOf := map[string]json.RawMessage{}
 		for _, tc := range step.ToolCalls {
 			argsOf[tc.ID] = tc.Input

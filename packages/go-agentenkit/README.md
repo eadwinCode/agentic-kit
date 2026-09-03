@@ -313,6 +313,14 @@ rt.Admin.Stats(ctx, agentenkit.StatsRange{})   // p50/p95 duration and queue wai
 rt.Admin.GetRun(ctx, runID)                     // one run: steps, nested runs, timeline, spend
 ```
 
+Its schema migrates itself, from numbered `.sql` files embedded in the binary
+(`admin/migrate/sql`). `SetupAgentCore` opens the connection and returns; the
+schema is brought up to date on a goroutine behind it, and every admin call
+waits for that before its first query. Several workers starting at once queue on
+a Postgres advisory lock rather than racing. An existing database needs nothing:
+migration `0001` is the schema as it stood before the migrator. Your own
+`Storage` is never touched by any of this.
+
 Configure nothing and it is SQLite on disk (`AGENTIC_KIT_ADMIN_DB` moves the file). Set
 `AGENTIC_KIT_ADMIN_DATABASE_URL` and it is Postgres. Either way the platform uses whichever
 `database/sql` driver the process has registered, like the TypeScript package uses whichever

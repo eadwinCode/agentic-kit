@@ -36,7 +36,7 @@ const queue = new InlineQueue();
 
 export const runtime = await setupAgentCore({
   storage: new SqliteStorage(db),      // ← later: PrismaStorage, or your own
-  admin: new SqliteAdminStore(db),     // ← later: PostgresAdminStore
+  admin: SqliteAdminStore.open(db),     // ← later: PostgresAdminStore
   bus: new MemoryBus(),                // ← later: RedisBus
   kv: new MemoryKv(),                  // ← later: RedisKv
   queue,                               // ← later: QStashQueue
@@ -209,6 +209,13 @@ await runtime.admin.listRuns({ state: ['FAILED'], since });
 await runtime.admin.stats({ since });    // p50/p95 duration and queue wait, tokens, failures
 await runtime.admin.getRun(runId);       // one run: steps, nested runs, timeline, spend
 ```
+
+Its schema migrates itself, from numbered migration files. `setupAgentCore`
+opens the connection and returns; the schema is brought up to date behind it,
+and every admin call waits for that before its first query. Several workers
+starting at once queue on a Postgres advisory lock rather than racing. An
+existing database needs nothing: migration `0001` is the schema as it stood
+before the migrator. Your own `Storage` is never touched by any of this.
 
 Configure nothing and it is SQLite on disk (`AGENTIC_KIT_ADMIN_DB` moves the file).
 Set `AGENTIC_KIT_ADMIN_DATABASE_URL` and it is Postgres — point it at its own database

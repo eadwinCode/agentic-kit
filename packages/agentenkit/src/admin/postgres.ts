@@ -3,11 +3,25 @@ import type {
   AdminStore, AdminThread, AdminThreadFilter, NewAdminThread,
   NewStepRecord, RunFilter, StepRecord,
 } from '../ports/admin.js';
+import { gatedAdminStore, runMigrations, type MigrationDriver } from './migrations/runner.js';
+import { dialect, migrations } from './migrations/postgres/index.js';
 
 /** Minimal structural type over a Postgres client. Both `pg`'s `Pool` and its
  *  `Client` satisfy it, so the package never imports the driver (§3.4). */
 export interface PgLike {
   query(text: string, params?: unknown[]): Promise<{ rows: any[] }>;
+  /** Checks out ONE connection. `pg`'s Pool has it; a bare Client does not,
+   *  and does not need it — it already is one connection.
+   *
+   *  The migrator needs this: a pool hands each query whichever connection is
+   *  free, so BEGIN on one and DDL on another is not a transaction at all. */
+  connect?(): Promise<PgClientLike>;
+}
+
+/** One checked-out connection, which must be handed back. */
+export interface PgClientLike {
+  query(text: string, params?: unknown[]): Promise<{ rows: any[] }>;
+  release(): void;
 }
 
 /** Open a `pg` Pool from a connection string. Dynamically imported so the
@@ -27,52 +41,24 @@ export async function openPostgres(url: string): Promise<PgLike> {
   }
 }
 
-// Tables are prefixed `agentic_` because this frequently shares a database
-// with the caller's own schema — AGENTIC_KIT_ADMIN_DATABASE_URL may well point
-// at the database they already have. Nothing here should collide with theirs.
-const SCHEMA = [
-  `CREATE TABLE IF NOT EXISTS agentic_threads (
-     id TEXT PRIMARY KEY, state TEXT NOT NULL, model TEXT NOT NULL,
-     "firstSeenAt" TIMESTAMPTZ NOT NULL DEFAULT now(),
-     "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT now(),
-     "startedWith" JSONB
-   )`,
-  `CREATE INDEX IF NOT EXISTS agentic_threads_state ON agentic_threads(state, "updatedAt")`,
-  `CREATE TABLE IF NOT EXISTS agentic_runs (
-     id TEXT PRIMARY KEY, "threadId" TEXT NOT NULL, "parentRunId" TEXT,
-     depth INT NOT NULL DEFAULT 0, agent TEXT NOT NULL, model TEXT NOT NULL,
-     state TEXT NOT NULL DEFAULT 'RUNNING', "stopReason" TEXT, error TEXT,
-     "startedAt" TIMESTAMPTZ NOT NULL DEFAULT now(), "endedAt" TIMESTAMPTZ,
-     "durationMs" INT, "queuedMs" INT,
-     attempts INT NOT NULL DEFAULT 0, steps INT NOT NULL DEFAULT 0,
-     "inputTokens" INT NOT NULL DEFAULT 0, "cachedInputTokens" INT NOT NULL DEFAULT 0,
-     "outputTokens" INT NOT NULL DEFAULT 0, "totalTokens" INT NOT NULL DEFAULT 0,
-     result JSONB, prompt TEXT, "tokenBudget" INT, "runState" JSONB, "providerOptions" JSONB
-   )`,
-  `ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS "providerOptions" JSONB`,
-  `ALTER TABLE agentic_threads ADD COLUMN IF NOT EXISTS "startedWith" JSONB`,
-  `ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS prompt TEXT`,
-  `ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS "tokenBudget" INT`,
-  `ALTER TABLE agentic_runs ADD COLUMN IF NOT EXISTS "runState" JSONB`,
-  `CREATE INDEX IF NOT EXISTS agentic_runs_thread ON agentic_runs("threadId", "startedAt" DESC)`,
-  `CREATE INDEX IF NOT EXISTS agentic_runs_state ON agentic_runs(state, "startedAt" DESC)`,
-  `CREATE INDEX IF NOT EXISTS agentic_runs_parent ON agentic_runs("parentRunId")`,
-  `CREATE TABLE IF NOT EXISTS agentic_steps (
-     "runId" TEXT NOT NULL, "threadId" TEXT, "agentId" TEXT, "index" INT NOT NULL,
-     "durationMs" INT NOT NULL, "finishReason" TEXT NOT NULL,
-     "inputTokens" INT NOT NULL DEFAULT 0, "cachedInputTokens" INT NOT NULL DEFAULT 0,
-     "outputTokens" INT NOT NULL DEFAULT 0, "totalTokens" INT NOT NULL DEFAULT 0,
-     tools JSONB, text TEXT, "toolCalls" JSONB,
-     at TIMESTAMPTZ NOT NULL DEFAULT now()
-   )`,
-  // CREATE TABLE IF NOT EXISTS leaves an existing table alone, so newer
-  // columns are added separately.
-  `ALTER TABLE agentic_steps ADD COLUMN IF NOT EXISTS text TEXT`,
-  `ALTER TABLE agentic_steps ADD COLUMN IF NOT EXISTS "threadId" TEXT`,
-  `CREATE INDEX IF NOT EXISTS agentic_steps_thread ON agentic_steps("threadId", at)`,
-  `ALTER TABLE agentic_steps ADD COLUMN IF NOT EXISTS "toolCalls" JSONB`,
-  `CREATE INDEX IF NOT EXISTS agentic_steps_run ON agentic_steps("runId", "index")`,
-];
+/** Run the migrations on ONE connection, checked out for the length of the
+ *  transaction and handed back after. */
+async function migrate(db: PgLike): Promise<void> {
+  const client = db.connect ? await db.connect() : null;
+  const handle = client ?? db;
+  const driver: MigrationDriver = {
+    exec: async (sql, params = []) => {
+      await handle.query(sql, params as unknown[]);
+    },
+    rows: async (sql, params = []) =>
+      (await handle.query(sql, params as unknown[])).rows as Array<Record<string, unknown>>,
+  };
+  try {
+    await runMigrations(driver, dialect, migrations);
+  } finally {
+    client?.release();
+  }
+}
 
 const toRun = (r: any): RunRecord => ({
   id: r.id, threadId: r.threadId, parentRunId: r.parentRunId ?? null, depth: r.depth,
@@ -94,12 +80,30 @@ const toRun = (r: any): RunRecord => ({
 export class PostgresAdminStore implements AdminStore {
   private constructor(private readonly db: PgLike) {}
 
-  /** Creates the tables if they are missing, then returns the store. A factory
-   *  rather than a constructor because that first step is asynchronous — and
-   *  `setupAgentCore` awaits its store precisely so this can fail at startup. */
-  static async connect(db: PgLike): Promise<PostgresAdminStore> {
-    for (const stmt of SCHEMA) await db.query(stmt);
-    return new PostgresAdminStore(db);
+  /** The store with its schema migration already running behind it (§2.9).
+   *
+   *  Connecting stays synchronous — a URL that cannot be reached is a
+   *  configuration problem worth failing on at startup. Only the schema moves
+   *  to the background, so a service starts at the same speed whether or not
+   *  it has migrating to do, and the returned store waits for it before its
+   *  first call.
+   *
+   *  Several workers starting at once is expected and safe: each migration
+   *  runs under a transaction-scoped advisory lock, so they queue rather than
+   *  race. */
+  static connect(
+    db: PgLike,
+    log?: { error(message: string, ...rest: unknown[]): void },
+  ): AdminStore {
+    const store = new PostgresAdminStore(db);
+    const ready = migrate(db).catch((err) => {
+      // Loud, because everything downstream of this is silent: admin writes
+      // are best effort, so a failed migration shows up as a dashboard with
+      // nothing in it rather than as an error.
+      (log ?? console).error('admin migrations failed', err);
+      throw err;
+    });
+    return gatedAdminStore(store, ready);
   }
 
   threads = {

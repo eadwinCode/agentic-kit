@@ -66,7 +66,7 @@ const queue = new InlineQueue();
 
 export const runtime = await setupAgentCore({
   storage: new SqliteStorage(db),    // ← later: PrismaStorage, or your own
-  admin: new SqliteAdminStore(db),   // ← later: Postgres, via one env var
+  admin: SqliteAdminStore.open(db),   // ← later: Postgres, via one env var
   bus: new MemoryBus(),              // ← later: RedisBus
   kv: new MemoryKv(),                // ← later: RedisKv
   queue,                             // ← later: QStashQueue

@@ -35,7 +35,7 @@ async function localRuntime(model: any = echo(), config: Partial<AgentConfig> = 
   const queue = new InlineQueue();
   const runtime = await setupAgentCore({
     storage: new SqliteStorage(db),
-    admin: new SqliteAdminStore(db),
+    admin: SqliteAdminStore.open(db),
     bus: new MemoryBus(),
     kv: new MemoryKv(),
     queue,
@@ -116,7 +116,7 @@ describe('SqliteStorage', () => {
 
 describe('SqliteAdminStore', () => {
   it('round-trips a run and its steps', async () => {
-    const a = new SqliteAdminStore(new Database(':memory:'));
+    const a = SqliteAdminStore.open(new Database(':memory:'));
     const run = await a.runs.start({ id: 'r1', threadId: 't1', agent: 'chat', model: 'gpt-4o' });
     expect(run).toMatchObject({ id: 'r1', depth: 0, parentRunId: null, state: 'RUNNING' });
 

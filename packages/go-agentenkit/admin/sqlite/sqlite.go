@@ -10,80 +10,57 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/admin/migrate"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
-
-// Schema is the DDL, split per statement.
-var Schema = []string{
-	`CREATE TABLE IF NOT EXISTS agentic_runs (
-	  id TEXT PRIMARY KEY, threadId TEXT NOT NULL, parentRunId TEXT,
-	  depth INTEGER NOT NULL DEFAULT 0, agent TEXT NOT NULL, model TEXT NOT NULL,
-	  state TEXT NOT NULL DEFAULT 'RUNNING', stopReason TEXT, error TEXT,
-	  startedAt INTEGER NOT NULL, endedAt INTEGER, durationMs INTEGER, queuedMs INTEGER,
-	  attempts INTEGER NOT NULL DEFAULT 0, steps INTEGER NOT NULL DEFAULT 0,
-	  inputTokens INTEGER NOT NULL DEFAULT 0, cachedInputTokens INTEGER NOT NULL DEFAULT 0,
-	  outputTokens INTEGER NOT NULL DEFAULT 0, totalTokens INTEGER NOT NULL DEFAULT 0,
-	  result TEXT, prompt TEXT, tokenBudget INTEGER, runState TEXT, providerOptions TEXT)`,
-	`CREATE INDEX IF NOT EXISTS agentic_runs_thread ON agentic_runs(threadId, startedAt)`,
-	`CREATE INDEX IF NOT EXISTS agentic_runs_state ON agentic_runs(state, startedAt)`,
-	`CREATE INDEX IF NOT EXISTS agentic_runs_parent ON agentic_runs(parentRunId)`,
-	`CREATE TABLE IF NOT EXISTS agentic_threads (
-	  id TEXT PRIMARY KEY, state TEXT NOT NULL, model TEXT NOT NULL,
-	  firstSeenAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL, startedWith TEXT)`,
-	`CREATE INDEX IF NOT EXISTS agentic_threads_state ON agentic_threads(state, updatedAt)`,
-	`CREATE TABLE IF NOT EXISTS agentic_steps (
-	  runId TEXT NOT NULL, threadId TEXT, agentId TEXT, "index" INTEGER NOT NULL,
-	  durationMs INTEGER NOT NULL, finishReason TEXT NOT NULL,
-	  inputTokens INTEGER NOT NULL DEFAULT 0, cachedInputTokens INTEGER NOT NULL DEFAULT 0,
-	  outputTokens INTEGER NOT NULL DEFAULT 0, totalTokens INTEGER NOT NULL DEFAULT 0,
-	  tools TEXT, text TEXT, toolCalls TEXT, at INTEGER NOT NULL)`,
-	`CREATE INDEX IF NOT EXISTS agentic_steps_run ON agentic_steps(runId, "index")`,
-	`CREATE INDEX IF NOT EXISTS agentic_steps_thread ON agentic_steps(threadId, at)`,
-}
 
 // Store is an AdminStore over SQLite.
 type Store struct{ db *sql.DB }
 
-// New creates the tables if missing and returns the store. It owns the
-// handle from here on; Close closes it.
-func New(db *sql.DB) (*Store, error) {
-	for _, stmt := range Schema {
-		if _, err := db.Exec(stmt); err != nil {
-			return nil, fmt.Errorf("sqlite admin schema: %w", err)
-		}
-	}
-	// CREATE TABLE IF NOT EXISTS never adds a column to a database that
-	// already exists, so newer fields are added separately.
-	if err := addMissing(db, "agentic_steps", map[string]string{
-		"text": "TEXT", "toolCalls": "TEXT", "threadId": "TEXT",
-		"costMicros": "INTEGER NOT NULL DEFAULT 0", "currency": "TEXT",
-	}); err != nil {
-		return nil, err
-	}
-	if err := addMissing(db, "agentic_runs", map[string]string{
-		"prompt": "TEXT", "tokenBudget": "INTEGER", "runState": "TEXT", "providerOptions": "TEXT",
-	}); err != nil {
-		return nil, err
-	}
-	if err := addMissing(db, "agentic_threads", map[string]string{"startedWith": "TEXT"}); err != nil {
-		return nil, err
-	}
-	return &Store{db: db}, nil
+// New returns the store with its schema migration already running behind it
+// (§2.9). It owns the handle from here on; Close closes it.
+//
+// The returned store waits for that migration before its first call, so a
+// caller never sees a half-built schema — but SetupAgentCore is not held up by
+// it. Opening the database is still synchronous: a file that cannot be opened
+// is a configuration problem worth failing on at startup.
+func New(db *sql.DB) (ports.AdminStore, error) {
+	return NewContext(context.Background(), db, nil)
 }
 
-func addMissing(db *sql.DB, table string, cols map[string]string) error {
-	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+// NewContext is New with a context for the background migration and a logger
+// for what it could not do.
+func NewContext(ctx context.Context, db *sql.DB, log *slog.Logger) (ports.AdminStore, error) {
+	ms, err := migrate.SQLiteMigrations()
+	if err != nil {
+		return nil, err
+	}
+	// SQLite cannot say ADD COLUMN IF NOT EXISTS, so the part of the baseline
+	// that patches an older database runs as the dialect's repair step —
+	// before the files, because the baseline indexes some of those columns.
+	dialect := migrate.SQLite
+	dialect.Repair = AddMissingColumns
+
+	gate := migrate.Start(ctx, db, dialect, ms, log)
+	return migrate.Gated(&Store{db: db}, gate), nil
+}
+
+// addMissing adds any of cols the table does not have yet. A table that does
+// not exist at all is left alone: on a fresh database the migration files
+// create it, columns and all.
+func addMissing(ctx context.Context, db migrate.Execer, table string, cols map[string]string) error {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
 	if err != nil {
 		return err
 	}
 	have := map[string]bool{}
 	for rows.Next() {
-		var cid int
+		var cid, notnull, pk int
 		var name, typ string
-		var notnull, pk int
 		var dflt sql.NullString
 		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
 			rows.Close()
@@ -92,11 +69,37 @@ func addMissing(db *sql.DB, table string, cols map[string]string) error {
 		have[name] = true
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(have) == 0 {
+		return nil // no such table yet
+	}
 	for col, typ := range cols {
-		if !have[col] {
-			if _, err := db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, col, typ)); err != nil {
-				return err
-			}
+		if have[col] {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, col, typ)); err != nil {
+			return fmt.Errorf("sqlite admin schema: add %s.%s: %w", table, col, err)
+		}
+	}
+	return nil
+}
+
+// AddMissingColumns adds the columns a database created by an older release
+// never got. SQLite has no ADD COLUMN IF NOT EXISTS, so this reads the table
+// and adds what is absent — the one part of migration 0001 that cannot be
+// expressed in the .sql file itself.
+func AddMissingColumns(ctx context.Context, db migrate.Execer) error {
+	for table, cols := range map[string]map[string]string{
+		"agentic_steps": {"text": "TEXT", "toolCalls": "TEXT", "threadId": "TEXT"},
+		"agentic_runs": {
+			"prompt": "TEXT", "tokenBudget": "INTEGER", "runState": "TEXT", "providerOptions": "TEXT",
+		},
+		"agentic_threads": {"startedWith": "TEXT"},
+	} {
+		if err := addMissing(ctx, db, table, cols); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -407,15 +410,15 @@ func (s stepStore) Record(ctx context.Context, n ports.NewStepRecord) error {
 		toolCalls = sql.NullString{String: string(b), Valid: true}
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO agentic_steps (runId,threadId,agentId,"index",durationMs,finishReason,inputTokens,cachedInputTokens,outputTokens,totalTokens,tools,text,toolCalls,costMicros,currency,at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO agentic_steps (runId,threadId,agentId,"index",durationMs,finishReason,inputTokens,cachedInputTokens,outputTokens,totalTokens,tools,text,toolCalls,at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		n.RunID, n.ThreadID, nullStr(n.AgentID), n.Index, n.DurationMs, n.FinishReason,
 		n.InputTokens, n.CachedInputTokens, n.OutputTokens, n.TotalTokens,
-		string(tools), nullStr(n.Text), toolCalls, n.CostMicros, nullStr(n.Currency), ms(at))
+		string(tools), nullStr(n.Text), toolCalls, ms(at))
 	return err
 }
 
-const stepCols = `runId, threadId, agentId, "index", durationMs, finishReason, inputTokens, cachedInputTokens, outputTokens, totalTokens, tools, text, toolCalls, COALESCE(costMicros,0), currency, at`
+const stepCols = `runId, threadId, agentId, "index", durationMs, finishReason, inputTokens, cachedInputTokens, outputTokens, totalTokens, tools, text, toolCalls, at`
 
 func (s stepStore) query(ctx context.Context, q string, args ...any) ([]ports.StepRecord, error) {
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -426,14 +429,13 @@ func (s stepStore) query(ctx context.Context, q string, args ...any) ([]ports.St
 	var out []ports.StepRecord
 	for rows.Next() {
 		var st ports.StepRecord
-		var threadID, agentID, tools, text, toolCalls, currency sql.NullString
+		var threadID, agentID, tools, text, toolCalls sql.NullString
 		var at int64
 		if err := rows.Scan(&st.RunID, &threadID, &agentID, &st.Index, &st.DurationMs, &st.FinishReason,
-			&st.InputTokens, &st.CachedInputTokens, &st.OutputTokens, &st.TotalTokens, &tools, &text, &toolCalls,
-			&st.CostMicros, &currency, &at); err != nil {
+			&st.InputTokens, &st.CachedInputTokens, &st.OutputTokens, &st.TotalTokens, &tools, &text, &toolCalls, &at); err != nil {
 			return nil, err
 		}
-		st.ThreadID, st.AgentID, st.Text, st.Currency, st.At = threadID.String, agentID.String, text.String, currency.String, fromMs(at)
+		st.ThreadID, st.AgentID, st.Text, st.At = threadID.String, agentID.String, text.String, fromMs(at)
 		st.Tools = []string{}
 		if tools.Valid {
 			_ = json.Unmarshal([]byte(tools.String), &st.Tools)

@@ -50,7 +50,7 @@ func SetupAgentCore(ctx context.Context, opts RuntimeOptions) (*AgentCore, error
 	}
 	store := opts.Admin
 	if store == nil {
-		store, err = admin.OpenDefaultAdminStore(ctx)
+		store, err = admin.OpenDefaultAdminStore(ctx, opts.Log)
 		if err != nil {
 			return nil, err
 		}

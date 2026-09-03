@@ -90,7 +90,7 @@ describe('what started a thread (§2.9)', () => {
   });
 
   it('survives the SQLite store, including its date', async () => {
-    const store = new SqliteAdminStore(await openSqlite(':memory:'));
+    const store = SqliteAdminStore.open(await openSqlite(':memory:'));
     const { runtime } = await makeRuntime({}, store);
     const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
     const ran = await chat.run({ prompt: 'durable', state: { orgId: 'acme' } });

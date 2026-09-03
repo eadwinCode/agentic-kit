@@ -35,6 +35,47 @@ AGENTIC_KIT_ADMIN_DATABASE_URL=postgresql://user:pass@host/db
 Pass `admin:` to `setupAgentCore` to override entirely — `MemoryAdminStore` is
 the right choice in tests, so a suite does not write to a file on disk.
 
+## Its schema migrates itself
+
+The admin store owns its schema and keeps it current. You never run a migration
+command, and there is nothing to add to your own migration tool: **this is the
+platform's database, not yours.** Your `Storage` is untouched by any of it.
+
+Migrations are numbered files — real `.sql` in Go, one `.ts` per migration in
+TypeScript, because a `.sql` read from disk does not survive being bundled.
+What has run is recorded in `agentic_migrations`.
+
+**It runs in the background.** `setupAgentCore` opens the connection and
+returns; the schema is brought up to date behind it, so a service starts at the
+same speed whether or not it has migrating to do. Nothing is left unsafe by
+that: every admin call waits for the schema first, so the first read after a
+cold start blocks for a moment rather than meeting a table that is not there
+yet.
+
+Opening the store is still synchronous, and still a startup error if it fails.
+Only the schema moved.
+
+Three things worth knowing:
+
+- **An existing database needs nothing.** Migration `0001` is the schema as it
+  stood before the migrator, written so that running it against a database that
+  already holds those tables changes nothing — and so that one left behind on an
+  older release picks up the columns it missed.
+- **Several workers starting at once is fine.** On Postgres the whole run takes
+  a transaction-scoped advisory lock, so they queue rather than race. The lock
+  covers creating the ledger too: `CREATE TABLE IF NOT EXISTS` is not atomic
+  against another session creating the same table, which is a real collision
+  when a deploy starts ten replicas together.
+- **A failed migration is loud.** It is logged through `log` (`console` by
+  default) and then raised by the first admin call. Admin writes are best
+  effort, so without that a broken schema would look exactly like a quiet
+  system.
+
+A released migration is never edited. Its checksum is recorded when it runs, and
+a later mismatch is refused — a database that no longer matches the code is
+precisely what an operational store should tell you about. To change the schema,
+add the next number.
+
 ## The reads
 
 ```ts
