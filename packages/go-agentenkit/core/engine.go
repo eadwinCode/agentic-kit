@@ -720,7 +720,11 @@ func redriveOnLockConflict(ctx context.Context, deps ports.RuntimePorts, agent *
 		return deps.Queue.Enqueue(ctx, ports.RunJob{
 			ThreadID: input.ThreadID, RunID: input.RunID, EnqueuedAt: time.Now().UnixMilli(),
 			Model: input.Model, Agent: agent.Name, TokenBudget: input.TokenBudget,
-			ProviderOptions: input.ProviderOptions, State: input.State, MaxSteps: input.MaxSteps,
+			// A redrive is the SAME run trying again, so it keeps the caps it
+			// was dispatched with: a retry that lost its money cap would be
+			// unbounded (§4).
+			CostBudgetMicros: input.CostBudgetMicros,
+			ProviderOptions:  input.ProviderOptions, State: input.State, MaxSteps: input.MaxSteps,
 		}, &ports.EnqueueOptions{Delay: deps.Config.RunRedriveDelay})
 	}
 	if err := deps.Kv.Del(ctx, RedriveKey(input.ThreadID)); err != nil {
@@ -790,7 +794,11 @@ func ExecuteWithPolicy(ctx context.Context, deps ports.RuntimePorts, agent *Regi
 		return deps.Queue.Enqueue(ctx, ports.RunJob{
 			ThreadID: input.ThreadID, RunID: input.RunID, EnqueuedAt: time.Now().UnixMilli(),
 			Model: input.Model, Agent: agent.Name, TokenBudget: input.TokenBudget,
-			ProviderOptions: input.ProviderOptions, State: input.State, MaxSteps: input.MaxSteps,
+			// A redrive is the SAME run trying again, so it keeps the caps it
+			// was dispatched with: a retry that lost its money cap would be
+			// unbounded (§4).
+			CostBudgetMicros: input.CostBudgetMicros,
+			ProviderOptions:  input.ProviderOptions, State: input.State, MaxSteps: input.MaxSteps,
 		}, nil)
 	}
 	// Attempts exhausted: finalize FAILED on BOTH the hot cache and durable

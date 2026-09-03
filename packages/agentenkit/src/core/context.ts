@@ -85,9 +85,21 @@ export async function compactContext(
   const older = history.slice(0, history.length - tail.length);
   if (older.length === 0) return history; // single oversized turn — blocked by the input guards above
 
-  // ... and summarize everything before it with a cheap model
-  const compactionModel = 'gpt-4o-mini';
-  const compactor = deps.resolveModel(compactionModel);
+  // ... and summarize everything before it with a cheap model, named in config
+  // so a registry that has never heard of 'gpt-4o-mini' can point this at its
+  // own (§2.6). Naming the key in the error matters: resolveModel throws from
+  // deep inside compaction, on a run that never mentioned this model, so the
+  // bare "Unknown model" says nothing about where it came from.
+  const compactionModel = deps.config.compactionModel;
+  let compactor;
+  try {
+    compactor = deps.resolveModel(compactionModel);
+  } catch (err) {
+    throw new Error(
+      `compactionModel ${JSON.stringify(compactionModel)} could not be resolved: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   const { text, usage, ...rest } = await generateText({
     model: compactor.instance(),
     prompt:

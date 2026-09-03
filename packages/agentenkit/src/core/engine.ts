@@ -5,7 +5,7 @@ import { wireId } from './types.js';
 import { compactContext } from './context.js';
 import type { TokenAttribution } from './usage.js';
 import { markPromptCaching } from './cache.js';
-import { repairDanglingToolCalls } from './messages.js';
+import { promptMessages, repairDanglingToolCalls } from './messages.js';
 import { mergeProviderOptions } from './types.js';
 import type { RegisteredAgent } from './agent.js';
 import {
@@ -461,9 +461,7 @@ export async function execute(
 
     // Prompt caching (§2.6): stamp the stable prefix once — appended step
     // messages extend the prompt without invalidating the breakpoints.
-    let messages = repairDanglingToolCalls(
-      history.map((m) => ({ role: m.role, content: m.content }) as any),
-    );
+    let messages = repairDanglingToolCalls(promptMessages(history) as any[]);
     if (deps.config.promptCaching) {
       messages = markPromptCaching(messages);
     }
@@ -646,6 +644,9 @@ async function redriveOnLockConflict(
         model: input.model,
         agent: agent.name,
         tokenBudget: input.tokenBudget,
+        // A redrive is the SAME run trying again, so it keeps the caps it was
+        // dispatched with — a retry that lost its money cap would be unbounded.
+        costBudgetMicros: input.costBudgetMicros,
         providerOptions: input.providerOptions,
       },
       { delaySeconds: deps.config.runRedriveDelaySeconds },
@@ -700,6 +701,9 @@ export async function executeWithPolicy(
         model: input.model,
         agent: agent.name,
         tokenBudget: input.tokenBudget,
+        // A redrive is the SAME run trying again, so it keeps the caps it was
+        // dispatched with — a retry that lost its money cap would be unbounded.
+        costBudgetMicros: input.costBudgetMicros,
         providerOptions: input.providerOptions,
       });
     }

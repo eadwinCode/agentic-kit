@@ -57,6 +57,7 @@ be opened should be a startup error.
 | `contextOutputReserveTokens` | `16000` | Held back for the completion. |
 | `compactionTrigger` | `0.8` | Compact past this share of budget. |
 | `contextTailShare` | `0.25` | Share of budget kept verbatim. |
+| `compactionModel` | `'gpt-4o-mini'` | Registry key of the cheap model that writes the summary. Resolved through your own `resolveModel`, so a registry without that key must name its own. |
 | `promptCaching` | `true` | Stamp cache breakpoints on the stable prefix. |
 | `nativeWindows` | — | Per-model windows below the ceiling. A `contextWindow` from `resolveModel` wins. |
 

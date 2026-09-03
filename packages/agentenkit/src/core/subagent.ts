@@ -16,7 +16,7 @@ import { publish, withPublishEvent } from './publish.js';
 import { HITL_PARKED, withHitl, type HitlFrame } from './hitl.js';
 import { withRunState, type AgentRunState } from './state.js';
 import { markPromptCaching } from './cache.js';
-import { repairDanglingToolCalls } from './messages.js';
+import { promptMessages, repairDanglingToolCalls } from './messages.js';
 import { runLoop, type LoopOutcome, type RunLedger } from './loop.js';
 
 /** Everything a nested run needs from the run that spawned it (§2.7). The
@@ -345,7 +345,7 @@ export async function runNestedAgent(
       // is for — it was the one prompt in the system going out unstamped.
       messages: maybeCache(
         ports,
-        repairDanglingToolCalls(persisted.map((m) => ({ role: m.role, content: m.content }) as any)),
+        repairDanglingToolCalls(promptMessages(persisted) as any[]),
       ),
       tools: nestedTools(ctx, d, frames, abortSignal),
       maxSteps: ports.config.subagentMaxSteps,

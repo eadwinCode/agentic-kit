@@ -437,6 +437,12 @@ export interface AgentConfig {
   compactionTrigger: number;
   /** Share of budget kept verbatim as the recent tail (§2.6) */
   contextTailShare: number;
+  /** Registry key of the cheap model that writes the context summary (§2.6).
+   *  It is resolved through your own `resolveModel`, so it must be a key that
+   *  resolver knows — a registry with no 'gpt-4o-mini' in it has to name its
+   *  own. The call is billed like any other, under `kind: 'compaction'` (§4).
+   *  Default: 'gpt-4o-mini'. */
+  compactionModel: string;
   /** Prompt caching (§2.6): when true, the engine stamps Anthropic-style
    *  ephemeral cache breakpoints on the prompt prefix so providers that
    *  support marking cache it. OpenAI models cache automatically (≥1024
@@ -490,6 +496,7 @@ export const DEFAULT_CONFIG: AgentConfig = {
   contextOutputReserveTokens: 16_000,
   compactionTrigger: 0.8,
   contextTailShare: 0.25,
+  compactionModel: 'gpt-4o-mini',
   promptCaching: true,
   runLockLeaseSeconds: 30 * 60,
 };
@@ -501,6 +508,11 @@ export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
     throw new Error(
       `Invalid config: subagentMaxSteps (${config.subagentMaxSteps}) must be between 1 and maxSteps (${config.maxSteps})`,
     );
+  }
+  if (!config.compactionModel) {
+    // Compaction has no fallback: without a model to summarize with, a thread
+    // that outgrows its window cannot run at all (§2.6).
+    throw new Error('Invalid config: compactionModel must be a non-empty registry key');
   }
   if (!Number.isInteger(config.stopPollMs) || config.stopPollMs < 1) {
     // The poll is the only thing that delivers a stop to a running worker (§2.1)

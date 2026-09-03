@@ -44,6 +44,13 @@ function scriptedModel(steps: ScriptedStep[]) {
         rawCall: { rawPrompt: null, rawSettings: {} },
       };
     },
+    // Compaction goes through generateText, not the stream (§2.6).
+    doGenerate: async () => ({
+      text: 'a dense summary',
+      finishReason: 'stop' as const,
+      usage: { promptTokens: 10, completionTokens: 5 },
+      rawCall: { rawPrompt: null, rawSettings: {} },
+    }),
   });
 }
 
@@ -56,6 +63,7 @@ async function makeRuntime(
   const queue = new MemoryQueue();
   const kv = new MemoryKv();
   const model = scriptedModel(steps);
+  const resolved: string[] = [];
   const deps: RuntimeOptions = {
     storage,
     admin: new MemoryAdminStore(),
@@ -64,15 +72,20 @@ async function makeRuntime(
     kv,
     // The wire id a key resolves to, recorded on every usage row (§4). A
     // resolver that declares none falls back to the key.
-    resolveModel: (name: string) => ({
-      instance: () => model,
-      contextWindow: 128_000,
-      ...(name === 'gpt-4o' ? { modelId: 'gpt-4o-2024-11-20' } : {}),
-    }),
+    resolveModel: (name: string) => {
+      resolved.push(name);
+      // Like the real thing, an unknown registry key throws (§3.3).
+      if (name.startsWith('unknown-')) throw new Error(`Unknown model: ${name}`);
+      return {
+        instance: () => model,
+        contextWindow: 128_000,
+        ...(name === 'gpt-4o' ? { modelId: 'gpt-4o-2024-11-20' } : {}),
+      };
+    },
     ...(opts.pricer ? { pricer: opts.pricer } : {}),
     config: resolveConfig(opts.config ?? {}),
   };
-  return { runtime: await setupAgentCore(deps), storage, bus, queue };
+  return { runtime: await setupAgentCore(deps), storage, bus, queue, resolved };
 }
 
 const probe = {
@@ -197,6 +210,68 @@ describe('cost as part of the usage store (§4)', () => {
     expect(terminal(bus).stopReason).toBe('cost_budget');
     expect(terminal(bus).state).toBe('COMPLETED');
     expect((await runtime.getThreadUsage(ran.threadId))!.tokens.totalTokens).toBe(30);
+  });
+});
+
+describe('compaction (§2.6, §4)', () => {
+  it('uses the compaction model from config and bills it under its own kind', async () => {
+    const long = 'word '.repeat(4_000);
+    const { runtime, storage, queue, resolved } = await makeRuntime([{ text: 'done' }], {
+      pricer: priceList,
+      config: {
+        // Small enough that the second run's history has to be compacted.
+        contextCeilingTokens: 2_000,
+        contextOutputReserveTokens: 200,
+        // The point of the test: a registry that has never heard of
+        // 'gpt-4o-mini' names its own summariser.
+        compactionModel: 'cheap-summariser',
+      },
+    });
+    const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
+
+    const ran = await chat.run({ prompt: long });
+    await runtime.worker.handleJob(queue.items[0]!);
+    await chat.run({ threadId: ran.threadId, prompt: long });
+    await runtime.worker.handleJob(queue.items[1]!);
+
+    expect(resolved).toContain('cheap-summariser');
+    const compactions = storage.usage.recorded.filter((u) => u.kind === 'compaction');
+    expect(compactions.length).toBeGreaterThan(0);
+    for (const c of compactions) {
+      expect(c.model).toBe('cheap-summariser');
+      expect(c.step).toBe(0);
+      // The platform's own housekeeping call is priced like any other — and
+      // this table has no price for it, so it is stored unpriced rather than
+      // silently free.
+      expect(c.cost).toBeFalsy();
+    }
+  });
+
+  it('names the key when the compaction model cannot be resolved', async () => {
+    // resolveModel throws from deep inside compaction, on a run that never
+    // mentioned this model, so the reason that reaches the operator has to say
+    // where it came from. It arrives as the FAILED run's error, not as a throw
+    // — the §2.8 policy catches it.
+    const { runtime, bus, queue } = await makeRuntime([{ text: 'done' }], {
+      config: {
+        contextCeilingTokens: 2_000,
+        contextOutputReserveTokens: 200,
+        compactionModel: 'unknown-summariser',
+        runMaxAttempts: 1, // fail on the first attempt rather than redriving
+      },
+    });
+    const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
+    const long = 'word '.repeat(4_000);
+    const ran = await chat.run({ prompt: long });
+    await runtime.worker.handleJob(queue.items[0]!);
+    await chat.run({ threadId: ran.threadId, prompt: long });
+    await runtime.worker.handleJob(queue.items[1]!);
+
+    const last = terminal(bus);
+    expect(last.state).toBe('FAILED');
+    expect(last.error).toContain('compactionModel');
+    expect(last.error).toContain('unknown-summariser');
+    expect(ran.threadId).toBeTruthy();
   });
 });
 

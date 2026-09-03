@@ -20,6 +20,19 @@ if estimate(history) > budget × compactionTrigger:
 | `contextOutputReserveTokens` | 16000 | Held back for the completion |
 | `compactionTrigger` | 0.8 | Compact past this share of budget |
 | `contextTailShare` | 0.25 | Share kept verbatim |
+| `compactionModel` | gpt-4o-mini | Registry key of the model that writes the summary |
+
+The summary is written by a cheap model, and that model is resolved through
+your own `resolveModel` — so a registry that has never heard of `gpt-4o-mini`
+must name its own, or the first thread to outgrow its window fails:
+
+```ts
+config: { compactionModel: 'claude-haiku' }
+```
+
+The call is billed like any other, under `kind: 'compaction'`, so what the
+platform's own housekeeping costs is visible on its own (see
+[Cost and pricing](./cost-and-pricing.md)).
 
 The summary is persisted as a `system` message and a `CONTEXT_COMPACTED` event
 is published. Reading current load:
