@@ -1,6 +1,6 @@
 {
   "name": "agentenkit",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Durable runtime for AI agent runs \u2014 a platform-owned loop, queue-dispatched execution that outlives the request, HITL suspension, nested runs, and context compaction. Bring your own storage, queue, bus and kv via four ports.",
   "license": "MIT",
   "repository": {
