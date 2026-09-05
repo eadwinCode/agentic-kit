@@ -12,6 +12,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  release-scripts:
+    name: release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test Go release tagging
+        run: bash .github/scripts/test-publish-go-tag.sh
+
   packages:
     name: packages (bun ${{ matrix.bun }})
     runs-on: ubuntu-latest
