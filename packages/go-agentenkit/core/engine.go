@@ -155,13 +155,14 @@ func unwindVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadI
 
 // closeRunRecord sums this segment onto the run's record and stamps how it
 // ended (§2.9). Observability must never fail a run that otherwise
-// succeeded, so errors are swallowed.
-func closeRunRecord(ctx context.Context, deps ports.RuntimePorts, runID string, f FinalizeInput) {
+// succeeded, so errors are swallowed. Returns the end time it stamped, for
+// the terminal event to carry: an accepted stop's time when there was one.
+func closeRunRecord(ctx context.Context, deps ports.RuntimePorts, runID string, f FinalizeInput) time.Time {
+	endedAt := time.Now()
 	prior, err := deps.Admin.Runs().Get(ctx, runID)
 	if err != nil || prior == nil {
-		return // a run started elsewhere, or a foreign dispatch
+		return endedAt // a run started elsewhere, or a foreign dispatch
 	}
-	endedAt := time.Now()
 	// Teardown can add usage, but cannot undo a recorded user stop.
 	if prior.State == ports.StateCancelled {
 		f.State, f.StopReason = ports.StateCancelled, "cancelled"
@@ -182,6 +183,7 @@ func closeRunRecord(ctx context.Context, deps ports.RuntimePorts, runID string, 
 		patch.Error = ports.Ptr(f.Error)
 	}
 	_ = deps.Admin.Runs().Patch(ctx, runID, patch)
+	return endedAt
 }
 
 // accrueRunRecord adds a parked segment's steps and tokens onto the run's
@@ -201,6 +203,66 @@ func accrueRunRecord(ctx context.Context, deps ports.RuntimePorts, runID string,
 	_ = deps.Admin.Runs().Patch(ctx, runID, patch)
 }
 
+// settleRun runs the spec's OnSettle for a run, once (§5.6). Every path that
+// ends a run goes through here: the worker that finished or aborted it, the
+// worker that failed it, and a stop that ended it while no worker held it.
+// The run record remembers that the settle ran, so whichever of those comes
+// second sees the mark and does nothing; the caller holds the run lock, so
+// the read and the mark are not racing another settler.
+//
+// Returns the hook's error, and whether the hook was reached at all. A run
+// with no record (a foreign dispatch) settles unmarked, as it always did.
+func settleRun(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, info ports.RunFinishInfo) (bool, error) {
+	var prior *ports.RunRecord
+	if info.RunID != "" {
+		rec, err := deps.Admin.Runs().Get(ctx, info.RunID)
+		if err != nil {
+			Logger(deps).Error("run record not read before settle", "run", info.RunID, "err", err)
+		}
+		prior = rec
+	}
+	if prior != nil && prior.SettledAt != nil {
+		return false, nil // already settled, by a stop or an earlier worker
+	}
+	var hookErr error
+	if agent != nil && agent.Args.OnSettle != nil {
+		hookErr = agent.Args.OnSettle(ctx, info)
+	}
+	if prior != nil {
+		_ = deps.Admin.Runs().Patch(context.WithoutCancel(ctx), info.RunID, ports.RunPatch{SettledAt: ports.Ptr(time.Now())})
+	}
+	return true, hookErr
+}
+
+// settleStoppedRun settles a run that a stop ended without a worker (§2.1,
+// §5.6): one that was still queued, or parked on an approval. The steps it
+// did make before that were priced as they happened, so its bill is real
+// and has to reach the hook. Nothing happens when the run already settled,
+// or when its record is not a stop.
+//
+// The caller holds the run lock. Stop takes it for exactly this; a worker
+// that finds the thread already cancelled at segment start holds it too.
+func settleStoppedRun(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, threadID, runID string) {
+	if agent == nil || runID == "" {
+		return
+	}
+	rec, err := deps.Admin.Runs().Get(ctx, runID)
+	if err != nil || rec == nil || rec.State != ports.StateCancelled || rec.SettledAt != nil {
+		return
+	}
+	bill, billErr := runBill(ctx, deps, threadID, runID)
+	info := ports.RunFinishInfo{
+		ThreadID: threadID, RunID: runID, State: ports.StateCancelled, StopReason: "cancelled",
+		TokensUsed: rec.TotalTokens, Steps: rec.Steps, Cancelled: true,
+		Usage: bill, UsageErr: billErr,
+	}
+	// A stop's settle error is ignored, as it is for a stopped worker: the
+	// run is cancelled either way.
+	if settled, _ := settleRun(ctx, deps, agent, info); settled && agent.Args.OnFinish != nil {
+		agent.Args.OnFinish(info)
+	}
+}
+
 // failRun finalises a run as FAILED on both homes AND keeps why (§2.9).
 //
 // The spec's OnSettle still runs (§5.6): a caller that opened records for
@@ -210,7 +272,7 @@ func failRun(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	if agent != nil && agent.Args.OnSettle != nil {
 		// A failed run still spent money on the steps it did make (§4).
 		bill, billErr := runBill(ctx, deps, threadID, runID)
-		_ = agent.Args.OnSettle(ctx, ports.RunFinishInfo{
+		_, _ = settleRun(ctx, deps, agent, ports.RunFinishInfo{
 			ThreadID: threadID, RunID: runID, State: ports.StateFailed, StopReason: "failed", Error: reason,
 			Usage: bill, UsageErr: billErr,
 		})
@@ -221,12 +283,17 @@ func failRun(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	if err := SetThreadState(ctx, deps, threadID, ports.StateFailed, ""); err != nil {
 		return err
 	}
+	endedAt := time.Now()
 	if runID != "" {
-		closeRunRecord(ctx, deps, runID, FinalizeInput{
+		endedAt = closeRunRecord(ctx, deps, runID, FinalizeInput{
 			State: ports.StateFailed, StopReason: "completed", Error: reason, RunID: runID,
 		})
 	}
-	_, err := Publish(ctx, deps, threadID, "STATE_CHANGE", map[string]any{"state": ports.StateFailed, "error": reason})
+	terminal := map[string]any{"state": ports.StateFailed, "error": reason, "endedAt": endedAt}
+	if runID != "" {
+		terminal["runId"] = runID
+	}
+	_, err := Publish(ctx, deps, threadID, "STATE_CHANGE", terminal)
 	return err
 }
 
@@ -280,7 +347,7 @@ func resumePendingHitl(ctx, genCtx context.Context, deps ports.RuntimePorts, thr
 	if err := SetThreadState(ctx, deps, threadID, ports.StateRunning, ""); err != nil {
 		return false, err
 	}
-	if _, err := Publish(ctx, deps, threadID, "STATE_CHANGE", map[string]any{"state": ports.StateRunning}); err != nil {
+	if _, err := Publish(ctx, deps, threadID, "STATE_CHANGE", runStatePayload(ctx, deps, ports.StateRunning, RunIDFromContext(ctx))); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -443,6 +510,13 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	}
 	if durable == nil || durable.State == ports.StateCancelled ||
 		durable.State == ports.StateCompleted || durable.State == ports.StateFailed {
+		if durable != nil && durable.State == ports.StateCancelled {
+			// A stop ended this run before any worker got to it, or while a
+			// worker was between segments. Stop settles it when it can take
+			// the run lock; when this worker took the lock first, the settle
+			// is this worker's to run — once, under the same lock.
+			settleStoppedRun(ctx, deps, agent, threadID, runID)
+		}
 		return OutcomeExecuted, nil
 	}
 
@@ -590,18 +664,15 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	// settle hook charges in one pass without keeping its own tally. Read
 	// once, handed to both hooks; a failed read is reported, not hidden.
 	bill, billErr := runBill(ctx, deps, threadID, runID)
-	if agent.Args.OnSettle != nil {
-		info := ports.RunFinishInfo{
-			ThreadID: threadID, RunID: runID, State: state, StopReason: stopReason,
-			TokensUsed: f.TokensUsed, Attribution: f.Attribution, Steps: f.Steps,
-			Cancelled: state == ports.StateCancelled,
-			Usage:     bill, UsageErr: billErr,
-		}
-		if err := agent.Args.OnSettle(genCtx, info); err != nil && state != ports.StateCancelled {
-			state = ports.StateFailed
-			f.State = state
-			f.Error = err.Error()
-		}
+	if _, err := settleRun(genCtx, deps, agent, ports.RunFinishInfo{
+		ThreadID: threadID, RunID: runID, State: state, StopReason: stopReason,
+		TokensUsed: f.TokensUsed, Attribution: f.Attribution, Steps: f.Steps,
+		Cancelled: state == ports.StateCancelled,
+		Usage:     bill, UsageErr: billErr,
+	}); err != nil && state != ports.StateCancelled {
+		state = ports.StateFailed
+		f.State = state
+		f.Error = err.Error()
 	}
 	if err := Finalize(ctx, deps, agent, threadID, f); err != nil {
 		return "", err
@@ -649,8 +720,9 @@ func Finalize(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAge
 	// Close the run's durable record (§2.9). Additive: a run that parked and
 	// resumed finalises once, but its steps and tokens accrued over several
 	// segments. The run lock (§3.4) makes this read-modify-write single-writer.
+	endedAt := time.Now()
 	if f.RunID != "" {
-		closeRunRecord(ctx, deps, f.RunID, f)
+		endedAt = closeRunRecord(ctx, deps, f.RunID, f)
 		// Past that, a replaced run stays silent. Its CANCELLED would otherwise
 		// land on top of the next run's RUNNING and wedge the thread (§2.1).
 		current, _, err := deps.Kv.Get(ctx, RunIDKey(threadID))
@@ -678,8 +750,14 @@ func Finalize(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAge
 	if err := SetThreadState(ctx, deps, threadID, f.State, ""); err != nil {
 		return err
 	}
+	// The run's identity and end time ride the terminal event, so a client
+	// closes the right timer without reading the run record back.
 	terminal := map[string]any{
 		"state": f.State, "stopReason": f.StopReason, "tokensUsed": f.TokensUsed, "usage": f.Attribution,
+		"endedAt": endedAt,
+	}
+	if f.RunID != "" {
+		terminal["runId"] = f.RunID
 	}
 	if f.Error != "" {
 		terminal["error"] = f.Error

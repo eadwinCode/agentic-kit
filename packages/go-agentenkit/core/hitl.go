@@ -259,7 +259,10 @@ func ParkForApproval(ctx context.Context, deps ports.RuntimePorts, i ParkInput) 
 	}); err != nil {
 		return err
 	}
-	if _, err := Publish(ctx, deps, i.ThreadID, "STATE_CHANGE", map[string]any{"state": ports.StateWaitingForInput}); err != nil {
+	// The park names its run and when the run started, like every other
+	// STATE_CHANGE, so a client keeps its timer without refetching history.
+	runID, _ := CurrentRunID(ctx, deps, i.ThreadID)
+	if _, err := Publish(ctx, deps, i.ThreadID, "STATE_CHANGE", runStatePayload(ctx, deps, ports.StateWaitingForInput, runID)); err != nil {
 		return err
 	}
 
@@ -268,7 +271,6 @@ func ParkForApproval(ctx context.Context, deps ports.RuntimePorts, i ParkInput) 
 	// run through the tool call. Reclamation (§2.5) covers the thread instead.
 	// Arriving early is equally harmless: an unexpired, unanswered request
 	// resolves to nothing and the job is a no-op (see resumePendingHitl).
-	runID, _ := CurrentRunID(ctx, deps, i.ThreadID)
 	_ = deps.Queue.Enqueue(ctx, ports.RunJob{
 		ThreadID: i.ThreadID, RunID: runID, Model: i.Resume.Model, Agent: i.Resume.Agent,
 		TokenBudget: i.Resume.TokenBudget, CostBudgetMicros: i.Resume.CostBudgetMicros,

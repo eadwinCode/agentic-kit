@@ -165,6 +165,10 @@ type RunRecord struct {
 	DurationMs *int64 `json:"durationMs,omitempty"`
 	// QueuedMs is the time between enqueue and a worker starting work (§2.8).
 	QueuedMs *int64 `json:"queuedMs,omitempty"`
+	// SettledAt is when the spec's OnSettle ran for this run (§5.6). A run
+	// settles exactly once: a worker that ends it, or a stop that ends it
+	// while no worker holds it. Unset until then.
+	SettledAt *time.Time `json:"settledAt,omitempty"`
 	// Steps is loop iterations completed, summed across every segment.
 	Steps             int `json:"steps"`
 	InputTokens       int `json:"inputTokens"`
@@ -209,6 +213,7 @@ type RunPatch struct {
 	EndedAt           *time.Time
 	DurationMs        *int64
 	QueuedMs          *int64
+	SettledAt         *time.Time
 	Steps             *int
 	InputTokens       *int
 	CachedInputTokens *int

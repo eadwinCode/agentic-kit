@@ -36,10 +36,37 @@ export function contentToText(content: unknown, format: EntryFormat): string {
     .join('\n');
 }
 
+/** Whether a tool result reports a failure: an object with an `error` key
+ *  (a tool that threw, or an unknown tool), or the `error: …` text a failed
+ *  tool's stored result carries. A denial or a cancellation is an answer,
+ *  not a failure. */
+export function isToolError(result: unknown): boolean {
+  if (typeof result === 'string') return result.startsWith('error: ');
+  return !!result && typeof result === 'object' && 'error' in (result as object);
+}
+
+/** What a stored history says about each tool call: `done` when a result is
+ *  durable, `error` when that result reports a failure. Keyed by call id, so
+ *  one call's result can never flip another. */
+export type ToolCallOutcomes = ReadonlyMap<string, 'done' | 'error'>;
+
+/** The state a durable tool call is in, given what is known about results. */
+function durableToolState(
+  toolCallId: string,
+  answered: ReadonlySet<string> | ToolCallOutcomes,
+): 'running' | 'done' | 'error' {
+  if (answered instanceof Map) return answered.get(toolCallId) ?? 'running';
+  return answered.has(toolCallId) ? 'done' : 'running';
+}
+
 /** The structured parts of a stored message, thinking left out (it becomes
  *  its own entry). `answered` names the tool calls whose result is durable,
- *  which is how a call knows it is done. */
-export function contentToParts(content: unknown, answered: ReadonlySet<string> = new Set()): EntryPart[] {
+ *  which is how a call knows it is done — as a set, or as the outcomes from
+ *  `toolCallOutcomes`, which also know which calls failed. */
+export function contentToParts(
+  content: unknown,
+  answered: ReadonlySet<string> | ToolCallOutcomes = new Set(),
+): EntryPart[] {
   if (typeof content === 'string') return content ? [{ type: 'text', text: content }] : [];
   if (!Array.isArray(content)) {
     const text = json(content);
@@ -60,7 +87,7 @@ export function contentToParts(content: unknown, answered: ReadonlySet<string> =
           toolCallId: part.toolCallId,
           toolName: part.toolName ?? 'tool',
           args: part.args ?? {},
-          state: answered.has(part.toolCallId) ? 'done' : 'running',
+          state: durableToolState(part.toolCallId, answered),
         });
         break;
       case 'tool-result':
@@ -82,7 +109,7 @@ export function contentToParts(content: unknown, answered: ReadonlySet<string> =
 export function messageToEntry(
   message: SnapshotMessage,
   format: EntryFormat,
-  answered: ReadonlySet<string> = new Set(),
+  answered: ReadonlySet<string> | ToolCallOutcomes = new Set(),
 ): ChatEntry | null {
   const text = contentToText(message.content, format);
   const structured = contentToParts(message.content, answered);
@@ -124,7 +151,7 @@ export function reasoningText(content: unknown): string {
 export function messageToEntries(
   message: SnapshotMessage,
   format: EntryFormat,
-  answered: ReadonlySet<string> = new Set(),
+  answered: ReadonlySet<string> | ToolCallOutcomes = new Set(),
 ): ChatEntry[] {
   const out: ChatEntry[] = [];
   const thought = reasoningText(message.content);
@@ -143,18 +170,25 @@ export function messageToEntries(
   return out;
 }
 
-/** Every tool call a stored history has a result for. */
-export function answeredToolCalls(messages: readonly SnapshotMessage[]): Set<string> {
-  const answered = new Set<string>();
+/** Every tool call a stored history has a result for, and how it went. A
+ *  denied approval, a stop, or an approval that ran the tool later never
+ *  streams a result, so this is the only way a reload learns their state. */
+export function toolCallOutcomes(messages: readonly SnapshotMessage[]): Map<string, 'done' | 'error'> {
+  const outcomes = new Map<string, 'done' | 'error'>();
   for (const m of messages) {
     if (!Array.isArray(m.content)) continue;
     for (const part of m.content as any[]) {
       if (part?.type === 'tool-result' && typeof part.toolCallId === 'string') {
-        answered.add(part.toolCallId);
+        outcomes.set(part.toolCallId, isToolError(part.result) ? 'error' : 'done');
       }
     }
   }
-  return answered;
+  return outcomes;
+}
+
+/** Every tool call a stored history has a result for. */
+export function answeredToolCalls(messages: readonly SnapshotMessage[]): Set<string> {
+  return new Set(toolCallOutcomes(messages).keys());
 }
 
 /** The activity a thread state implies when nothing more specific is happening. */

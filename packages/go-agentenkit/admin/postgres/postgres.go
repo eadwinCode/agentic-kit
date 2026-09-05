@@ -167,23 +167,27 @@ type runStore struct{ db *sql.DB }
 
 const runCols = `id, "threadId", "parentRunId", depth, agent, model, state, "stopReason", error, "startedAt", "endedAt",
 	"durationMs", "queuedMs", attempts, steps, "inputTokens", "cachedInputTokens", "outputTokens", "totalTokens",
-	result, prompt, "tokenBudget", "runState", "providerOptions"`
+	result, prompt, "tokenBudget", "runState", "providerOptions", "settledAt"`
 
 func scanRun(row interface{ Scan(...any) error }) (*ports.RunRecord, error) {
 	var r ports.RunRecord
 	var parent, stop, errMsg, prompt sql.NullString
-	var ended sql.NullTime
+	var ended, settled sql.NullTime
 	var duration, queued, budget sql.NullInt64
 	var result, runState, providerOptions []byte
 	if err := row.Scan(&r.ID, &r.ThreadID, &parent, &r.Depth, &r.Agent, &r.Model, &r.State, &stop, &errMsg,
 		&r.StartedAt, &ended, &duration, &queued, &r.Attempts, &r.Steps, &r.InputTokens, &r.CachedInputTokens,
-		&r.OutputTokens, &r.TotalTokens, &result, &prompt, &budget, &runState, &providerOptions); err != nil {
+		&r.OutputTokens, &r.TotalTokens, &result, &prompt, &budget, &runState, &providerOptions, &settled); err != nil {
 		return nil, err
 	}
 	r.ParentRunID, r.StopReason, r.Error, r.Prompt = parent.String, stop.String, errMsg.String, prompt.String
 	if ended.Valid {
 		t := ended.Time
 		r.EndedAt = &t
+	}
+	if settled.Valid {
+		t := settled.Time
+		r.SettledAt = &t
 	}
 	if duration.Valid {
 		r.DurationMs = ports.Ptr(duration.Int64)
@@ -253,6 +257,9 @@ func (r runStore) Patch(ctx context.Context, runID string, p ports.RunPatch) err
 	}
 	if p.QueuedMs != nil {
 		set(`"queuedMs"`, *p.QueuedMs)
+	}
+	if p.SettledAt != nil {
+		set(`"settledAt"`, *p.SettledAt)
 	}
 	if p.Steps != nil {
 		set("steps", *p.Steps)

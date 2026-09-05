@@ -9,7 +9,7 @@ import {
   type ResolvedConfig,
 } from './config.js';
 import { mergeConfig, useAgentRunConfig } from './context.js';
-import { answeredToolCalls, messageToEntries, messageToEntry, stateActivity } from './format.js';
+import { isToolError, messageToEntries, messageToEntry, stateActivity, toolCallOutcomes } from './format.js';
 import type {
   AgentActivity,
   AgentState,
@@ -23,6 +23,7 @@ import type {
   SubagentStatus,
   SubagentView,
   ThreadListItem,
+  ThreadRun,
   ThreadSnapshot,
   ThreadUsage,
 } from './types.js';
@@ -43,6 +44,10 @@ export interface UseAgentThread {
   threads: ThreadListItem[];
   threadsLoading: boolean;
   usage: ThreadUsage | null;
+  /** The thread's latest run with its clocks, for a "running for" timer.
+   *  Hydrated from the snapshot, then kept from `STATE_CHANGE` alone; null
+   *  before the first run. */
+  currentRun: ThreadRun | null;
   loadThreads: () => Promise<void>;
   loadUsage: (threadId?: string) => Promise<void>;
   newThread: () => void;
@@ -72,7 +77,7 @@ export interface RunOptions {
 /** Mark the call a result belongs to as done (or failed) on the entry that
  *  announced it, so a tool card can flip state in place. */
 function settleToolCall(entries: ChatEntry[], toolCallId: string, result: unknown): ChatEntry[] {
-  const failed = !!result && typeof result === 'object' && 'error' in (result as object);
+  const failed = isToolError(result);
   let touched = false;
   const next = entries.map((entry) => {
     if (!entry.parts.some((p) => p.type === 'tool-call' && p.toolCallId === toolCallId)) return entry;
@@ -87,6 +92,36 @@ function settleToolCall(entries: ChatEntry[], toolCallId: string, result: unknow
     };
   });
   return touched ? next : entries;
+}
+
+/** The run a STATE_CHANGE speaks for, with the clock it carries: `startedAt`
+ *  while the run is running or waiting, `endedAt` once it ended. An event
+ *  without a run id says nothing about timing and leaves what is known. */
+function runFromStateChange(prev: ThreadRun | null, state: AgentState, p: any): ThreadRun | null {
+  if (typeof p?.runId !== 'string') return prev;
+  const same = prev?.id === p.runId;
+  const next: ThreadRun = { id: p.runId };
+  const startedAt = typeof p.startedAt === 'string' ? p.startedAt : same ? prev?.startedAt : undefined;
+  if (startedAt) next.startedAt = startedAt;
+  if (state === 'COMPLETED' || state === 'FAILED' || state === 'CANCELLED') {
+    const endedAt = typeof p.endedAt === 'string' ? p.endedAt : same ? prev?.endedAt : undefined;
+    if (endedAt) next.endedAt = endedAt;
+  }
+  return next;
+}
+
+/** The snapshot's own dispatched run: the latest at depth 0. */
+function latestRun(runs: readonly ThreadSnapshot['runs'][number][] | undefined): ThreadRun | null {
+  let latest: ThreadSnapshot['runs'][number] | undefined;
+  for (const r of runs ?? []) {
+    if (r.depth !== 0) continue;
+    if (!latest || (r.startedAt ?? '') > (latest.startedAt ?? '')) latest = r;
+  }
+  if (!latest) return null;
+  const run: ThreadRun = { id: latest.id };
+  if (latest.startedAt) run.startedAt = latest.startedAt;
+  if (latest.endedAt) run.endedAt = latest.endedAt;
+  return run;
 }
 
 /** Hydrates durable messages first, then resumes the canonical event stream at
@@ -123,8 +158,14 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
   const [threads, setThreads] = useState<ThreadListItem[]>([]);
   const [threadsLoading, setThreadsLoading] = useState(resolved.loadThreadsOnMount);
   const [usage, setUsage] = useState<ThreadUsage | null>(null);
+  const [currentRun, setCurrentRun] = useState<ThreadRun | null>(null);
   const threadRef = useRef<string | undefined>(threadId);
   threadRef.current = threadId;
+  /** When each run ended, as its terminal STATE_CHANGE said. A stop is
+   *  accepted before the worker that held the run has torn down, so a
+   *  snapshot taken in between can still lack the end; the event's word
+   *  stands. */
+  const runEndings = useRef<Map<string, string>>(new Map());
   /** Tool calls already visible from the durable messages. The snapshot's
    *  activeEvents can replay the same step's chunks, so without this a
    *  reconnect renders a finished tool call twice. */
@@ -211,6 +252,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
     setSubagents([]);
     setPendingInputs([]);
     setUsage(null);
+    setCurrentRun(null);
     setAgentState('IDLE');
     setActivity(stateActivity('IDLE', cfgRef.current.labels));
     cfgRef.current.persistence?.clear();
@@ -264,6 +306,10 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
         case 'STATE_CHANGE': {
           const nextState = p.state as AgentState;
           setAgentState(nextState);
+          if (typeof p.runId === 'string' && typeof p.endedAt === 'string') {
+            runEndings.current.set(p.runId, p.endedAt);
+          }
+          setCurrentRun((prev) => runFromStateChange(prev, nextState, p));
           if (nextState === 'RUNNING') {
             // The park was resolved: every child that was waiting is re-entered
             // where it stopped.
@@ -553,6 +599,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
           setThreadId(undefined);
           setEntries([]);
           setUsage(null);
+          setCurrentRun(null);
           setAgentState('IDLE');
           setActivity(stateActivity('IDLE', cfg.labels));
           return;
@@ -564,8 +611,11 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
         // A nested run's turns live in the same log under its own agentId.
         // They are its transcript, not the main conversation's.
         const mainMessages = snapshot.messages.filter((m) => (m.agentId ?? null) === null);
-        const answered = answeredToolCalls(snapshot.messages);
-        setEntries(mainMessages.flatMap((m) => messageToEntries(m, cfg.format, answered)));
+        // A durable result settles its call, as done or as failed: a denied
+        // approval or a stop never streams a result, so this is where a
+        // reload learns how those calls ended.
+        const outcomes = toolCallOutcomes(snapshot.messages);
+        setEntries(mainMessages.flatMap((m) => messageToEntries(m, cfg.format, outcomes)));
 
         // Rebuild each child's card from what it actually wrote, so a reload
         // does not lose a subagent's output.
@@ -578,7 +628,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
             .map((part) => part.toolCallId)
             .filter((id: unknown): id is string => typeof id === 'string'),
         );
-        seenToolResults.current = new Set(answered);
+        seenToolResults.current = new Set(outcomes.keys());
 
         // Name, depth and final state come from the durable run rows; the
         // SUBAGENT_* events only replay while a run is unfinished, so on a
@@ -615,6 +665,14 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
         setSubagents([...byAgent.values()]);
         setPendingInputs([]);
         void loadUsage(threadId);
+        // The latest run's clocks. An end this client already saw on the
+        // wire stands over a snapshot that does not carry it yet.
+        const run = latestRun(snapshot.runs);
+        if (run && !run.endedAt) {
+          const ended = runEndings.current.get(run.id);
+          if (ended) run.endedAt = ended;
+        }
+        setCurrentRun(run);
         setAgentState(snapshot.thread.state);
         setActivity(stateActivity(snapshot.thread.state, cfg.labels));
 
@@ -670,6 +728,9 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
       });
       setSubagents([]);
       setPendingInputs([]);
+      // A new run is starting: the last one's clocks are no longer the
+      // thread's. The stream's RUNNING names the run and its start.
+      setCurrentRun(null);
       setAgentState('RUNNING');
       setActivity({ phase: 'thinking', label: cfg.labels.thinking });
 
@@ -687,6 +748,9 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
           throw new Error(data.error ?? `Run request failed (${response.status})`);
         }
         if (data.threadId) setThreadId(data.threadId);
+        // The stream usually names the run first; a late answer must not
+        // wipe the start it already carried.
+        if (data.runId) setCurrentRun((prev) => (prev?.id === data.runId ? prev : { id: data.runId! }));
         void loadThreads(); // the sidebar reflects a new thread immediately
         return data;
       } catch (error) {
@@ -761,6 +825,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
     threads,
     threadsLoading,
     usage,
+    currentRun,
     loadThreads,
     loadUsage,
     newThread,

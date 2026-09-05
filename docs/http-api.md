@@ -86,7 +86,8 @@ export async function GET(req: NextRequest) {
 The snapshot carries `thread`, `messages`, `runs`, `lastEventSeq` and
 `activeEvents`. A client renders the messages, applies `activeEvents` to restore
 whatever the in-flight run has produced but not yet committed, then opens the
-stream at `lastEventSeq`.
+stream at `lastEventSeq`. Each of `runs` carries its `startedAt` and, once it
+ended, its `endedAt`.
 
 `activeEvents` deliberately excludes stream chunks from steps that are already
 durable. Replaying those on top of the messages would render each finished step

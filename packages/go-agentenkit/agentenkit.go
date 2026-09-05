@@ -161,14 +161,16 @@ func Ptr[T any](v T) *T { return ports.Ptr(v) }
 type (
 	ExecuteInput   = core.ExecuteInput
 	ExecuteOutcome = core.ExecuteOutcome
-	FinalizeInput  = core.FinalizeInput
-	Policy         = core.Policy
-	ExecuteFunc    = core.ExecuteFunc
-	StepResult     = core.StepResult
-	StepCall       = core.StepCall
-	LoopInput      = core.LoopInput
-	LoopOutcome    = core.LoopOutcome
-	RunLedger      = core.RunLedger
+	StopOptions    = core.StopOptions
+
+	FinalizeInput = core.FinalizeInput
+	Policy        = core.Policy
+	ExecuteFunc   = core.ExecuteFunc
+	StepResult    = core.StepResult
+	StepCall      = core.StepCall
+	LoopInput     = core.LoopInput
+	LoopOutcome   = core.LoopOutcome
+	RunLedger     = core.RunLedger
 
 	AgentHandle     = core.Handle
 	RegisteredAgent = core.RegisteredAgent
@@ -242,8 +244,10 @@ var (
 	RunIDKey         = core.RunIDKey
 	RedriveKey       = core.RedriveKey
 	StateKey         = core.StateKey
-	RunLockKey       = core.RunLockKey
-	NewID            = core.NewID
+	SeqKey           = core.SeqKey
+
+	RunLockKey = core.RunLockKey
+	NewID      = core.NewID
 
 	CountTokens     = core.CountTokens
 	AttributeTokens = core.AttributeTokens
@@ -268,6 +272,7 @@ var (
 
 	Run          = core.Run
 	Stop         = core.Stop
+	StopRun      = core.StopRun
 	DeleteThread = core.DeleteThread
 
 	RunStateFromContext = core.RunStateFromContext

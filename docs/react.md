@@ -56,6 +56,12 @@ is assumed.
 | `subagents` | nested runs, with status and text |
 | `threads`, `threadsLoading` | the thread list, for a sidebar |
 | `usage` | tokens spent, money spent, and context load |
+| `currentRun` | the thread's latest run: `{ id, startedAt?, endedAt? }`, or `null` before the first |
+
+`currentRun` is what a "running for 1:32" timer counts from. It is hydrated
+from the snapshot's `runs` and then kept from `STATE_CHANGE` alone: every one
+names its run and carries `startedAt` while the run is running or waiting, or
+`endedAt` once it ended. A client never refetches history for timing.
 
 **Actions**
 
@@ -88,8 +94,14 @@ type EntryPart =
 
 A tool call's `state` flips to `done` (or `error`) in place when its result
 arrives, live or on reload, so a card can settle without a second lookup.
-Parts are filled the same way from the durable snapshot and from the stream:
-a reload renders what the live run did.
+Live, the runtime publishes a `tool-result` chunk for every tool it ran,
+before the step commits. On reload the state is derived from the durable tool
+messages, which is how a denied approval, a stop, or an approval that ran the
+tool later gets its state: those never stream a result. `error` means the
+result reports a failure (`{ error }`, or the `error: …` text a failed tool's
+result carries); a denial or a cancellation is an answer, so the call is
+`done`. Parts are filled the same way from the durable snapshot and from the
+stream: a reload renders what the live run did.
 
 `kind` is what a UI branches on:
 

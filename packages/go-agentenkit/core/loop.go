@@ -509,6 +509,23 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		}
 		messages = append(messages, step.ResponseMessages...)
 
+		// goai runs a step's tools after the step finishes and streams no
+		// tool-result chunk for them, so a client would keep showing the call
+		// as running until its next snapshot. One is published per result
+		// here, before the step commits, in the same shape a provider-run
+		// tool's result streams in. A parked call has no result yet: its
+		// verdict arrives with the resume.
+		if onChunk != nil {
+			for _, r := range step.ToolResults {
+				if _, parked := IsParked(r.Output); parked {
+					continue
+				}
+				onChunk(provider.StreamChunk{
+					Type: provider.ChunkToolResult, ToolCallID: r.ToolCallID, ToolName: r.ToolName,
+					Text: r.Output, Error: r.Error,
+				})
+			}
+		}
 		// A replay boundary (§2.2): everything this step produced is durable
 		// history now, so a reconnecting client must NOT also replay its
 		// chunks. Persisted (not a notice) because the snapshot needs its seq.

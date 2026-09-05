@@ -1,6 +1,6 @@
 {
   "name": "use-agentenkit",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "React hook for agentenkit \u2014 durable threads, live streaming, human-in-the-loop approvals and nested runs, with every route and label under your control.",
   "license": "MIT",
   "repository": {

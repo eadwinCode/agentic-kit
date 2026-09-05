@@ -202,6 +202,14 @@ func (c *AgentCore) register(name string, handle *core.Handle, kind AgentKind) *
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.registry[name] = handle
+	// A stop ends whichever agent's run is active; that agent's settle hook
+	// is found through the registry (§5.6).
+	handle.Registry(func(name string) *core.RegisteredAgent {
+		if h := c.GetAgent(name); h != nil {
+			return h.Agent()
+		}
+		return nil
+	})
 	// The first registered stream-text handle is the default for jobs that
 	// omit `agent` (§5).
 	if kind == KindStreamText && c.defaultAgent == "" {

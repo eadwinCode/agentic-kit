@@ -50,6 +50,28 @@ type ScopeFn func(state ports.AgentRunState, runID string) ports.RuntimePorts
 type Handle struct {
 	agent *RegisteredAgent
 	scope ScopeFn
+	// lookup finds the other agents registered beside this one, by name.
+	// Nil for a handle built outside a runtime.
+	lookup func(name string) *RegisteredAgent
+}
+
+// Registry lets the handle find the OTHER agents registered beside it, by
+// name. Stop needs it: the run it ends may belong to any of them, and the
+// settle hook that closes that run's books is that agent's (§5.6). Without
+// one, a stop settles only this handle's own runs.
+func (h *Handle) Registry(lookup func(name string) *RegisteredAgent) { h.lookup = lookup }
+
+// resolveAgent is the run record's agent name back to its registration.
+func (h *Handle) resolveAgent(name string) *RegisteredAgent {
+	if h.lookup != nil {
+		if a := h.lookup(name); a != nil {
+			return a
+		}
+	}
+	if name == h.agent.Name {
+		return h.agent
+	}
+	return nil
 }
 
 // Name is the handle's registry key.
@@ -80,9 +102,10 @@ func (h *Handle) Run(ctx context.Context, input ports.RunInput) (ports.RunResult
 }
 
 // Stop is the platform stop (§2.1); works regardless of which agent's run
-// is active.
+// is active. A run it ends with no worker holding it is settled here, by
+// the agent that run belongs to (§5.6).
 func (h *Handle) Stop(ctx context.Context, threadID string, state ports.AgentRunState) (ports.StopResult, error) {
-	return Stop(ctx, h.scope(state, ""), threadID)
+	return StopRun(ctx, h.scope(state, ""), threadID, StopOptions{Agent: h.resolveAgent})
 }
 
 func newHandle(scope ScopeFn, agent *RegisteredAgent) *Handle {

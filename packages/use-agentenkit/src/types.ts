@@ -181,6 +181,20 @@ export interface SnapshotRun {
   /** 0 is the dispatched run itself; nested runs are 1+. */
   depth: number;
   state: SubagentStatus;
+  /** ISO time the run started; the clock a "running for" timer counts from. */
+  startedAt?: string;
+  /** ISO time it ended, once it has. */
+  endedAt?: string;
+}
+
+/** The thread's latest run and its clocks, kept from `STATE_CHANGE` alone:
+ *  every one names its run and carries `startedAt` (while it runs or waits)
+ *  or `endedAt` (when it ends), so a timer never refetches history. */
+export interface ThreadRun {
+  id: string;
+  startedAt?: string;
+  /** Set once the run ended; absent while it is running or waiting. */
+  endedAt?: string;
 }
 
 export interface ThreadSnapshot {

@@ -159,11 +159,15 @@ housekeeping.
 
 **EventBus.** One `LISTEN` connection per process (`pgxlisten`, over pgx),
 fan-out by thread id in memory. NOTIFY payloads are capped at 8000 bytes,
-which a tool result can exceed: an event that does not fit travels as
-`{threadId, seq}` and the subscriber reads it back from `Storage.Events`; a
-notice (seq 0) that does not fit is parked in the kv for a minute and
-referenced by key. At-most-once still: a dropped notification is recovered
-by the client's cursor replay.
+which a tool result can exceed: an event that does not fit, durable or not,
+is parked in the kv for a minute and travels as a reference to that key. The
+kv needs no storage scope to read back, so a storage that requires a tenant
+on every read still gets its oversized events. Each subscription keeps the
+last durable seq it delivered; when the `LISTEN` connection comes back after
+a drop, the bus replays what each subscriber missed from `Storage.Events`,
+scoped with the run state on the subscriber's own context, and delivers
+nothing twice. At-most-once still, and the client's cursor replay stays the
+last line.
 
 **Queue.** `Enqueue` is one insert; a delay is a future `runAt`. The consumer
 claims with `SELECT … FOR UPDATE SKIP LOCKED`, so several processes can

@@ -139,6 +139,9 @@ func applyPatch(cur *ports.RunRecord, p ports.RunPatch) {
 	if p.QueuedMs != nil {
 		cur.QueuedMs = p.QueuedMs
 	}
+	if p.SettledAt != nil {
+		cur.SettledAt = p.SettledAt
+	}
 	if p.Steps != nil {
 		cur.Steps = *p.Steps
 	}

@@ -178,8 +178,15 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 		rec.ProviderOptions = providerOptionsFor(deps, agent, input)
 		start.Prompt, start.TokenBudget, start.State, start.ProviderOptions = rec.Prompt, rec.TokenBudget, rec.RunState, rec.ProviderOptions
 	}
-	if _, err := deps.Admin.Runs().Start(ctx, rec); err != nil {
+	opened, err := deps.Admin.Runs().Start(ctx, rec)
+	if err != nil {
 		return ports.RunResult{}, err
+	}
+	// The clock a client shows "running for" against: the run record's own
+	// start, so the wire and the snapshot agree on it.
+	startedAt := start.At
+	if opened != nil {
+		startedAt = opened.StartedAt
 	}
 	if active, err := dispatchActive(ctx, deps, threadID, runID); err != nil {
 		return ports.RunResult{}, err
@@ -219,8 +226,11 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 		return refuse("Run was stopped before dispatch")
 	}
 	// A durable run boundary lets reconnecting clients distinguish this
-	// turn's in-flight chunks from earlier completed turns.
-	if _, err := Publish(ctx, deps, threadID, "STATE_CHANGE", map[string]any{"state": ports.StateRunning}); err != nil {
+	// turn's in-flight chunks from earlier completed turns. It names the run
+	// and its start, so a client never has to refetch history for timing.
+	if _, err := Publish(ctx, deps, threadID, "STATE_CHANGE", map[string]any{
+		"state": ports.StateRunning, "runId": runID, "startedAt": startedAt,
+	}); err != nil {
 		return ports.RunResult{}, err
 	}
 
@@ -288,11 +298,27 @@ func failDispatch(ctx context.Context, deps ports.RuntimePorts, threadID, runID,
 	if err := SetThreadState(ctx, deps, threadID, ports.StateFailed, model); err != nil {
 		return err
 	}
-	closeRunRecord(ctx, deps, runID, FinalizeInput{State: ports.StateFailed, StopReason: "failed", Error: reason})
+	endedAt := closeRunRecord(ctx, deps, runID, FinalizeInput{State: ports.StateFailed, StopReason: "failed", Error: reason})
 	_, err = Publish(ctx, deps, threadID, "STATE_CHANGE", map[string]any{
-		"state": ports.StateFailed, "stopReason": "failed", "runId": runID, "error": reason,
+		"state": ports.StateFailed, "stopReason": "failed", "runId": runID, "error": reason, "endedAt": endedAt,
 	})
 	return err
+}
+
+// runStatePayload is a non-terminal STATE_CHANGE: the state, the run it
+// belongs to, and when that run started, read off its record. Every
+// STATE_CHANGE names its run, so a client keeps one timer per run and never
+// refetches history to find its start.
+func runStatePayload(ctx context.Context, deps ports.RuntimePorts, state ports.ExecutionState, runID string) map[string]any {
+	p := map[string]any{"state": state}
+	if runID == "" {
+		return p
+	}
+	p["runId"] = runID
+	if rec, err := deps.Admin.Runs().Get(ctx, runID); err == nil && rec != nil {
+		p["startedAt"] = rec.StartedAt
+	}
+	return p
 }
 
 // providerOptionsFor is the provider options a run is dispatched with (§3.1):

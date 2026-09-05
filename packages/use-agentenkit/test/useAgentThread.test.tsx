@@ -505,3 +505,160 @@ describe('structured parts (live)', () => {
     expect(body.maxSteps).toBe(3);
   });
 });
+
+describe('the current run and its clocks', () => {
+  const runningSnapshot = {
+    thread: { id: 't1', state: 'RUNNING' as const },
+    messages: [{ id: 'm1', role: 'user' as const, content: 'go', agentId: null }],
+    runs: [
+      { id: 'r0', agent: 'chat', depth: 0, state: 'COMPLETED' as const, startedAt: '2026-09-05T09:00:00Z', endedAt: '2026-09-05T09:00:10Z' },
+      { id: 'r1', agent: 'chat', depth: 0, state: 'RUNNING' as const, startedAt: '2026-09-05T10:00:00Z' },
+      { id: 'sub', agent: 'mailer', depth: 1, state: 'RUNNING' as const, startedAt: '2026-09-05T10:00:05Z' },
+    ],
+    lastEventSeq: 4,
+    activeEvents: [],
+  };
+
+  it('hydrates the latest dispatched run from the snapshot', async () => {
+    const { view } = await mount({ snapshot: runningSnapshot });
+    expect(view.result.current.currentRun).toEqual({ id: 'r1', startedAt: '2026-09-05T10:00:00Z' });
+  });
+
+  it('follows STATE_CHANGE without refetching history', async () => {
+    const { view, emit, calls } = await mount();
+    const fetched = () => calls.filter((c) => c.url.includes('/api/agent/history')).length;
+    const before = fetched();
+
+    await act(async () => {
+      emit({ seq: 8, type: 'STATE_CHANGE', payload: { state: 'RUNNING', runId: 'r2', startedAt: '2026-09-05T11:00:00Z' } });
+    });
+    expect(view.result.current.currentRun).toEqual({ id: 'r2', startedAt: '2026-09-05T11:00:00Z' });
+
+    // A park keeps the same run and the same clock.
+    await act(async () => {
+      emit({ seq: 9, type: 'STATE_CHANGE', payload: { state: 'WAITING_FOR_INPUT', runId: 'r2', startedAt: '2026-09-05T11:00:00Z' } });
+    });
+    expect(view.result.current.currentRun).toEqual({ id: 'r2', startedAt: '2026-09-05T11:00:00Z' });
+
+    // The end closes the clock, keeping the start it already knew.
+    await act(async () => {
+      emit({ seq: 10, type: 'STATE_CHANGE', payload: { state: 'CANCELLED', runId: 'r2', endedAt: '2026-09-05T11:01:32Z' } });
+    });
+    expect(view.result.current.currentRun).toEqual({
+      id: 'r2', startedAt: '2026-09-05T11:00:00Z', endedAt: '2026-09-05T11:01:32Z',
+    });
+    expect(fetched()).toBe(before);
+  });
+
+  it('starts a fresh clock when a new run begins', async () => {
+    const { view, emit } = await mount({ snapshot: runningSnapshot });
+    await act(async () => {
+      emit({ seq: 5, type: 'STATE_CHANGE', payload: { state: 'COMPLETED', runId: 'r1', endedAt: '2026-09-05T10:00:30Z' } });
+    });
+    await act(async () => {
+      await view.result.current.run('again');
+    });
+    // Until the stream names the new run, only its id is known.
+    expect(view.result.current.currentRun).toEqual({ id: 'r1' });
+    await act(async () => {
+      emit({ seq: 6, type: 'STATE_CHANGE', payload: { state: 'RUNNING', runId: 'r1', startedAt: '2026-09-05T10:05:00Z' } });
+    });
+    expect(view.result.current.currentRun).toEqual({ id: 'r1', startedAt: '2026-09-05T10:05:00Z' });
+  });
+
+  it("keeps a stop's endedAt over a later snapshot that lacks it", async () => {
+    const { view, emit } = await mount({ snapshot: runningSnapshot });
+    await act(async () => {
+      emit({ seq: 5, type: 'STATE_CHANGE', payload: { state: 'CANCELLED', runId: 'r1', endedAt: '2026-09-05T10:00:42Z' } });
+    });
+    // Reopen the thread: the snapshot still shows r1 without an end, as it
+    // does while the stopped worker is tearing down.
+    await act(async () => {
+      view.result.current.newThread();
+    });
+    expect(view.result.current.currentRun).toBeNull();
+    await act(async () => {
+      view.result.current.selectThread('t1');
+    });
+    await waitFor(() => expect(view.result.current.historyLoading).toBe(false));
+    expect(view.result.current.currentRun).toEqual({
+      id: 'r1', startedAt: '2026-09-05T10:00:00Z', endedAt: '2026-09-05T10:00:42Z',
+    });
+  });
+
+  it('ignores a STATE_CHANGE that names no run', async () => {
+    const { view, emit } = await mount({ snapshot: runningSnapshot });
+    await act(async () => {
+      emit({ seq: 5, type: 'STATE_CHANGE', payload: { state: 'COMPLETED' } });
+    });
+    expect(view.result.current.agentState).toBe('COMPLETED');
+    expect(view.result.current.currentRun).toEqual({ id: 'r1', startedAt: '2026-09-05T10:00:00Z' });
+  });
+});
+
+describe('tool call outcomes', () => {
+  it('flips only the call a result names, to done or to error', async () => {
+    const { view, emit } = await mount();
+    await act(async () => {
+      emit({ seq: 8, type: 'CHUNK', payload: { type: 'tool-call', toolCallId: 'c1', toolName: 'lookup', args: {} } });
+      emit({ seq: 9, type: 'CHUNK', payload: { type: 'tool-call', toolCallId: 'c2', toolName: 'broken', args: {} } });
+      emit({ seq: 10, type: 'CHUNK', payload: { type: 'tool-result', toolCallId: 'c2', toolName: 'broken', result: { error: 'boom' } } });
+    });
+    const calls = view.result.current.entries.flatMap((e) => e.parts).filter((p) => p.type === 'tool-call');
+    expect(calls).toMatchObject([
+      { toolCallId: 'c1', state: 'running' },
+      { toolCallId: 'c2', state: 'error', result: { error: 'boom' } },
+    ]);
+    // A replay of the same result changes nothing, and c1 stays running.
+    await act(async () => {
+      emit({ seq: 10, type: 'CHUNK', payload: { type: 'tool-result', toolCallId: 'c2', toolName: 'broken', result: { error: 'boom' } } });
+    });
+    const again = view.result.current.entries.flatMap((e) => e.parts).filter((p) => p.type === 'tool-call');
+    expect(again).toMatchObject([{ toolCallId: 'c1', state: 'running' }, { toolCallId: 'c2', state: 'error' }]);
+    expect(view.result.current.entries.filter((e) => e.parts.some((p) => p.type === 'tool-result'))).toHaveLength(1);
+  });
+
+  it('derives done and error from the durable tool messages on reload', async () => {
+    const { view } = await mount({
+      snapshot: {
+        thread: { id: 't1', state: 'COMPLETED' },
+        messages: [
+          { id: 'm1', role: 'user', content: 'go', agentId: null },
+          {
+            id: 'm2', role: 'assistant', agentId: null,
+            content: [
+              { type: 'tool-call', toolCallId: 'ok', toolName: 'lookup', args: {} },
+              { type: 'tool-call', toolCallId: 'threw', toolName: 'broken', args: {} },
+              { type: 'tool-call', toolCallId: 'unknown', toolName: 'gone', args: {} },
+              { type: 'tool-call', toolCallId: 'denied', toolName: 'wipe', args: {} },
+              { type: 'tool-call', toolCallId: 'open', toolName: 'slow', args: {} },
+            ],
+          },
+          {
+            id: 'm3', role: 'tool', agentId: null,
+            content: [
+              { type: 'tool-result', toolCallId: 'ok', toolName: 'lookup', result: { found: true } },
+              // What a failed tool's result looks like once stored.
+              { type: 'tool-result', toolCallId: 'threw', toolName: 'broken', result: 'error: boom' },
+              // An approval that resumed onto a tool that no longer exists.
+              { type: 'tool-result', toolCallId: 'unknown', toolName: 'gone', result: { error: 'Unknown tool: gone' } },
+              // A denial is an answer, not a failure.
+              { type: 'tool-result', toolCallId: 'denied', toolName: 'wipe', result: { denied: true } },
+            ],
+          },
+        ],
+        runs: [],
+        lastEventSeq: 9,
+        activeEvents: [],
+      },
+    });
+    const calls = view.result.current.entries.flatMap((e) => e.parts).filter((p) => p.type === 'tool-call');
+    expect(calls.map((p) => [p.toolCallId, p.state])).toEqual([
+      ['ok', 'done'],
+      ['threw', 'error'],
+      ['unknown', 'error'],
+      ['denied', 'done'],
+      ['open', 'running'],
+    ]);
+  });
+});

@@ -208,16 +208,16 @@ type runStore struct{ db *sql.DB }
 
 const runCols = `id, threadId, parentRunId, depth, agent, model, state, stopReason, error, startedAt, endedAt,
 	durationMs, queuedMs, attempts, steps, inputTokens, cachedInputTokens, outputTokens, totalTokens,
-	result, prompt, tokenBudget, runState, providerOptions`
+	result, prompt, tokenBudget, runState, providerOptions, settledAt`
 
 func scanRun(row interface{ Scan(...any) error }) (*ports.RunRecord, error) {
 	var r ports.RunRecord
 	var parent, stop, errMsg, result, prompt, runState, providerOptions sql.NullString
 	var started int64
-	var ended, duration, queued, budget sql.NullInt64
+	var ended, duration, queued, budget, settled sql.NullInt64
 	if err := row.Scan(&r.ID, &r.ThreadID, &parent, &r.Depth, &r.Agent, &r.Model, &r.State, &stop, &errMsg,
 		&started, &ended, &duration, &queued, &r.Attempts, &r.Steps, &r.InputTokens, &r.CachedInputTokens,
-		&r.OutputTokens, &r.TotalTokens, &result, &prompt, &budget, &runState, &providerOptions); err != nil {
+		&r.OutputTokens, &r.TotalTokens, &result, &prompt, &budget, &runState, &providerOptions, &settled); err != nil {
 		return nil, err
 	}
 	r.ParentRunID, r.StopReason, r.Error, r.Prompt = parent.String, stop.String, errMsg.String, prompt.String
@@ -225,6 +225,10 @@ func scanRun(row interface{ Scan(...any) error }) (*ports.RunRecord, error) {
 	if ended.Valid {
 		t := fromMs(ended.Int64)
 		r.EndedAt = &t
+	}
+	if settled.Valid {
+		t := fromMs(settled.Int64)
+		r.SettledAt = &t
 	}
 	if duration.Valid {
 		r.DurationMs = ports.Ptr(duration.Int64)
@@ -296,6 +300,9 @@ func (r runStore) Patch(ctx context.Context, runID string, p ports.RunPatch) err
 	}
 	if p.QueuedMs != nil {
 		set("queuedMs", *p.QueuedMs)
+	}
+	if p.SettledAt != nil {
+		set("settledAt", ms(*p.SettledAt))
 	}
 	if p.Steps != nil {
 		set("steps", *p.Steps)

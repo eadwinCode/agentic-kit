@@ -2,7 +2,9 @@ package agentenkit_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"sync"
@@ -22,10 +24,12 @@ import (
 // pgPlatform is the whole operational side on one Postgres: storage, kv,
 // bus and queue, prefixed so the tables never collide with another test's.
 type pgPlatform struct {
+	db      *sql.DB
 	storage *pgstorage.Storage
-	kv      *pgstorage.Kv
-	bus     *pgstorage.Bus
-	queue   *pgstorage.Queue
+
+	kv    *pgstorage.Kv
+	bus   *pgstorage.Bus
+	queue *pgstorage.Queue
 }
 
 func openPgPlatform(t *testing.T, prefix string, queueOpts pgstorage.QueueOptions) pgPlatform {
@@ -52,7 +56,7 @@ func openPgPlatform(t *testing.T, prefix string, queueOpts pgstorage.QueueOption
 		queue.Close()
 		db.Close()
 	})
-	return pgPlatform{storage: storage, kv: kv, bus: bus, queue: queue}
+	return pgPlatform{db: db, storage: storage, kv: kv, bus: bus, queue: queue}
 }
 
 func TestPostgresKv_BehavesLikeRedis(t *testing.T) {
@@ -302,4 +306,154 @@ func TestPostgresPlatform_RunsARunEndToEnd(t *testing.T) {
 		}
 	}
 	mustEqual(t, model.Calls(), 2, "two round trips")
+}
+
+// scopedEvents is a storage that needs a tenant on every read (§2.10):
+// what a listener serving every tenant cannot supply.
+type scopedEvents struct{ ports.EventStore }
+
+func (s scopedEvents) ListSince(ctx context.Context, threadID string, sinceSeq int64, sc ports.StorageContext) ([]ports.AgentEvent, error) {
+	if sc.State["tenant"] == nil {
+		return nil, errors.New("tenant scope required")
+	}
+	return s.EventStore.ListSince(ctx, threadID, sinceSeq, sc)
+}
+
+// An oversized durable event must reach a subscriber whose storage cannot
+// be read without a tenant, and a NOTIFY lost while the LISTEN connection
+// was down must be replayed, from the subscriber's own scope. Each event
+// arrives once, in order, on its own tenant's stream only.
+func TestPostgresBus_OversizedEventsOnScopedStorageAndReplayAfterReconnect(t *testing.T) {
+	p := openPgPlatform(t, "busscope_", pgstorage.QueueOptions{})
+	ctx := context.Background()
+	listener := pgxlisten.New(os.Getenv("TEST_ADMIN_PG"))
+	listener.Backoff = 50 * time.Millisecond
+	dropped := make(chan struct{}, 8)
+	listener.OnError = func(error) { dropped <- struct{}{} }
+
+	bus := pgstorage.NewBus(p.db, listener, scopedEvents{p.storage.Events()}, p.kv, pgstorage.BusOptions{Heartbeat: time.Hour})
+
+	type tenant struct {
+		name   string
+		thread string
+		sc     ports.StorageContext
+		got    chan ports.AgentEvent
+	}
+	var tenants []*tenant
+	for _, name := range []string{"a", "b"} {
+		sc := ports.StorageContext{State: ports.AgentRunState{"tenant": name}}
+		th, err := p.storage.Threads().Create(ctx, ports.ThreadInit{Model: "m"}, sc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tn := &tenant{name: name, thread: th.ID, sc: sc, got: make(chan ports.AgentEvent, 64)}
+		unsubscribe, err := bus.Subscribe(agentenkit.ContextWithRunState(ctx, sc.State), th.ID, func(e ports.AgentEvent) { tn.got <- e })
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = unsubscribe() })
+		tenants = append(tenants, tn)
+	}
+	// One seq counter per thread, kept like core keeps it, so the bus can
+	// anchor a replay on it.
+	next := map[string]int64{}
+	publish := func(tn *tenant, typ string, payload string) ports.AgentEvent {
+		t.Helper()
+		next[tn.thread]++
+		_, _ = p.kv.Incr(ctx, agentenkit.SeqKey(tn.thread))
+		e := ports.AgentEvent{ThreadID: tn.thread, Seq: next[tn.thread], Type: typ, Payload: json.RawMessage(payload), CreatedAt: time.Now()}
+		if err := p.storage.Events().Append(ctx, tn.thread, e, tn.sc); err != nil {
+			t.Fatal(err)
+		}
+		if err := bus.Publish(ctx, tn.thread, e); err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	expect := func(tn *tenant, seq int64, minBytes int) {
+		t.Helper()
+		select {
+		case e := <-tn.got:
+			if e.Seq == 0 {
+				t.Fatalf("tenant %s: unexpected notice %s", tn.name, e.Type)
+			}
+			mustEqual(t, e.ThreadID, tn.thread, "tenant "+tn.name+" thread")
+			mustEqual(t, e.Seq, seq, "tenant "+tn.name+" order")
+			if len(e.Payload) < minBytes {
+				t.Fatalf("tenant %s seq %d: payload %d bytes, want at least %d", tn.name, seq, len(e.Payload), minBytes)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("tenant %s: seq %d never arrived", tn.name, seq)
+		}
+	}
+	quiet := func(tn *tenant) {
+		t.Helper()
+		select {
+		case e := <-tn.got:
+			t.Fatalf("tenant %s: unexpected extra delivery seq %d %s", tn.name, e.Seq, e.Type)
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+
+	// The LISTEN connection comes up asynchronously: publish until it hears
+	// us, then drain the copies made while it was not.
+	deadline := time.Now().Add(5 * time.Second)
+	for heard := false; !heard; {
+		publish(tenants[0], "WARMUP", `{}`)
+		select {
+		case <-tenants[0].got:
+			heard = true
+		case <-time.After(200 * time.Millisecond):
+			if time.Now().After(deadline) {
+				t.Fatal("the listener never delivered")
+			}
+		}
+	}
+	for drained := false; !drained; {
+		select {
+		case <-tenants[0].got:
+		case <-time.After(300 * time.Millisecond):
+			drained = true
+		}
+	}
+
+	// Small, oversized, small: on a store that cannot be read from the
+	// listener, the big one still lands, in order, from the kv reference.
+	big := `{"blob":"` + strings.Repeat("x", 20_000) + `"}`
+	for _, tn := range tenants {
+		base := next[tn.thread]
+		publish(tn, "SMALL", `{"n":1}`)
+		publish(tn, "BIG", big)
+		publish(tn, "SMALL", `{"n":3}`)
+		expect(tn, base+1, 0)
+		expect(tn, base+2, 20_000)
+		expect(tn, base+3, 0)
+	}
+
+	// The LISTEN connection drops. What is published while it is down is
+	// never notified; once it is back, each subscriber gets it from the log,
+	// read with its own tenant.
+	if _, err := p.db.ExecContext(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND query ILIKE 'listen %'`); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-dropped: // the connection is confirmed gone; nothing hears the next NOTIFY
+	case <-time.After(5 * time.Second):
+		t.Fatal("the LISTEN connection never dropped")
+	}
+	var missed []ports.AgentEvent
+
+	for _, tn := range tenants {
+		missed = append(missed, publish(tn, "MISSED", big))
+	}
+	for i, tn := range tenants {
+		expect(tn, missed[i].Seq, 20_000)
+	}
+	// Live again: the replay must not have moved anything twice, and a fresh
+	// event arrives once.
+	for _, tn := range tenants {
+		e := publish(tn, "AFTER", `{"n":5}`)
+		expect(tn, e.Seq, 0)
+		quiet(tn)
+	}
 }
