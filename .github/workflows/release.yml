@@ -19,6 +19,9 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # Publish the nested Go module tag.
+      id-token: write
 
     # The same Postgres CI uses. The suite fails loudly without it rather than
     # skipping — which is right, and is why the first v0.1.0 run stopped before
@@ -45,6 +48,11 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: packages/go-agentenkit/go.mod
+          cache-dependency-path: packages/go-agentenkit/go.sum
 
       # Writes the .npmrc that NODE_AUTH_TOKEN below fills in.
       - uses: actions/setup-node@v4
@@ -77,12 +85,25 @@ jobs:
       - name: Test
         run: bun run test
 
+      - name: Test Go module
+        working-directory: packages/go-agentenkit
+        run: go test -race -count=1 ./...
+
+      - name: Test Go release tagging
+        run: bash .github/scripts/test-publish-go-tag.sh
+
       - name: Build
         run: bun run build
 
       # The published tarball must be importable, not merely compilable.
       - name: Verify the packages import from a clean install
         run: bash .github/scripts/verify-package.sh
+
+      # Go modules in subdirectories require a path-prefixed tag. Publish it
+      # before npm so a partially published npm release cannot block a retry.
+      - name: Publish Go module tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: bash .github/scripts/publish-go-tag.sh "$GITHUB_REF_NAME" "$GITHUB_SHA"
 
       - name: Publish agentenkit
         if: startsWith(github.ref, 'refs/tags/')
