@@ -62,6 +62,12 @@ is assumed.
 `run`, `stop`, `respondToInput`, `newThread`, `selectThread`, `deleteThread`,
 `loadThreads`, `loadUsage`.
 
+`stop()` and `respondToInput()` return `true` when the server confirms the
+action, and `false` on refusal or a transport failure. Failures appear in
+`activity.label` and `activity.detail`; `agentState` still reflects the run.
+Approval cards stay visible until delivery is confirmed. Customize the error
+labels with `labels.stopFailed` and `labels.responseFailed`.
+
 ## Entries
 
 ```ts

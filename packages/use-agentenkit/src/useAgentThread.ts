@@ -49,8 +49,9 @@ export interface UseAgentThread {
   selectThread: (threadId: string) => void;
   deleteThread: (threadId: string) => Promise<boolean>;
   run: (prompt: string, options?: RunOptions) => Promise<RunResult>;
-  stop: () => Promise<void>;
-  respondToInput: (toolCallId: string, approved: boolean, payload?: unknown) => Promise<void>;
+  /** False on refusal or transport failure; activity.detail explains why. */
+  stop: () => Promise<boolean>;
+  respondToInput: (toolCallId: string, approved: boolean, payload?: unknown) => Promise<boolean>;
 }
 
 export interface RunOptions {
@@ -702,28 +703,49 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
   );
 
   const stop = useCallback(async () => {
-    if (!threadRef.current) return;
+    const requestedThread = threadRef.current;
+    if (!requestedThread) return false;
     const cfg = cfgRef.current;
-    await postJson(cfg.baseUrl + cfg.routes.stop, { threadId: threadRef.current });
+    try {
+      const response = await postJson(cfg.baseUrl + cfg.routes.stop, { threadId: requestedThread });
+      await checkControlResponse(response, 'accepted', cfg.labels.stopFailed);
+      return true;
+    } catch (error) {
+      if (threadRef.current === requestedThread) setActivity({
+        phase: 'failed', label: cfg.labels.stopFailed,
+        detail: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
   }, [postJson]);
 
   const respondToInput = useCallback(
     async (toolCallId: string, approved: boolean, payload?: unknown) => {
-      if (!threadRef.current) return;
+      const requestedThread = threadRef.current;
+      if (!requestedThread) return false;
       const cfg = cfgRef.current;
-      // Drop this card straight away; the run only moves once the LAST open
-      // approval is answered, so the others stay on screen.
-      setPendingInputs((prev) => prev.filter((r) => r.toolCallId !== toolCallId));
-      setActivity({
-        phase: 'thinking',
-        label: approved ? cfg.labels.approvalSent : cfg.labels.requestDenied,
-      });
-      await postJson(cfg.baseUrl + cfg.routes.respond, {
-        threadId: threadRef.current,
-        toolCallId,
-        approved,
-        payload,
-      });
+      try {
+        const response = await postJson(cfg.baseUrl + cfg.routes.respond, {
+          threadId: requestedThread, toolCallId, approved, payload,
+        });
+        await checkControlResponse(response, 'delivered', cfg.labels.responseFailed);
+        if (threadRef.current === requestedThread) {
+          setPendingInputs((prev) => prev.filter((r) => r.toolCallId !== toolCallId));
+          // A stream event may already have resumed or finished the run.
+          // A delayed HTTP acknowledgement must not replace that activity.
+          setActivity((current) => current.phase === 'waiting-input' ||
+            (current.phase === 'failed' && current.label === cfg.labels.responseFailed)
+            ? { phase: 'thinking', label: approved ? cfg.labels.approvalSent : cfg.labels.requestDenied }
+            : current);
+        }
+        return true;
+      } catch (error) {
+        if (threadRef.current === requestedThread) setActivity({
+          phase: 'failed', label: cfg.labels.responseFailed,
+          detail: error instanceof Error ? error.message : String(error),
+        });
+        return false;
+      }
     },
     [postJson],
   );
@@ -751,3 +773,13 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
 }
 
 export { withQuery };
+
+async function checkControlResponse(response: Response, field: 'accepted' | 'delivered', label: string): Promise<void> {
+  const data = await response.json().catch(() => null);
+  // Support custom routes returning { ok: true }, but an explicit refusal
+  // always wins over that legacy envelope.
+  if (!response.ok || !data || data[field] === false ||
+      (data[field] !== true && data.ok !== true)) {
+    throw new Error(data?.error ?? data?.reason ?? `${label} (${response.status})`);
+  }
+}

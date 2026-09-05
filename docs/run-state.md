@@ -94,3 +94,14 @@ a cancellation:
 ```ts
 await chat.stop(threadId, { orgId: 'acme' });
 ```
+
+An accepted stop also closes the current run's operational record with
+`state: 'CANCELLED'`, `stopReason: 'cancelled'`, `endedAt`, and `durationMs`.
+This includes runs still queued or waiting for input, which may never reach a
+worker again. Read the record through `runtime.admin.getRun(runId)` or list
+the thread's runs through `runtime.admin.listRunsByThread(threadId)`.
+
+The durable `STATE_CHANGE` event emitted by `stop` includes the stopped
+`runId`, `stopReason: 'cancelled'`, and `endedAt`. This timestamp records the
+accepted stop; a running worker can still add usage during teardown without
+changing it. Existing step and token counters are preserved by `stop`.

@@ -1,7 +1,9 @@
 import type { RuntimePorts, RunInput, RunResult } from '../ports/runtime.js';
 import type { RegisteredAgent } from './agent.js';
 import { reclaimIfOrphaned } from './reclaim.js';
-import { claimRun } from './keys.js';
+import { runIdKey } from './keys.js';
+import { recordStoppedRun } from './stop.js';
+import { randomUUID } from 'node:crypto';
 import { publish, setThreadState, publishEvent } from './publish.js';
 import { mergeProviderOptions } from './types.js';
 
@@ -27,7 +29,11 @@ export async function run(
   await reclaimIfOrphaned(deps, threadId);
 
   const state = await deps.kv.get(`agent:state:${threadId}`);
-  if (state === 'RUNNING' || state === 'WAITING_FOR_INPUT') {
+  const thread = await deps.storage.threads.get(threadId);
+  if (!thread) return { accepted: false, threadId, error: 'Thread not found' };
+  const initialState = thread.state;
+  if (state === 'RUNNING' || state === 'WAITING_FOR_INPUT' ||
+      thread.state === 'RUNNING' || thread.state === 'WAITING_FOR_INPUT') {
     return { accepted: false, threadId, error: 'Thread has an active run' };
   }
 
@@ -61,93 +67,159 @@ export async function run(
     if (target.role !== 'user') {
       return { accepted: false, threadId, error: 'Only a user message can be edited' };
     }
-    await deps.storage.messages.deleteFrom(threadId, input.editMessageId);
-    // Other clients are showing turns that no longer exist (§2.2). The tab
-    // that made the edit truncated its own view; every other one needs telling.
-    await publish(deps, threadId, 'MESSAGES_DROPPED', { fromMessageId: input.editMessageId });
   }
 
-  const userMessage = await deps.storage.messages.append(threadId, {
-    role: 'user',
-    content: input.prompt,
-  });
+  // The durable store already provides an atomic state claim. Do this before
+  // editing or appending history, so only the winning send changes the thread.
+  const runId = randomUUID();
+  const previousRunId = await deps.kv.get(runIdKey(threadId));
+  const admitted = await deps.storage.threads.claimState(threadId, initialState, 'RUNNING');
+  if (!admitted) return { accepted: false, threadId, error: 'Thread has an active run' };
 
-  // The user's turn goes on the bus like everything else (§2.2). Without it a
-  // second client watching the same thread sees the reply stream in with no
-  // question in front of it — the sending tab had only ever added the message
-  // to its own local state.
-  await publish(deps, threadId, 'MESSAGE_APPENDED', {
-    id: userMessage.id,
-    role: userMessage.role,
-    content: userMessage.content,
-    agentId: userMessage.agentId,
-    createdAt: userMessage.createdAt,
-  });
+  let installed = false;
+  try {
+    await deps.kv.set(runIdKey(threadId), runId);
+    installed = true;
 
-  // Claim the thread for THIS run before the state key is touched (§2.1). The
-  // next line overwrites whatever stop() may have just written, so the run id
-  // — not the state key — is what retires a worker still running the previous
-  // message.
-  const runId = await claimRun(deps, threadId);
+    await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
 
-  await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
-  await setThreadState(deps, threadId, 'RUNNING', model);
-  // A durable run boundary lets reconnecting clients distinguish this turn's
-  // in-flight chunks from earlier completed turns.
-  await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
+    // The run's durable record opens here (§2.9): a thread accumulates many runs
+    // and Thread.state only ever describes the latest, so this is the only place
+    // "what happened, how long, what did it cost" can be answered from.
+    await deps.admin.runs.start({
+      id: runId, threadId, agent: agent.name, model,
+      // What this run was asked to do (§2.9) — without it a dashboard can show
+      // that a run was slow but not what it was slow at.
+      ...(deps.config.recordPayloads
+        ? {
+            prompt:
+              input.prompt.length > deps.config.payloadCapChars
+                ? `${input.prompt.slice(0, deps.config.payloadCapChars)}…`
+                : input.prompt,
+            tokenBudget: input.tokenBudget ?? null,
+            runState: input.state ?? null,
+            providerOptions: providerOptionsFor(deps, agent, input),
+          }
+        : {}),
+    });
 
-  // The run's durable record opens here (§2.9): a thread accumulates many runs
-  // and Thread.state only ever describes the latest, so this is the only place
-  // "what happened, how long, what did it cost" can be answered from.
-  await deps.admin.runs.start({
-    id: runId, threadId, agent: agent.name, model,
-    // What this run was asked to do (§2.9) — without it a dashboard can show
-    // that a run was slow but not what it was slow at.
-    ...(deps.config.recordPayloads
-      ? {
-          prompt:
-            input.prompt.length > deps.config.payloadCapChars
-              ? `${input.prompt.slice(0, deps.config.payloadCapChars)}…`
-              : input.prompt,
-          tokenBudget: input.tokenBudget ?? null,
-          runState: input.state ?? null,
-          providerOptions: providerOptionsFor(deps, agent, input),
-        }
-      : {}),
-  });
+    if (!await dispatchActive(deps, threadId, runId)) {
+      return { accepted: false, threadId, runId, error: 'Run was stopped before dispatch' };
+    }
 
-  // What started the thread (§2.9), recorded once: the first dispatched
-  // run's parameters. A later run never overwrites it. Observability must
-  // never fail a run, so this is best-effort.
-  await deps.admin.threads
-    .upsert({
-      id: threadId, state: 'RUNNING', model,
-      startedWith: {
-        runId, agent: agent.name, model, at: new Date(),
-        ...(deps.config.recordPayloads
-          ? {
-              prompt: capText(input.prompt, deps.config.payloadCapChars),
-              tokenBudget: input.tokenBudget ?? null,
-              state: input.state ?? null,
-              providerOptions: providerOptionsFor(deps, agent, input),
-            }
-          : {}),
-      },
-    })
-    .catch(() => undefined);
+    if (input.editMessageId) {
+      await deps.storage.messages.deleteFrom(threadId, input.editMessageId);
+      // Other clients are showing turns that no longer exist (§2.2). The tab
+      // that made the edit truncated its own view; every other one needs telling.
+      await publish(deps, threadId, 'MESSAGES_DROPPED', { fromMessageId: input.editMessageId });
+    }
 
-  await deps.queue.enqueue({
-    threadId, runId, model, agent: agent.name,
-    enqueuedAt: Date.now(),
-    // Persisted on the ticket so a worker — or a resume after an approval,
-    // hours later, in another process — rehydrates the same state (§2.10).
-    ...(input.state ? { state: input.state } : {}),
-    tokenBudget: input.tokenBudget,
-    costBudgetMicros: input.costBudgetMicros,
-    providerOptions: input.providerOptions,
-  });
+    const userMessage = await deps.storage.messages.append(threadId, {
+      role: 'user',
+      content: input.prompt,
+    });
 
-  return { accepted: true, threadId, runId, state: 'RUNNING' };
+    // The user's turn goes on the bus like everything else (§2.2). Without it a
+    // second client watching the same thread sees the reply stream in with no
+    // question in front of it — the sending tab had only ever added the message
+    // to its own local state.
+    await publish(deps, threadId, 'MESSAGE_APPENDED', {
+      id: userMessage.id,
+      role: userMessage.role,
+      content: userMessage.content,
+      agentId: userMessage.agentId,
+      createdAt: userMessage.createdAt,
+    });
+
+    // Admission already set durable RUNNING. Never overwrite a stop that
+    // arrived while history was being persisted.
+    if (!await dispatchActive(deps, threadId, runId)) {
+      return { accepted: false, threadId, runId, error: 'Run was stopped before dispatch' };
+    }
+    // A durable run boundary lets reconnecting clients distinguish this turn's
+    // in-flight chunks from earlier completed turns.
+    await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
+
+    // What started the thread (§2.9), recorded once: the first dispatched
+    // run's parameters. A later run never overwrites it. Observability must
+    // never fail a run, so this is best-effort.
+    await deps.admin.threads
+      .upsert({
+        id: threadId, state: 'RUNNING', model,
+        startedWith: {
+          runId, agent: agent.name, model, at: new Date(),
+          ...(deps.config.recordPayloads
+            ? {
+                prompt: capText(input.prompt, deps.config.payloadCapChars),
+                tokenBudget: input.tokenBudget ?? null,
+                state: input.state ?? null,
+                providerOptions: providerOptionsFor(deps, agent, input),
+              }
+            : {}),
+        },
+      })
+      .catch(() => undefined);
+
+    if (!await dispatchActive(deps, threadId, runId)) {
+      return { accepted: false, threadId, runId, error: 'Run was stopped before dispatch' };
+    }
+    await deps.queue.enqueue({
+      threadId, runId, model, agent: agent.name,
+      enqueuedAt: Date.now(),
+      // Persisted on the ticket so a worker — or a resume after an approval,
+      // hours later, in another process — rehydrates the same state (§2.10).
+      ...(input.state ? { state: input.state } : {}),
+      tokenBudget: input.tokenBudget,
+      costBudgetMicros: input.costBudgetMicros,
+      providerOptions: input.providerOptions,
+    });
+
+    return { accepted: true, threadId, runId, state: 'RUNNING' };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    await failDispatch(deps, threadId, runId, model, error, installed ? undefined : previousRunId);
+    return { accepted: false, threadId, runId, error };
+  }
+}
+
+/** Stop can arrive while a request is still preparing its dispatch. */
+async function dispatchActive(deps: RuntimePorts, threadId: string, runId: string): Promise<boolean> {
+  const current = await deps.kv.get(runIdKey(threadId));
+  const thread = await deps.storage.threads.get(threadId);
+  if (current === runId && thread?.state === 'RUNNING') return true;
+  await recordStoppedRun(deps, runId, new Date());
+  if (current === runId && thread?.state === 'CANCELLED') {
+    await deps.kv.set(`agent:state:${threadId}`, 'CANCELLED');
+  }
+  return false;
+}
+
+/** A rejected dispatch must not leave an active thread with no worker.
+ *  Conditional cleanup cannot overwrite a stop or a newer run. */
+async function failDispatch(
+  deps: RuntimePorts, threadId: string, runId: string,
+  model: string, error: string,
+  previousRunId?: string | null,
+): Promise<void> {
+  const key = `agent:state:${threadId}`;
+  const current = await deps.kv.get(runIdKey(threadId));
+  // If installing the identity failed, the reservation can still be ours
+  // under the prior id. Never close or modify that prior run's record.
+  if (current !== runId && (previousRunId === undefined || current !== previousRunId)) return;
+  if (!await deps.storage.threads.claimState(threadId, 'RUNNING', 'FAILED')) return;
+  await deps.kv.set(key, 'FAILED');
+  await setThreadState(deps, threadId, 'FAILED', model);
+  try {
+    const prior = await deps.admin.runs.get(runId);
+    if (prior) {
+      const endedAt = new Date();
+      await deps.admin.runs.patch(runId, {
+        state: 'FAILED', stopReason: 'failed', error, endedAt,
+        durationMs: endedAt.getTime() - new Date(prior.startedAt).getTime(),
+      });
+    }
+  } catch { /* Operational history must not block dispatch recovery. */ }
+  await publish(deps, threadId, 'STATE_CHANGE', { state: 'FAILED', stopReason: 'failed', runId, error });
 }
 
 /** The provider options a run is dispatched with (§3.1): config → spec →

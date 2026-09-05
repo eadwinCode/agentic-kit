@@ -80,6 +80,29 @@ function danglingCalls(prompt: any[]): string[] {
 }
 
 describe('stop while parked (§2.5)', () => {
+  it('records a queued stop before any worker runs and keeps it after redelivery', async () => {
+    const { model, prompts } = scriptedModel([{ text: 'should not run' }]);
+    const r = await makeRuntime(model);
+    const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
+    const ran = await chat.run({ prompt: 'go' });
+    expect((await chat.stop(ran.threadId)).accepted).toBe(true);
+
+    const stopped = (await r.admin.runs.get(ran.runId!))!;
+    expect(stopped).toMatchObject({ state: 'CANCELLED', stopReason: 'cancelled', totalTokens: 0 });
+    expect(stopped.endedAt).toBeInstanceOf(Date);
+    expect(stopped.durationMs).toBeGreaterThanOrEqual(0);
+    const events = await r.storage.events.listSince(ran.threadId, 0);
+    expect(events.at(-1)!.payload).toMatchObject({
+      state: 'CANCELLED', stopReason: 'cancelled', runId: ran.runId, endedAt: stopped.endedAt,
+    });
+    expect((await r.runtime.admin.stats()).byStopReason.cancelled).toBe(1);
+
+    expect((await chat.stop(ran.threadId)).accepted).toBe(false);
+    await r.runtime.worker.handleJob(r.queue.items[0]!);
+    expect(prompts).toEqual([]);
+    expect((await r.admin.runs.get(ran.runId!))!.endedAt).toEqual(stopped.endedAt);
+  });
+
   it('closes the dangling tool call, so the next run sends a well-formed prompt', async () => {
     const executed: string[] = [];
     const { model, prompts } = scriptedModel([
@@ -99,8 +122,16 @@ describe('stop while parked (§2.5)', () => {
     const ran = await chat.run({ prompt: 'go' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
     expect(roles(r.storage, ran.threadId)).toEqual(['user', 'assistant']); // parked: no result yet
+    const prior = (await r.admin.runs.get(ran.runId!))!;
+    const { totalTokens, steps } = prior;
+    expect(totalTokens).toBe(15);
+    expect(steps).toBe(1);
 
     expect((await chat.stop(ran.threadId)).accepted).toBe(true);
+    const stopped = (await r.admin.runs.get(ran.runId!))!;
+    expect(stopped).toMatchObject({ state: 'CANCELLED', stopReason: 'cancelled', totalTokens, steps });
+    expect(stopped.endedAt).toBeInstanceOf(Date);
+    expect(stopped.durationMs).toBeGreaterThanOrEqual(0);
     expect(roles(r.storage, ran.threadId)).toEqual(['user', 'assistant', 'tool']);
     const closed = r.storage.messages.store.get(ran.threadId)!.at(-1)!.content as any[];
     expect(closed[0]).toMatchObject({ type: 'tool-result', toolCallId: 'c1', result: { cancelled: true, reason: 'stopped' } });
@@ -138,6 +169,34 @@ describe('stop while parked (§2.5)', () => {
     expect((r.storage.messages.store.get(ran.threadId)!.at(-1)!.content as any[])[0].toolCallId).toBe('s1');
     expect(roles(r.storage, ran.threadId, childId)).toEqual(['user', 'assistant', 'tool']);
     expect((await r.admin.runs.get(childId))!.state).toBe('CANCELLED');
+    expect((await r.admin.runs.get(childId))!.durationMs).toBeGreaterThanOrEqual(0);
+    expect((await r.admin.runs.get(ran.runId!))!.state).toBe('CANCELLED');
+  });
+
+  it('accumulates each parked segment once, then includes it in the completed totals', async () => {
+    const { model } = scriptedModel([
+      { toolCalls: [{ toolCallId: 'c1', toolName: 'wipe', args: {} }] },
+      { toolCalls: [{ toolCallId: 'c2', toolName: 'wipe', args: {} }] },
+      { text: 'done' },
+    ]);
+    const r = await makeRuntime(model);
+    const chat = r.runtime.createStreamTextAgent({
+      name: 'chat', model: 'gpt-4o', tools: {
+        wipe: markRequiresConfirmation(agentTool({ parameters: z.object({}), execute: async () => 'ok' })),
+      },
+    });
+    const ran = await chat.run({ prompt: 'go' });
+    await r.runtime.worker.handleJob(r.queue.items[0]!);
+    expect((await r.admin.runs.get(ran.runId!))!).toMatchObject({ steps: 1, totalTokens: 15 });
+    // Redelivery with no answer must not accrue the same segment again.
+    await r.runtime.worker.handleJob(r.queue.items[0]!);
+    expect((await r.admin.runs.get(ran.runId!))!).toMatchObject({ steps: 1, totalTokens: 15 });
+    for (const [i, toolCallId] of ['c1', 'c2'].entries()) {
+      expect((await r.runtime.hitl.respond({ threadId: ran.threadId, toolCallId, approved: false })).delivered).toBe(true);
+      await r.runtime.worker.handleJob(r.queue.items.at(-1)!);
+      expect((await r.admin.runs.get(ran.runId!))!).toMatchObject({ steps: i + 2, totalTokens: (i + 2) * 15 });
+    }
+    expect((await r.admin.runs.get(ran.runId!))!).toMatchObject({ state: 'COMPLETED', inputTokens: 30, outputTokens: 15 });
   });
 });
 

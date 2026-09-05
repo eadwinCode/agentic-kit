@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
@@ -22,21 +23,45 @@ func Stop(ctx context.Context, deps ports.RuntimePorts, threadID string) (ports.
 		}
 		return ports.StopResult{Accepted: false, Error: fmt.Sprintf("Cannot stop thread in state %s", state)}, nil
 	}
+	wasParked := thread.State == ports.StateWaitingForInput
+	runID, err := CurrentRunID(ctx, deps, threadID)
+	if err != nil {
+		return ports.StopResult{}, err
+	}
+	endedAt := time.Now()
 	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateCancelled), ports.SetOptions{}); err != nil {
 		return ports.StopResult{}, err
 	}
 	if err := SetThreadState(ctx, deps, threadID, ports.StateCancelled, thread.Model); err != nil {
 		return ports.StopResult{}, err
 	}
-	if _, err := Publish(ctx, deps, threadID, "STATE_CHANGE", map[string]any{"state": ports.StateCancelled}); err != nil {
+	if runID != "" {
+		recordStoppedRun(ctx, deps, runID, endedAt)
+	}
+	if _, err := Publish(ctx, deps, threadID, "STATE_CHANGE", map[string]any{
+		"state": ports.StateCancelled, "stopReason": "cancelled", "runId": runID, "endedAt": endedAt,
+	}); err != nil {
 		return ports.StopResult{}, err
 	}
-	if thread.State == ports.StateWaitingForInput {
+	if wasParked {
 		if err := closeOpenParks(ctx, deps, threadID); err != nil {
 			return ports.StopResult{}, err
 		}
 	}
 	return ports.StopResult{Accepted: true}, nil
+}
+
+// A queued or parked run may never execute again. Close its record at stop
+// without overwriting usage a running worker may still be accruing.
+func recordStoppedRun(ctx context.Context, deps ports.RuntimePorts, runID string, endedAt time.Time) {
+	prior, err := deps.Admin.Runs().Get(ctx, runID)
+	if err != nil || prior == nil || prior.State == ports.StateCancelled {
+		return
+	}
+	_ = deps.Admin.Runs().Patch(ctx, runID, ports.RunPatch{
+		State: ports.Ptr(ports.StateCancelled), StopReason: ports.Ptr("cancelled"),
+		EndedAt: &endedAt, DurationMs: ports.Ptr(endedAt.Sub(prior.StartedAt).Milliseconds()),
+	})
 }
 
 // closeOpenParks answers every open approval with a cancellation, so the
@@ -51,7 +76,6 @@ func closeOpenParks(ctx context.Context, deps ports.RuntimePorts, threadID strin
 	if err != nil {
 		return err
 	}
-	cancelled := ports.StateCancelled
 	result := map[string]any{"cancelled": true, "reason": "stopped"}
 	for _, p := range open {
 		if _, err := deps.Storage.Messages.Append(ctx, threadID, ports.NewMessage{
@@ -60,7 +84,7 @@ func closeOpenParks(ctx context.Context, deps ports.RuntimePorts, threadID strin
 			return err
 		}
 		if p.Nested != nil {
-			_ = deps.Admin.Runs().Patch(ctx, p.Nested.AgentID, ports.RunPatch{State: &cancelled, StopReason: ports.Ptr("cancelled")})
+			recordStoppedRun(ctx, deps, p.Nested.AgentID, time.Now())
 		}
 		for _, f := range p.Frames {
 			if _, err := deps.Storage.Messages.Append(ctx, threadID, ports.NewMessage{
@@ -69,7 +93,7 @@ func closeOpenParks(ctx context.Context, deps ports.RuntimePorts, threadID strin
 				return err
 			}
 			if f.Nested != nil {
-				_ = deps.Admin.Runs().Patch(ctx, f.Nested.AgentID, ports.RunPatch{State: &cancelled, StopReason: ports.Ptr("cancelled")})
+				recordStoppedRun(ctx, deps, f.Nested.AgentID, time.Now())
 			}
 		}
 	}

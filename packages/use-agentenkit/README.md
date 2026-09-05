@@ -165,6 +165,12 @@ State: `threadId`, `entries`, `agentState`, `activity`, `historyLoading`,
 Actions: `run`, `stop`, `respondToInput`, `newThread`, `selectThread`,
 `deleteThread`, `loadThreads`, `loadUsage`.
 
+`stop()` and `respondToInput()` return a boolean: `true` confirms delivery;
+`false` reports refusal or transport failure through `activity.label` and
+`activity.detail`. The run's state is preserved on failure, and an approval
+card remains visible until delivery succeeds. The error labels are
+configurable as `labels.stopFailed` and `labels.responseFailed`.
+
 An entry is `{ id, kind, role, text, agentId }`, where `kind` is `'text'`,
 `'tool'` or `'reasoning'`.
 

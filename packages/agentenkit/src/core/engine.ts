@@ -173,10 +173,13 @@ async function closeRunRecord(
   try {
     const prior = await deps.admin.runs.get(runId);
     if (!prior) return; // a run started before §2.9, or a foreign dispatch
-    const endedAt = new Date();
+    // stop() already records when the user ended this run. Worker teardown
+    // may add usage, but must not move that timestamp or undo cancellation.
+    const cancelled = prior.state === 'CANCELLED';
+    const endedAt = cancelled && prior.endedAt ? new Date(prior.endedAt) : new Date();
     await deps.admin.runs.patch(runId, {
-      state: f.state,
-      stopReason: f.stopReason,
+      state: cancelled ? 'CANCELLED' : f.state,
+      stopReason: cancelled ? 'cancelled' : f.stopReason,
       ...(f.error ? { error: f.error } : {}),
       endedAt,
       durationMs: endedAt.getTime() - new Date(prior.startedAt).getTime(),
@@ -509,6 +512,18 @@ export async function execute(
       // recorded and priced as it happened (§4), so there is nothing left to
       // bill here. NO state flip: WAITING_FOR_INPUT (or CANCELLED if the user
       // stopped meanwhile) stands.
+      if (runId) {
+        try {
+          const prior = await deps.admin.runs.get(runId);
+          if (prior) await deps.admin.runs.patch(runId, {
+            steps: prior.steps + loop.steps,
+            inputTokens: prior.inputTokens + attribution.inputTokens,
+            cachedInputTokens: prior.cachedInputTokens + attribution.cachedInputTokens,
+            outputTokens: prior.outputTokens + attribution.outputTokens,
+            totalTokens: prior.totalTokens + attribution.totalTokens,
+          });
+        } catch { /* Operational history must not fail a parked run. */ }
+      }
       return 'executed';
     }
 
@@ -607,6 +622,10 @@ export async function finalize(
   // message the user just sent (§2.1).
   if (f.runId !== undefined && (await deps.kv.get(runIdKey(threadId))) !== f.runId) return;
 
+  if ((await deps.kv.get(`agent:state:${threadId}`)) === 'CANCELLED') {
+    f = { ...f, state: 'CANCELLED', stopReason: 'cancelled', oneShotText: undefined };
+  }
+
   if (f.oneShotText !== undefined) {
     // One-shot flavor: no CHUNK stream — publish the final text as one event
     await publish(deps, threadId, 'TEXT_RESULT', { text: f.oneShotText });
@@ -655,6 +674,7 @@ async function redriveOnLockConflict(
         // dispatched with — a retry that lost its money cap would be unbounded.
         costBudgetMicros: input.costBudgetMicros,
         providerOptions: input.providerOptions,
+        state: input.state,
       },
       { delaySeconds: deps.config.runRedriveDelaySeconds },
     );
@@ -712,6 +732,7 @@ export async function executeWithPolicy(
         // dispatched with — a retry that lost its money cap would be unbounded.
         costBudgetMicros: input.costBudgetMicros,
         providerOptions: input.providerOptions,
+        state: input.state,
       });
     }
 

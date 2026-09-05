@@ -26,6 +26,11 @@ func TestStop_TearsARunningWorkerDown(t *testing.T) {
 	if _, err := chat.Stop(h.ctx, ran.ThreadID, nil); err != nil {
 		t.Fatal(err)
 	}
+	stopped, _ := h.admin.Runs().Get(h.ctx, ran.RunID)
+	if stopped.EndedAt == nil || stopped.DurationMs == nil {
+		t.Fatal("stop did not record timing before worker teardown")
+	}
+	stoppedAt := *stopped.EndedAt
 	wg.Wait()
 	if time.Since(started) > 400*time.Millisecond {
 		t.Fatal("the stop did not interrupt the model call")
@@ -38,6 +43,58 @@ func TestStop_TearsARunningWorkerDown(t *testing.T) {
 	mustEqual(t, h.queue.Len(), 0, "a stop is never retried")
 	rec, _ := h.admin.Runs().Get(h.ctx, ran.RunID)
 	mustEqual(t, rec.State, agentenkit.StateCancelled, "run record")
+	if rec.EndedAt == nil || !rec.EndedAt.Equal(stoppedAt) {
+		t.Fatal("worker teardown changed the stop timestamp")
+	}
+}
+
+func TestStop_TracksQueuedAndParkedRunsWithoutAnotherWorker(t *testing.T) {
+	for _, parked := range []bool{false, true} {
+		name := "queued"
+		if parked {
+			name = "parked"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := makeRuntime(t, scripted(step{calls: []call{{"c1", "wipe", `{}`}}}))
+			wipe := tool("wipe", nil)
+			wipe.RequiresConfirmation = true
+			chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat", Tools: []agentenkit.Tool{wipe}})
+			ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
+			if parked {
+				h.handleNext(t)
+				mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateWaitingForInput, "parked")
+			}
+			prior, _ := h.admin.Runs().Get(h.ctx, ran.RunID)
+			res, err := chat.Stop(h.ctx, ran.ThreadID, nil)
+			if err != nil || !res.Accepted {
+				t.Fatalf("stop: %+v %v", res, err)
+			}
+			stopped, _ := h.admin.Runs().Get(h.ctx, ran.RunID)
+			mustEqual(t, stopped.State, agentenkit.StateCancelled, "run state")
+			mustEqual(t, stopped.StopReason, "cancelled", "reason")
+			mustEqual(t, stopped.TotalTokens, prior.TotalTokens, "usage retained")
+			mustEqual(t, stopped.Steps, prior.Steps, "steps retained")
+			if stopped.EndedAt == nil || stopped.DurationMs == nil || *stopped.DurationMs < 0 {
+				t.Fatal("missing stop timing")
+			}
+			term := h.lastTerminal(ran.ThreadID)
+			mustEqual(t, term["runId"], ran.RunID, "event run identity")
+			mustEqual(t, term["stopReason"], "cancelled", "event reason")
+			if term["endedAt"] == nil {
+				t.Fatal("missing event timestamp")
+			}
+			res, err = chat.Stop(h.ctx, ran.ThreadID, nil)
+			if err != nil || res.Accepted {
+				t.Fatalf("repeat stop: %+v %v", res, err)
+			}
+			h.drain(t)
+			redelivered, _ := h.admin.Runs().Get(h.ctx, ran.RunID)
+			mustEqual(t, redelivered.State, agentenkit.StateCancelled, "state after redelivery")
+			if !redelivered.EndedAt.Equal(*stopped.EndedAt) {
+				t.Fatal("redelivery changed the stop timestamp")
+			}
+		})
+	}
 }
 
 // The user stops, then sends another message before the old worker's poll

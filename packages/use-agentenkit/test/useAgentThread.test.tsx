@@ -203,7 +203,7 @@ describe('approvals (§2.5)', () => {
     expect(view.result.current.agentState).toBe('WAITING_FOR_INPUT');
   });
 
-  it('drops the answered card immediately and posts the verdict', async () => {
+  it('drops the answered card after confirmation and posts the verdict', async () => {
     const { view, emit, calls } = await mount();
 
     await act(async () => {
@@ -237,6 +237,58 @@ describe('approvals (§2.5)', () => {
     });
 
     expect(view.result.current.pendingInputs.map((p) => p.toolCallId)).toEqual(['c2']);
+  });
+});
+
+describe('control failures', () => {
+  for (const kind of ['refusal', 'http', 'network', 'invalid-json'] as const) {
+    for (const control of ['stop', 'respond'] as const) it(`reports ${control} ${kind} without losing run state or approval cards`, async () => {
+      const base = harness();
+      const { view, emit } = await mount({
+        fetch: async (input, init) => {
+          if (init?.method !== 'POST') return base.config.fetch!(input, init);
+          if (kind === 'network') throw new Error('offline');
+          if (kind === 'invalid-json') return new Response('invalid', { status: 200 });
+          return new Response(JSON.stringify({ accepted: false, delivered: false, error: 'request refused' }), {
+            status: kind === 'http' ? 503 : 200,
+          });
+        },
+      });
+      await act(async () => {
+        emit({ seq: 8, type: 'INPUT_REQUIRED', payload: { toolCallId: 'c1', toolName: 'wipe', arguments: {} } });
+      });
+      await act(async () => {
+        const ok = control === 'stop' ? await view.result.current.stop() : await view.result.current.respondToInput('c1', true);
+        expect(ok).toBe(false);
+      });
+      expect(view.result.current.agentState).toBe('WAITING_FOR_INPUT');
+      expect(view.result.current.pendingInputs.map((p) => p.toolCallId)).toEqual(['c1']);
+      expect(view.result.current.activity.detail).toBeTruthy();
+      expect(view.result.current.activity.label).toBe(control === 'stop' ? 'Could not stop run' : 'Could not send response');
+    });
+  }
+
+  for (const terminal of ['COMPLETED', 'FAILED', 'CANCELLED'] as const) it(`keeps the card during delivery and does not replace a newer ${terminal} activity`, async () => {
+    const base = harness();
+    let complete!: (res: Response) => void;
+    const { view, emit } = await mount({
+      fetch: (input, init) => init?.method === 'POST'
+        ? new Promise<Response>((resolve) => { complete = resolve; })
+        : base.config.fetch!(input, init),
+    });
+    await act(async () => {
+      emit({ seq: 8, type: 'INPUT_REQUIRED', payload: { toolCallId: 'c1', toolName: 'wipe', arguments: {} } });
+    });
+    let pending!: Promise<boolean>;
+    await act(async () => { pending = view.result.current.respondToInput('c1', true); });
+    expect(view.result.current.pendingInputs).toHaveLength(1);
+    await act(async () => {
+      emit({ seq: 9, type: 'STATE_CHANGE', payload: { state: terminal } });
+      complete(new Response(JSON.stringify({ delivered: true })));
+      expect(await pending).toBe(true);
+    });
+    expect(view.result.current.pendingInputs).toHaveLength(0);
+    expect(view.result.current.activity.phase).toBe(terminal === 'CANCELLED' ? 'stopped' : terminal === 'FAILED' ? 'failed' : 'completed');
   });
 });
 
