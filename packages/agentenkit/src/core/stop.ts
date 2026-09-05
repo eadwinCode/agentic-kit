@@ -2,6 +2,7 @@ import type { RuntimePorts } from '../ports/runtime.js';
 import { publish, setThreadState } from './publish.js';
 import { loadOpenHitls } from './hitl.js';
 import type { StopResult } from '../ports/runtime.js';
+import { currentRunId } from './keys.js';
 
 /** The whole stop mechanism (§2.1): one button, one behavior — everything
  *  stops immediately. The engine's poller sees CANCELLED on the hot cache and
@@ -15,14 +16,34 @@ export async function stop(deps: RuntimePorts, threadId: string): Promise<StopRe
   // Read before the write: an adapter may hand back the very object the
   // state write mutates.
   const wasParked = thread.state === 'WAITING_FOR_INPUT';
+  const runId = await currentRunId(deps, threadId);
+  const endedAt = new Date();
 
   await deps.kv.set(`agent:state:${threadId}`, 'CANCELLED');
   await setThreadState(deps, threadId, 'CANCELLED', thread.model);
-  await publish(deps, threadId, 'STATE_CHANGE', { state: 'CANCELLED' });
+  // A queued or parked run may never execute again. Close its record here,
+  // without touching usage that a running worker can still be accruing.
+  if (runId) await recordStoppedRun(deps, runId, endedAt);
+  await publish(deps, threadId, 'STATE_CHANGE', {
+    state: 'CANCELLED', stopReason: 'cancelled', runId, endedAt,
+  });
 
   if (wasParked) await closeOpenParks(deps, threadId);
 
   return { accepted: true };
+}
+
+export async function recordStoppedRun(deps: RuntimePorts, runId: string, endedAt: Date): Promise<void> {
+  try {
+    const prior = await deps.admin.runs.get(runId);
+    if (!prior || prior.state === 'CANCELLED') return;
+    await deps.admin.runs.patch(runId, {
+      state: 'CANCELLED', stopReason: 'cancelled', endedAt,
+      durationMs: endedAt.getTime() - new Date(prior.startedAt).getTime(),
+    });
+  } catch {
+    // Operational history must not prevent cancellation.
+  }
 }
 
 /** Answer every open approval with a cancellation, so the history the next
@@ -43,9 +64,7 @@ async function closeOpenParks(deps: RuntimePorts, threadId: string): Promise<voi
       content: toolResult(pending.toolCallId, pending.toolName),
     });
     if (pending.nested) {
-      await deps.admin.runs
-        .patch(pending.nested.agentId, { state: 'CANCELLED', stopReason: 'cancelled', endedAt: new Date() })
-        .catch(() => undefined);
+      await recordStoppedRun(deps, pending.nested.agentId, new Date());
     }
     for (const frame of pending.frames) {
       await deps.storage.messages.append(threadId, {
@@ -54,9 +73,7 @@ async function closeOpenParks(deps: RuntimePorts, threadId: string): Promise<voi
         content: toolResult(frame.toolCallId, 'spawnSubagent'),
       });
       if (frame.nested) {
-        await deps.admin.runs
-          .patch(frame.nested.agentId, { state: 'CANCELLED', stopReason: 'cancelled', endedAt: new Date() })
-          .catch(() => undefined);
+        await recordStoppedRun(deps, frame.nested.agentId, new Date());
       }
     }
   }

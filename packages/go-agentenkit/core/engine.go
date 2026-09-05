@@ -162,6 +162,13 @@ func closeRunRecord(ctx context.Context, deps ports.RuntimePorts, runID string, 
 		return // a run started elsewhere, or a foreign dispatch
 	}
 	endedAt := time.Now()
+	// Teardown can add usage, but cannot undo a recorded user stop.
+	if prior.State == ports.StateCancelled {
+		f.State, f.StopReason = ports.StateCancelled, "cancelled"
+		if prior.EndedAt != nil {
+			endedAt = *prior.EndedAt
+		}
+	}
 	patch := ports.RunPatch{
 		State: &f.State, StopReason: ports.Ptr(f.StopReason), EndedAt: &endedAt,
 		DurationMs:        ports.Ptr(endedAt.Sub(prior.StartedAt).Milliseconds()),
@@ -653,6 +660,11 @@ func Finalize(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAge
 		if current != f.RunID {
 			return nil
 		}
+	}
+	if state, _, err := deps.Kv.Get(ctx, StateKey(threadID)); err != nil {
+		return err
+	} else if state == string(ports.StateCancelled) {
+		f.State, f.StopReason, f.OneShotText = ports.StateCancelled, "cancelled", nil
 	}
 	if f.OneShotText != nil {
 		// One-shot flavor: no CHUNK stream; publish the final text as one event

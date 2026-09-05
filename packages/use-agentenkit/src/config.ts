@@ -68,6 +68,8 @@ export interface ActivityLabels {
   stopped: string;
   failed: string;
   runFailed: string;
+  stopFailed: string;
+  responseFailed: string;
   loadFailed: string;
 }
 
@@ -91,6 +93,8 @@ export const defaultLabels: ActivityLabels = {
   stopped: 'Stopped',
   failed: 'Failed',
   runFailed: 'Could not start run',
+  stopFailed: 'Could not stop run',
+  responseFailed: 'Could not send response',
   loadFailed: 'Could not load conversation',
 };
 

@@ -55,6 +55,8 @@ export async function reclaimIfOrphaned(deps: RuntimePorts, threadId: string): P
           agent: resume.agent,
           ...(resume.tokenBudget !== undefined ? { tokenBudget: resume.tokenBudget } : {}),
           ...(resume.providerOptions ? { providerOptions: resume.providerOptions } : {}),
+          ...(resume.state ? { state: resume.state } : {}),
+          ...(resume.costBudgetMicros !== undefined ? { costBudgetMicros: resume.costBudgetMicros } : {}),
         }
       : {}),
   });

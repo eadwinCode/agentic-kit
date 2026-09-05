@@ -57,6 +57,34 @@ function spyingStorage() {
 }
 
 describe('run state (§2.10)', () => {
+  for (const conflict of [false, true]) it(`preserves tenant context through ${conflict ? 'a lock redrive' : 'a failure retry'}`, async () => {
+    const spy = spyingStorage();
+    const queue = new MemoryQueue(), kv = new MemoryKv();
+    let fail = !conflict;
+    const healthy = model();
+    const flaky = new MockLanguageModelV1({ doStream: async (options) => {
+      if (fail) { fail = false; throw new Error('temporary provider failure'); }
+      return healthy.doStream(options);
+    } });
+    const runtime = await setupAgentCore({
+      storage: spy.storage, bus: new MemoryBus(), queue, kv, admin: new MemoryAdminStore(),
+      resolveModel: () => ({ instance: () => flaky, contextWindow: 128_000 }),
+    });
+    const chat = runtime.createStreamTextAgent({ name: 'chat', maxRetries: 0 });
+    const state = { orgId: 'acme', userId: 'u1' };
+    const ran = await chat.run({ prompt: 'hi', state });
+    if (conflict) await kv.set(`agent:lock:${ran.threadId}`, 'older-run');
+    await runtime.worker.handleJob(queue.items[0]!);
+    expect(queue.items).toHaveLength(2);
+    expect(queue.items[1]!.state).toEqual(state);
+    if (conflict) await kv.del(`agent:lock:${ran.threadId}`);
+    spy.seen.length = 0;
+    await runtime.worker.handleJob(queue.items[1]!);
+    expect(spy.seen.length).toBeGreaterThan(0);
+    for (const call of spy.seen) expect(call.ctx.state).toEqual(state);
+    expect((await spy.inner.threads.get(ran.threadId))!.state).toBe('COMPLETED');
+  });
+
   const make = async () => {
     const spy = spyingStorage();
     const queue = new MemoryQueue();

@@ -127,7 +127,13 @@ describe('stop, then send another message right away (§2.1)', () => {
     const workerA = runtime.worker.handleJob(queue.items[0]!);
     await sleep(30);
     await chat.stop(ran.threadId);
+    const stoppedAt = (await runtime.admin.getRun(ran.runId!))!.run.endedAt;
+    expect(stoppedAt).toBeInstanceOf(Date);
     await workerA;
+    const stopped = (await runtime.admin.getRun(ran.runId!))!.run;
+    expect(stopped.state).toBe('CANCELLED');
+    expect(stopped.stopReason).toBe('cancelled');
+    expect(stopped.endedAt).toEqual(stoppedAt);
 
     expect(state.aborted).toBe(true);
     expect((await storage.threads.get(ran.threadId))!.state).toBe('CANCELLED');
