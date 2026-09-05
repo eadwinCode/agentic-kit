@@ -85,8 +85,13 @@ jobs:
       - name: Test
         run: bun run test
 
+      # lib/pq wants sslmode spelled out against the plain service container,
+      # and the Go suite fails loudly rather than skipping when it cannot
+      # connect. Same URL the CI workflow's Go job uses.
       - name: Test Go module
         working-directory: packages/go-agentenkit
+        env:
+          TEST_ADMIN_PG: postgres://postgres:password@localhost:5432/agentic_admin_test?sslmode=disable
         run: go test -race -count=1 ./...
 
       - name: Test Go release tagging
