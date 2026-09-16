@@ -12,6 +12,7 @@ generator client {
 
 enum ExecutionState {
   IDLE
+  QUEUED
   RUNNING
   WAITING_FOR_INPUT
   CANCELLED

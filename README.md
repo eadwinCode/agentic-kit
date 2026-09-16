@@ -87,7 +87,7 @@ import { useAgentThread } from 'use-agentenkit';
 
 export function Chat() {
   const { entries, run, stop, agentState, pendingInputs, respondToInput } = useAgentThread();
-  const running = agentState === 'RUNNING' || agentState === 'WAITING_FOR_INPUT';
+  const running = agentState === 'QUEUED' || agentState === 'RUNNING' || agentState === 'WAITING_FOR_INPUT';
 
   return (
     <>
