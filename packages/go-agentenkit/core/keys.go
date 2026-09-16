@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"time"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
@@ -19,8 +20,25 @@ func RunLockKey(threadID string) string { return "agent:lock:" + threadID }
 // SeqKey is the per-thread event sequence counter (§3.4).
 func SeqKey(threadID string) string { return "agent:seq:" + threadID }
 
-// AttemptsKey counts §2.8 failure retries.
-func AttemptsKey(threadID string) string { return "agent:attempts:" + threadID }
+// AttemptsKey counts §2.8 failure retries of ONE run. Keyed by the run, so
+// a new run on the thread starts with a full budget by construction and
+// nothing an older run banked can reach it. A legacy job without a run id
+// keys it by the thread instead; see CounterScope.
+func AttemptsKey(runID string) string { return "agent:attempts:" + runID }
+
+// CounterScope is what the retry counters are keyed by: the run id, or the
+// thread id for a legacy dispatch that has none.
+func CounterScope(threadID, runID string) string {
+	if runID != "" {
+		return runID
+	}
+	return threadID
+}
+
+// counterTTL is how long a retry counter lives when nothing clears it: long
+// past any retry backoff, short enough that a counter a crash left behind
+// does not sit in the kv for ever.
+const counterTTL = 6 * time.Hour
 
 // RunIDKey holds the thread's CURRENT run id (§2.1).
 //
@@ -33,8 +51,9 @@ func RunIDKey(threadID string) string { return "agent:run:" + threadID }
 
 // RedriveKey counts re-dispatches of a job that keeps finding the run lock
 // held by an OLDER run (§2.8). Separate from the attempts key: a blocked job
-// has not failed, it simply has not started yet.
-func RedriveKey(threadID string) string { return "agent:redrive:" + threadID }
+// has not failed, it simply has not started yet. Keyed by the run, like
+// AttemptsKey.
+func RedriveKey(runID string) string { return "agent:redrive:" + runID }
 
 // CurrentRunID is the run that owns the thread right now, or "" on a thread
 // that predates run ids. Resuming a parked run (§2.5) REUSES this: a resume

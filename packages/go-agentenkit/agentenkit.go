@@ -38,6 +38,9 @@ type (
 	EventBus       = ports.EventBus
 	Queue          = ports.Queue
 	EnqueueOptions = ports.EnqueueOptions
+	QueueStats     = ports.QueueStats
+	QueuedJob      = ports.QueuedJob
+	JobKind        = ports.JobKind
 	Kv             = ports.Kv
 	SetOptions     = ports.SetOptions
 
@@ -109,6 +112,8 @@ type (
 	Tool             = ports.Tool
 	AgentConfig      = ports.AgentConfig
 	BillingCheck     = ports.BillingCheck
+	BillingStage     = ports.BillingStage
+	RunBudget        = ports.RunBudget
 )
 
 const (
@@ -120,6 +125,7 @@ const (
 	UsageErrored  = ports.UsageErrored
 
 	StateIdle            = ports.StateIdle
+	StateQueued          = ports.StateQueued
 	StateRunning         = ports.StateRunning
 	StateWaitingForInput = ports.StateWaitingForInput
 	StateCancelled       = ports.StateCancelled
@@ -133,6 +139,29 @@ const (
 
 	KindStreamText   = ports.KindStreamText
 	KindGenerateText = ports.KindGenerateText
+
+	JobDispatch = ports.JobDispatch
+	JobRetry    = ports.JobRetry
+	JobRedrive  = ports.JobRedrive
+	JobResume   = ports.JobResume
+	JobExpiry   = ports.JobExpiry
+	JobReclaim  = ports.JobReclaim
+	PriorityLow = ports.PriorityLow
+
+	BillingAtDispatch = ports.BillingAtDispatch
+	BillingAtPickup   = ports.BillingAtPickup
+
+	RefusedActiveRun = ports.RefusedActiveRun
+	RefusedQueueFull = ports.RefusedQueueFull
+	RefusedBilling   = ports.RefusedBilling
+)
+
+// Errors a queue answers with, so a host can tell them apart.
+var (
+	ErrQueueFull       = ports.ErrQueueFull
+	ErrPayloadTooLarge = ports.ErrPayloadTooLarge
+	ErrDuplicateJob    = ports.ErrDuplicateJob
+	ErrUnsupported     = ports.ErrUnsupported
 )
 
 var (
@@ -211,6 +240,7 @@ const (
 	OutcomeExecuted     = core.OutcomeExecuted
 	OutcomeLockConflict = core.OutcomeLockConflict
 	OutcomeStale        = core.OutcomeStale
+	OutcomeLockLost     = core.OutcomeLockLost
 
 	HITLParked          = core.HITLParked
 	ReasonApproval      = core.ReasonApproval
@@ -243,6 +273,8 @@ var (
 	CurrentRunID     = core.CurrentRunID
 	RunIDKey         = core.RunIDKey
 	RedriveKey       = core.RedriveKey
+	AttemptsKey      = core.AttemptsKey
+	IsActive         = core.IsActive
 	StateKey         = core.StateKey
 	SeqKey           = core.SeqKey
 

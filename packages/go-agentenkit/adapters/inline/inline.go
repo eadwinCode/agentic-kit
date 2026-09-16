@@ -29,9 +29,16 @@ type Handler func(ctx context.Context, job ports.RunJob) error
 type Queue struct {
 	mu      sync.Mutex
 	handler Handler
-	pending map[*time.Timer]struct{}
+	pending map[*time.Timer]pendingJob
 	wg      sync.WaitGroup
 	ctx     context.Context
+}
+
+// pendingJob is one timer's job, with what Cancel and Find need to see.
+type pendingJob struct {
+	job   ports.RunJob
+	key   string
+	runAt time.Time
 }
 
 // New makes a queue. Jobs run with a context derived from ctx; pass
@@ -40,7 +47,7 @@ func New(ctx context.Context) *Queue {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return &Queue{pending: map[*time.Timer]struct{}{}, ctx: ctx}
+	return &Queue{pending: map[*time.Timer]pendingJob{}, ctx: ctx}
 }
 
 // Bind wires the worker. The queue and the worker each need the other, so
@@ -54,11 +61,19 @@ func (q *Queue) Bind(handler Handler) {
 
 func (q *Queue) Enqueue(_ context.Context, job ports.RunJob, opts *ports.EnqueueOptions) error {
 	var delay time.Duration
+	key := ""
 	if opts != nil {
-		delay = opts.Delay
+		delay, key = opts.Delay, opts.Key
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if key != "" {
+		for _, p := range q.pending {
+			if p.key == key {
+				return ports.ErrDuplicateJob
+			}
+		}
+	}
 	q.wg.Add(1)
 	var timer *time.Timer
 	timer = time.AfterFunc(delay, func() {
@@ -74,8 +89,56 @@ func (q *Queue) Enqueue(_ context.Context, job ports.RunJob, opts *ports.Enqueue
 		// business (§2.8 redrive), never the enqueuer's.
 		_ = handler(q.ctx, job)
 	})
-	q.pending[timer] = struct{}{}
+	q.pending[timer] = pendingJob{job: job, key: key, runAt: time.Now().Add(delay)}
 	return nil
+}
+
+// Cancel stops every timer waiting under key.
+func (q *Queue) Cancel(_ context.Context, key string) error {
+	if key == "" {
+		return nil
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for timer, p := range q.pending {
+		if p.key == key && timer.Stop() {
+			delete(q.pending, timer)
+			q.wg.Done()
+		}
+	}
+	return nil
+}
+
+// Find returns the earliest waiting job for a run, or nil.
+func (q *Queue) Find(_ context.Context, runID string) (*ports.QueuedJob, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var found *ports.QueuedJob
+	for _, p := range q.pending {
+		if runID == "" || p.job.RunID != runID {
+			continue
+		}
+		if found == nil || p.runAt.Before(found.RunAt) {
+			found = &ports.QueuedJob{RunID: runID, ThreadID: p.job.ThreadID, Kind: p.job.Kind, RunAt: p.runAt, Position: -1}
+		}
+	}
+	return found, nil
+}
+
+// Stats counts the timers still pending.
+func (q *Queue) Stats(_ context.Context) (ports.QueueStats, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var s ports.QueueStats
+	now := time.Now()
+	for _, p := range q.pending {
+		if p.runAt.After(now) {
+			s.Delayed++
+		} else {
+			s.Ready++
+		}
+	}
+	return s, nil
 }
 
 // Clear drops everything still scheduled: for tests and clean shutdown.

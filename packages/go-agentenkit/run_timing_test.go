@@ -27,19 +27,34 @@ func TestRunTiming_EveryStateChangeNamesItsRunAndItsClock(t *testing.T) {
 	wipe.RequiresConfirmation = true
 	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat", Tools: []agentenkit.Tool{wipe}})
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
-	rec, _ := h.admin.Runs().Get(h.ctx, ran.RunID)
+	queued, _ := h.admin.Runs().Get(h.ctx, ran.RunID)
 
-	// Dispatch: RUNNING names the run and its start, the record's own.
-	running := payload(h.events(ran.ThreadID, "STATE_CHANGE")[0])
-	mustEqual(t, running["state"], "RUNNING", "first state")
-	mustEqual(t, running["runId"], ran.RunID, "run on the dispatch boundary")
+	// Dispatch: QUEUED names the run and when it was accepted, the record's
+	// own. No start yet: nothing has started.
+	accepted := payload(h.events(ran.ThreadID, "STATE_CHANGE")[0])
+	mustEqual(t, accepted["state"], "QUEUED", "first state")
+	mustEqual(t, accepted["runId"], ran.RunID, "run on the dispatch boundary")
+	if queued.EnqueuedAt == nil || !rfc3339(accepted["enqueuedAt"]).Equal(*queued.EnqueuedAt) {
+		t.Fatalf("enqueuedAt on the wire %v, record %v", accepted["enqueuedAt"], queued.EnqueuedAt)
+	}
+	if _, ok := accepted["startedAt"]; ok {
+		t.Fatal("a queued run has not started")
+	}
+
+	// Pickup: RUNNING names the run and its start, which the record now
+	// carries too; the park then carries the same run and the same start.
+	h.handleNext(t)
+	rec, _ := h.admin.Runs().Get(h.ctx, ran.RunID)
+	states := h.events(ran.ThreadID, "STATE_CHANGE")
+	running := payload(states[1])
+	mustEqual(t, running["state"], "RUNNING", "picked up")
+	mustEqual(t, running["runId"], ran.RunID, "run on the pickup")
 	if !rfc3339(running["startedAt"]).Equal(rec.StartedAt) {
 		t.Fatalf("startedAt on the wire %v, record %v", running["startedAt"], rec.StartedAt)
 	}
-
-	// The park: WAITING_FOR_INPUT carries the same run and the same start.
-	h.handleNext(t)
-	states := h.events(ran.ThreadID, "STATE_CHANGE")
+	if !rec.StartedAt.After(*rec.EnqueuedAt) && !rec.StartedAt.Equal(*rec.EnqueuedAt) {
+		t.Fatalf("the start is the pickup, after the enqueue: %v vs %v", rec.StartedAt, rec.EnqueuedAt)
+	}
 	waiting := payload(states[len(states)-1])
 	mustEqual(t, waiting["state"], "WAITING_FOR_INPUT", "parked")
 	mustEqual(t, waiting["runId"], ran.RunID, "run on the park")

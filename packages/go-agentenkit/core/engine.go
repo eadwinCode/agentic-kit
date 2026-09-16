@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"slices"
 	"sync/atomic"
 	"time"
@@ -229,38 +230,72 @@ func settleRun(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAg
 		hookErr = agent.Args.OnSettle(ctx, info)
 	}
 	if prior != nil {
-		_ = deps.Admin.Runs().Patch(context.WithoutCancel(ctx), info.RunID, ports.RunPatch{SettledAt: ports.Ptr(time.Now())})
+		if hookErr == nil {
+			_ = deps.Admin.Runs().Patch(context.WithoutCancel(ctx), info.RunID, ports.RunPatch{SettledAt: ports.Ptr(time.Now())})
+		} else {
+			// The mark is only set once the hook has done its work. A hook
+			// that failed leaves the run unsettled, so a later stop, a later
+			// delivery or the stuck-run sweep can run it again.
+			Logger(deps).Error("settle hook failed; the run stays unsettled for a retry", "run", info.RunID, "err", hookErr)
+		}
 	}
 	return true, hookErr
 }
 
-// settleStoppedRun settles a run that a stop ended without a worker (§2.1,
-// §5.6): one that was still queued, or parked on an approval. The steps it
-// did make before that were priced as they happened, so its bill is real
-// and has to reach the hook. Nothing happens when the run already settled,
-// or when its record is not a stop.
+// settleEndedRun settles a run whose record has ended but whose settle
+// never ran (§2.1, §5.6): a stop that ended it while it was queued or
+// parked, a worker that died between finishing and settling, or a settle
+// hook that failed and left the mark unset. The steps it did make were
+// priced as they happened, so its bill is real and has to reach the hook.
+// Nothing happens when the run already settled, or when its record is
+// still open.
 //
 // The caller holds the run lock. Stop takes it for exactly this; a worker
-// that finds the thread already cancelled at segment start holds it too.
-func settleStoppedRun(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, threadID, runID string) {
+// that finds the thread already ended at segment start holds it too, and so
+// does the stuck-run sweep.
+func settleEndedRun(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, threadID, runID string) bool {
 	if agent == nil || runID == "" {
-		return
+		return false
 	}
 	rec, err := deps.Admin.Runs().Get(ctx, runID)
-	if err != nil || rec == nil || rec.State != ports.StateCancelled || rec.SettledAt != nil {
-		return
+	if err != nil || rec == nil || rec.SettledAt != nil || !isTerminal(rec.State) {
+		return false
 	}
 	bill, billErr := runBill(ctx, deps, threadID, runID)
 	info := ports.RunFinishInfo{
-		ThreadID: threadID, RunID: runID, State: ports.StateCancelled, StopReason: "cancelled",
-		TokensUsed: rec.TotalTokens, Steps: rec.Steps, Cancelled: true,
+		ThreadID: threadID, RunID: runID, State: rec.State, StopReason: rec.StopReason, Error: rec.Error,
+		TokensUsed: rec.TotalTokens, Steps: rec.Steps, Cancelled: rec.State == ports.StateCancelled,
 		Usage: bill, UsageErr: billErr,
 	}
-	// A stop's settle error is ignored, as it is for a stopped worker: the
-	// run is cancelled either way.
-	if settled, _ := settleRun(ctx, deps, agent, info); settled && agent.Args.OnFinish != nil {
+	if info.StopReason == "" {
+		info.StopReason = "cancelled"
+	}
+	// The settle error is ignored, as it is for a stopped worker: the run
+	// has already ended either way, and the mark stays unset for a retry.
+	settled, _ := settleRun(ctx, deps, agent, info)
+	if settled && agent.Args.OnFinish != nil {
 		agent.Args.OnFinish(info)
 	}
+	return settled
+}
+
+// isTerminal reports whether a state is one a run cannot leave.
+func isTerminal(state ports.ExecutionState) bool {
+	return state == ports.StateCancelled || state == ports.StateCompleted || state == ports.StateFailed
+}
+
+// closeIfOpen closes a run record that can never be worked on again (§2.9):
+// the thread is gone, or a newer run replaced this one. Without this the
+// record stays RUNNING for ever and every "in flight" count carries it.
+func closeIfOpen(ctx context.Context, deps ports.RuntimePorts, runID, stopReason string) {
+	if runID == "" {
+		return
+	}
+	rec, err := deps.Admin.Runs().Get(ctx, runID)
+	if err != nil || rec == nil || rec.EndedAt != nil {
+		return
+	}
+	closeRunRecord(ctx, deps, runID, FinalizeInput{State: ports.StateCancelled, StopReason: stopReason, RunID: runID})
 }
 
 // failRun finalises a run as FAILED on both homes AND keeps why (§2.9).
@@ -362,6 +397,13 @@ type ExecuteInput struct {
 	RunID string
 	// EnqueuedAt is epoch ms at enqueue, for the queue-wait measurement (§2.9).
 	EnqueuedAt int64
+	// DispatchedAt is epoch ms of the run's first dispatch (§2.8), carried
+	// onto every retry so the run keeps its place in line.
+	DispatchedAt int64
+	// Kind says why this job exists. See ports.JobKind.
+	Kind ports.JobKind
+	// PartitionKey is the caller's tenant on the ticket, carried onto retries.
+	PartitionKey string
 	// State is the run's state (§2.10), carried so a redrive keeps it.
 	State       ports.AgentRunState
 	TokenBudget int
@@ -371,6 +413,22 @@ type ExecuteInput struct {
 	ProviderOptions  ports.ProviderOptions
 	// MaxSteps is the run's own step cap; zero keeps the config's (§2.1).
 	MaxSteps int
+}
+
+// job rebuilds the dispatch ticket for a job that goes back on the queue: a
+// retry, a redrive. Same run, same caps, same place in line.
+func (input ExecuteInput) job(agent string, kind ports.JobKind) ports.RunJob {
+	return ports.RunJob{
+		ThreadID: input.ThreadID, RunID: input.RunID, Model: input.Model, Agent: agent,
+		Kind: kind, PartitionKey: input.PartitionKey,
+		EnqueuedAt: time.Now().UnixMilli(), DispatchedAt: input.DispatchedAt,
+		State: input.State, TokenBudget: input.TokenBudget,
+		// A redrive is the SAME run trying again, so it keeps the caps it
+		// was dispatched with: a retry that lost its money cap would be
+		// unbounded (§4).
+		CostBudgetMicros: input.CostBudgetMicros,
+		ProviderOptions:  input.ProviderOptions, MaxSteps: input.MaxSteps,
+	}
 }
 
 // ExecuteOutcome says what Execute did.
@@ -383,6 +441,10 @@ const (
 	OutcomeLockConflict ExecuteOutcome = "lock-conflict"
 	// OutcomeStale: a NEWER run owns the thread; this job must do nothing.
 	OutcomeStale ExecuteOutcome = "stale"
+	// OutcomeLockLost: this worker held the lock and could not keep it
+	// renewed; the segment ended early and the job should come back once
+	// the lock is free. Every step it finished is already persisted.
+	OutcomeLockLost ExecuteOutcome = "lock-lost"
 )
 
 // Execute is the engine (§2.1, §5.6). Worker-side only: runs are dispatched
@@ -394,8 +456,9 @@ const (
 // between steps, never inside goai.
 //
 // Concurrency: acquires the per-thread run lock (SET NX + lease) before any
-// work. Two workers can never run one thread, and a crashed worker's lock
-// expires instead of blocking forever (§3.4).
+// work and renews it while the segment runs, so a held lock always means a
+// live worker. Two workers can never run one thread, and a crashed worker's
+// lock expires within a lease instead of blocking forever (§3.4).
 func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, input ExecuteInput) (ExecuteOutcome, error) {
 	threadID, runID := input.ThreadID, input.RunID
 	if err := ValidateTokenBudget(input.TokenBudget, "tokenBudget"); err != nil {
@@ -407,6 +470,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	// The run's identity and state ride the context from here, so the model
 	// calls (and anything wrapping a model) can see whose run they serve.
 	ctx = ContextWithRunState(ContextWithRunID(ctx, runID), input.State)
+	log := Logger(deps).With("thread", threadID, "run", runID)
 
 	// True once the thread has started a NEWER run than this one (§2.1).
 	stale := func() (bool, error) {
@@ -432,8 +496,10 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	if !locked {
 		return OutcomeLockConflict, nil // another worker owns this thread (§2.8)
 	}
-	// Release on success, failure, or stop.
-	defer func() { _ = deps.Kv.Del(context.WithoutCancel(ctx), RunLockKey(threadID)) }()
+	// Release on success, failure, or stop: only while the lock is still
+	// this worker's. A lock another worker took after this one lapsed is
+	// theirs to free (§3.4).
+	defer func() { _, _ = deps.Kv.DelIfValue(context.WithoutCancel(ctx), RunLockKey(threadID), lockValue) }()
 
 	// Token budget (§2.1 safety cap): execute input → spec → config. Checked
 	// BETWEEN steps: the finished step is always kept in full.
@@ -458,13 +524,25 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		ports.MergeProviderOptions(deps.Config.ProviderOptions, agent.Spec.ProviderOptions),
 		input.ProviderOptions)
 
-	// Two ways a run ends early, one behavior: everything tears down at once.
+	// Three ways a segment ends early, one behavior: everything tears down at once.
 	//   1. the state key reads CANCELLED: the user pressed stop (§2.1);
 	//   2. the run id has moved on: the user pressed stop and then sent another
 	//      message, which put RUNNING back over CANCELLED before this poll
-	//      could read it. The state key lies in that window; the run id never does.
-	genCtx, cancel := context.WithCancel(ctx)
-	var abortedFlag atomic.Bool
+	//      could read it. The state key lies in that window; the run id never does;
+	//   3. the run lock could not be kept: by then another worker may own
+	//      the thread, so this one must stop touching it (§3.4).
+	// A SegmentTimeout, when set, is a fourth: the segment is bounded in
+	// wall time and settles FAILED past it rather than holding the worker.
+	genBase := ctx
+	var segmentDeadline time.Time
+	if deps.Config.SegmentTimeout > 0 {
+		segmentDeadline = time.Now().Add(deps.Config.SegmentTimeout)
+		var cancelSegment context.CancelFunc
+		genBase, cancelSegment = context.WithDeadline(ctx, segmentDeadline)
+		defer cancelSegment()
+	}
+	genCtx, cancel := context.WithCancel(genBase)
+	var abortedFlag, lockLost atomic.Bool
 	aborted := func() bool { return abortedFlag.Load() }
 	pollDone := make(chan struct{})
 	go func() {
@@ -489,16 +567,52 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			}
 		}
 	}()
+	// The lock is renewed every third of its lease while the segment runs,
+	// the way a queue renews a job lease, so an expired lock means a dead
+	// worker and nothing else. A renewal that finds the key gone or holding
+	// another value, or that fails three times running, ends the segment.
+	renewDone := make(chan struct{})
+	go func() {
+		defer close(renewDone)
+		ticker := time.NewTicker(deps.Config.RunLockLease / 3)
+		defer ticker.Stop()
+		failures := 0
+		for {
+			select {
+			case <-genCtx.Done():
+				return
+			case <-ticker.C:
+				ok, err := deps.Kv.SetIfValue(ctx, RunLockKey(threadID), lockValue, lockValue, deps.Config.RunLockLease)
+				if err != nil {
+					failures++
+					log.Warn("run lock renewal failed", "err", err, "consecutive", failures)
+					if failures < 3 {
+						continue
+					}
+				} else if ok {
+					failures = 0
+					continue
+				}
+				log.Error("run lock lost; ending the segment", "err", err)
+				lockLost.Store(true)
+				cancel()
+				return
+			}
+		}
+	}()
 	defer func() {
 		cancel()
 		<-pollDone
+		<-renewDone
 	}()
 
 	// A newer run already owns this thread: this job has nothing to do, and
-	// must not touch state on the live run's behalf (§2.1).
+	// must not touch state on the live run's behalf (§2.1). Its own record
+	// is closed, so it does not count as in flight for ever.
 	if replaced, err := stale(); err != nil {
 		return "", err
 	} else if replaced {
+		closeIfOpen(ctx, deps, runID, "replaced")
 		return OutcomeStale, nil
 	}
 	// At-least-once idempotency (§2.8): a job whose run already ended, or was
@@ -508,16 +622,56 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	if err != nil {
 		return "", err
 	}
-	if durable == nil || durable.State == ports.StateCancelled ||
-		durable.State == ports.StateCompleted || durable.State == ports.StateFailed {
-		if durable != nil && durable.State == ports.StateCancelled {
-			// A stop ended this run before any worker got to it, or while a
-			// worker was between segments. Stop settles it when it can take
-			// the run lock; when this worker took the lock first, the settle
-			// is this worker's to run — once, under the same lock.
-			settleStoppedRun(ctx, deps, agent, threadID, runID)
-		}
+	if durable == nil {
+		closeIfOpen(ctx, deps, runID, "orphaned")
 		return OutcomeExecuted, nil
+	}
+	if isTerminal(durable.State) {
+		// A stop ended this run before any worker got to it, or while a
+		// worker was between segments; or the run ended and its settle
+		// never landed. Whoever holds the lock settles it, once.
+		settleEndedRun(ctx, deps, agent, threadID, runID)
+		return OutcomeExecuted, nil
+	}
+
+	// A wait has a ceiling (§2.8): a job picked up long past it fails with
+	// the reason, instead of doing work nobody is waiting for any more.
+	if deps.Config.MaxQueueWait > 0 && input.EnqueuedAt > 0 {
+		if waited := time.Since(time.UnixMilli(input.EnqueuedAt)); waited > deps.Config.MaxQueueWait {
+			reason := fmt.Sprintf("the run waited %s in the queue, past the %s limit", waited.Round(time.Second), deps.Config.MaxQueueWait)
+			log.Warn("run queued too long; failing it", "waited", waited)
+			if durable.State == ports.StateWaitingForInput {
+				_ = closeOpenParks(ctx, deps, threadID)
+			}
+			return OutcomeExecuted, failRun(ctx, deps, agent, threadID, runID, reason)
+		}
+	}
+
+	// Billing at pickup (§4): the dispatch check ran before the wait; the
+	// balance may have moved since. A refusal here fails the run with the
+	// reason; a lowered cap applies to this segment.
+	if deps.Config.BillingPreCheck != nil && runID != "" {
+		budget := &ports.RunBudget{CostBudgetMicros: costBudget, MaxSteps: input.MaxSteps}
+		check := ports.BillingCheck{
+			ThreadID: threadID, RunID: runID, State: input.State, Stage: ports.BillingAtPickup, Budget: budget,
+			PublishEvent: func(ctx context.Context, typ string, payload any, notice bool) (ports.AgentEvent, error) {
+				return PublishEvent(ctx, deps, threadID, typ, payload, PublishOptions{Notice: notice})
+			},
+		}
+		if err := deps.Config.BillingPreCheck(ctx, check); err != nil {
+			log.Warn("run refused at pickup", "err", err)
+			_, _ = Publish(ctx, deps, threadID, "RUN_REFUSED", map[string]any{"reason": ports.RefusedBilling, "error": err.Error(), "runId": runID})
+			if durable.State == ports.StateWaitingForInput {
+				_ = closeOpenParks(ctx, deps, threadID)
+			}
+			return OutcomeExecuted, failRun(ctx, deps, agent, threadID, runID, err.Error())
+		}
+		if budget.CostBudgetMicros > 0 && (costBudget == 0 || budget.CostBudgetMicros < costBudget) {
+			costBudget = budget.CostBudgetMicros
+		}
+		if budget.MaxSteps > 0 && (input.MaxSteps == 0 || budget.MaxSteps < input.MaxSteps) {
+			input.MaxSteps = budget.MaxSteps
+		}
 	}
 
 	// Step ceiling (§2.1): the run's own cap when it set one, the config's
@@ -527,7 +681,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		maxSteps = input.MaxSteps
 	}
 	resume := ports.ResumeInfo{
-		Agent: agent.Name, Model: input.Model, RunID: runID,
+		Agent: agent.Name, Model: input.Model, RunID: runID, DispatchedAt: input.DispatchedAt,
 		TokenBudget: input.TokenBudget, CostBudgetMicros: input.CostBudgetMicros,
 		ProviderOptions: providerOptions,
 		// Carried so the resumed segment scopes its storage the same way (§2.10).
@@ -537,11 +691,41 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	// same safety cap the main agent is checked against (§2.7).
 	ledger := &RunLedger{}
 
-	// How long the dispatch sat in the queue before a worker took it (§2.9).
-	if runID != "" && input.EnqueuedAt > 0 {
-		_ = deps.Admin.Runs().Patch(ctx, runID, ports.RunPatch{
-			QueuedMs: ports.Ptr(time.Now().UnixMilli() - input.EnqueuedAt),
-		})
+	// Pickup (§2.8): the run has a worker now. A QUEUED thread becomes
+	// RUNNING on every home, its record takes the moment work started, and
+	// the wire says so, so a client's clock measures work rather than
+	// waiting. The wait itself is kept on the record: the latest dispatch's,
+	// so a resume's or a retry's wait shows as its own.
+	pickedUp := time.Now()
+	if runID != "" {
+		patch := ports.RunPatch{}
+		if input.EnqueuedAt > 0 {
+			patch.QueuedMs = ports.Ptr(pickedUp.UnixMilli() - input.EnqueuedAt)
+		}
+		if durable.State == ports.StateQueued {
+			startedAt := pickedUp
+			if rec, err := deps.Admin.Runs().Get(ctx, runID); err == nil && rec != nil && rec.QueuedMs != nil {
+				startedAt = rec.StartedAt // a retry: the run started when it first ran
+			} else {
+				patch.StartedAt = &pickedUp
+			}
+			patch.State = ports.Ptr(ports.StateRunning)
+			_ = deps.Admin.Runs().Patch(ctx, runID, patch)
+			if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateRunning), ports.SetOptions{}); err != nil {
+				return "", err
+			}
+			if err := SetThreadState(ctx, deps, threadID, ports.StateRunning, input.Model); err != nil {
+				return "", err
+			}
+			if _, err := Publish(ctx, deps, threadID, "STATE_CHANGE", map[string]any{
+				"state": ports.StateRunning, "runId": runID, "startedAt": startedAt,
+			}); err != nil {
+				return "", err
+			}
+			durable.State = ports.StateRunning
+		} else if patch.QueuedMs != nil {
+			_ = deps.Admin.Runs().Patch(ctx, runID, patch)
+		}
 	}
 
 	// Platform-owned toolset: HITL (§2.5) over the user's set; spawnSubagent
@@ -619,8 +803,22 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			}
 		},
 	}, ledger)
+	timedOut := false
 	if err != nil {
-		return "", err
+		if lockLost.Load() {
+			// Every finished step is persisted; the job comes back once the
+			// lock is free and resumes from the last one.
+			log.Warn("segment ended early: run lock lost", "steps", loop.Steps)
+			return OutcomeLockLost, nil
+		}
+		if errors.Is(genBase.Err(), context.DeadlineExceeded) {
+			// The segment's own deadline ended it, whatever the provider
+			// turned that into.
+			timedOut = true
+			log.Warn("segment timed out", "after", deps.Config.SegmentTimeout, "steps", loop.Steps)
+		} else {
+			return "", err
+		}
 	}
 
 	if loop.Parked {
@@ -638,6 +836,8 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	stopReason := "completed"
 	state := ports.StateCompleted
 	switch {
+	case timedOut:
+		stopReason, state = "timeout", ports.StateFailed
 	case aborted():
 		stopReason, state = "cancelled", ports.StateCancelled
 	case loop.CostExhausted:
@@ -651,7 +851,10 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		State: state, StopReason: stopReason, TokensUsed: ledger.TokensUsed(),
 		Attribution: loop.Attribution, RunID: runID, Steps: loop.Steps,
 	}
-	if agent.Kind == ports.KindGenerateText {
+	if timedOut {
+		f.Error = fmt.Sprintf("the run ran longer than %s and was stopped", deps.Config.SegmentTimeout)
+	}
+	if agent.Kind == ports.KindGenerateText && !timedOut {
 		text := loop.Text
 		f.OneShotText = &text
 	}
@@ -665,7 +868,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	// once, handed to both hooks; a failed read is reported, not hidden.
 	bill, billErr := runBill(ctx, deps, threadID, runID)
 	if _, err := settleRun(genCtx, deps, agent, ports.RunFinishInfo{
-		ThreadID: threadID, RunID: runID, State: state, StopReason: stopReason,
+		ThreadID: threadID, RunID: runID, State: state, StopReason: stopReason, Error: f.Error,
 		TokensUsed: f.TokensUsed, Attribution: f.Attribution, Steps: f.Steps,
 		Cancelled: state == ports.StateCancelled,
 		Usage:     bill, UsageErr: billErr,
@@ -691,7 +894,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 // FinalizeInput is how a run ended.
 type FinalizeInput struct {
 	State ports.ExecutionState
-	// StopReason is 'completed' | 'token_budget' | 'max_steps' | 'cancelled'.
+	// StopReason is 'completed' | 'token_budget' | 'max_steps' | 'cancelled' | 'timeout'.
 	StopReason  string
 	TokensUsed  int
 	Attribution TokenAttribution
@@ -770,14 +973,21 @@ func Finalize(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAge
 // (§2.8), and only one of them is a no-op:
 //
 //   - the lock carries THIS run's id → an at-least-once duplicate of a job
-//     that is already executing. Drop it.
+//     that is already executing. Drop it, and say so.
 //   - the lock belongs to an OLDER run that has not finished tearing down →
 //     this job never ran. Dropping it strands the message the user just sent,
 //     so come back once the lock clears. Bounded by maxAttempts, then FAILED.
+//
+// Because the lock is renewed while its worker runs (§3.4), a held lock
+// means a live worker. One case is neither: the thread already ended under
+// the held lock and its settle never ran. That job is the last chance to
+// settle, so it comes back once the lock has surely cleared.
 func redriveOnLockConflict(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, input ExecuteInput, maxAttempts int) error {
 	if input.RunID == "" {
 		return nil // legacy dispatch, no identity: old drop behavior
 	}
+	log := Logger(deps).With("thread", input.ThreadID, "run", input.RunID, "kind", string(input.Kind))
+	scope := CounterScope(input.ThreadID, input.RunID)
 	if holder, _, err := deps.Kv.Get(ctx, RunLockKey(input.ThreadID)); err != nil {
 		return err
 	} else if holder == input.RunID {
@@ -793,31 +1003,41 @@ func redriveOnLockConflict(ctx context.Context, deps ports.RuntimePorts, agent *
 		if err != nil {
 			return err
 		}
-		if durable == nil || durable.State != ports.StateWaitingForInput {
+		switch {
+		case durable == nil || durable.State == ports.StateWaitingForInput:
+			// fall through to the redrive below
+		case isTerminal(durable.State):
+			rec, err := deps.Admin.Runs().Get(ctx, input.RunID)
+			if err == nil && rec != nil && rec.SettledAt == nil {
+				log.Info("run ended under a held lock and is not settled; settle retried once the lock clears")
+				err := deps.Queue.Enqueue(ctx, input.job(agent.Name, ports.JobRedrive),
+					&ports.EnqueueOptions{Delay: deps.Config.RunLockLease, Key: "settle:" + input.RunID, Priority: ports.PriorityLow})
+				if errors.Is(err, ports.ErrDuplicateJob) {
+					return nil
+				}
+				return err
+			}
+			return nil
+		default:
+			log.Info("duplicate delivery dropped: this run already holds the lock")
 			return nil // own duplicate
 		}
 	}
 	if current, _, err := deps.Kv.Get(ctx, RunIDKey(input.ThreadID)); err != nil {
 		return err
 	} else if current != input.RunID {
+		log.Info("delivery dropped: a newer run owns the thread")
 		return nil // already replaced
 	}
-	tries, err := deps.Kv.Incr(ctx, RedriveKey(input.ThreadID))
+	tries, err := deps.Kv.IncrWithExpiry(ctx, RedriveKey(scope), counterTTL)
 	if err != nil {
 		return err
 	}
 	if tries <= int64(maxAttempts) {
-		return deps.Queue.Enqueue(ctx, ports.RunJob{
-			ThreadID: input.ThreadID, RunID: input.RunID, EnqueuedAt: time.Now().UnixMilli(),
-			Model: input.Model, Agent: agent.Name, TokenBudget: input.TokenBudget,
-			// A redrive is the SAME run trying again, so it keeps the caps it
-			// was dispatched with: a retry that lost its money cap would be
-			// unbounded (§4).
-			CostBudgetMicros: input.CostBudgetMicros,
-			ProviderOptions:  input.ProviderOptions, State: input.State, MaxSteps: input.MaxSteps,
-		}, &ports.EnqueueOptions{Delay: deps.Config.RunRedriveDelay})
+		log.Info("run lock held by an older run; redriven", "try", tries, "in", deps.Config.RunRedriveDelay)
+		return deps.Queue.Enqueue(ctx, input.job(agent.Name, ports.JobRedrive), &ports.EnqueueOptions{Delay: deps.Config.RunRedriveDelay})
 	}
-	if err := deps.Kv.Del(ctx, RedriveKey(input.ThreadID)); err != nil {
+	if err := deps.Kv.Del(ctx, RedriveKey(scope)); err != nil {
 		return err
 	}
 	return failRun(ctx, deps, agent, input.ThreadID, input.RunID, "the run lock never cleared")
@@ -834,9 +1054,10 @@ type Policy struct {
 }
 
 // ExecuteWithPolicy is the §2.8 failure policy: transient errors redrive
-// through the queue; exhausted attempts finalize FAILED (hot cache +
-// durable). A user stop is never retried, and a successful run resets the
-// attempt counter.
+// through the queue, each retry waiting longer than the last; exhausted
+// attempts finalize FAILED (hot cache + durable). A user stop is never
+// retried, a shutdown never costs an attempt, and a successful run resets
+// the attempt counter.
 //
 // It returns nil once the outcome has been handled, whether the run ran,
 // was redriven, or was finalized FAILED. It returns an error only when the
@@ -852,15 +1073,16 @@ func ExecuteWithPolicy(ctx context.Context, deps ports.RuntimePorts, agent *Regi
 			exec = policy.Exec
 		}
 	}
+	scope := CounterScope(input.ThreadID, input.RunID)
 	outcome, err := exec(ctx, deps, agent, input)
 	if err == nil {
 		switch outcome {
 		case OutcomeExecuted:
 			// Only a run THIS worker executed may reset the retry budget (§2.8)
-			if err := deps.Kv.Del(ctx, AttemptsKey(input.ThreadID)); err != nil {
+			if err := deps.Kv.Del(ctx, AttemptsKey(scope)); err != nil {
 				return err
 			}
-			return deps.Kv.Del(ctx, RedriveKey(input.ThreadID))
+			return deps.Kv.Del(ctx, RedriveKey(scope))
 		case OutcomeStale:
 			return nil // a newer run owns the thread: this job is a genuine no-op
 		default:
@@ -868,35 +1090,102 @@ func ExecuteWithPolicy(ctx context.Context, deps ports.RuntimePorts, agent *Regi
 		}
 	}
 
+	// From here the policy works on a context a shutdown cannot cancel: a
+	// worker told to stop must still hand its job back or fail it, or the
+	// thread reads RUNNING for ever.
+	bg := context.WithoutCancel(ctx)
+	log := Logger(deps).With("thread", input.ThreadID, "run", input.RunID)
+	if ctx.Err() != nil {
+		// The worker was cut off: a shutdown, or the queue's own cap. That
+		// is not the run's fault, so it goes back at once and the attempt
+		// is not counted.
+		log.Info("run interrupted; requeued", "err", err)
+		return requeue(bg, deps, agent, input, 0)
+	}
+
 	// A user stop already finalized the thread: never retry a stop
-	if state, _, kvErr := deps.Kv.Get(ctx, StateKey(input.ThreadID)); kvErr != nil {
+	if state, _, kvErr := deps.Kv.Get(bg, StateKey(input.ThreadID)); kvErr != nil {
 		return errors.Join(err, kvErr)
 	} else if state == string(ports.StateCancelled) {
 		return nil
 	}
-	attempts, kvErr := deps.Kv.Incr(ctx, AttemptsKey(input.ThreadID))
+	attempts, kvErr := deps.Kv.IncrWithExpiry(bg, AttemptsKey(scope), counterTTL)
 	if kvErr != nil {
 		return errors.Join(err, kvErr)
 	}
 	if attempts < int64(maxAttempts) {
 		// A retry is the SAME run trying again (§2.1): it keeps the id, so it
 		// can notice it was replaced and redrive if it finds the lock held.
-		return deps.Queue.Enqueue(ctx, ports.RunJob{
-			ThreadID: input.ThreadID, RunID: input.RunID, EnqueuedAt: time.Now().UnixMilli(),
-			Model: input.Model, Agent: agent.Name, TokenBudget: input.TokenBudget,
-			// A redrive is the SAME run trying again, so it keeps the caps it
-			// was dispatched with: a retry that lost its money cap would be
-			// unbounded (§4).
-			CostBudgetMicros: input.CostBudgetMicros,
-			ProviderOptions:  input.ProviderOptions, State: input.State, MaxSteps: input.MaxSteps,
-		}, nil)
+		delay := retryBackoff(deps.Config, int(attempts))
+		log.Warn("run failed; retry scheduled", "err", err, "attempt", attempts, "maxAttempts", maxAttempts, "in", delay.Round(time.Millisecond))
+		return requeue(bg, deps, agent, input, delay)
 	}
 	// Attempts exhausted: finalize FAILED on BOTH the hot cache and durable
 	// truth, or subsequent runs would still treat the thread as active (§2.1)
-	if failErr := failRun(ctx, deps, agent, input.ThreadID, input.RunID, err.Error()); failErr != nil {
+	log.Error("run failed; attempts spent", "err", err, "attempts", attempts)
+	if failErr := failRun(bg, deps, agent, input.ThreadID, input.RunID, err.Error()); failErr != nil {
 		return errors.Join(err, failErr)
 	}
-	return deps.Kv.Del(ctx, AttemptsKey(input.ThreadID))
+	return deps.Kv.Del(bg, AttemptsKey(scope))
+}
+
+// requeue puts the same run back on the queue as a retry (§2.8). The
+// thread reads QUEUED while it waits, so a client sees a run waiting to
+// retry rather than one that looks like it is working.
+func requeue(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, input ExecuteInput, delay time.Duration) error {
+	if input.RunID != "" {
+		if err := markQueued(ctx, deps, input.ThreadID, input.RunID, input.Model); err != nil {
+			return err
+		}
+	}
+	return deps.Queue.Enqueue(ctx, input.job(agent.Name, ports.JobRetry), &ports.EnqueueOptions{Delay: delay})
+}
+
+// markQueued moves a RUNNING thread back to QUEUED for a retry, on every
+// home, and says so on the wire. A parked thread keeps WAITING_FOR_INPUT:
+// the park machinery reads that state. A replaced run leaves the live run's
+// state alone.
+func markQueued(ctx context.Context, deps ports.RuntimePorts, threadID, runID, model string) error {
+	current, err := CurrentRunID(ctx, deps, threadID)
+	if err != nil || current != runID {
+		return err
+	}
+	durable, err := deps.Storage.Threads.Get(ctx, threadID)
+	if err != nil || durable == nil || durable.State != ports.StateRunning {
+		return err
+	}
+	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateQueued), ports.SetOptions{}); err != nil {
+		return err
+	}
+	if err := SetThreadState(ctx, deps, threadID, ports.StateQueued, model); err != nil {
+		return err
+	}
+	_ = deps.Admin.Runs().Patch(ctx, runID, ports.RunPatch{State: ports.Ptr(ports.StateQueued)})
+	_, err = Publish(ctx, deps, threadID, "STATE_CHANGE", map[string]any{
+		"state": ports.StateQueued, "runId": runID, "enqueuedAt": time.Now(),
+	})
+	return err
+}
+
+// retryBackoff is how long the nth retry waits (§2.8): the base doubled per
+// attempt, capped, with up to a quarter of jitter so a fleet that failed
+// together does not retry together.
+func retryBackoff(cfg ports.AgentConfig, attempt int) time.Duration {
+	if cfg.RunRetryBackoff <= 0 {
+		return 0
+	}
+	d := cfg.RunRetryBackoff
+	for i := 1; i < attempt; i++ {
+		d *= 2
+		if cfg.RunRetryBackoffMax > 0 && d >= cfg.RunRetryBackoffMax {
+			d = cfg.RunRetryBackoffMax
+			break
+		}
+	}
+	if cfg.RunRetryBackoffMax > 0 && d > cfg.RunRetryBackoffMax {
+		d = cfg.RunRetryBackoffMax
+	}
+	return d + time.Duration(rand.Int64N(int64(d)/4+1))
 }
 
 // runBill sums every model call a run made, nested runs included (§4). A
@@ -914,4 +1203,46 @@ func runBill(ctx context.Context, deps ports.RuntimePorts, threadID, runID strin
 		return ports.UsageTotals{}, err
 	}
 	return total, nil
+}
+
+// FailLostRun fails a run the queue gave up on (§2.8), when it is still the
+// thread's current run and the thread is still waiting on it. Returns false
+// when the run had already moved on. Runs under the run lock like every
+// other terminal write.
+func FailLostRun(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, threadID, runID, reason string) (bool, error) {
+	if runID == "" {
+		return false, nil
+	}
+	current, err := CurrentRunID(ctx, deps, threadID)
+	if err != nil || current != runID {
+		return false, err
+	}
+	thread, err := deps.Storage.Threads.Get(ctx, threadID)
+	if err != nil || thread == nil || !IsActive(thread.State) {
+		return false, err
+	}
+	locked, err := deps.Kv.Set(ctx, RunLockKey(threadID), runID, ports.SetOptions{OnlyIfNotExists: true, Expiry: deps.Config.RunLockLease})
+	if err != nil || !locked {
+		return false, err // a worker still holds it; the run is not lost
+	}
+	defer func() { _, _ = deps.Kv.DelIfValue(context.WithoutCancel(ctx), RunLockKey(threadID), runID) }()
+	if thread.State == ports.StateWaitingForInput {
+		_ = closeOpenParks(ctx, deps, threadID)
+	}
+	return true, failRun(ctx, deps, agent, threadID, runID, reason)
+}
+
+// SettleLate settles an ended run whose settle never ran (§5.6), under the
+// run lock. Returns false when the run was settled meanwhile or a worker
+// holds it.
+func SettleLate(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, threadID, runID string) (bool, error) {
+	if runID == "" {
+		return false, nil
+	}
+	locked, err := deps.Kv.Set(ctx, RunLockKey(threadID), runID, ports.SetOptions{OnlyIfNotExists: true, Expiry: deps.Config.RunLockLease})
+	if err != nil || !locked {
+		return false, err
+	}
+	defer func() { _, _ = deps.Kv.DelIfValue(context.WithoutCancel(ctx), RunLockKey(threadID), runID) }()
+	return settleEndedRun(ctx, deps, agent, threadID, runID), nil
 }

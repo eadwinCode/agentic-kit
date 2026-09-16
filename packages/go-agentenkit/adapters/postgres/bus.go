@@ -13,10 +13,10 @@ import (
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
 
-// NotifyChannel is the one Postgres channel every thread's events travel on.
-// LISTEN is per connection, not per channel-pattern, so one channel and an
-// in-process fan-out by thread id costs one connection per process however
-// many threads it watches.
+// NotifyChannel is the default Postgres channel every thread's events travel
+// on. LISTEN is per connection, not per channel-pattern, so one channel and
+// an in-process fan-out by thread id costs one connection per process
+// however many threads it watches. BusOptions.Channel picks another one.
 const NotifyChannel = "agentenkit_events"
 
 // notifyPayloadCap is Postgres's NOTIFY limit (8000 bytes) with room for the
@@ -72,6 +72,8 @@ type Bus struct {
 	started bool
 	// heartbeat drives the §2.5 watchdog on every subscription.
 	heartbeat time.Duration
+	// channel is the NOTIFY channel, per deployment.
+	channel string
 }
 
 // subscription is one handler on one thread, with the cursor the reconnect
@@ -130,6 +132,10 @@ type BusOptions struct {
 	// Heartbeat is the interval of the bus-only HEARTBEAT notice each
 	// subscription emits. Zero means one minute.
 	Heartbeat time.Duration
+	// Channel is the NOTIFY channel this bus publishes and listens on. Two
+	// deployments sharing one database must not share a channel, or each
+	// delivers the other's events. Empty means NotifyChannel.
+	Channel string
 }
 
 // NewBus builds the bus. Publishing goes through db (pg_notify); listening
@@ -141,7 +147,11 @@ func NewBus(db *sql.DB, listener Listener, events ports.EventStore, kv *Kv, opts
 	if hb <= 0 {
 		hb = time.Minute
 	}
-	return &Bus{db: db, kv: kv, events: events, listener: listener, subs: map[string]map[int]*subscription{}, heartbeat: hb}
+	channel := opts.Channel
+	if channel == "" {
+		channel = NotifyChannel
+	}
+	return &Bus{db: db, kv: kv, events: events, listener: listener, subs: map[string]map[int]*subscription{}, heartbeat: hb, channel: channel}
 }
 
 // frame is what travels over NOTIFY: the event itself when it fits, else a
@@ -175,7 +185,7 @@ func (b *Bus) Publish(ctx context.Context, threadID string, event ports.AgentEve
 			return err
 		}
 	}
-	_, err = b.db.ExecContext(ctx, `SELECT pg_notify($1, $2)`, NotifyChannel, string(body))
+	_, err = b.db.ExecContext(ctx, `SELECT pg_notify($1, $2)`, b.channel, string(body))
 	return err
 }
 
@@ -246,7 +256,7 @@ func (b *Bus) start() {
 		n.OnConnect(b.connected)
 	}
 	go func() {
-		_ = b.listener.Listen(context.Background(), NotifyChannel, b.receive)
+		_ = b.listener.Listen(context.Background(), b.channel, b.receive)
 	}()
 }
 

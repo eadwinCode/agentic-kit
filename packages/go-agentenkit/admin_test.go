@@ -17,8 +17,11 @@ func TestAdmin_RunRecordsOpenOnRunAndCloseWithTimingTokensAndSteps(t *testing.T)
 	})
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
 	open, _ := h.admin.Runs().Get(h.ctx, ran.RunID)
-	mustEqual(t, open.State, agentenkit.StateRunning, "open")
+	mustEqual(t, open.State, agentenkit.StateQueued, "open: accepted, no worker yet")
 	mustEqual(t, open.Agent, "chat", "agent")
+	if open.EnqueuedAt == nil {
+		t.Fatal("the record remembers when it was enqueued")
+	}
 	h.handleNext(t)
 	closed, _ := h.admin.Runs().Get(h.ctx, ran.RunID)
 	mustEqual(t, closed.State, agentenkit.StateCompleted, "closed")
@@ -111,14 +114,19 @@ func TestAdmin_OverviewStatsAndThreadRollUps(t *testing.T) {
 	}
 	mustEqual(t, ov.Runs.Total, 3, "runs")
 	mustEqual(t, ov.RunsByState[agentenkit.StateCompleted], 2, "completed")
-	mustEqual(t, ov.RunsByState[agentenkit.StateRunning], 1, "running")
-	mustEqual(t, ov.Threads[agentenkit.StateRunning], 1, "threads running")
+	mustEqual(t, ov.RunsByState[agentenkit.StateQueued], 1, "queued: accepted, no worker yet")
+	mustEqual(t, ov.Threads[agentenkit.StateQueued], 1, "threads queued")
 	mustEqual(t, ov.Threads[agentenkit.StateCompleted], 1, "threads completed")
 	mustEqual(t, len(ov.Active), 1, "active")
 	mustEqual(t, ov.Active[0].ThreadID, b.ThreadID, "active thread")
+	mustEqual(t, ov.ActiveTotal, 1, "active total counts queued runs")
+	mustEqual(t, ov.Runs.Waiting, 1, "one run still waiting")
 	mustEqual(t, ov.Runs.Tokens.TotalTokens, 30, "tokens")
 	if ov.Runs.Duration == nil || ov.Runs.Queued == nil {
 		t.Fatal("percentiles missing")
+	}
+	if ov.Queue == nil || ov.Queue.Ready != 1 {
+		t.Fatalf("the overview carries the queue's own depth: %+v", ov.Queue)
 	}
 
 	stats, _ := h.rt.Admin.Stats(h.ctx, agentenkit.StatsRange{})
@@ -155,6 +163,6 @@ func TestAdmin_OverviewStatsAndThreadRollUps(t *testing.T) {
 	since := time.Now().Add(time.Hour)
 	later, _ := h.rt.Admin.ListRuns(h.ctx, agentenkit.RunFilter{Since: &since})
 	mustEqual(t, len(later), 0, "since filter")
-	byState, _ := h.rt.Admin.ListRuns(h.ctx, agentenkit.RunFilter{State: []agentenkit.ExecutionState{agentenkit.StateRunning}})
+	byState, _ := h.rt.Admin.ListRuns(h.ctx, agentenkit.RunFilter{State: []agentenkit.ExecutionState{agentenkit.StateQueued}})
 	mustEqual(t, len(byState), 1, "state filter")
 }

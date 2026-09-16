@@ -17,6 +17,14 @@ func (q admissionQueue) Enqueue(ctx context.Context, job ports.RunJob, opts *por
 	return q(ctx, job, opts)
 }
 
+func (admissionQueue) Cancel(context.Context, string) error { return nil }
+func (admissionQueue) Find(context.Context, string) (*ports.QueuedJob, error) {
+	return nil, ports.ErrUnsupported
+}
+func (admissionQueue) Stats(context.Context) (ports.QueueStats, error) {
+	return ports.QueueStats{}, ports.ErrUnsupported
+}
+
 func TestAdmission_ConcurrentSendsOnlyPersistAndDispatchOneTurn(t *testing.T) {
 	for _, cached := range []bool{false, true} {
 		name := "missing-cache"
@@ -136,9 +144,9 @@ func TestAdmission_LateQueueFailureCannotFailANewerRun(t *testing.T) {
 	if err := <-done; err == nil {
 		t.Fatal("expected queue failure")
 	}
-	mustEqual(t, h.thread(t, first.ThreadID).State, ports.StateRunning, "new run remains active")
+	mustEqual(t, h.thread(t, first.ThreadID).State, ports.StateQueued, "new run remains active")
 	prior, _ := h.admin.Runs().Get(h.ctx, first.RunID)
 	next, _ := h.admin.Runs().Get(h.ctx, second.RunID)
 	mustEqual(t, prior.State, ports.StateCancelled, "stop retained")
-	mustEqual(t, next.State, ports.StateRunning, "new record retained")
+	mustEqual(t, next.State, ports.StateQueued, "new record retained")
 }

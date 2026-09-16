@@ -194,6 +194,8 @@ export function answeredToolCalls(messages: readonly SnapshotMessage[]): Set<str
 /** The activity a thread state implies when nothing more specific is happening. */
 export function stateActivity(state: AgentState, labels: ActivityLabels): AgentActivity {
   switch (state) {
+    case 'QUEUED':
+      return { phase: 'queued', label: labels.queued };
     case 'RUNNING':
       return { phase: 'thinking', label: labels.thinking };
     case 'WAITING_FOR_INPUT':

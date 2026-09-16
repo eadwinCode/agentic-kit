@@ -99,10 +99,20 @@ type runStore struct{ s *Store }
 func (r runStore) Start(_ context.Context, n ports.NewRunRecord) (*ports.RunRecord, error) {
 	r.s.mu.Lock()
 	defer r.s.mu.Unlock()
+	state := n.State
+	if state == "" {
+		state = ports.StateRunning
+	}
 	rec := &ports.RunRecord{
 		ID: n.ID, ThreadID: n.ThreadID, ParentRunID: n.ParentRunID, Depth: n.Depth,
-		Agent: n.Agent, Model: n.Model, State: ports.StateRunning, StartedAt: time.Now(),
+		Agent: n.Agent, Model: n.Model, State: state, StartedAt: time.Now(),
 		Prompt: n.Prompt, TokenBudget: n.TokenBudget, RunState: n.RunState, ProviderOptions: n.ProviderOptions,
+		CostBudgetMicros: n.CostBudgetMicros, MaxSteps: n.MaxSteps,
+	}
+	if n.EnqueuedAt != nil {
+		t := *n.EnqueuedAt
+		rec.EnqueuedAt = &t
+		rec.StartedAt = t
 	}
 	r.s.runs[rec.ID] = rec
 	copy := *rec
@@ -123,6 +133,9 @@ func (r runStore) Patch(_ context.Context, runID string, p ports.RunPatch) error
 func applyPatch(cur *ports.RunRecord, p ports.RunPatch) {
 	if p.State != nil {
 		cur.State = *p.State
+	}
+	if p.StartedAt != nil {
+		cur.StartedAt = *p.StartedAt
 	}
 	if p.StopReason != nil {
 		cur.StopReason = *p.StopReason

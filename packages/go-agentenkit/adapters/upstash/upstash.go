@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
@@ -121,6 +122,43 @@ func (k *Kv) Incr(ctx context.Context, key string) (int64, error) {
 	}
 	var n int64
 	return n, json.Unmarshal(res, &n)
+}
+
+// The compare-and-act calls run as scripts so the read and the write are
+// one atomic step on the server (§3.4).
+const (
+	setIfValueScript = `if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+if tonumber(ARGV[3]) > 0 then redis.call('SET', KEYS[1], ARGV[2], 'PX', ARGV[3]) else redis.call('SET', KEYS[1], ARGV[2]) end
+return 1`
+	delIfValueScript = `if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+return redis.call('DEL', KEYS[1])`
+	incrWithExpiryScript = `local n = redis.call('INCR', KEYS[1])
+if n == 1 and tonumber(ARGV[1]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
+return n`
+)
+
+func (k *Kv) eval(ctx context.Context, script string, key string, args ...any) (int64, error) {
+	cmd := append([]any{"EVAL", script, 1, key}, args...)
+	res, err := k.redis.Do(ctx, cmd...)
+	if err != nil {
+		return 0, err
+	}
+	var n int64
+	return n, json.Unmarshal(res, &n)
+}
+
+func (k *Kv) SetIfValue(ctx context.Context, key, expected, value string, ttl time.Duration) (bool, error) {
+	n, err := k.eval(ctx, setIfValueScript, key, expected, value, ttl.Milliseconds())
+	return n == 1, err
+}
+
+func (k *Kv) DelIfValue(ctx context.Context, key, expected string) (bool, error) {
+	n, err := k.eval(ctx, delIfValueScript, key, expected)
+	return n == 1, err
+}
+
+func (k *Kv) IncrWithExpiry(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+	return k.eval(ctx, incrWithExpiryScript, key, ttl.Milliseconds())
 }
 
 // Subscriber tails a thread channel. Return an unsubscribe function.

@@ -50,6 +50,8 @@ export const defaultRoutes: AgentRoutes = {
 export interface ActivityLabels {
   idle: string;
   loading: string;
+  /** The run is accepted and waiting for a worker. */
+  queued: string;
   thinking: string;
   responding: string;
   reviewingSources: string;
@@ -76,6 +78,7 @@ export interface ActivityLabels {
 export const defaultLabels: ActivityLabels = {
   idle: 'Idle',
   loading: 'Loading conversation',
+  queued: 'Waiting to start',
   thinking: 'Thinking',
   responding: 'Responding',
   reviewingSources: 'Reviewing sources',

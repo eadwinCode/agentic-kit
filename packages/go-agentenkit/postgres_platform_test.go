@@ -36,7 +36,7 @@ func openPgPlatform(t *testing.T, prefix string, queueOpts pgstorage.QueueOption
 	t.Helper()
 	db := openPostgres(t)
 	ctx := context.Background()
-	for _, tbl := range []string{"jobs", "kv", "usage", "events", "messages", "threads"} {
+	for _, tbl := range []string{"jobs_control", "jobs", "kv", "usage", "events", "messages", "threads"} {
 		_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS "+prefix+tbl)
 	}
 	storage, err := pgstorage.New(ctx, db, pgstorage.WithPrefix(prefix))
@@ -221,7 +221,7 @@ func TestPostgresBus_DeliversLiveAndResolvesOversizedFrames(t *testing.T) {
 }
 
 func TestPostgresQueue_DeliversHonoursDelaysAndRedelivers(t *testing.T) {
-	p := openPgPlatform(t, "qt_", pgstorage.QueueOptions{Poll: 20 * time.Millisecond, Lease: 300 * time.Millisecond, MaxAttempts: 2})
+	p := openPgPlatform(t, "qt_", pgstorage.QueueOptions{Poll: 20 * time.Millisecond, Lease: 300 * time.Millisecond, MaxAttempts: 2, RetryBackoff: 30 * time.Millisecond, RetryBackoffMax: 30 * time.Millisecond})
 	ctx := context.Background()
 	var mu sync.Mutex
 	var seen []string

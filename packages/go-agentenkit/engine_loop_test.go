@@ -30,7 +30,7 @@ func TestEngineLoop_FeedsToolResultsBackAndPersistsPerStep(t *testing.T) {
 	h.handleNext(t)
 
 	mustStrings(t, executed, []string{"x"}, "executed tools")
-	mustStrings(t, h.states(ran.ThreadID), []string{"RUNNING", "COMPLETED"}, "states")
+	mustStrings(t, h.states(ran.ThreadID), []string{"QUEUED", "RUNNING", "COMPLETED"}, "states")
 	terminal := h.lastTerminal(ran.ThreadID)
 	mustEqual(t, terminal["stopReason"], "completed", "stopReason")
 	mustEqual(t, terminal["tokensUsed"], float64(30), "tokensUsed") // 15 per step × 2 steps
@@ -89,7 +89,8 @@ func TestEngineLoop_BudgetIsCheckedBetweenSteps(t *testing.T) {
 	mustEqual(t, len(exhausted), 1, "TOKEN_BUDGET_EXHAUSTED")
 	mustEqual(t, payload(exhausted[0])["tokensUsed"], float64(120), "tokensUsed on the event")
 	mustEqual(t, payload(exhausted[0])["tokenBudget"], float64(100), "tokenBudget on the event")
-	if exhausted[0].Seq >= h.events(ran.ThreadID, "STATE_CHANGE")[1].Seq {
+	changes := h.events(ran.ThreadID, "STATE_CHANGE")
+	if exhausted[0].Seq >= changes[len(changes)-1].Seq {
 		t.Fatal("must be published before the terminal STATE_CHANGE")
 	}
 }
@@ -320,7 +321,7 @@ func TestHITL_RespondApprovedResumesViaTheQueue(t *testing.T) {
 	part := agentenkit.ParseContent(toolMsg.Content)[0]
 	mustEqual(t, part.ToolCallID, "c1", "tool result id")
 	mustEqual(t, string(part.Result), `{"deleted":true}`, "tool result")
-	mustStrings(t, h.states(ran.ThreadID), []string{"RUNNING", "WAITING_FOR_INPUT", "RUNNING", "COMPLETED"}, "states")
+	mustStrings(t, h.states(ran.ThreadID), []string{"QUEUED", "RUNNING", "WAITING_FOR_INPUT", "RUNNING", "COMPLETED"}, "states")
 	mustEqual(t, h.kvGet(agentenkit.HitlKey("c1")), "", "handoff key consumed")
 }
 

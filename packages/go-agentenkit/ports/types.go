@@ -25,7 +25,10 @@ import (
 type ExecutionState string
 
 const (
-	StateIdle            ExecutionState = "IDLE"
+	StateIdle ExecutionState = "IDLE"
+	// StateQueued is a run accepted and waiting for a worker (§2.8). It
+	// becomes RUNNING the moment a worker picks the job up.
+	StateQueued          ExecutionState = "QUEUED"
 	StateRunning         ExecutionState = "RUNNING"
 	StateWaitingForInput ExecutionState = "WAITING_FOR_INPUT"
 	StateCancelled       ExecutionState = "CANCELLED"
@@ -157,13 +160,19 @@ type RunRecord struct {
 	// set at finalize.
 	StopReason string `json:"stopReason,omitempty"`
 	// Error is why it failed, when it did.
-	Error     string     `json:"error,omitempty"`
+	Error string `json:"error,omitempty"`
+	// EnqueuedAt is when the run was accepted and put on the queue (§2.8).
+	// Nil on a nested run, which is never queued.
+	EnqueuedAt *time.Time `json:"enqueuedAt,omitempty"`
+	// StartedAt is when a worker first picked the run up. Until then it is
+	// the enqueue time, so a listing sorted on it stays stable.
 	StartedAt time.Time  `json:"startedAt"`
 	EndedAt   *time.Time `json:"endedAt,omitempty"`
 	// DurationMs is EndedAt - StartedAt, kept so a listing never recomputes
 	// it. A parked run legitimately spans however long the human took (§2.5).
 	DurationMs *int64 `json:"durationMs,omitempty"`
-	// QueuedMs is the time between enqueue and a worker starting work (§2.8).
+	// QueuedMs is the time between the latest enqueue and a worker starting
+	// on it (§2.8): the first dispatch's wait, then a retry's or a resume's.
 	QueuedMs *int64 `json:"queuedMs,omitempty"`
 	// SettledAt is when the spec's OnSettle ran for this run (§5.6). A run
 	// settles exactly once: a worker that ends it, or a stop that ends it
@@ -183,6 +192,10 @@ type RunRecord struct {
 	Prompt      string        `json:"prompt,omitempty"`
 	TokenBudget *int          `json:"tokenBudget,omitempty"`
 	RunState    AgentRunState `json:"runState,omitempty"`
+	// CostBudgetMicros and MaxSteps are the caps the run was dispatched with
+	// (§4, §2.1), kept so a run re-dispatched from its record keeps them.
+	CostBudgetMicros int64 `json:"costBudgetMicros,omitempty"`
+	MaxSteps         int   `json:"maxSteps,omitempty"`
 	// ProviderOptions the run was dispatched with (§3.1), merged across
 	// config, spec and input. Present only when RecordPayloads is on.
 	ProviderOptions ProviderOptions `json:"providerOptions,omitempty"`
@@ -203,13 +216,23 @@ type NewRunRecord struct {
 	// Depth defaults to 0, a dispatched run.
 	Depth       int
 	ParentRunID string
+	// State the record opens in. Empty means RUNNING, which is what a nested
+	// run is from its first step; a dispatched run opens QUEUED.
+	State ExecutionState
+	// EnqueuedAt is set on a dispatched run: when it was put on the queue.
+	EnqueuedAt *time.Time
+	// CostBudgetMicros and MaxSteps are the dispatched caps (§4, §2.1).
+	CostBudgetMicros int64
+	MaxSteps         int
 }
 
 // RunPatch is a partial update of a run record. A nil field is left alone.
 type RunPatch struct {
-	State             *ExecutionState
-	StopReason        *string
-	Error             *string
+	State      *ExecutionState
+	StopReason *string
+	Error      *string
+	// StartedAt moves the start to the moment a worker picked the run up.
+	StartedAt         *time.Time
 	EndedAt           *time.Time
 	DurationMs        *int64
 	QueuedMs          *int64
@@ -573,8 +596,20 @@ type RunJob struct {
 	// time and `agent:run:{threadId}` holds its id; a job whose id no longer
 	// matches has been replaced and must not execute.
 	RunID string `json:"runId,omitempty"`
-	// EnqueuedAt is epoch milliseconds at enqueue (§2.9).
+	// EnqueuedAt is epoch milliseconds at THIS enqueue (§2.9): the queue
+	// wait a worker measures on pickup.
 	EnqueuedAt int64 `json:"enqueuedAt,omitempty"`
+	// DispatchedAt is epoch milliseconds of the run's first dispatch. A
+	// retry, redrive or resume carries it on, so the run keeps its place in
+	// line instead of going to the back. Zero means "now".
+	DispatchedAt int64 `json:"dispatchedAt,omitempty"`
+	// Kind says why the job exists: a fresh dispatch, a retry, a resume, a
+	// park expiry. See JobKind.
+	Kind JobKind `json:"kind,omitempty"`
+	// PartitionKey is the caller's tenant, opaque to the platform. A queue
+	// that can spread its claims across partitions serves one tenant's
+	// backlog without starving the others. Empty means one shared lane.
+	PartitionKey string `json:"partitionKey,omitempty"`
 	// State is the run's state (§2.10), so a worker rehydrates exactly what
 	// the caller attached.
 	State       AgentRunState `json:"state,omitempty"`
@@ -599,9 +634,12 @@ type NestedDescriptor struct {
 // ResumeInfo is everything needed to resume a parked HITL run segment (§2.5).
 // Persisted inside the INPUT_REQUIRED event payload.
 type ResumeInfo struct {
-	Agent            string          `json:"agent"`
-	Model            string          `json:"model"`
-	RunID            string          `json:"runId,omitempty"`
+	Agent string `json:"agent"`
+	Model string `json:"model"`
+	RunID string `json:"runId,omitempty"`
+	// DispatchedAt is epoch milliseconds of the run's first dispatch, so a
+	// resume keeps the run's place in line.
+	DispatchedAt     int64           `json:"dispatchedAt,omitempty"`
 	TokenBudget      int             `json:"tokenBudget,omitempty"`
 	CostBudgetMicros int64           `json:"costBudgetMicros,omitempty"`
 	ProviderOptions  ProviderOptions `json:"providerOptions,omitempty"`
@@ -687,12 +725,42 @@ type SubagentProfile struct {
 	MaxSteps int
 }
 
+// BillingStage says when a BillingCheck runs.
+type BillingStage string
+
+const (
+	// BillingAtDispatch runs inside Run, before anything is written. A
+	// refusal here means the run never exists.
+	BillingAtDispatch BillingStage = "dispatch"
+	// BillingAtPickup runs when a worker takes the job, however long it
+	// waited: a first dispatch, a retry, or a resume after an approval. A
+	// refusal here fails the run. The check may also lower the run's caps
+	// through Budget.
+	BillingAtPickup BillingStage = "pickup"
+)
+
+// RunBudget is the money and step cap a segment runs with.
+type RunBudget struct {
+	// CostBudgetMicros is the money cap (§4); zero is unbounded.
+	CostBudgetMicros int64
+	// MaxSteps is the step cap; zero keeps the config's.
+	MaxSteps int
+}
+
 // BillingCheck is what BillingPreCheck receives: the thread about to run,
 // the run's state (§2.10), and a way to publish on the thread (a credit
 // warning, a reset date) before the refusal reaches the caller.
 type BillingCheck struct {
 	ThreadID string
-	State    AgentRunState
+	// RunID is set at pickup; empty at dispatch, where the run has no id yet.
+	RunID string
+	State AgentRunState
+	// Stage is when the check runs. See BillingStage.
+	Stage BillingStage
+	// Budget is the cap the job carries. At pickup the check may lower
+	// either field and the segment runs with the lowered cap; raising is
+	// ignored. Nil at dispatch.
+	Budget *RunBudget
 	// PublishEvent publishes a durable event on the thread; Notice for a
 	// bus-only one.
 	PublishEvent func(ctx context.Context, typ string, payload any, notice bool) (AgentEvent, error)
@@ -716,6 +784,30 @@ type AgentConfig struct {
 	// RunRedriveDelay is the delay before re-dispatching a job that found the
 	// run lock still held by an OLDER run (§2.8).
 	RunRedriveDelay time.Duration
+	// RunRetryBackoff is the delay before the first retry of a failed run
+	// (§2.8). Each further retry waits twice as long, up to
+	// RunRetryBackoffMax, with a little jitter so a fleet does not retry in
+	// step. Zero retries at once.
+	RunRetryBackoff time.Duration
+	// RunRetryBackoffMax caps the retry delay. Zero means no cap.
+	RunRetryBackoffMax time.Duration
+	// StepTimeout bounds one model round trip, tools included. A step past
+	// it fails like any other failed step and the run takes the retry
+	// policy. Zero is no bound.
+	StepTimeout time.Duration
+	// SegmentTimeout bounds one worker segment: from pickup to finish or
+	// park. A segment past it settles the run FAILED with a reason the
+	// client can show, instead of holding the worker slot. Zero is no bound.
+	SegmentTimeout time.Duration
+	// MaxQueueWait is the longest a job may sit in the queue and still run.
+	// A job picked up later than this is settled FAILED with the reason,
+	// instead of executing work nobody is waiting for. Zero is no bound.
+	MaxQueueWait time.Duration
+	// MaxQueueDepth refuses a new run, before anything is written, once this
+	// many jobs are ready and waiting (Queue.Stats). The refusal names
+	// RefusedQueueFull so a host can answer 503 with a Retry-After. Zero is
+	// no bound. A queue adapter may enforce its own cap on top.
+	MaxQueueDepth int
 	// TokenBudget is the default per-run token budget (input + output). Zero
 	// means unbounded apart from MaxSteps.
 	TokenBudget int
@@ -757,8 +849,10 @@ type AgentConfig struct {
 	// NativeWindows are per-model native windows below the ceiling (§2.6).
 	// A ContextWindow declared via ResolveModel wins over this table.
 	NativeWindows map[string]int
-	// RunLockLease is the lease for the per-thread run lock. Must exceed the
-	// longest possible run segment (§2.8, §3.4).
+	// RunLockLease is the lease for the per-thread run lock (§2.8, §3.4). The
+	// worker renews it every third of the lease while its segment runs, so
+	// it only has to outlast a renewal gap plus a crash: an expired lock
+	// means a dead worker and nothing else.
 	RunLockLease time.Duration
 	// BillingPreCheck rejects a run before it starts (§4). Nil means no
 	// check. The check can publish on the thread, so the refusal is visible
@@ -790,7 +884,9 @@ func DefaultConfig() AgentConfig {
 		ContextTailShare:           0.25,
 		CompactionModel:            "gpt-4o-mini",
 		PromptCaching:              true,
-		RunLockLease:               30 * time.Minute,
+		RunLockLease:               2 * time.Minute,
+		RunRetryBackoff:            5 * time.Second,
+		RunRetryBackoffMax:         2 * time.Minute,
 	}
 }
 
@@ -812,6 +908,12 @@ func ResolveConfig(partial *AgentConfig) (AgentConfig, error) {
 	}
 	if config.RunRedriveDelay < 0 {
 		return config, fmt.Errorf("invalid config: RunRedriveDelay (%s) must not be negative", config.RunRedriveDelay)
+	}
+	if config.RunRetryBackoff < 0 || config.RunRetryBackoffMax < 0 {
+		return config, errors.New("invalid config: RunRetryBackoff and RunRetryBackoffMax must not be negative")
+	}
+	if config.StepTimeout < 0 || config.SegmentTimeout < 0 || config.MaxQueueWait < 0 || config.MaxQueueDepth < 0 {
+		return config, errors.New("invalid config: StepTimeout, SegmentTimeout, MaxQueueWait and MaxQueueDepth must not be negative")
 	}
 	if config.RunLockLease < time.Second {
 		// The lease is the only thing that heals a crashed worker's lock (§3.4)

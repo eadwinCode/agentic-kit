@@ -53,6 +53,36 @@ func (k *Kv) Incr(ctx context.Context, key string) (int64, error) {
 	return k.client.Incr(ctx, key).Result()
 }
 
+// The compare-and-act calls run as scripts so the read and the write are
+// one atomic step on the server (§3.4).
+var (
+	setIfValueScript = goredis.NewScript(`
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+if tonumber(ARGV[3]) > 0 then redis.call('SET', KEYS[1], ARGV[2], 'PX', ARGV[3]) else redis.call('SET', KEYS[1], ARGV[2]) end
+return 1`)
+	delIfValueScript = goredis.NewScript(`
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+return redis.call('DEL', KEYS[1])`)
+	incrWithExpiryScript = goredis.NewScript(`
+local n = redis.call('INCR', KEYS[1])
+if n == 1 and tonumber(ARGV[1]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
+return n`)
+)
+
+func (k *Kv) SetIfValue(ctx context.Context, key, expected, value string, ttl time.Duration) (bool, error) {
+	n, err := setIfValueScript.Run(ctx, k.client, []string{key}, expected, value, ttl.Milliseconds()).Int64()
+	return n == 1, err
+}
+
+func (k *Kv) DelIfValue(ctx context.Context, key, expected string) (bool, error) {
+	n, err := delIfValueScript.Run(ctx, k.client, []string{key}, expected).Int64()
+	return n == 1, err
+}
+
+func (k *Kv) IncrWithExpiry(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+	return incrWithExpiryScript.Run(ctx, k.client, []string{key}, ttl.Milliseconds()).Int64()
+}
+
 // Bus is an EventBus over Redis Pub/Sub.
 //
 // While subscribed, it emits a bus-only HEARTBEAT notice (seq 0, never

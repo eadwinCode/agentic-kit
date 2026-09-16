@@ -203,7 +203,7 @@ func SpawnSubagentTool(sctx *SubagentCtx) ports.Tool {
 			if cfg.RecordPayloads {
 				// A nested run's "prompt" is the brief it was delegated (§2.7).
 				rec.Prompt = capText(in.Instructions, cfg.PayloadCapChars)
-				rec.RunState = sctx.State
+				rec.RunState = capRunState(sctx.State, cfg.PayloadCapChars)
 			}
 			run, err := sctx.Ports.Admin.Runs().Start(io, rec)
 			if err != nil {

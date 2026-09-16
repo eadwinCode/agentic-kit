@@ -94,13 +94,16 @@ function settleToolCall(entries: ChatEntry[], toolCallId: string, result: unknow
   return touched ? next : entries;
 }
 
-/** The run a STATE_CHANGE speaks for, with the clock it carries: `startedAt`
- *  while the run is running or waiting, `endedAt` once it ended. An event
- *  without a run id says nothing about timing and leaves what is known. */
+/** The run a STATE_CHANGE speaks for, with the clock it carries:
+ *  `enqueuedAt` while the run waits for a worker, `startedAt` once one has
+ *  it, `endedAt` once it ended. An event without a run id says nothing about
+ *  timing and leaves what is known. */
 function runFromStateChange(prev: ThreadRun | null, state: AgentState, p: any): ThreadRun | null {
   if (typeof p?.runId !== 'string') return prev;
   const same = prev?.id === p.runId;
   const next: ThreadRun = { id: p.runId };
+  const enqueuedAt = typeof p.enqueuedAt === 'string' ? p.enqueuedAt : same ? prev?.enqueuedAt : undefined;
+  if (enqueuedAt) next.enqueuedAt = enqueuedAt;
   const startedAt = typeof p.startedAt === 'string' ? p.startedAt : same ? prev?.startedAt : undefined;
   if (startedAt) next.startedAt = startedAt;
   if (state === 'COMPLETED' || state === 'FAILED' || state === 'CANCELLED') {
@@ -119,7 +122,10 @@ function latestRun(runs: readonly ThreadSnapshot['runs'][number][] | undefined):
   }
   if (!latest) return null;
   const run: ThreadRun = { id: latest.id };
-  if (latest.startedAt) run.startedAt = latest.startedAt;
+  if (latest.enqueuedAt) run.enqueuedAt = latest.enqueuedAt;
+  // A run still waiting has no start of its own: its record's startedAt is
+  // the enqueue time until a worker picks it up.
+  if (latest.startedAt && latest.state !== 'QUEUED') run.startedAt = latest.startedAt;
   if (latest.endedAt) run.endedAt = latest.endedAt;
   return run;
 }
@@ -640,7 +646,15 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
             .filter((r) => r.depth > 0)
             .map((r) => [
               r.id,
-              { agentId: r.id, name: r.agent, depth: r.depth, status: r.state, text: '' },
+              // A nested run is never queued: it runs inside its parent's
+              // segment. The type allows QUEUED for the dispatched run only.
+              {
+                agentId: r.id,
+                name: r.agent,
+                depth: r.depth,
+                status: r.state === 'QUEUED' ? 'RUNNING' : r.state,
+                text: '',
+              },
             ]),
         );
         for (const m of snapshot.messages) {
@@ -729,10 +743,11 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
       setSubagents([]);
       setPendingInputs([]);
       // A new run is starting: the last one's clocks are no longer the
-      // thread's. The stream's RUNNING names the run and its start.
+      // thread's. The server accepts it as QUEUED; the stream's RUNNING names
+      // the run and its start once a worker has it.
       setCurrentRun(null);
-      setAgentState('RUNNING');
-      setActivity({ phase: 'thinking', label: cfg.labels.thinking });
+      setAgentState('QUEUED');
+      setActivity({ phase: 'queued', label: cfg.labels.queued });
 
       try {
         const response = await postJson(cfg.baseUrl + cfg.routes.run, {

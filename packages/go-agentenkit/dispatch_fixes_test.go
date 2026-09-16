@@ -46,7 +46,12 @@ func TestDispatch_TheFailureRetryCarriesTheRunID(t *testing.T) {
 	retry := h.queue.Items()[0]
 	mustEqual(t, retry.RunID, ran.RunID, "the retry is the same run")
 	mustEqual(t, retry.State["orgId"], "acme", "the retry keeps the state")
-	mustEqual(t, h.kvGet(agentenkit.StateKey(ran.ThreadID)), "RUNNING", "still running")
+	mustEqual(t, retry.Kind, agentenkit.JobRetry, "the retry says what it is")
+	if h.queue.Delays()[0] <= 0 {
+		t.Fatal("a retry waits before it goes again")
+	}
+	mustEqual(t, h.kvGet(agentenkit.StateKey(ran.ThreadID)), "QUEUED", "waiting to retry, not running")
+	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateQueued, "durable state says so too")
 	h.handleNext(t)
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "recovered")
 	mustEqual(t, h.kvGet("agent:attempts:"+ran.ThreadID), "", "attempt counter reset")
@@ -116,7 +121,7 @@ func TestDispatch_AStaleJobIsANoOp(t *testing.T) {
 	}
 	mustEqual(t, outcome, agentenkit.OutcomeStale, "stale")
 	mustEqual(t, h.model.Calls(), 0, "nothing ran")
-	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateRunning, "state untouched")
+	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateQueued, "state untouched")
 }
 
 func TestDispatch_UnknownAgentIsRefusedAndTheDefaultIsTheFirstStreamHandle(t *testing.T) {

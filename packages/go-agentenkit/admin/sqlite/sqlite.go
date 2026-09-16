@@ -208,18 +208,19 @@ type runStore struct{ db *sql.DB }
 
 const runCols = `id, threadId, parentRunId, depth, agent, model, state, stopReason, error, startedAt, endedAt,
 	durationMs, queuedMs, attempts, steps, inputTokens, cachedInputTokens, outputTokens, totalTokens,
-	result, prompt, tokenBudget, runState, providerOptions, settledAt`
+	result, prompt, tokenBudget, runState, providerOptions, settledAt, enqueuedAt, costBudgetMicros, maxSteps`
 
 func scanRun(row interface{ Scan(...any) error }) (*ports.RunRecord, error) {
 	var r ports.RunRecord
 	var parent, stop, errMsg, result, prompt, runState, providerOptions sql.NullString
 	var started int64
-	var ended, duration, queued, budget, settled sql.NullInt64
+	var ended, duration, queued, budget, settled, enqueued, costCap, stepCap sql.NullInt64
 	if err := row.Scan(&r.ID, &r.ThreadID, &parent, &r.Depth, &r.Agent, &r.Model, &r.State, &stop, &errMsg,
 		&started, &ended, &duration, &queued, &r.Attempts, &r.Steps, &r.InputTokens, &r.CachedInputTokens,
-		&r.OutputTokens, &r.TotalTokens, &result, &prompt, &budget, &runState, &providerOptions, &settled); err != nil {
+		&r.OutputTokens, &r.TotalTokens, &result, &prompt, &budget, &runState, &providerOptions, &settled, &enqueued, &costCap, &stepCap); err != nil {
 		return nil, err
 	}
+	r.CostBudgetMicros, r.MaxSteps = costCap.Int64, int(stepCap.Int64)
 	r.ParentRunID, r.StopReason, r.Error, r.Prompt = parent.String, stop.String, errMsg.String, prompt.String
 	r.StartedAt = fromMs(started)
 	if ended.Valid {
@@ -229,6 +230,10 @@ func scanRun(row interface{ Scan(...any) error }) (*ports.RunRecord, error) {
 	if settled.Valid {
 		t := fromMs(settled.Int64)
 		r.SettledAt = &t
+	}
+	if enqueued.Valid {
+		t := fromMs(enqueued.Int64)
+		r.EnqueuedAt = &t
 	}
 	if duration.Valid {
 		r.DurationMs = ports.Ptr(duration.Int64)
@@ -266,11 +271,20 @@ func (r runStore) Start(ctx context.Context, n ports.NewRunRecord) (*ports.RunRe
 		b, _ := json.Marshal(n.ProviderOptions)
 		providerOptions = sql.NullString{String: string(b), Valid: true}
 	}
+	state := n.State
+	if state == "" {
+		state = ports.StateRunning
+	}
+	var enqueued sql.NullInt64
+	if n.EnqueuedAt != nil {
+		enqueued = sql.NullInt64{Int64: ms(*n.EnqueuedAt), Valid: true}
+		started = enqueued.Int64
+	}
 	if _, err := r.db.ExecContext(ctx,
-		`INSERT INTO agentic_runs (id,threadId,parentRunId,depth,agent,model,state,startedAt,prompt,tokenBudget,runState,providerOptions)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-		n.ID, n.ThreadID, nullStr(n.ParentRunID), n.Depth, n.Agent, n.Model, string(ports.StateRunning), started,
-		nullStr(n.Prompt), budget, runState, providerOptions); err != nil {
+		`INSERT INTO agentic_runs (id,threadId,parentRunId,depth,agent,model,state,startedAt,prompt,tokenBudget,runState,providerOptions,enqueuedAt,costBudgetMicros,maxSteps)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		n.ID, n.ThreadID, nullStr(n.ParentRunID), n.Depth, n.Agent, n.Model, string(state), started,
+		nullStr(n.Prompt), budget, runState, providerOptions, enqueued, n.CostBudgetMicros, n.MaxSteps); err != nil {
 		return nil, err
 	}
 	return r.Get(ctx, n.ID)
@@ -291,6 +305,9 @@ func (r runStore) Patch(ctx context.Context, runID string, p ports.RunPatch) err
 	}
 	if p.Error != nil {
 		set("error", *p.Error)
+	}
+	if p.StartedAt != nil {
+		set("startedAt", ms(*p.StartedAt))
 	}
 	if p.EndedAt != nil {
 		set("endedAt", ms(*p.EndedAt))

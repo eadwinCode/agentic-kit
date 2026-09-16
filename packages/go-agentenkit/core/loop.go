@@ -3,6 +3,8 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -462,11 +464,27 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			}
 			prompt = prepared
 		}
-		step, err := ExecuteStep(genCtx, agent, StepCall{
+		// One round trip is bounded in wall time when StepTimeout is set: a
+		// model that accepts the call and never answers ends this step like
+		// any failed step, and the run takes the retry policy (§2.8).
+		stepCtx, cancelStep := genCtx, context.CancelFunc(func() {})
+		if deps.Config.StepTimeout > 0 {
+			stepCtx, cancelStep = context.WithTimeout(genCtx, deps.Config.StepTimeout)
+		}
+		step, err := ExecuteStep(stepCtx, agent, StepCall{
 			Kind: input.Kind, Model: input.Model, Messages: prompt, Tools: input.Tools,
 			ProviderOptions: input.ProviderOptions, OnChunk: onChunk,
 			System: system, CacheSystemPrompt: input.CacheSystemPrompt,
 		})
+		stepTimedOut := deps.Config.StepTimeout > 0 && errors.Is(stepCtx.Err(), context.DeadlineExceeded) && genCtx.Err() == nil
+		cancelStep()
+		if stepTimedOut {
+			if err == nil {
+				err = context.DeadlineExceeded
+			}
+			err = fmt.Errorf("step %d ran longer than %s: %w", out.Steps+1, deps.Config.StepTimeout, err)
+			Logger(deps).Warn("step timed out", "run", input.RunID, "step", out.Steps+1, "after", deps.Config.StepTimeout)
+		}
 		if err != nil || !step.Finished {
 			// The call ended without a finish: a user stop, or the provider
 			// failing part way. Either way the provider billed for what it had

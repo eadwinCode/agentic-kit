@@ -79,8 +79,39 @@ interface Queue {
 }
 ```
 
+```go
+type Queue interface {
+	Enqueue(ctx context.Context, job RunJob, opts *EnqueueOptions) error
+	// Cancel drops every waiting job enqueued under a key.
+	Cancel(ctx context.Context, key string) error
+	// Find returns a run's waiting or running job, or nil.
+	Find(ctx context.Context, runID string) (*QueuedJob, error)
+	// Stats counts what waits, runs and died.
+	Stats(ctx context.Context) (QueueStats, error)
+}
+```
+
 At-least-once. The engine is idempotent under redelivery through the per-thread
 run lock.
+
+The Go port carries a little more than `Enqueue`, because an engine that
+cannot see its queue cannot refuse work, withdraw a park's expiry once the
+park is answered, or tell a dead worker's run from a live one:
+
+- `EnqueueOptions.Key` dedupes: at most one live job per key
+  (`ErrDuplicateJob` for a second), and `Cancel(key)` withdraws it. The
+  engine keys a park's expiry and its resume, and a thread's reclaim.
+- `EnqueueOptions.Priority` orders ready jobs: higher first. The engine's own
+  housekeeping (expiries, reclaims, redrives) goes in at `PriorityLow`, so a
+  user's message never queues behind it.
+- `RunJob.Kind` says why a job exists (dispatch, retry, redrive, resume,
+  expiry, reclaim); `RunJob.PartitionKey` is the caller's tenant;
+  `RunJob.DispatchedAt` is the run's first dispatch, carried onto every
+  retry so the run keeps its place in line.
+- `Stats` and `Find` feed the engine's overload refusal
+  (`AgentConfig.MaxQueueDepth`), the admin overview, and the stuck-run sweep.
+  An adapter with no read side answers `ErrUnsupported` and the engine treats
+  that as "unknown", never as a failure.
 
 An adapter that cannot honour `delaySeconds` may deliver immediately, but **must
 never throw for it** — a HITL expiry is scheduled from inside a parked tool call,
@@ -174,7 +205,20 @@ claims with `SELECT … FOR UPDATE SKIP LOCKED`, so several processes can
 share the table, and renews the row's lease while the job runs. A worker
 that dies mid-job loses its lease and the job is redelivered — at-least-once,
 which the run lock makes safe. A handler that returns an error hands the job
-back at once; after `MaxAttempts` it is dropped.
+back after a growing backoff (`RetryBackoff`, `RetryBackoffMax`); after
+`MaxAttempts` the row is kept as dead with the reason, the `DeadHandler`
+bound with the worker fails its run, and an operator can list, redrive or
+purge it. The claim spreads across partitions: the partition with the fewest
+jobs in flight goes first, then priority, then dispatch time, so one tenant's
+burst cannot hold the head of the line. Every consumer of a `Namespace` takes
+only that namespace's rows, and `Pause`/`Resume` hold every consumer of it
+through a control row. With a `Listener` the consumer wakes on an enqueue
+instead of polling; `Poll` is then the backstop. `MaxDepth` refuses a fresh
+dispatch with `ErrQueueFull`, `MaxPayloadBytes` refuses an oversized ticket,
+`MaxAge` keeps a row that waited too long as dead instead of running it,
+`MaxRunTime` cancels a handler that ignores its context, and `Close` gives
+running handlers `DrainTimeout` to finish before it cancels them. The queue
+logs what it does through `Log`.
 
 Tests: `TEST_ADMIN_PG=postgres://… go test ./...` runs the platform end to end
 on these adapters, including the over-cap frames and a concurrent `Incr`.

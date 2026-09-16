@@ -86,13 +86,47 @@ func (k *Kv) Del(_ context.Context, key string) error {
 }
 
 func (k *Kv) Incr(_ context.Context, key string) (int64, error) {
+	return k.IncrWithExpiry(context.Background(), key, 0)
+}
+
+func (k *Kv) IncrWithExpiry(_ context.Context, key string, ttl time.Duration) (int64, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	e, _ := k.live(key)
+	e, ok := k.live(key)
 	n, _ := strconv.ParseInt(e.value, 10, 64)
 	n++
-	k.m[key] = memEntry{value: strconv.FormatInt(n, 10), expiresAt: e.expiresAt}
+	expires := e.expiresAt
+	if !ok && ttl > 0 {
+		expires = time.Now().Add(ttl)
+	}
+	k.m[key] = memEntry{value: strconv.FormatInt(n, 10), expiresAt: expires}
 	return n, nil
+}
+
+func (k *Kv) SetIfValue(_ context.Context, key, expected, value string, ttl time.Duration) (bool, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	e, ok := k.live(key)
+	if !ok || e.value != expected {
+		return false, nil
+	}
+	next := memEntry{value: value}
+	if ttl > 0 {
+		next.expiresAt = time.Now().Add(ttl)
+	}
+	k.m[key] = next
+	return true, nil
+}
+
+func (k *Kv) DelIfValue(_ context.Context, key, expected string) (bool, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	e, ok := k.live(key)
+	if !ok || e.value != expected {
+		return false, nil
+	}
+	delete(k.m, key)
+	return true, nil
 }
 
 // Bus is a synchronous in-memory bus. Publishes are delivered to subscribers
@@ -154,11 +188,22 @@ func (b *Bus) Subscribers(threadID string) int {
 }
 
 // Queue is an in-memory queue with a Drain helper: tests process jobs
-// exactly like the worker would.
+// exactly like the worker would. It honours the port's keys (a duplicate
+// key is refused, Cancel drops it) and an optional depth cap, so the
+// engine's behaviour around both can be tested without a database.
 type Queue struct {
-	mu     sync.Mutex
-	items  []ports.RunJob
-	delays []time.Duration
+	mu    sync.Mutex
+	items []queued
+	// MaxDepth refuses a fresh dispatch past this many waiting jobs; zero is
+	// unbounded.
+	MaxDepth int
+}
+
+type queued struct {
+	job      ports.RunJob
+	delay    time.Duration
+	key      string
+	priority int
 }
 
 // NewQueue makes an empty Queue.
@@ -167,27 +212,117 @@ func NewQueue() *Queue { return &Queue{} }
 func (q *Queue) Enqueue(_ context.Context, job ports.RunJob, opts *ports.EnqueueOptions) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.items = append(q.items, job)
-	var d time.Duration
+	item := queued{job: job}
 	if opts != nil {
-		d = opts.Delay
+		item.delay, item.key, item.priority = opts.Delay, opts.Key, opts.Priority
 	}
-	q.delays = append(q.delays, d)
+	if item.key != "" {
+		for _, it := range q.items {
+			if it.key == item.key {
+				return ports.ErrDuplicateJob
+			}
+		}
+	}
+	// The cap counts everything ready to run, but refuses only new work: a
+	// retry, a resume or an expiry belongs to a run already under way.
+	if q.MaxDepth > 0 && job.Kind == ports.JobDispatch {
+		ready := 0
+		for _, it := range q.items {
+			if it.delay <= 0 {
+				ready++
+			}
+		}
+		if ready >= q.MaxDepth {
+			return ports.ErrQueueFull
+		}
+	}
+	q.items = append(q.items, item)
 	return nil
+}
+
+// Cancel drops every waiting job under key.
+func (q *Queue) Cancel(_ context.Context, key string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	kept := q.items[:0]
+	for _, it := range q.items {
+		if key == "" || it.key != key {
+			kept = append(kept, it)
+		}
+	}
+	q.items = kept
+	return nil
+}
+
+// Find returns the earliest waiting job for a run, or nil.
+func (q *Queue) Find(_ context.Context, runID string) (*ports.QueuedJob, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i, it := range q.items {
+		if it.job.RunID == runID && runID != "" {
+			return &ports.QueuedJob{ID: fmt.Sprint(i), RunID: runID, ThreadID: it.job.ThreadID, Kind: it.job.Kind, RunAt: time.Now().Add(it.delay), Position: i}, nil
+		}
+	}
+	return nil, nil
+}
+
+// Stats counts what waits.
+func (q *Queue) Stats(_ context.Context) (ports.QueueStats, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var s ports.QueueStats
+	for _, it := range q.items {
+		if it.delay > 0 {
+			s.Delayed++
+		} else {
+			s.Ready++
+		}
+	}
+	return s, nil
 }
 
 // Items are the jobs waiting, oldest first.
 func (q *Queue) Items() []ports.RunJob {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return append([]ports.RunJob(nil), q.items...)
+	out := make([]ports.RunJob, 0, len(q.items))
+	for _, it := range q.items {
+		out = append(out, it.job)
+	}
+	return out
 }
 
 // Delays are the delivery delays requested per enqueue, index-aligned with Items.
 func (q *Queue) Delays() []time.Duration {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return append([]time.Duration(nil), q.delays...)
+	out := make([]time.Duration, 0, len(q.items))
+	for _, it := range q.items {
+		out = append(out, it.delay)
+	}
+	return out
+}
+
+// Keys are the dedupe keys per enqueue, index-aligned with Items.
+func (q *Queue) Keys() []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	out := make([]string, 0, len(q.items))
+	for _, it := range q.items {
+		out = append(out, it.key)
+	}
+	return out
+}
+
+// Priorities are the priorities per enqueue, index-aligned with Items.
+func (q *Queue) Priorities() []int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	out := make([]int, 0, len(q.items))
+	for _, it := range q.items {
+		out = append(out, it.priority)
+	}
+	return out
 }
 
 // Len is how many jobs wait.
@@ -204,9 +339,8 @@ func (q *Queue) Shift() (ports.RunJob, bool) {
 	if len(q.items) == 0 {
 		return ports.RunJob{}, false
 	}
-	job := q.items[0]
+	job := q.items[0].job
 	q.items = q.items[1:]
-	q.delays = q.delays[1:]
 	return job, true
 }
 
