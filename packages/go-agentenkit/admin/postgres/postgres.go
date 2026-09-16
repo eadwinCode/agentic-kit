@@ -167,23 +167,32 @@ type runStore struct{ db *sql.DB }
 
 const runCols = `id, "threadId", "parentRunId", depth, agent, model, state, "stopReason", error, "startedAt", "endedAt",
 	"durationMs", "queuedMs", attempts, steps, "inputTokens", "cachedInputTokens", "outputTokens", "totalTokens",
-	result, prompt, "tokenBudget", "runState", "providerOptions"`
+	result, prompt, "tokenBudget", "runState", "providerOptions", "settledAt", "enqueuedAt", "costBudgetMicros", "maxSteps"`
 
 func scanRun(row interface{ Scan(...any) error }) (*ports.RunRecord, error) {
 	var r ports.RunRecord
 	var parent, stop, errMsg, prompt sql.NullString
-	var ended sql.NullTime
-	var duration, queued, budget sql.NullInt64
+	var ended, settled, enqueued sql.NullTime
+	var duration, queued, budget, costCap, stepCap sql.NullInt64
 	var result, runState, providerOptions []byte
 	if err := row.Scan(&r.ID, &r.ThreadID, &parent, &r.Depth, &r.Agent, &r.Model, &r.State, &stop, &errMsg,
 		&r.StartedAt, &ended, &duration, &queued, &r.Attempts, &r.Steps, &r.InputTokens, &r.CachedInputTokens,
-		&r.OutputTokens, &r.TotalTokens, &result, &prompt, &budget, &runState, &providerOptions); err != nil {
+		&r.OutputTokens, &r.TotalTokens, &result, &prompt, &budget, &runState, &providerOptions, &settled, &enqueued, &costCap, &stepCap); err != nil {
 		return nil, err
 	}
+	r.CostBudgetMicros, r.MaxSteps = costCap.Int64, int(stepCap.Int64)
 	r.ParentRunID, r.StopReason, r.Error, r.Prompt = parent.String, stop.String, errMsg.String, prompt.String
 	if ended.Valid {
 		t := ended.Time
 		r.EndedAt = &t
+	}
+	if settled.Valid {
+		t := settled.Time
+		r.SettledAt = &t
+	}
+	if enqueued.Valid {
+		t := enqueued.Time
+		r.EnqueuedAt = &t
 	}
 	if duration.Valid {
 		r.DurationMs = ports.Ptr(duration.Int64)
@@ -218,10 +227,18 @@ func (r runStore) Start(ctx context.Context, n ports.NewRunRecord) (*ports.RunRe
 	if n.ProviderOptions != nil {
 		providerOptions, _ = json.Marshal(n.ProviderOptions)
 	}
+	state := n.State
+	if state == "" {
+		state = ports.StateRunning
+	}
+	var enqueued sql.NullTime
+	if n.EnqueuedAt != nil {
+		enqueued = sql.NullTime{Time: *n.EnqueuedAt, Valid: true}
+	}
 	rec, err := scanRun(r.db.QueryRowContext(ctx,
-		`INSERT INTO agentic_runs (id, "threadId", "parentRunId", depth, agent, model, state, prompt, "tokenBudget", "runState", "providerOptions")
-		 VALUES ($1, $2, $3, $4, $5, $6, 'RUNNING', $7, $8, $9, $10) RETURNING `+runCols,
-		n.ID, n.ThreadID, nullStr(n.ParentRunID), n.Depth, n.Agent, n.Model, nullStr(n.Prompt), budget, nullBytes(runState), nullBytes(providerOptions)))
+		`INSERT INTO agentic_runs (id, "threadId", "parentRunId", depth, agent, model, state, prompt, "tokenBudget", "runState", "providerOptions", "enqueuedAt", "startedAt", "costBudgetMicros", "maxSteps")
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, COALESCE($12, now()), $13, $14) RETURNING `+runCols,
+		n.ID, n.ThreadID, nullStr(n.ParentRunID), n.Depth, n.Agent, n.Model, string(state), nullStr(n.Prompt), budget, nullBytes(runState), nullBytes(providerOptions), enqueued, n.CostBudgetMicros, n.MaxSteps))
 	return rec, err
 }
 
@@ -245,6 +262,9 @@ func (r runStore) Patch(ctx context.Context, runID string, p ports.RunPatch) err
 	if p.Error != nil {
 		set("error", *p.Error)
 	}
+	if p.StartedAt != nil {
+		set(`"startedAt"`, *p.StartedAt)
+	}
 	if p.EndedAt != nil {
 		set(`"endedAt"`, *p.EndedAt)
 	}
@@ -253,6 +273,9 @@ func (r runStore) Patch(ctx context.Context, runID string, p ports.RunPatch) err
 	}
 	if p.QueuedMs != nil {
 		set(`"queuedMs"`, *p.QueuedMs)
+	}
+	if p.SettledAt != nil {
+		set(`"settledAt"`, *p.SettledAt)
 	}
 	if p.Steps != nil {
 		set("steps", *p.Steps)

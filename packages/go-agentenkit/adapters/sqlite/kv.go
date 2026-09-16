@@ -101,3 +101,50 @@ func (k *Kv) Incr(ctx context.Context, key string) (int64, error) {
 	}
 	return strconv.ParseInt(value, 10, 64)
 }
+
+// SetIfValue writes only while the row still holds expected and is live.
+func (k *Kv) SetIfValue(ctx context.Context, key, expected, value string, ttl time.Duration) (bool, error) {
+	var expires sql.NullInt64
+	if ttl > 0 {
+		expires = sql.NullInt64{Int64: nowMs() + ttl.Milliseconds(), Valid: true}
+	}
+	res, err := k.db.ExecContext(ctx,
+		`UPDATE kv SET value = ?, expiresAt = ? WHERE key = ? AND value = ? AND (expiresAt IS NULL OR expiresAt > ?)`,
+		value, expires, key, expected, nowMs())
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// DelIfValue deletes only while the row still holds expected.
+func (k *Kv) DelIfValue(ctx context.Context, key, expected string) (bool, error) {
+	res, err := k.db.ExecContext(ctx, `DELETE FROM kv WHERE key = ? AND value = ?`, key, expected)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// IncrWithExpiry is Incr that stamps a new (or expired) counter with an
+// expiry; a live counter keeps the one it has.
+func (k *Kv) IncrWithExpiry(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+	var expires sql.NullInt64
+	if ttl > 0 {
+		expires = sql.NullInt64{Int64: nowMs() + ttl.Milliseconds(), Valid: true}
+	}
+	var value string
+	err := k.db.QueryRowContext(ctx,
+		`INSERT INTO kv (key, value, expiresAt) VALUES (?1, '1', ?2)
+		 ON CONFLICT(key) DO UPDATE SET
+		   value = CASE WHEN kv.expiresAt IS NOT NULL AND kv.expiresAt <= ?3 THEN '1'
+		                ELSE CAST(CAST(kv.value AS INTEGER) + 1 AS TEXT) END,
+		   expiresAt = CASE WHEN kv.expiresAt IS NOT NULL AND kv.expiresAt <= ?3 THEN excluded.expiresAt ELSE kv.expiresAt END
+		 RETURNING value`, key, expires, nowMs()).Scan(&value)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(value, 10, 64)
+}

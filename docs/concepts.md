@@ -121,12 +121,19 @@ it twice.
 ## Thread states
 
 ```
-IDLE ──► RUNNING ──► COMPLETED
-           │  ▲          
-           │  └── WAITING_FOR_INPUT   (parked; holds no process)
-           ├────► CANCELLED           (stopped)
-           └────► FAILED              (attempts exhausted)
+IDLE ──► QUEUED ──► RUNNING ──► COMPLETED
+                      │  ▲
+                      │  └── WAITING_FOR_INPUT   (parked; holds no process)
+                      ├────► CANCELLED           (stopped)
+                      └────► FAILED              (attempts exhausted, timed out, refused)
 ```
+
+`QUEUED` (Go runtime) is a run the server accepted and put on the queue: no
+worker has it yet. It becomes `RUNNING` the moment a worker picks the job up,
+and goes back to `QUEUED` while a failed run waits for its retry. A client can
+tell a run that is waiting in line from one that is working, and so can an
+operator: the run record keeps `enqueuedAt` and the queue-wait percentiles
+count the runs still waiting.
 
 `WAITING_FOR_INPUT` is the interesting one: it is a durable state, not a blocked
 promise. No worker, no lock, no memory is held while a thread waits for a human.

@@ -40,7 +40,14 @@ func ChunkPayload(c provider.StreamChunk) map[string]any {
 		}
 		return map[string]any{"type": "tool-call", "toolCallId": c.ToolCallID, "toolName": c.ToolName, "args": args}
 	case provider.ChunkToolResult:
-		return map[string]any{"type": "tool-result", "toolCallId": c.ToolCallID, "toolName": c.ToolName, "result": jsonOrString(c.Text)}
+		result := jsonOrString(c.Text)
+		if c.Error != nil {
+			// A tool that failed: the result names the error, the way a
+			// denied or unknown tool's result already does, so a client can
+			// mark the call failed from the result alone.
+			result = MarshalPayload(map[string]any{"error": c.Error.Error()})
+		}
+		return map[string]any{"type": "tool-result", "toolCallId": c.ToolCallID, "toolName": c.ToolName, "result": result}
 	case provider.ChunkStepFinish:
 		return map[string]any{"type": "step-finish", "finishReason": string(c.FinishReason), "usage": usageJSON(c.Usage)}
 	case provider.ChunkFinish:

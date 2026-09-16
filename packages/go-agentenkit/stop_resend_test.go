@@ -124,11 +124,11 @@ func TestStop_ThenResend_TheReplacedWorkerStaysSilent(t *testing.T) {
 		t.Fatal("a resend is a new run")
 	}
 	wg.Wait() // the old worker aborts on the run-id change and finalizes nothing
-	mustEqual(t, h.thread(t, first.ThreadID).State, agentenkit.StateRunning, "the new run's RUNNING stands")
-	mustEqual(t, h.kvGet(agentenkit.StateKey(first.ThreadID)), "RUNNING", "hot state stands")
+	mustEqual(t, h.thread(t, first.ThreadID).State, agentenkit.StateQueued, "the new run's QUEUED stands")
+	mustEqual(t, h.kvGet(agentenkit.StateKey(first.ThreadID)), "QUEUED", "hot state stands")
 	h.handleNext(t)
 	mustEqual(t, h.lastTerminal(first.ThreadID)["state"], "COMPLETED", "the new run finishes")
-	mustStrings(t, h.states(first.ThreadID), []string{"RUNNING", "CANCELLED", "RUNNING", "COMPLETED"}, "states")
+	mustStrings(t, h.states(first.ThreadID), []string{"QUEUED", "RUNNING", "CANCELLED", "QUEUED", "RUNNING", "COMPLETED"}, "states")
 	rows := h.storage.MessageRows(first.ThreadID)
 	mustEqual(t, string(rows[len(rows)-1].Content), `[{"type":"text","text":"fresh answer"}]`, "answer")
 }

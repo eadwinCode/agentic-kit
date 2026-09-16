@@ -15,12 +15,12 @@ func TestRun_CreatesThreadPersistsMarksRunningEnqueues(t *testing.T) {
 	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat", Model: "gpt-4o"})
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hello"})
 
-	mustEqual(t, ran.State, agentenkit.StateRunning, "result state")
+	mustEqual(t, ran.State, agentenkit.StateQueued, "result state: accepted, waiting for a worker")
 	if ran.RunID == "" {
 		t.Fatal("no run id")
 	}
-	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateRunning, "durable state")
-	mustEqual(t, h.kvGet(agentenkit.StateKey(ran.ThreadID)), "RUNNING", "hot state")
+	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateQueued, "durable state")
+	mustEqual(t, h.kvGet(agentenkit.StateKey(ran.ThreadID)), "QUEUED", "hot state")
 	mustEqual(t, h.kvGet(agentenkit.RunIDKey(ran.ThreadID)), ran.RunID, "run id key")
 	mustStrings(t, h.roles(ran.ThreadID), []string{"user"}, "roles")
 	mustEqual(t, string(h.storage.MessageRows(ran.ThreadID)[0].Content), `"hello"`, "user content")
@@ -38,7 +38,7 @@ func TestRun_CreatesThreadPersistsMarksRunningEnqueues(t *testing.T) {
 	mustEqual(t, evs[0].Type, "MESSAGE_APPENDED", "first event")
 	mustEqual(t, evs[1].Type, "STATE_CHANGE", "second event")
 	rec, _ := h.admin.Runs().Get(h.ctx, ran.RunID)
-	mustEqual(t, rec.State, agentenkit.StateRunning, "run record")
+	mustEqual(t, rec.State, agentenkit.StateQueued, "run record")
 	mustEqual(t, rec.Prompt, "hello", "recorded prompt")
 }
 
@@ -120,7 +120,7 @@ func TestStop_WritesCancelledToBothHomes(t *testing.T) {
 	}
 	mustEqual(t, h.kvGet(agentenkit.StateKey(ran.ThreadID)), "CANCELLED", "hot")
 	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCancelled, "durable")
-	mustStrings(t, h.states(ran.ThreadID), []string{"RUNNING", "CANCELLED"}, "states")
+	mustStrings(t, h.states(ran.ThreadID), []string{"QUEUED", "CANCELLED"}, "states")
 	// The queued job is now a no-op
 	h.handleNext(t)
 	mustEqual(t, h.model.Calls(), 0, "model never called")

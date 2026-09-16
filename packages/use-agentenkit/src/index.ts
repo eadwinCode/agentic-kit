@@ -34,11 +34,14 @@ export {
   contentToParts,
   contentToText,
   formatCost,
+  isToolError,
   messageToEntry,
   messageToEntries,
   reasoningText,
   stateActivity,
+  toolCallOutcomes,
 } from './format.js';
+export type { ToolCallOutcomes } from './format.js';
 
 export type {
   AgentState,
@@ -56,6 +59,7 @@ export type {
   SubagentStatus,
   SubagentView,
   ThreadListItem,
+  ThreadRun,
   ThreadSnapshot,
   ThreadUsage,
   UsageTotals,

@@ -109,6 +109,11 @@ type RunInput struct {
 	// Attachments are images the user sent with the prompt. They are stored
 	// as image parts on the user message and reach the model natively.
 	Attachments []Attachment
+	// PartitionKey is the caller's tenant, written on the dispatch ticket so
+	// a queue that spreads its claims across partitions can keep one tenant's
+	// backlog from starving the others. Opaque to the platform; empty means
+	// one shared lane.
+	PartitionKey string
 }
 
 // Attachment is one image on a user turn: a URL the provider can fetch, or
@@ -142,13 +147,25 @@ type PrepareStepFunc func(ctx context.Context, threadID string, state AgentRunSt
 // redelivered. Keep it idempotent on RunID.
 type SettleFunc func(ctx context.Context, info RunFinishInfo) error
 
-// RunResult is what Run answers. Accepted false carries a reason in Error.
+// Why a run was refused, for a host that answers differently to each.
+const (
+	// RefusedActiveRun: the thread already has a run.
+	RefusedActiveRun = "active_run"
+	// RefusedQueueFull: the queue is at its depth cap; try again shortly.
+	RefusedQueueFull = "queue_full"
+	// RefusedBilling: the BillingPreCheck said no.
+	RefusedBilling = "billing"
+)
+
+// RunResult is what Run answers. Accepted false carries a reason in Error
+// and, for the refusals a host acts on, a code in Reason.
 type RunResult struct {
 	Accepted bool           `json:"accepted"`
 	ThreadID string         `json:"threadId"`
 	RunID    string         `json:"runId,omitempty"`
 	State    ExecutionState `json:"state,omitempty"`
 	Error    string         `json:"error,omitempty"`
+	Reason   string         `json:"reason,omitempty"`
 }
 
 // StopResult is what Stop answers.

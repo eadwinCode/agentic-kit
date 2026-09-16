@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"time"
 
@@ -21,12 +22,16 @@ type RunStats struct {
 	ByState      map[ports.ExecutionState]int `json:"byState"`
 	ByStopReason map[string]int               `json:"byStopReason"`
 	Tokens       ports.UsageTotals            `json:"tokens"`
-	// Duration is wall time from enqueue to finish, over runs that ended. A
+	// Duration is wall time from pickup to finish, over runs that ended. A
 	// parked run legitimately includes however long the human took (§2.5).
 	Duration *Percentiles `json:"duration"`
 	// Queued is time spent waiting for a worker: the backlog signal (§2.8).
+	// A run still waiting counts with the time it has waited so far, so the
+	// number rises while a backlog grows, not after it clears.
 	Queued *Percentiles `json:"queued"`
-	Failed int          `json:"failed"`
+	// Waiting is how many runs in the window are still QUEUED.
+	Waiting int `json:"waiting"`
+	Failed  int `json:"failed"`
 }
 
 // AdminOverview is the top of an operational view.
@@ -36,8 +41,17 @@ type AdminOverview struct {
 	Threads map[ports.ExecutionState]int `json:"threads"`
 	// RunsByState is every run ever, by state, unbounded by the stats window.
 	RunsByState map[ports.ExecutionState]int `json:"runsByState"`
-	// Active are runs still in flight, newest first.
+	// ActiveTotal is every run queued, running or waiting on a human, from
+	// RunsByState: the number to show, where Active is a bounded sample.
+	ActiveTotal int `json:"activeTotal"`
+	// Active are runs still in flight, newest first, at most ActiveLimit.
 	Active []ports.RunRecord `json:"active"`
+	// ActiveLimit is the cap on Active; when ActiveTotal is above it the
+	// list is a sample.
+	ActiveLimit int `json:"activeLimit"`
+	// Queue is what the queue says about itself: ready, delayed, in flight,
+	// dead, the oldest wait. Nil when the queue adapter cannot count.
+	Queue *ports.QueueStats `json:"queue,omitempty"`
 }
 
 // ThreadSummary is a thread with its runs rolled up (§2.9).
@@ -98,6 +112,7 @@ func Summarise(runs []ports.RunRecord) RunStats {
 		ByState: map[ports.ExecutionState]int{}, ByStopReason: map[string]int{}, Total: len(runs),
 	}
 	var durations, queued []int64
+	now := time.Now()
 	for _, r := range runs {
 		out.ByState[r.State]++
 		if r.StopReason != "" {
@@ -110,7 +125,13 @@ func Summarise(runs []ports.RunRecord) RunStats {
 		if r.DurationMs != nil {
 			durations = append(durations, *r.DurationMs)
 		}
-		if r.QueuedMs != nil {
+		switch {
+		case r.State == ports.StateQueued && r.EnqueuedAt != nil:
+			// Still waiting: a live sample, so the percentile moves while the
+			// backlog grows rather than once it has cleared.
+			queued = append(queued, now.Sub(*r.EnqueuedAt).Milliseconds())
+			out.Waiting++
+		case r.QueuedMs != nil:
 			queued = append(queued, *r.QueuedMs)
 		}
 		if r.State == ports.StateFailed {
@@ -156,6 +177,9 @@ func RunStatsFor(ctx context.Context, deps ports.RuntimePorts, r StatsRange) (Ru
 	return Summarise(runs), nil
 }
 
+// activeLimit caps the Active sample in an overview.
+const activeLimit = 50
+
 // Overview assembles the top of an operational view.
 func Overview(ctx context.Context, deps ports.RuntimePorts, since *time.Time) (AdminOverview, error) {
 	threads, err := deps.Admin.Threads().CountByState(ctx)
@@ -171,12 +195,23 @@ func Overview(ctx context.Context, deps ports.RuntimePorts, since *time.Time) (A
 		return AdminOverview{}, err
 	}
 	active, err := deps.Admin.Runs().List(ctx, ports.RunFilter{
-		State: []ports.ExecutionState{ports.StateRunning, ports.StateWaitingForInput}, Limit: 50,
+		State: []ports.ExecutionState{ports.StateQueued, ports.StateRunning, ports.StateWaitingForInput}, Limit: activeLimit,
 	})
 	if err != nil {
 		return AdminOverview{}, err
 	}
-	return AdminOverview{Runs: Summarise(recent), Threads: threads, RunsByState: runsByState, Active: active}, nil
+	out := AdminOverview{
+		Runs: Summarise(recent), Threads: threads, RunsByState: runsByState, Active: active, ActiveLimit: activeLimit,
+		ActiveTotal: runsByState[ports.StateQueued] + runsByState[ports.StateRunning] + runsByState[ports.StateWaitingForInput],
+	}
+	// The queue's own numbers ride the same response every dashboard
+	// already fetches. A queue that cannot count leaves the field empty.
+	if stats, err := deps.Queue.Stats(ctx); err == nil {
+		out.Queue = &stats
+	} else if !errors.Is(err, ports.ErrUnsupported) {
+		Logger(deps).Warn("queue stats not read for the overview", "err", err)
+	}
+	return out, nil
 }
 
 // ListSteps is a run's steps, in order (§2.9).

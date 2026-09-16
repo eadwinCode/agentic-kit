@@ -28,6 +28,17 @@ be opened should be a startup error.
 | `hitlTtlMs` | `900000` (15 min) | How long a parked approval stays answerable. On expiry it resolves as a timeout denial and the run continues. |
 | `reclaimGraceMs` | `60000` | Grace beyond the TTL before orphan reclamation may claim a thread. |
 
+### Run limits (Go runtime additions)
+
+| Key | Default | What it does |
+| :--- | :--- | :--- |
+| `RunLockLease` | `2m` | The per-thread run lock's lease. The worker renews it every third of the lease while its segment runs, so an expired lock means a dead worker. |
+| `RunRetryBackoff` / `RunRetryBackoffMax` | `5s` / `2m` | A failed run waits this long before its first retry, twice as long each time after, with jitter. |
+| `StepTimeout` | off | Bounds one model round trip; a step past it fails and the run takes the retry policy. |
+| `SegmentTimeout` | off | Bounds one worker segment; a segment past it settles the run `FAILED` with a reason. |
+| `MaxQueueWait` | off | A job picked up later than this fails with the reason instead of running. |
+| `MaxQueueDepth` | off | A new run is refused (`RefusedQueueFull`) before anything is written once this many jobs are ready and waiting. |
+
 ### Run limits
 
 | Setting | Default | Meaning |

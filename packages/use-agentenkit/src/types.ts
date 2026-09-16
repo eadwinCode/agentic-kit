@@ -4,6 +4,8 @@
 
 export type AgentState =
   | 'IDLE'
+  /** Accepted and waiting for a worker. Nothing has started yet. */
+  | 'QUEUED'
   | 'RUNNING'
   | 'WAITING_FOR_INPUT'
   | 'CANCELLED'
@@ -52,6 +54,8 @@ export interface Attachment {
 export type ActivityPhase =
   | 'idle'
   | 'loading'
+  /** The run is accepted and waiting for a worker. */
+  | 'queued'
   | 'thinking'
   | 'responding'
   | 'tool-call'
@@ -180,7 +184,28 @@ export interface SnapshotRun {
   agent: string;
   /** 0 is the dispatched run itself; nested runs are 1+. */
   depth: number;
-  state: SubagentStatus;
+  state: SubagentStatus | 'QUEUED';
+  /** ISO time the run was accepted and put on the queue. */
+  enqueuedAt?: string;
+  /** ISO time a worker picked the run up; the clock a "running for" timer
+   *  counts from. A queued run's is its enqueue time until then. */
+  startedAt?: string;
+  /** ISO time it ended, once it has. */
+  endedAt?: string;
+}
+
+/** The thread's latest run and its clocks, kept from `STATE_CHANGE` alone:
+ *  every one names its run and carries `enqueuedAt` (while it waits for a
+ *  worker), `startedAt` (while it runs or waits on a human) or `endedAt`
+ *  (when it ends), so a timer never refetches history. */
+export interface ThreadRun {
+  id: string;
+  /** Set while the run waits for a worker, and kept after. */
+  enqueuedAt?: string;
+  /** Set once a worker has the run; absent while it is still queued. */
+  startedAt?: string;
+  /** Set once the run ended; absent while it is running or waiting. */
+  endedAt?: string;
 }
 
 export interface ThreadSnapshot {

@@ -6,6 +6,7 @@ package pgxlisten
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -19,6 +20,19 @@ type Listener struct {
 	Backoff time.Duration
 	// OnError is told about a dropped connection, if set.
 	OnError func(err error)
+
+	mu        sync.Mutex
+	onConnect func()
+}
+
+// OnConnect registers fn to run on every connection that reaches LISTEN,
+// the first one included, before any notification is read off it. The bus
+// replays from the durable log in it, so the callback should return once
+// that is done.
+func (l *Listener) OnConnect(fn func()) {
+	l.mu.Lock()
+	l.onConnect = fn
+	l.mu.Unlock()
 }
 
 // New makes a listener for a connection string (postgres://...).
@@ -26,8 +40,8 @@ func New(connString string) *Listener { return &Listener{connString: connString}
 
 // Listen connects, LISTENs on channel, and calls handler for every
 // notification until ctx ends. A dropped connection is retried after
-// Backoff; what was missed meanwhile is the log's job to carry, not the
-// bus's (§2.2).
+// Backoff; what was missed meanwhile is the log's job to carry (§2.2), and
+// the OnConnect callback is where the bus goes back for it.
 func (l *Listener) Listen(ctx context.Context, channel string, handler func(payload string)) error {
 	backoff := l.Backoff
 	if backoff <= 0 {
@@ -57,6 +71,12 @@ func (l *Listener) once(ctx context.Context, channel string, handler func(payloa
 	defer conn.Close(context.WithoutCancel(ctx))
 	if _, err := conn.Exec(ctx, "LISTEN "+pgx.Identifier{channel}.Sanitize()); err != nil {
 		return err
+	}
+	l.mu.Lock()
+	connected := l.onConnect
+	l.mu.Unlock()
+	if connected != nil {
+		connected()
 	}
 	for {
 		n, err := conn.WaitForNotification(ctx)

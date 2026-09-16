@@ -3,6 +3,8 @@ package agentenkit
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -84,6 +86,9 @@ func (c *AgentCore) scope(state AgentRunState, runID string) ports.RuntimePorts 
 // or for a run when state is given.
 func (c *AgentCore) Ports(state AgentRunState) RuntimePorts { return c.scope(state, "") }
 
+// log is the platform's logger, defaulted.
+func (c *AgentCore) log() *slog.Logger { return core.Logger(c.scope(nil, "")) }
+
 // Config is the resolved config.
 func (c *AgentCore) Config() AgentConfig { return c.config }
 
@@ -141,7 +146,10 @@ func (c *AgentCore) GetThreadSnapshot(ctx context.Context, threadID string, stat
 	if len(events) > 0 {
 		snap.LastEventSeq = events[len(events)-1].Seq
 	}
-	if thread.State == StateRunning || thread.State == StateWaitingForInput {
+	if core.IsActive(thread.State) {
+		// The run's boundary is where it was accepted (QUEUED) or picked up
+		// (RUNNING), whichever came last; a resume after a park publishes
+		// RUNNING too.
 		boundary := 0
 		for i := len(events) - 1; i >= 0; i-- {
 			if events[i].Type != "STATE_CHANGE" {
@@ -150,7 +158,7 @@ func (c *AgentCore) GetThreadSnapshot(ctx context.Context, threadID string, stat
 			var p struct {
 				State string `json:"state"`
 			}
-			if events[i].PayloadInto(&p) == nil && p.State == string(StateRunning) {
+			if events[i].PayloadInto(&p) == nil && (p.State == string(StateRunning) || p.State == string(StateQueued)) {
 				boundary = i
 				break
 			}
@@ -202,6 +210,14 @@ func (c *AgentCore) register(name string, handle *core.Handle, kind AgentKind) *
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.registry[name] = handle
+	// A stop ends whichever agent's run is active; that agent's settle hook
+	// is found through the registry (§5.6).
+	handle.Registry(func(name string) *core.RegisteredAgent {
+		if h := c.GetAgent(name); h != nil {
+			return h.Agent()
+		}
+		return nil
+	})
 	// The first registered stream-text handle is the default for jobs that
 	// omit `agent` (§5).
 	if kind == KindStreamText && c.defaultAgent == "" {
@@ -356,18 +372,31 @@ type HandleJobResult struct {
 	Reason   string `json:"reason,omitempty"`
 }
 
+// ErrUnknownAgent is a job for an agent this process has not registered,
+// with no default handle to fall back on. It is an error rather than a
+// quiet refusal: the queue keeps the job and retries it, so a process that
+// registers its agents a moment after it starts consuming heals on its own,
+// and one that never does leaves a dead row and a log line, not silence.
+var ErrUnknownAgent = errors.New("agentenkit: no agent registered for this job")
+
+// resolve finds the handle a job dispatches to: its own, or the default.
+func (w *WorkerAPI) resolve(name string) *core.Handle {
+	w.c.mu.RLock()
+	defer w.c.mu.RUnlock()
+	agent := w.c.registry[name]
+	if agent == nil && w.c.defaultAgent != "" {
+		agent = w.c.registry[w.c.defaultAgent] // missing `agent` → the default handle
+	}
+	return agent
+}
+
 // HandleJob resolves the handle, applies the failure policy, and is
 // idempotent under at-least-once delivery. The HTTP layer only verifies
 // signatures, parses JSON, and calls this.
 func (w *WorkerAPI) HandleJob(ctx context.Context, job RunJob) (HandleJobResult, error) {
-	w.c.mu.RLock()
-	agent := w.c.registry[job.Agent]
-	if agent == nil && w.c.defaultAgent != "" {
-		agent = w.c.registry[w.c.defaultAgent] // missing `agent` → the default handle
-	}
-	w.c.mu.RUnlock()
+	agent := w.resolve(job.Agent)
 	if agent == nil {
-		return HandleJobResult{Accepted: false, Reason: "unknown-agent"}, nil
+		return HandleJobResult{Accepted: false, Reason: "unknown-agent"}, fmt.Errorf("%w: %q", ErrUnknownAgent, job.Agent)
 	}
 	// ExecuteWithPolicy: run lock (idempotent under at-least-once delivery,
 	// §3.4) + §2.8 failure policy: redrive < maxAttempts, else finalize
@@ -377,8 +406,10 @@ func (w *WorkerAPI) HandleJob(ctx context.Context, job RunJob) (HandleJobResult,
 		// The dispatch's identity (§2.1): without it the worker cannot tell it
 		// has been replaced by a newer run, and a blocked job is dropped.
 		RunID: job.RunID,
-		// Carries the queue wait through to the run record (§2.9).
-		EnqueuedAt: job.EnqueuedAt,
+		// Carries the queue wait through to the run record (§2.9), and the
+		// run's place in line onto any retry (§2.8).
+		EnqueuedAt: job.EnqueuedAt, DispatchedAt: job.DispatchedAt,
+		Kind: job.Kind, PartitionKey: job.PartitionKey,
 		// Rehydrated from the ticket: this worker never saw the caller (§2.10).
 		State: job.State, Model: job.Model, TokenBudget: job.TokenBudget,
 		CostBudgetMicros: job.CostBudgetMicros, ProviderOptions: job.ProviderOptions,
@@ -390,10 +421,114 @@ func (w *WorkerAPI) HandleJob(ctx context.Context, job RunJob) (HandleJobResult,
 	return HandleJobResult{Accepted: true}, nil
 }
 
-// Handler adapts the worker to an inline queue's handler signature.
+// Handler adapts the worker to a queue's handler signature. A refused job
+// is logged with its reason before the error goes back to the queue.
 func (w *WorkerAPI) Handler() func(ctx context.Context, job RunJob) error {
 	return func(ctx context.Context, job RunJob) error {
-		_, err := w.HandleJob(ctx, job)
+		res, err := w.HandleJob(ctx, job)
+		if !res.Accepted {
+			w.c.log().Error("job refused", "thread", job.ThreadID, "run", job.RunID, "agent", job.Agent, "reason", res.Reason, "err", err)
+		}
 		return err
 	}
 }
+
+// HandleDeadJob is what a queue calls when it gives up on a job (§2.8): the
+// run behind it is failed with the reason, so its thread does not read
+// QUEUED or RUNNING for ever and its spend is settled. A job whose run has
+// already moved on (a newer run, a stop, a finished run) is left alone.
+func (w *WorkerAPI) HandleDeadJob(ctx context.Context, job RunJob, attempts int, cause error) {
+	log := w.c.log().With("thread", job.ThreadID, "run", job.RunID, "kind", string(job.Kind), "attempts", attempts)
+	agent := w.resolve(job.Agent)
+	if agent == nil {
+		log.Error("dead job for an unknown agent; its run cannot be failed", "err", cause)
+		return
+	}
+	reason := fmt.Sprintf("the run's job was dropped by the queue after %d deliveries: %v", attempts, cause)
+	failed, err := core.FailLostRun(ctx, w.c.scope(job.State, job.RunID), agent.Agent(), job.ThreadID, job.RunID, reason)
+	switch {
+	case err != nil:
+		log.Error("dead job: run not failed", "err", err)
+	case failed:
+		log.Error("dead job: run failed", "err", cause)
+	default:
+		log.Warn("dead job: run had already moved on; nothing to fail", "err", cause)
+	}
+}
+
+// ReclaimReport is what a stuck-run sweep did.
+type ReclaimReport struct {
+	// Checked is how many open run records the sweep looked at.
+	Checked int `json:"checked"`
+	// Redispatched is how many runs went back on the queue or were moved
+	// to their record's end state.
+	Redispatched int `json:"redispatched"`
+	// Settled is how many ended runs had their settle run late.
+	Settled int `json:"settled"`
+	// Errors is how many runs the sweep could not act on.
+	Errors int `json:"errors"`
+}
+
+// ReclaimStuckRuns is the backstop for a run that nothing is working on
+// (§2.5, §2.8): a QUEUED or RUNNING record older than olderThan whose lock
+// nobody holds and whose job the queue no longer has is re-dispatched, and
+// an ended record older than olderThan whose settle never ran is settled.
+// Call it from a periodic job. It needs the run's recorded state to scope
+// storage (RecordPayloads), and skips records without one.
+func (c *AgentCore) ReclaimStuckRuns(ctx context.Context, olderThan time.Duration) (ReclaimReport, error) {
+	var report ReclaimReport
+	until := time.Now().Add(-olderThan)
+	open, err := c.admin.Runs().List(ctx, ports.RunFilter{
+		State: []ports.ExecutionState{StateQueued, StateRunning}, Until: &until, Limit: 500,
+	})
+	if err != nil {
+		return report, err
+	}
+	for _, rec := range open {
+		if rec.Depth > 0 || rec.RunState == nil {
+			continue
+		}
+		report.Checked++
+		deps := c.scope(rec.RunState, rec.ID)
+		if rec.EndedAt != nil {
+			continue
+		}
+		did, err := core.ReclaimIfOrphaned(ctx, deps, rec.ThreadID)
+		if err != nil {
+			report.Errors++
+			c.log().Error("stuck run not reclaimed", "thread", rec.ThreadID, "run", rec.ID, "err", err)
+			continue
+		}
+		if did {
+			report.Redispatched++
+		}
+	}
+	ended, err := c.admin.Runs().List(ctx, ports.RunFilter{
+		State: []ports.ExecutionState{StateCancelled, StateCompleted, StateFailed}, Until: &until, Limit: 500,
+	})
+	if err != nil {
+		return report, err
+	}
+	for _, rec := range ended {
+		if rec.Depth > 0 || rec.RunState == nil || rec.SettledAt != nil || rec.EndedAt == nil || rec.EndedAt.After(until) {
+			continue
+		}
+		report.Checked++
+		agent := w(c).resolve(rec.Agent)
+		if agent == nil {
+			continue
+		}
+		settled, err := core.SettleLate(ctx, c.scope(rec.RunState, rec.ID), agent.Agent(), rec.ThreadID, rec.ID)
+		if err != nil {
+			report.Errors++
+			c.log().Error("unsettled run not settled", "thread", rec.ThreadID, "run", rec.ID, "err", err)
+			continue
+		}
+		if settled {
+			report.Settled++
+		}
+	}
+	return report, nil
+}
+
+func w(c *AgentCore) *WorkerAPI { return c.Worker }

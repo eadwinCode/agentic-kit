@@ -213,7 +213,13 @@ func TestSQLiteBaselineRepairsADatabaseFromAnOlderRelease(t *testing.T) {
 		// one of them. Getting that order wrong fails right here.
 		t.Fatalf("reading a repaired database: %v", err)
 	}
-	if got := versions(t, db); len(got) != 1 || got[0] != "0001_init" {
+	// Every embedded migration ran, the baseline first.
+	all, err := migrate.SQLiteMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := versions(t, db)
+	if len(got) != len(all) || got[0] != "0001_init" {
 		t.Fatalf("ledger: %v", got)
 	}
 }

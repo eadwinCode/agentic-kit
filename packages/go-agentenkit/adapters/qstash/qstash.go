@@ -56,6 +56,20 @@ func New(client Client, opts Options) *Queue {
 	return &Queue{client: client, opts: opts}
 }
 
+// Cancel is a no-op: QStash offers no way to withdraw a queued message by
+// key, and every caller treats a delivered row as a correct no-op.
+func (q *Queue) Cancel(context.Context, string) error { return nil }
+
+// Find cannot look a message up; the caller treats this as unknown.
+func (q *Queue) Find(context.Context, string) (*ports.QueuedJob, error) {
+	return nil, ports.ErrUnsupported
+}
+
+// Stats cannot count; the caller treats this as unknown.
+func (q *Queue) Stats(context.Context) (ports.QueueStats, error) {
+	return ports.QueueStats{}, ports.ErrUnsupported
+}
+
 // Enqueue dispatches a job. A delayed job goes out as a published message
 // rather than a queued one: QStash supports delays on publish only and
 // rejects Upstash-Delay on enqueue. The trade is that this one message

@@ -272,7 +272,12 @@ rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
 Rules: an error fails the run (the reason lands on the terminal event and the
 run record); a user stop reaches the hook with `Cancelled` set on a cancelled
 context and its error is ignored; a run whose attempts are exhausted still
-settles, as `FAILED` with `Error` set. It can run more than once for one run
+settles, as `FAILED` with `Error` set. A stop that ends a run no worker holds
+(one still queued, or parked on an approval) settles it right there, from the
+stop, with `Cancelled` set and the usage of the steps it did make on `Usage`;
+the hook then runs on the stop request's own context. Whichever side ends
+the run records the settle on it (`settledAt`), so a worker that wakes up
+later for the same run settles nothing. It can run more than once for one run
 — a worker that dies inside it is redelivered — so keep it idempotent on
 `RunID`.
 

@@ -5,6 +5,9 @@ import type { AgentRunState } from './state.js';
  *  (`agent:state:{threadId}`) is a hot cache the engine polls (§2.1, §3.4). */
 export type ExecutionState =
   | 'IDLE'
+  /** Accepted and waiting for a worker; written by the Go runtime. It becomes
+   *  RUNNING the moment a worker picks the job up. */
+  | 'QUEUED'
   | 'RUNNING'
   | 'WAITING_FOR_INPUT'
   | 'CANCELLED'

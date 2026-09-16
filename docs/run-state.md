@@ -105,3 +105,10 @@ The durable `STATE_CHANGE` event emitted by `stop` includes the stopped
 `runId`, `stopReason: 'cancelled'`, and `endedAt`. This timestamp records the
 accepted stop; a running worker can still add usage during teardown without
 changing it. Existing step and token counters are preserved by `stop`.
+
+> Go runtime: every `STATE_CHANGE` names its run. `QUEUED` carries `runId`
+> and `enqueuedAt` (when the run was accepted); `RUNNING` and
+> `WAITING_FOR_INPUT` carry `runId` and `startedAt` (when a worker picked the
+> run up); `COMPLETED`, `FAILED` and `CANCELLED` carry `runId` and `endedAt`.
+> A client keeps a timer per run from the stream alone, and its clock measures
+> work rather than waiting.

@@ -24,6 +24,14 @@ const HITLParked = "__hitl_parked__"
 // HitlKey is the handoff key an answer is written to.
 func HitlKey(toolCallID string) string { return "agent:hitl:" + toolCallID }
 
+// expiryJobKey names a park's expiry row on the queue, so the answer can
+// withdraw it (§2.5).
+func expiryJobKey(toolCallID string) string { return "hitl-expiry:" + toolCallID }
+
+// resumeJobKey names a park's resume row on the queue: one per answer,
+// however many times the answer is sent.
+func resumeJobKey(toolCallID string) string { return "hitl-resume:" + toolCallID }
+
 // HitlResponse is what /respond writes to the handoff key.
 type HitlResponse struct {
 	Approved bool `json:"approved"`
@@ -259,7 +267,10 @@ func ParkForApproval(ctx context.Context, deps ports.RuntimePorts, i ParkInput) 
 	}); err != nil {
 		return err
 	}
-	if _, err := Publish(ctx, deps, i.ThreadID, "STATE_CHANGE", map[string]any{"state": ports.StateWaitingForInput}); err != nil {
+	// The park names its run and when the run started, like every other
+	// STATE_CHANGE, so a client keeps its timer without refetching history.
+	runID, _ := CurrentRunID(ctx, deps, i.ThreadID)
+	if _, err := Publish(ctx, deps, i.ThreadID, "STATE_CHANGE", runStatePayload(ctx, deps, ports.StateWaitingForInput, runID)); err != nil {
 		return err
 	}
 
@@ -268,13 +279,17 @@ func ParkForApproval(ctx context.Context, deps ports.RuntimePorts, i ParkInput) 
 	// run through the tool call. Reclamation (§2.5) covers the thread instead.
 	// Arriving early is equally harmless: an unexpired, unanswered request
 	// resolves to nothing and the job is a no-op (see resumePendingHitl).
-	runID, _ := CurrentRunID(ctx, deps, i.ThreadID)
-	_ = deps.Queue.Enqueue(ctx, ports.RunJob{
+	// The row is keyed so an answer can withdraw it, and it queues behind
+	// every user message: an expiry that came due is never urgent.
+	if err := deps.Queue.Enqueue(ctx, ports.RunJob{
 		ThreadID: i.ThreadID, RunID: runID, Model: i.Resume.Model, Agent: i.Resume.Agent,
+		Kind: ports.JobExpiry, DispatchedAt: i.Resume.DispatchedAt,
 		TokenBudget: i.Resume.TokenBudget, CostBudgetMicros: i.Resume.CostBudgetMicros,
 		ProviderOptions: i.Resume.ProviderOptions, State: i.Resume.State,
 		MaxSteps: i.Resume.MaxSteps,
-	}, &ports.EnqueueOptions{Delay: ttl + deps.Config.ReclaimGrace})
+	}, &ports.EnqueueOptions{Delay: ttl + deps.Config.ReclaimGrace, Key: expiryJobKey(i.ToolCallID), Priority: ports.PriorityLow}); err != nil && !errors.Is(err, ports.ErrDuplicateJob) {
+		Logger(deps).Warn("park expiry not scheduled; reclamation covers the thread", "thread", i.ThreadID, "toolCall", i.ToolCallID, "err", err)
+	}
 	return nil
 }
 
@@ -433,9 +448,16 @@ func Respond(ctx context.Context, deps ports.RuntimePorts, input ports.RespondIn
 	if remaining < time.Minute {
 		remaining = time.Minute
 	}
+	// The first answer wins. A repeat, from a second tab or a retry, must
+	// not overwrite it: an approval that can be rewritten after it was taken
+	// is a suggestion, not an approval.
 	answer, _ := json.Marshal(HitlResponse{Approved: input.Approved, Payload: input.Payload})
-	if _, err := deps.Kv.Set(ctx, HitlKey(input.ToolCallID), string(answer), ports.SetOptions{Expiry: remaining}); err != nil {
+	written, err := deps.Kv.Set(ctx, HitlKey(input.ToolCallID), string(answer), ports.SetOptions{Expiry: remaining, OnlyIfNotExists: true})
+	if err != nil {
 		return ports.RespondResult{}, err
+	}
+	if !written {
+		return ports.RespondResult{Delivered: false, Error: "This request was already answered"}, nil
 	}
 	// Bus-only fast-path notice (seq 0 = never persisted) for live UIs (§2.5)
 	_ = PublishNotice(ctx, deps, input.ThreadID, "HITL_RESPONSE", map[string]any{
@@ -450,10 +472,11 @@ func Respond(ctx context.Context, deps ports.RuntimePorts, input ports.RespondIn
 	if err != nil {
 		return ports.RespondResult{}, err
 	}
-	job := ports.RunJob{ThreadID: input.ThreadID, RunID: runID, Model: thread.Model}
+	job := ports.RunJob{ThreadID: input.ThreadID, RunID: runID, Model: thread.Model, Kind: ports.JobResume, EnqueuedAt: time.Now().UnixMilli()}
 	if r := match.Resume; r != nil {
 		job.Model = r.Model
 		job.Agent = r.Agent
+		job.DispatchedAt = r.DispatchedAt
 		job.TokenBudget = r.TokenBudget
 		job.CostBudgetMicros = r.CostBudgetMicros
 		job.ProviderOptions = r.ProviderOptions
@@ -462,8 +485,20 @@ func Respond(ctx context.Context, deps ports.RuntimePorts, input ports.RespondIn
 		job.State = r.State
 		job.MaxSteps = r.MaxSteps
 	}
-	if err := deps.Queue.Enqueue(ctx, job, nil); err != nil {
+	// One resume row per answer, keyed on the call: a second enqueue for
+	// the same answer is refused by the queue itself.
+	if err := deps.Queue.Enqueue(ctx, job, &ports.EnqueueOptions{Key: resumeJobKey(input.ToolCallID)}); err != nil {
+		if errors.Is(err, ports.ErrDuplicateJob) {
+			return ports.RespondResult{Delivered: false, Error: "This request was already answered"}, nil
+		}
+		// The answer is withdrawn so a retry of the request can land it.
+		_ = deps.Kv.Del(ctx, HitlKey(input.ToolCallID))
 		return ports.RespondResult{}, fmt.Errorf("resume dispatch: %w", err)
+	}
+	// The park's own deadline is answered for: its row is withdrawn rather
+	// than left to be delivered as a no-op. Best-effort, like the row itself.
+	if err := deps.Queue.Cancel(ctx, expiryJobKey(input.ToolCallID)); err != nil {
+		Logger(deps).Warn("park expiry row not withdrawn", "thread", input.ThreadID, "toolCall", input.ToolCallID, "err", err)
 	}
 	return ports.RespondResult{Delivered: true}, nil
 }

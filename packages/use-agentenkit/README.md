@@ -160,7 +160,12 @@ without the text. Anthropic extended thinking and DeepSeek R1 do send it.
 ## What the hook returns
 
 State: `threadId`, `entries`, `agentState`, `activity`, `historyLoading`,
-`pendingInputs`, `subagents`, `threads`, `threadsLoading`, `usage`.
+`pendingInputs`, `subagents`, `threads`, `threadsLoading`, `usage`,
+`currentRun`.
+
+`currentRun` is the thread's latest run with its clocks, `{ id, startedAt?,
+endedAt? }`, for a "running for" timer. It is hydrated from the snapshot and
+then kept from `STATE_CHANGE` alone, so it never costs a history request.
 
 Actions: `run`, `stop`, `respondToInput`, `newThread`, `selectThread`,
 `deleteThread`, `loadThreads`, `loadUsage`.

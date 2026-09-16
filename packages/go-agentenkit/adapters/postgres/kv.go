@@ -55,7 +55,7 @@ func (k *Kv) Get(ctx context.Context, key string) (string, bool, error) {
 	return value, true, nil
 }
 
-func expiry(d time.Duration) sql.NullTime {
+func expiryAt(d time.Duration) sql.NullTime {
 	if d <= 0 {
 		return sql.NullTime{}
 	}
@@ -67,7 +67,7 @@ func (k *Kv) Set(ctx context.Context, key, value string, opts ports.SetOptions) 
 		_, err := k.db.ExecContext(ctx,
 			`INSERT INTO `+k.table+` (key, value, "expiresAt") VALUES ($1, $2, $3)
 			 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "expiresAt" = EXCLUDED."expiresAt"`,
-			key, value, expiry(opts.Expiry))
+			key, value, expiryAt(opts.Expiry))
 		return err == nil, err
 	}
 	// SET NX in one statement (§3.4): the insert wins on a missing key, the
@@ -76,7 +76,7 @@ func (k *Kv) Set(ctx context.Context, key, value string, opts ports.SetOptions) 
 		`INSERT INTO `+k.table+` AS kv (key, value, "expiresAt") VALUES ($1, $2, $3)
 		 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "expiresAt" = EXCLUDED."expiresAt"
 		 WHERE kv."expiresAt" IS NOT NULL AND kv."expiresAt" <= now()`,
-		key, value, expiry(opts.Expiry))
+		key, value, expiryAt(opts.Expiry))
 	if err != nil {
 		return false, err
 	}
@@ -114,4 +114,46 @@ func (k *Kv) DeleteExpired(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// SetIfValue is the compare-and-set half of a lease renewal (§3.4): the
+// write lands only while the row still holds expected and is not expired.
+func (k *Kv) SetIfValue(ctx context.Context, key, expected, value string, ttl time.Duration) (bool, error) {
+	res, err := k.db.ExecContext(ctx,
+		`UPDATE `+k.table+` SET value = $3, "expiresAt" = $4
+		 WHERE key = $1 AND value = $2 AND ("expiresAt" IS NULL OR "expiresAt" > now())`,
+		key, expected, value, expiryAt(ttl))
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// DelIfValue frees a lease only while it is still this caller's.
+func (k *Kv) DelIfValue(ctx context.Context, key, expected string) (bool, error) {
+	res, err := k.db.ExecContext(ctx, `DELETE FROM `+k.table+` WHERE key = $1 AND value = $2`, key, expected)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// IncrWithExpiry is Incr that stamps a NEW counter (or one that had expired)
+// with an expiry, so a counter nobody clears still ages out. A live counter
+// keeps the expiry it already has.
+func (k *Kv) IncrWithExpiry(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+	var value string
+	err := k.db.QueryRowContext(ctx,
+		`INSERT INTO `+k.table+` AS kv (key, value, "expiresAt") VALUES ($1, '1', $2)
+		 ON CONFLICT (key) DO UPDATE SET
+		   value = CASE WHEN kv."expiresAt" IS NOT NULL AND kv."expiresAt" <= now() THEN '1'
+		                ELSE (kv.value::bigint + 1)::text END,
+		   "expiresAt" = CASE WHEN kv."expiresAt" IS NOT NULL AND kv."expiresAt" <= now() THEN EXCLUDED."expiresAt" ELSE kv."expiresAt" END
+		 RETURNING value`, key, expiryAt(ttl)).Scan(&value)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(value, 10, 64)
 }
