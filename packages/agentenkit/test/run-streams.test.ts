@@ -1,9 +1,18 @@
 import { describe, expect, it } from 'bun:test';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { MemoryRunStreams } from '../src/adapters/memory.js';
+import { openSqlite, SqliteRunStreams } from '../src/adapters/sqlite.js';
 import { parseStreamId, streamIdOf } from '../src/core/stream-events.js';
 import { runStreamsSuite } from './run-streams-suite.js';
 
 runStreamsSuite('memory', async () => new MemoryRunStreams());
+
+// SQLite on a file, so a second handle is another process's view.
+const sqliteFile = join(mkdtempSync(join(tmpdir(), 'streams-')), 'streams.sqlite');
+const openSqliteStreams = async () => new SqliteRunStreams(await openSqlite(sqliteFile), { pollMs: 50 });
+runStreamsSuite('sqlite', openSqliteStreams, { other: openSqliteStreams, settleMs: 100 });
 
 describe('stream ids', () => {
   it('a stream id names its run and segment', () => {
@@ -52,6 +61,23 @@ if (redisAddr) {
   };
   runStreamsSuite('upstash', async () => new UpstashRunStreams(upstashLike, { pollMs: 50 }), {
     other: async () => new UpstashRunStreams(upstashLike, { pollMs: 50 }),
+    settleMs: 100,
+  });
+}
+
+// Prisma against a real database: TEST_PRISMA_DB is a Postgres URL with the
+// example app's migrations applied, and the example's generated client is
+// the one used.
+const prismaDb = process.env.TEST_PRISMA_DB;
+if (prismaDb) {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(join(import.meta.dir, '../../../examples/nextjs-app/package.json'));
+  const { PrismaClient } = require('@prisma/client');
+  const { PrismaRunStreams } = await import('../src/adapters/prisma.js');
+  const prisma = new PrismaClient({ datasources: { db: { url: prismaDb } } });
+  const other = new PrismaClient({ datasources: { db: { url: prismaDb } } });
+  runStreamsSuite('prisma', async () => new PrismaRunStreams(prisma, { pollMs: 50 }), {
+    other: async () => new PrismaRunStreams(other, { pollMs: 50 }),
     settleMs: 100,
   });
 }

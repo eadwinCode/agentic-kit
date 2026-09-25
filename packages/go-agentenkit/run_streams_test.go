@@ -13,11 +13,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 
 	goredis "github.com/redis/go-redis/v9"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/memory"
+	pgstorage "github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/postgres"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/postgres/pgxlisten"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/redis"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/sqlite"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/upstash"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
@@ -332,6 +336,41 @@ func runStreamsSuite(t *testing.T, name string, make func(t *testing.T) ports.Ru
 
 func TestRunStreams(t *testing.T) {
 	runStreamsSuite(t, "memory", func(*testing.T) ports.RunStreams { return memory.NewRunStreams() }, streamsSuiteOptions{})
+
+	// SQLite on a file, so a second handle is another process's view.
+	file := filepath.Join(t.TempDir(), "streams.sqlite")
+	openSqliteStreams := func(t *testing.T) ports.RunStreams {
+		db, err := sqlite.Open(file)
+		must(t, err)
+		t.Cleanup(func() { db.Close() })
+		s, err := sqlite.NewRunStreams(context.Background(), db, 50*time.Millisecond)
+		must(t, err)
+		return s
+	}
+	runStreamsSuite(t, "sqlite", openSqliteStreams, streamsSuiteOptions{other: openSqliteStreams, settle: 100 * time.Millisecond})
+
+	if url := os.Getenv("TEST_ADMIN_PG"); url != "" {
+		db := openPostgres(t)
+		t.Cleanup(func() { db.Close() })
+		for _, tbl := range []string{"rs_stream_events", "rs_streams", "rs_migrations"} {
+			_, _ = db.Exec("DROP TABLE IF EXISTS " + tbl)
+		}
+		listening, err := pgstorage.NewRunStreams(context.Background(), db,
+			pgstorage.StreamsOptions{Listener: pgxlisten.New(url), Channel: "rs_streams"}, pgstorage.WithPrefix("rs_"))
+		must(t, err)
+		t.Cleanup(listening.Shutdown)
+		// A handle with no listener of its own and a long poll: a reader on
+		// the listening handle must still wake at once on its writes,
+		// through NOTIFY alone.
+		quiet, err := pgstorage.NewRunStreams(context.Background(), db,
+			pgstorage.StreamsOptions{Channel: "rs_streams", Poll: time.Minute}, pgstorage.WithPrefix("rs_"))
+		must(t, err)
+		time.Sleep(300 * time.Millisecond) // the LISTEN connection comes up
+		runStreamsSuite(t, "postgres", func(*testing.T) ports.RunStreams { return listening },
+			streamsSuiteOptions{other: func(*testing.T) ports.RunStreams { return quiet }})
+	} else {
+		t.Log("TEST_ADMIN_PG not set: skipping the postgres cases")
+	}
 
 	if os.Getenv("TEST_REDIS_ADDR") == "" {
 		t.Log("TEST_REDIS_ADDR not set: skipping the redis and upstash cases")

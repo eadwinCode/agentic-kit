@@ -53,6 +53,29 @@ model Message {
   @@index([threadId, seq])
 }
 
+/// A run segment's short-lived stream (agentenkit PrismaRunStreams). Closed
+/// when the segment ends and deleted after a grace window.
+model RunStream {
+  id        String   @id
+  threadId  String
+  runId     String
+  closed    Boolean  @default(false)
+  endEvent  String?
+  expiresAt DateTime
+
+  @@index([expiresAt])
+  @@index([threadId])
+}
+
+/// One event in a run stream. The autoincrement key is the stream offset.
+model RunStreamEvent {
+  pos      BigInt @id @default(autoincrement())
+  streamId String
+  event    String
+
+  @@index([streamId, pos])
+}
+
 model AgentEvent {
   id        String   @id @default(cuid())
   threadId  String
