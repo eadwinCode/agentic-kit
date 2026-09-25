@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
@@ -25,21 +27,91 @@ func MarshalPayload(payload any) json.RawMessage {
 	return b
 }
 
+// publishLocks serialises taking a seq and storing the event, per thread in
+// this process, so the log is written in seq order and a counter reseed (see
+// nextSeq) cannot race another publisher here. The bus send is left outside:
+// a subscriber may publish from inside it, and a follower fills any gap the
+// bus leaves from storage (see FollowEvents).
+var publishLocks = newKeyedMutex()
+
 // Publish persists to the replayable event log, then fans out live to all
 // subscribers (§2.2). Seq comes from Kv.Incr, monotonic per thread (§3.4).
 func Publish(ctx context.Context, deps ports.RuntimePorts, threadID, typ string, payload any) (ports.AgentEvent, error) {
-	seq, err := deps.Kv.Incr(ctx, SeqKey(threadID))
+	unlock := publishLocks.lock(threadID)
+	seq, err := nextSeq(ctx, deps, threadID)
 	if err != nil {
+		unlock()
 		return ports.AgentEvent{}, err
 	}
 	event := ports.AgentEvent{
 		ThreadID: threadID, Seq: seq, Type: typ,
 		Payload: MarshalPayload(payload), CreatedAt: time.Now(),
 	}
-	if err := deps.Storage.Events.Append(ctx, threadID, event); err != nil {
+	err = deps.Storage.Events.Append(ctx, threadID, event)
+	unlock()
+	if err != nil {
 		return event, err
 	}
 	return event, deps.Bus.Publish(ctx, threadID, event)
+}
+
+// nextSeq takes the thread's next event seq. A counter that restarts at 1 on
+// a thread that already has events means the kv lost the key (a flush, an
+// eviction, a restart without persistence). Carrying on from 1 would repeat
+// seqs the log already holds, and every client would drop the new events as
+// already seen, so the counter is moved past the stored ones first. The move
+// is a compare-and-set, so a publisher that took 2 meanwhile is not undone.
+func nextSeq(ctx context.Context, deps ports.RuntimePorts, threadID string) (int64, error) {
+	seq, err := deps.Kv.IncrWithExpiry(ctx, SeqKey(threadID), ThreadKeyTTL)
+	if err != nil || seq != 1 {
+		return seq, err
+	}
+	stored, err := deps.Storage.Events.ListSince(ctx, threadID, 0)
+	if err != nil || len(stored) == 0 {
+		return seq, err
+	}
+	top := stored[len(stored)-1].Seq
+	if top < 1 {
+		return seq, nil
+	}
+	if _, err := deps.Kv.SetIfValue(ctx, SeqKey(threadID), "1", strconv.FormatInt(top, 10), 0); err != nil {
+		return 0, err
+	}
+	return deps.Kv.Incr(ctx, SeqKey(threadID))
+}
+
+// keyedMutex is a mutex per key, dropped once nobody holds or waits on it.
+type keyedMutex struct {
+	mu    sync.Mutex
+	locks map[string]*keyedEntry
+}
+
+type keyedEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func newKeyedMutex() *keyedMutex { return &keyedMutex{locks: map[string]*keyedEntry{}} }
+
+func (k *keyedMutex) lock(key string) (unlock func()) {
+	k.mu.Lock()
+	e := k.locks[key]
+	if e == nil {
+		e = &keyedEntry{}
+		k.locks[key] = e
+	}
+	e.refs++
+	k.mu.Unlock()
+	e.mu.Lock()
+	return func() {
+		e.mu.Unlock()
+		k.mu.Lock()
+		e.refs--
+		if e.refs == 0 {
+			delete(k.locks, key)
+		}
+		k.mu.Unlock()
+	}
 }
 
 // PublishNotice publishes a bus-only notice (never persisted), e.g. HITL
@@ -66,7 +138,7 @@ var ReservedEventTypes = map[string]bool{
 	"MESSAGE_APPENDED": true, "MESSAGES_DROPPED": true, "CONTEXT_COMPACTED": true,
 	"SUBAGENT_STARTED": true, "SUBAGENT_CHUNK": true, "SUBAGENT_COMPLETED": true, "SUBAGENT_FAILED": true,
 	"TEXT_RESULT": true, "THREAD_DELETED": true, "HEARTBEAT": true,
-	"RUN_REFUSED": true, "TOKEN_BUDGET_EXHAUSTED": true,
+	"RUN_REFUSED": true, "TOKEN_BUDGET_EXHAUSTED": true, "COST_BUDGET_EXHAUSTED": true,
 }
 
 // PublishOptions tunes PublishEvent.
@@ -156,7 +228,7 @@ func Transition(ctx context.Context, deps ports.RuntimePorts, threadID string, c
 	if err != nil || !won {
 		return false, err
 	}
-	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(c.To), ports.SetOptions{}); err != nil {
+	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(c.To), ports.SetOptions{Expiry: ThreadKeyTTL}); err != nil {
 		return true, err
 	}
 	upsertAdminThread(ctx, deps, threadID, c.To, c.Model)

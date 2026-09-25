@@ -545,6 +545,8 @@ export async function execute(
       // Parks raised during this segment wait here until the step that raised
       // them is saved (see ParkBox).
       const parks = new ParkBox();
+      // Calls whose tool failed, for their live chunk (see chunkPayload).
+      const toolErrors = new Map<string, string>();
       const subCtx: SubagentCtx | null = sub
         ? {
             threadId,
@@ -565,6 +567,7 @@ export async function execute(
             abortSignal: abort.signal,
             fenced: () => lease.lost,
             parks,
+            toolErrors,
             state: input.state,
           }
         : null;
@@ -580,7 +583,7 @@ export async function execute(
         withPublishEvent(
           deps,
           threadId,
-          withHitl(deps, threadId, rawTools, { resume, agentId: null, frames: [], parks }),
+          withHitl(deps, threadId, rawTools, { resume, agentId: null, frames: [], parks, toolErrors }),
         ),
         input.state ?? {},
       );
@@ -647,10 +650,14 @@ export async function execute(
           cacheSystemPrompt: deps.config.promptCaching,
           fenced: () => lease.lost,
           commitParks: () => commitParks(deps, parks),
-          onChunk: async (chunk) => {
-            // One canonical path for every client: durable log + live Pub/Sub (§2.1, §2.2)
+          // One canonical path for every client: durable log + live Pub/Sub
+          // (§2.1, §2.2), with token deltas merged (see ChunkBatcher).
+          publishChunk: async (chunk) => {
             await publish(deps, threadId, 'CHUNK', chunk);
-            userArgs.onChunk?.({ chunk }); // user callback still fires
+          },
+          toolErrors,
+          onChunk: async (chunk) => {
+            userArgs.onChunk?.({ chunk }); // the user callback sees every raw chunk
           },
         },
         ledger,

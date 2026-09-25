@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/core"
@@ -41,6 +42,13 @@ func New(ctx context.Context, db *sql.DB, opts ...Option) (*Storage, error) {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return nil, fmt.Errorf("postgres storage schema: %w", err)
 		}
+	}
+	// One event per seq on a thread: a counter that restarted must fail its
+	// write, never land a second event under a seq clients already have. A
+	// log from before this check may already hold duplicates; the index is
+	// then left off and said so, rather than refusing to start.
+	if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS `+s.t("events_thread_seq_unique")+` ON `+s.t("events")+`("threadId", seq)`); err != nil {
+		slog.Warn("event seq uniqueness not enforced: the log already holds duplicate seqs", "table", s.t("events"), "err", err)
 	}
 	return s, nil
 }

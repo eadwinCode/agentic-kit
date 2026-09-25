@@ -12,7 +12,7 @@ import {
 } from './usage.js';
 import { estimateTokens } from './context.js';
 import type { NewUsage } from './types.js';
-import { drainOrThrow } from './stream.js';
+import { ChunkBatcher, chunkPayload, drainOrThrow } from './stream.js';
 import { publish, publishNotice } from './publish.js';
 import { HITL_PARKED } from './hitl.js';
 import { RunLockLostError } from './lease.js';
@@ -229,7 +229,13 @@ export interface LoopInput {
   /** The name that goes on the bill line: the registered handle for the main
    *  run, the delegation's name for a nested one. */
   agentName?: string;
+  /** Every raw chunk, as the SDK streams it: the host's own callback. */
   onChunk?: (chunk: unknown) => Promise<void>;
+  /** Publishes a chunk as an event. Deltas reach it merged (see ChunkBatcher),
+   *  and everything a step streamed is out before the step is committed. */
+  publishChunk?: (chunk: unknown) => Promise<void>;
+  /** Calls whose tool failed (see withHitl), for their tool-result chunk. */
+  toolErrors?: Map<string, string>;
   /** Persona for a nested run; omitted, the agent's own spec `system` stands. */
   system?: string;
   /** Carry the system prompt as a stamped message rather than the SDK's
@@ -299,6 +305,7 @@ export async function runLoop(
     const stepStartedAt = Date.now();
     const partial = { text: '' };
     let step: StepResult;
+    const batcher = input.publishChunk ? new ChunkBatcher(input.publishChunk) : null;
     try {
       step = await executeStep(agent, {
         kind: input.kind,
@@ -307,12 +314,21 @@ export async function runLoop(
         tools: input.tools,
         providerOptions: input.providerOptions,
         abortSignal: input.abortSignal,
-        onChunk: input.kind === 'stream-text' ? input.onChunk : undefined,
+        onChunk:
+          input.kind === 'stream-text'
+            ? async (chunk: unknown) => {
+                const published = chunkPayload(chunk, input.toolErrors);
+                if (published !== null) await batcher?.push(published);
+                await input.onChunk?.(chunk);
+              }
+            : undefined,
         system: input.system,
         cacheSystemPrompt: input.cacheSystemPrompt,
         partial,
       });
+      await batcher?.flush(); // the step's text is out before anything below
     } catch (err) {
+      await batcher?.flush();
       // The call ended without a finish: a user stop, or the provider failing
       // part way. Either way the provider billed for what it had already
       // produced, so the call is recorded rather than dropped — with
@@ -443,9 +459,11 @@ export async function runLoop(
       tools: (step.toolResults ?? [])
         .map((r: any) => r?.toolName)
         .filter(Boolean) as string[],
+      at: new Date(),
       ...(deps.config.recordPayloads
         ? {
-            text: cap(step.text, deps.config.payloadCapChars),
+            // Left out when empty, as the Go runtime does.
+            ...(step.text ? { text: cap(step.text, deps.config.payloadCapChars) } : {}),
             toolCalls: (step.toolResults ?? []).map((r: any) => ({
               toolName: r?.toolName,
               args: capValue(r?.args, deps.config.payloadCapChars),

@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"time"
@@ -141,6 +142,13 @@ func New(db *sql.DB) (*Storage, error) {
 	// The thread's current run, for ThreadTransition's compare-and-set.
 	if err := addMissing(db, "threads", map[string]string{"runId": "TEXT"}); err != nil {
 		return nil, err
+	}
+	// One event per seq on a thread: a counter that restarted must fail its
+	// write, never land a second event under a seq clients already have. A
+	// log from before this check may already hold duplicates; the index is
+	// then left off and said so, rather than refusing to start.
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS events_thread_seq_unique ON events(threadId, seq)`); err != nil {
+		slog.Warn("event seq uniqueness not enforced: the log already holds duplicate seqs", "err", err)
 	}
 	if err := addMissing(db, "usage", usageColumns); err != nil {
 		return nil, err

@@ -371,7 +371,12 @@ type LoopInput struct {
 	// AgentName is the name that goes on the bill line: the registered
 	// handle for the main run, the delegation's name for a nested one.
 	AgentName string
-	OnChunk   func(provider.StreamChunk)
+	// OnChunk sees every raw chunk: the host's own callback.
+	OnChunk func(provider.StreamChunk)
+	// PublishChunk publishes a chunk as an event. Deltas reach it merged
+	// (see chunkBatcher), and everything a step streamed is out before the
+	// step is committed.
+	PublishChunk func(payload map[string]any)
 	// System is the persona for a nested run; empty keeps the spec's.
 	System string
 	// SystemFn builds the persona per step (§3.1); it wins over System and
@@ -462,8 +467,19 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		stepsLeft--
 		stepStartedAt := time.Now()
 		var onChunk func(provider.StreamChunk)
+		var batcher *chunkBatcher
 		if input.Kind == ports.KindStreamText {
-			onChunk = input.OnChunk
+			if input.PublishChunk != nil {
+				batcher = newChunkBatcher(input.PublishChunk)
+			}
+			onChunk = func(c provider.StreamChunk) {
+				if batcher != nil {
+					batcher.push(ChunkPayload(c))
+				}
+				if input.OnChunk != nil {
+					input.OnChunk(c)
+				}
+			}
 		}
 		system := input.System
 		if input.SystemFn != nil {
@@ -497,6 +513,9 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		})
 		stepTimedOut := deps.Config.StepTimeout > 0 && errors.Is(stepCtx.Err(), context.DeadlineExceeded) && genCtx.Err() == nil
 		cancelStep()
+		if batcher != nil {
+			batcher.flush() // the step's text is out before anything below
+		}
 		if stepTimedOut {
 			if err == nil {
 				err = context.DeadlineExceeded
@@ -636,7 +655,7 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		if input.RunID != "" {
 			_ = deps.Admin.Steps().Record(ctx, marker)
 		}
-		_ = PublishNotice(ctx, deps, threadID, "STEP_FINISHED", marker)
+		_ = PublishNotice(ctx, deps, threadID, "STEP_FINISHED", stepFinishedPayload(marker))
 
 		// §2.5 park: a RequiresConfirmation tool returned the sentinel; the
 		// segment ends here on WAITING_FOR_INPUT (set by ParkForApproval).
@@ -674,10 +693,14 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			if err != nil {
 				Logger(deps).Error("cost budget not checked", "run", input.BillingRunID, "err", err)
 			} else if spent.CostMicros >= input.CostBudgetMicros {
-				_, _ = Publish(ctx, deps, threadID, "COST_BUDGET_EXHAUSTED", map[string]any{
+				exhausted := map[string]any{
 					"agentId": nullable(input.AgentID), "costMicros": spent.CostMicros,
-					"costBudgetMicros": input.CostBudgetMicros, "currency": spent.Currency,
-				})
+					"costBudgetMicros": input.CostBudgetMicros,
+				}
+				if spent.Currency != "" { // left out when unset, as TS does
+					exhausted["currency"] = spent.Currency
+				}
+				_, _ = Publish(ctx, deps, threadID, "COST_BUDGET_EXHAUSTED", exhausted)
 				out.CostExhausted = true
 				break
 			}
@@ -725,4 +748,14 @@ func unfinishedUsage(input LoopInput, step int, s *StepResult, outcome ports.Usa
 		u.OutputTokens, u.Estimated = estimateTokens([]byte(s.StreamedText)), true
 	}
 	return u
+}
+
+// stepFinishedPayload is the STEP_FINISHED notice: the step record, with the
+// main agent's stream named null rather than "", as the TS runtime sends it.
+func stepFinishedPayload(marker ports.StepRecord) map[string]any {
+	raw, _ := json.Marshal(marker)
+	var out map[string]any
+	_ = json.Unmarshal(raw, &out)
+	out["agentId"] = nullable(marker.AgentID)
+	return out
 }

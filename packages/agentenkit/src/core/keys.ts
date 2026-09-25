@@ -32,6 +32,13 @@ export const counterScope = (threadId: string, runId?: string) => runId || threa
  *  the kv for ever. */
 export const COUNTER_TTL_SECONDS = 6 * 60 * 60;
 
+/** How long a thread's hot keys (state, current run, event seq) live after
+ *  they were last written. The durable row is the truth; these only save a
+ *  read, so a thread idle past this simply reads storage again, and its seq
+ *  counter carries on from the stored events (see nextSeq). Without an
+ *  expiry, every thread ever run keeps three keys in the kv for ever. */
+export const THREAD_KEY_TTL_SECONDS = 30 * 24 * 60 * 60;
+
 /** The run that owns the thread right now, or null on a thread that predates
  *  run ids. Resuming a parked run (§2.5) REUSES this — a resume is the same
  *  run continuing, not a new one, so it must never bump the id. */
@@ -49,6 +56,6 @@ export async function currentRunId(
  *  new run is about to overwrite. */
 export async function claimRun(deps: RuntimePorts, threadId: string): Promise<string> {
   const runId = randomUUID();
-  await deps.kv.set(runIdKey(threadId), runId);
+  await deps.kv.set(runIdKey(threadId), runId, { exSeconds: THREAD_KEY_TTL_SECONDS });
   return runId;
 }

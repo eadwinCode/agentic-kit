@@ -157,6 +157,9 @@ export function withHitl(
     /** Where parks wait for their step to be saved (see ParkBox). Absent
      *  parks at once. */
     parks?: ParkBox;
+    /** Calls whose tool failed, by id, with the message: their live chunk
+     *  names the error (see chunkPayload). */
+    toolErrors?: Map<string, string>;
   },
 ): Record<string, any> {
   const out: Record<string, any> = {};
@@ -209,7 +212,9 @@ export function withHitl(
             // A stop is not the tool's failure: it ends the run, as it does
             // in Go, where the cancelled step never reaches the model.
             if (err instanceof RunStoppedError || (opts as any)?.abortSignal?.aborted) throw err;
-            return `error: ${err instanceof Error ? err.message : String(err)}`;
+            const message = err instanceof Error ? err.message : String(err);
+            if (opts?.toolCallId) ctx.toolErrors?.set(opts.toolCallId, message);
+            return `error: ${message}`;
           }
           // A resumed call that parks again has nowhere to go: the verdict
           // for this call is being consumed right now.

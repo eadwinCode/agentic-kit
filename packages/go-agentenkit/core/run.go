@@ -328,7 +328,7 @@ func dispatchActive(ctx context.Context, deps ports.RuntimePorts, threadID, runI
 	}
 	recordStoppedRun(ctx, deps, runID, time.Now())
 	if current == runID && thread != nil && thread.State == ports.StateCancelled {
-		_, err = deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateCancelled), ports.SetOptions{})
+		_, err = deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateCancelled), ports.SetOptions{Expiry: ThreadKeyTTL})
 	}
 	return false, err
 }

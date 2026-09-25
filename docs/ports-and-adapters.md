@@ -164,10 +164,17 @@ interface EventBus {
 }
 ```
 
-At-most-once, deliberately. A dropped frame is recovered by replaying the
-durable event log from the client's cursor, so the bus does not need delivery
-guarantees — which is what lets it be Redis pub/sub, Ably, or Postgres
-`LISTEN/NOTIFY`.
+At-most-once, deliberately. A dropped frame is recovered from the durable event
+log, so the bus does not need delivery guarantees — which is what lets it be
+Redis pub/sub, Ably, or Postgres `LISTEN/NOTIFY`. Nor does it need ordering: a
+follower that sees seq N+1 before N (another process published N and is still
+writing it, or the bus dropped it) reads the gap back from storage before it
+yields N+1, so a client never misses an event and never sees one twice.
+
+The reference buses keep one subscriber connection per process, shared by every
+subscription, and give each subscription its own queue, so one slow client
+holds up nobody. Token deltas are merged before they are published (one event
+per 50 ms of text rather than one per token), in the same event shape.
 
 ## Kv
 

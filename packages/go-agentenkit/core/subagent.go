@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/zendev-sh/goai"
-	"github.com/zendev-sh/goai/provider"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
@@ -464,10 +463,10 @@ func RunNestedAgent(genCtx context.Context, sctx *SubagentCtx, d ports.NestedDes
 		PrepareStep:       prepareStep,
 		State:             sctx.State,
 		CacheSystemPrompt: deps.Config.PromptCaching,
-		OnChunk: func(chunk provider.StreamChunk) {
+		PublishChunk: func(p map[string]any) {
 			// Namespaced into the shared thread event log → same multi-user pipeline (§2.2)
 			_, _ = Publish(io, deps, threadID, "SUBAGENT_CHUNK", map[string]any{
-				"agentId": d.AgentID, "chunk": ChunkPayload(chunk),
+				"agentId": d.AgentID, "chunk": p,
 			})
 		},
 	}, sctx.Ledger)

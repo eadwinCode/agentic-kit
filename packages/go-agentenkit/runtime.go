@@ -269,7 +269,9 @@ func (e *EventsAPI) Since(ctx context.Context, threadID string, sinceSeq int64, 
 	return e.c.scope(state, "").Storage.Events.ListSince(ctx, threadID, sinceSeq)
 }
 
-// Subscribe is the raw tail. Returns an unsubscribe function.
+// Subscribe is the raw tail. Returns an unsubscribe function. A bus that
+// reads storage itself (the Postgres bus, after a reconnect) takes the run
+// state from ctx: wrap it with ContextWithRunState on scoped storage.
 func (e *EventsAPI) Subscribe(ctx context.Context, threadID string, handler func(AgentEvent)) (func() error, error) {
 	return e.c.opts.Bus.Subscribe(ctx, threadID, handler)
 }
@@ -283,6 +285,9 @@ type FollowStateOptions struct {
 // Follow is replay then live, as one sequence, with the cursor discipline
 // already applied (§2.2). Cancel ctx, or the subscription outlives the client.
 func (e *EventsAPI) Follow(ctx context.Context, threadID string, opts FollowStateOptions) (*EventStream, error) {
+	// The state rides the context too: a bus that reads storage itself (the
+	// Postgres bus replays after a reconnect) needs the same scope.
+	ctx = core.ContextWithRunState(ctx, opts.State)
 	return core.FollowEvents(ctx, e.c.scope(opts.State, ""), threadID, opts.FollowOptions)
 }
 
@@ -295,6 +300,7 @@ type SSEStateOptions struct {
 // SSE is Follow, encoded as Server-Sent Events. Serve it with ServeHTTP or
 // WriteTo.
 func (e *EventsAPI) SSE(ctx context.Context, threadID string, opts SSEStateOptions) (*SSEStream, error) {
+	ctx = core.ContextWithRunState(ctx, opts.State) // see Follow
 	stream, err := core.FollowEvents(ctx, e.c.scope(opts.State, ""), threadID, opts.FollowOptions)
 	if err != nil {
 		return nil, err

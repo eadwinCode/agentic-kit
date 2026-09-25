@@ -148,14 +148,16 @@ describe('InlineQueue', () => {
 });
 
 describe('RedisBus', () => {
-  const client = (subscribeFails = false) => {
+  const client = (subscribeFails = false, connectFails = false) => {
     const sub = {
       listeners: {} as Record<string, (err: unknown) => void>,
       quits: 0,
       on(event: string, fn: (err: unknown) => void) {
         this.listeners[event] = fn;
       },
-      connect: async () => undefined,
+      connect: async () => {
+        if (connectFails) throw new Error('connect refused');
+      },
       subscribe: async () => {
         if (subscribeFails) throw new Error('subscribe refused');
       },
@@ -182,11 +184,19 @@ describe('RedisBus', () => {
     }
   });
 
-  it('closes its connection when the subscribe fails', async () => {
-    const { redis, sub } = client(true);
+  it('closes its connection when it cannot connect', async () => {
+    const { redis, sub } = client(false, true);
     await expect(new RedisBus(redis, 60_000).subscribe('t1', () => undefined)).rejects.toThrow(
-      'subscribe refused',
+      'connect refused',
     );
     expect(sub.quits).toBe(1);
+  });
+
+  it('a failed channel subscribe leaves nothing behind, and the shared connection open', async () => {
+    const { redis, sub } = client(true);
+    const bus = new RedisBus(redis, 60_000);
+    await expect(bus.subscribe('t1', () => undefined)).rejects.toThrow('subscribe refused');
+    expect(sub.quits).toBe(0); // other channels share it
+    expect((bus as any).handlers.size).toBe(0);
   });
 });

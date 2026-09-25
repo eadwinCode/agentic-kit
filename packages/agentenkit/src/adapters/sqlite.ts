@@ -142,6 +142,15 @@ export class SqliteStorage implements Storage {
     this.db.prepare('CREATE INDEX IF NOT EXISTS usage_run ON usage(runId, createdAt)').run();
     // The thread's current run, for ThreadTransition's compare-and-set.
     this.addMissing('threads', { runId: 'TEXT' });
+    // One event per seq on a thread: a counter that restarted must fail its
+    // write, never land a second event under a seq clients already have. A log
+    // from before this check may already hold duplicates; the index is then
+    // left off and said so, rather than refusing to start.
+    try {
+      this.db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS events_thread_seq_unique ON events(threadId, seq)').run();
+    } catch (err) {
+      console.warn('event seq uniqueness not enforced: the log already holds duplicate seqs', err);
+    }
   }
 
   private addMissing(table: string, cols: Record<string, string>) {

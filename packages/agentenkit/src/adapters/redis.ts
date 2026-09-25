@@ -76,11 +76,21 @@ export class RedisKv implements Kv {
 
 /** Reference EventBus adapter over plain Redis Pub/Sub (node-redis).
  *
- *  While subscribed, emits a bus-only `HEARTBEAT` notice (seq 0, never
- *  persisted) every heartbeatMs — the §2.5 watchdog pattern: pub/sub is
- *  at-most-once, so the SSE distributor treats heartbeats as a trigger to
- *  re-check for orphaned HITL waits. */
+ *  One subscriber connection per process, shared by every subscription: a
+ *  channel is subscribed when its first handler arrives and unsubscribed when
+ *  its last one leaves. A connection per viewer would run a busy deployment
+ *  into Redis's `maxclients`.
+ *
+ *  While subscribed, a bus-only `HEARTBEAT` notice (seq 0, never persisted)
+ *  reaches every subscription each `heartbeatMs`, from one timer per process —
+ *  the §2.5 watchdog pattern: pub/sub is at-most-once, so the SSE distributor
+ *  treats heartbeats as a trigger to re-check for orphaned HITL waits, and a
+ *  follower fills any gap from the log. */
 export class RedisBus implements EventBus {
+  private sub: Promise<RedisSubscriberLike> | null = null;
+  private readonly handlers = new Map<string, Set<(event: AgentEvent) => void>>();
+  private heartbeat?: ReturnType<typeof setInterval>;
+
   constructor(
     private readonly client: RedisClientLike,
     private readonly heartbeatMs = 60_000,
@@ -90,41 +100,92 @@ export class RedisBus implements EventBus {
     await this.client.publish(THREAD_CHANNEL(threadId), JSON.stringify(event));
   }
 
-  async subscribe(threadId: string, handler: (event: AgentEvent) => void) {
-    const sub = this.client.duplicate();
-    // node-redis emits 'error' on a dropped connection and reconnects by
-    // itself. With no listener, the emit throws and ends the process, so one
-    // Redis failover would take down every worker and SSE server.
-    sub.on('error', (err: unknown) => console.error('redis subscriber error', err));
-    try {
-      await sub.connect();
-      await sub.subscribe(THREAD_CHANNEL(threadId), (message: string) => {
-        try {
-          handler(JSON.parse(message) as AgentEvent);
-        } catch {
-          // malformed frame — never kill the subscription
-        }
-      });
-    } catch (err) {
-      // The connection is ours; a failed subscribe must not leak it.
-      await Promise.resolve(sub.quit()).catch(() => undefined);
-      throw err;
+  /** The shared subscriber connection, opened on first use. */
+  private connection(): Promise<RedisSubscriberLike> {
+    if (!this.sub) {
+      const sub = this.client.duplicate() as RedisSubscriberLike;
+      // node-redis emits 'error' on a dropped connection and reconnects by
+      // itself. With no listener, the emit throws and ends the process, so one
+      // Redis failover would take down every worker and SSE server.
+      sub.on('error', (err: unknown) => console.error('redis subscriber error', err));
+      this.sub = Promise.resolve(sub.connect()).then(
+        () => sub,
+        (err) => {
+          this.sub = null; // a later subscribe tries again
+          void Promise.resolve(sub.quit()).catch(() => undefined);
+          throw err;
+        },
+      );
     }
+    return this.sub;
+  }
 
-    const heartbeat = setInterval(() => {
+  private deliver(handlers: Iterable<(event: AgentEvent) => void>, event: AgentEvent) {
+    for (const handler of handlers) {
       try {
-        handler({
+        handler(event);
+      } catch {
+        // one throwing handler must not stop the others
+      }
+    }
+  }
+
+  async subscribe(threadId: string, handler: (event: AgentEvent) => void) {
+    const channel = THREAD_CHANNEL(threadId);
+    const sub = await this.connection();
+    let set = this.handlers.get(channel);
+    if (!set) {
+      set = new Set();
+      this.handlers.set(channel, set);
+      const mine = set;
+      try {
+        await sub.subscribe(channel, (message: string) => {
+          let event: AgentEvent;
+          try {
+            event = JSON.parse(message) as AgentEvent;
+            event.createdAt = new Date(event.createdAt);
+          } catch {
+            return; // malformed frame — never kill the subscription
+          }
+          this.deliver([...mine], event);
+        });
+      } catch (err) {
+        this.handlers.delete(channel);
+        throw err;
+      }
+    }
+    set.add(handler);
+    this.startHeartbeat();
+
+    let done = false;
+    return async () => {
+      if (done) return;
+      done = true;
+      const current = this.handlers.get(channel);
+      current?.delete(handler);
+      if (current && current.size === 0) {
+        this.handlers.delete(channel);
+        await sub.unsubscribe(channel).catch(() => undefined);
+      }
+      if (this.handlers.size === 0) this.stopHeartbeat();
+    };
+  }
+
+  private startHeartbeat() {
+    if (this.heartbeat) return;
+    this.heartbeat = setInterval(() => {
+      for (const [channel, set] of this.handlers) {
+        const threadId = channel.slice('thread:'.length, -':events'.length);
+        this.deliver([...set], {
           threadId, seq: 0, type: 'HEARTBEAT', payload: null, createdAt: new Date(),
         } as AgentEvent);
-      } catch {
-        // a throwing handler must not become an uncaught timer error
       }
     }, this.heartbeatMs);
+    (this.heartbeat as unknown as { unref?: () => void }).unref?.();
+  }
 
-    return async () => {
-      clearInterval(heartbeat);
-      await sub.unsubscribe(THREAD_CHANNEL(threadId)).catch(() => undefined);
-      await sub.quit().catch(() => undefined);
-    };
+  private stopHeartbeat() {
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    this.heartbeat = undefined;
   }
 }

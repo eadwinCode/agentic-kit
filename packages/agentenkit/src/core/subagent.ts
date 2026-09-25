@@ -58,6 +58,8 @@ export interface SubagentCtx {
   fenced?: () => boolean;
   /** The segment's park box, shared by every depth (see ParkBox). */
   parks?: ParkBox;
+  /** Calls whose tool failed, shared by every depth (see chunkPayload). */
+  toolErrors?: Map<string, string>;
   /** The run's state, handed down unchanged (§2.10). */
   state?: AgentRunState;
 }
@@ -318,6 +320,7 @@ function nestedTools(
         frames,
         nested: d,
         parks: ctx.parks,
+        toolErrors: ctx.toolErrors,
       }),
     ),
     ctx.state ?? {},
@@ -411,7 +414,8 @@ export async function runNestedAgent(
       agentName: d.name,
       system: `You are the "${d.name}" subagent. Complete the task, then stop.`,
       cacheSystemPrompt: ports.config.promptCaching,
-      onChunk: async (chunk) => {
+      toolErrors: ctx.toolErrors,
+      publishChunk: async (chunk) => {
         // Namespaced into the shared thread event log → same multi-user pipeline (§2.2)
         await publish(ports, threadId, 'SUBAGENT_CHUNK', { agentId: d.agentId, chunk });
       },

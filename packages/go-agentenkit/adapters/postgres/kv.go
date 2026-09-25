@@ -116,14 +116,25 @@ func (k *Kv) Incr(ctx context.Context, key string) (int64, error) {
 	return strconv.ParseInt(value, 10, 64)
 }
 
-// DeleteExpired drops rows past their expiry. Expiry is already enforced on
-// read, so this is housekeeping: call it from a periodic job.
+// DeleteExpired drops rows past their expiry, in batches of 1,000 so a large
+// backlog never holds one long lock on the table the run locks live in.
+// Expiry is already enforced on read, so this is housekeeping: the Postgres
+// bus runs it every few minutes (its parked oversized frames are rows here);
+// without the bus, call it from a periodic job.
 func (k *Kv) DeleteExpired(ctx context.Context) (int64, error) {
-	res, err := k.db.ExecContext(ctx, `DELETE FROM `+k.table+` WHERE "expiresAt" IS NOT NULL AND "expiresAt" <= now()`)
-	if err != nil {
-		return 0, err
+	var total int64
+	for {
+		res, err := k.db.ExecContext(ctx, `DELETE FROM `+k.table+` WHERE key IN (
+			SELECT key FROM `+k.table+` WHERE "expiresAt" IS NOT NULL AND "expiresAt" <= now() LIMIT 1000)`)
+		if err != nil {
+			return total, err
+		}
+		n, err := res.RowsAffected()
+		total += n
+		if err != nil || n < 1000 {
+			return total, err
+		}
 	}
-	return res.RowsAffected()
 }
 
 // SetIfValue is the compare-and-set half of a lease renewal (§3.4): the

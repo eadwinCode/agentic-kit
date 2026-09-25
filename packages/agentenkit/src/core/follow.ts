@@ -10,6 +10,18 @@ export interface FollowOptions {
   signal?: AbortSignal;
 }
 
+/** Caps the events a follower holds for a slow consumer. Past it the queue is
+ *  dropped and the follower reads what it missed back from storage instead:
+ *  the log has every durable event, so nothing is lost but notices, which
+ *  nobody needs twice. */
+const MAX_LIVE_QUEUE = 10_000;
+
+/** How long a follower waits for a missing seq to reach storage: another
+ *  process may have taken seq N, and still be writing it, when seq N+1
+ *  arrives on the bus. */
+const GAP_RETRIES = 3;
+const GAP_WAIT_MS = 50;
+
 /** Every event on a thread, replay first and then live, as one sequence.
  *
  *  The ordering here is the whole point, and it is easy to get wrong in a route
@@ -20,6 +32,10 @@ export interface FollowOptions {
  *   2. **Never emit at or below the cursor.** The client would render it twice.
  *   3. **`seq === 0` is a bus-only notice** (heartbeats, death notices).
  *      Always forward it, never let it move the cursor.
+ *   4. **Never skip a seq.** The bus is at-most-once and does not promise
+ *      order: an event can be dropped, or arrive after the one published
+ *      behind it. An event that jumps past the next seq first has the gap
+ *      read back from storage, in order.
  *
  *  Framework-neutral on purpose: an async iterable is something Express, Hono,
  *  Nest, Next and a plain worker can each consume in their own way. */
@@ -34,10 +50,11 @@ export async function* followEvents(
   let lastSeq = since;
   let live = false;
   let closed = false;
+  let overflow = false;
   /** Published while the replay is still running. */
   const pending: AgentEvent[] = [];
   /** Published once live, waiting for the consumer. */
-  const queue: AgentEvent[] = [];
+  let queue: AgentEvent[] = [];
   let wake: (() => void) | null = null;
 
   const notify = () => {
@@ -52,6 +69,10 @@ export async function* followEvents(
       pending.push(event);
       return;
     }
+    if (queue.length >= MAX_LIVE_QUEUE) {
+      queue = [];
+      overflow = true;
+    }
     queue.push(event);
     notify();
   });
@@ -62,33 +83,62 @@ export async function* followEvents(
   };
   signal?.addEventListener('abort', onAbort, { once: true });
 
-  /** Rules 2 and 3 in one place, so no caller has to remember them. */
-  const admit = (event: AgentEvent): boolean => {
-    if (event.seq === 0) return true; // a notice: forward, but do not advance
-    if (event.seq <= lastSeq) return false;
-    lastSeq = event.seq;
-    return true;
+  /** Every stored event after the cursor and before `upTo` (all of them when
+   *  absent), in order, moving the cursor. */
+  const fromStorage = async (upTo?: number): Promise<AgentEvent[]> => {
+    const out: AgentEvent[] = [];
+    for (const e of await deps.storage.events.listSince(threadId, lastSeq)) {
+      if (upTo !== undefined && e.seq >= upTo) break;
+      if (e.seq > lastSeq) {
+        out.push(e);
+        lastSeq = e.seq;
+      }
+    }
+    return out;
+  };
+
+  /** Rules 2 to 4 in one place, so no caller has to remember them. */
+  const deliver = async (event: AgentEvent): Promise<AgentEvent[]> => {
+    if (event.seq === 0) return [event]; // a notice: forward, but do not advance
+    const out: AgentEvent[] = [];
+    for (let attempt = 0; event.seq > Math.max(lastSeq, 0) + 1 && attempt < GAP_RETRIES; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, GAP_WAIT_MS));
+      try {
+        out.push(...(await fromStorage(event.seq)));
+      } catch {
+        break; // the live event still goes out; the gap stays
+      }
+    }
+    if (event.seq > lastSeq) {
+      lastSeq = event.seq;
+      out.push(event);
+    }
+    return out;
   };
 
   try {
     if (signal?.aborted) return;
 
     // …then the durable log…
-    for (const event of await deps.storage.events.listSince(threadId, since)) {
-      if (admit(event)) yield event;
-    }
+    for (const event of await fromStorage()) yield event;
 
     // …then whatever arrived behind it, in order.
     for (const event of pending.sort((a, b) => a.seq - b.seq)) {
-      if (admit(event)) yield event;
+      for (const e of await deliver(event)) yield e;
     }
     pending.length = 0;
     live = true;
 
     while (!closed && !signal?.aborted) {
+      if (overflow) {
+        // The consumer fell too far behind: catch up from the log.
+        overflow = false;
+        queue = [];
+        for (const e of await fromStorage()) yield e;
+      }
       while (queue.length > 0) {
         const event = queue.shift()!;
-        if (admit(event)) yield event;
+        for (const e of await deliver(event)) yield e;
       }
       if (closed || signal?.aborted) break;
       await new Promise<void>((resolve) => {

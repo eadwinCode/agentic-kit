@@ -22,16 +22,16 @@ type Listener struct {
 	OnError func(err error)
 
 	mu        sync.Mutex
-	onConnect func()
+	onConnect []func()
 }
 
 // OnConnect registers fn to run on every connection that reaches LISTEN,
-// the first one included, before any notification is read off it. The bus
-// replays from the durable log in it, so the callback should return once
-// that is done.
+// the first one included, before any notification is read off it. Every
+// registered callback runs, so one listener can serve a bus and a queue
+// alike. The bus only queues its replay here, so this returns at once.
 func (l *Listener) OnConnect(fn func()) {
 	l.mu.Lock()
-	l.onConnect = fn
+	l.onConnect = append(l.onConnect, fn)
 	l.mu.Unlock()
 }
 
@@ -73,10 +73,10 @@ func (l *Listener) once(ctx context.Context, channel string, handler func(payloa
 		return err
 	}
 	l.mu.Lock()
-	connected := l.onConnect
+	connected := append([]func(){}, l.onConnect...)
 	l.mu.Unlock()
-	if connected != nil {
-		connected()
+	for _, fn := range connected {
+		fn()
 	}
 	for {
 		n, err := conn.WaitForNotification(ctx)

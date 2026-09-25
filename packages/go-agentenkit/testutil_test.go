@@ -32,6 +32,8 @@ type step struct {
 	// noFinish ends the stream after the text with no finish chunk and no
 	// error: a provider that cut the stream short without saying so.
 	noFinish bool
+	// deltas streams the text as these separate chunks instead of one.
+	deltas []string
 }
 
 // scriptedModel plays back one scripted step per round-trip. The platform
@@ -127,7 +129,11 @@ func (m *scriptedModel) DoStream(ctx context.Context, p provider.GenerateParams)
 		if s.reasoning != "" {
 			ch <- provider.StreamChunk{Type: provider.ChunkReasoning, Text: s.reasoning}
 		}
-		if s.text != "" {
+		if len(s.deltas) > 0 {
+			for _, d := range s.deltas {
+				ch <- provider.StreamChunk{Type: provider.ChunkText, Text: d}
+			}
+		} else if s.text != "" {
 			ch <- provider.StreamChunk{Type: provider.ChunkText, Text: s.text}
 		}
 		for _, c := range s.calls {

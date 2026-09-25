@@ -1,6 +1,43 @@
 import type { RuntimePorts } from '../ports/runtime.js';
+import { THREAD_KEY_TTL_SECONDS } from './keys.js';
 import type { ExecutionState, ThreadTransition } from './types.js';
 import type { AgentEvent } from './types.js';
+
+/** Per-thread chains that serialise taking a seq and storing the event in
+ *  this process, so the log is written in seq order and a counter reseed (see
+ *  nextSeq) cannot race another publisher here. The bus send is left outside:
+ *  a subscriber may publish from inside it, and a follower fills any gap the
+ *  bus leaves from storage (see followEvents). */
+const publishChains = new Map<string, Promise<unknown>>();
+
+function serialise<T>(threadId: string, work: () => Promise<T>): Promise<T> {
+  const before = publishChains.get(threadId) ?? Promise.resolve();
+  const mine = before.then(work, work);
+  const tail = mine.catch(() => undefined);
+  publishChains.set(threadId, tail);
+  // Dropped once nothing queues behind it, so the map does not grow per thread.
+  void tail.then(() => {
+    if (publishChains.get(threadId) === tail) publishChains.delete(threadId);
+  });
+  return mine;
+}
+
+/** The thread's next event seq. A counter that restarts at 1 on a thread that
+ *  already has events means the kv lost the key (a flush, an eviction, a
+ *  restart without persistence). Carrying on from 1 would repeat seqs the log
+ *  already holds, and every client would drop the new events as already seen,
+ *  so the counter is moved past the stored ones first. The move is a
+ *  compare-and-set, so a publisher that took 2 meanwhile is not undone. */
+async function nextSeq(deps: RuntimePorts, threadId: string): Promise<number> {
+  const key = `agent:seq:${threadId}`;
+  const seq = await deps.kv.incrWithExpiry(key, THREAD_KEY_TTL_SECONDS);
+  if (seq !== 1) return seq;
+  const stored = await deps.storage.events.listSince(threadId, 0);
+  const top = stored.at(-1)?.seq ?? 0;
+  if (top < 1) return seq;
+  await deps.kv.setIfValue(key, '1', String(top));
+  return deps.kv.incr(key);
+}
 
 /** Persist to the replayable event log, then fan out live to all subscribers
  *  (§2.2). Seq comes from Kv.incr — monotonic per thread (§3.4). */
@@ -10,9 +47,12 @@ export async function publish(
   type: string,
   payload: unknown,
 ): Promise<AgentEvent> {
-  const seq = await deps.kv.incr(`agent:seq:${threadId}`);
-  const event: AgentEvent = { threadId, seq, type, payload, createdAt: new Date() };
-  await deps.storage.events.append(threadId, event);
+  const event = await serialise(threadId, async () => {
+    const seq = await nextSeq(deps, threadId);
+    const e: AgentEvent = { threadId, seq, type, payload, createdAt: new Date() };
+    await deps.storage.events.append(threadId, e);
+    return e;
+  });
   await deps.bus.publish(threadId, event);
   return event;
 }
@@ -51,6 +91,7 @@ export const RESERVED_EVENT_TYPES: ReadonlySet<string> = new Set([
   'HEARTBEAT',
   'RUN_REFUSED',
   'TOKEN_BUDGET_EXHAUSTED',
+  'COST_BUDGET_EXHAUSTED',
 ]);
 
 export interface PublishEventOptions {
@@ -151,7 +192,7 @@ export async function transition(
 ): Promise<boolean> {
   const { model, ...t } = change;
   if (!(await deps.storage.threads.transition(threadId, t))) return false;
-  await deps.kv.set(`agent:state:${threadId}`, t.to);
+  await deps.kv.set(`agent:state:${threadId}`, t.to, { exSeconds: THREAD_KEY_TTL_SECONDS });
   await upsertAdminThread(deps, threadId, t.to, model);
   return true;
 }

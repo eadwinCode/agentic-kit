@@ -923,13 +923,12 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		CostBudgetMicros: costBudget, BillingRunID: runID,
 		ModelKey: input.Model, ModelID: model.WireID(input.Model), AgentName: agent.Name,
 		CacheSystemPrompt: deps.Config.PromptCaching,
-		OnChunk: func(chunk provider.StreamChunk) {
-			// One canonical path for every client: durable log + live bus (§2.1, §2.2)
-			_, _ = Publish(ctx, deps, threadID, "CHUNK", ChunkPayload(chunk))
-			if agent.Args.OnChunk != nil {
-				agent.Args.OnChunk(chunk) // user callback still fires
-			}
+		// One canonical path for every client: durable log + live bus (§2.1,
+		// §2.2), with token deltas merged (see chunkBatcher).
+		PublishChunk: func(p map[string]any) {
+			_, _ = Publish(ctx, deps, threadID, "CHUNK", p)
 		},
+		OnChunk: agent.Args.OnChunk, // the user callback sees every raw chunk
 	}, ledger)
 	// A lost lock ends the segment whatever the loop returned: another
 	// worker may own the thread now, so nothing below may write to it. A

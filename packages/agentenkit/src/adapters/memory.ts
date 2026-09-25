@@ -13,6 +13,16 @@ interface MemEntry { value: string; expiresAt?: number }
  *  collide on the same counter (§3.4). */
 export class MemoryKv implements Kv {
   private m = new Map<string, MemEntry>();
+  private lastSweep = Date.now();
+
+  /** Expired keys nobody reads again are dropped as writes come in, at most
+   *  once a minute: no timer to leak, and the map does not grow for ever. */
+  private sweep() {
+    const now = Date.now();
+    if (now - this.lastSweep < 60_000) return;
+    this.lastSweep = now;
+    for (const [k, e] of this.m) if (e.expiresAt && e.expiresAt < now) this.m.delete(k);
+  }
   async get(key: string) {
     const e = this.m.get(key);
     if (!e) return null;
@@ -20,6 +30,7 @@ export class MemoryKv implements Kv {
     return e.value;
   }
   async set(key: string, value: string, opts?: { exSeconds?: number; onlyIfNotExists?: boolean }) {
+    this.sweep();
     if (opts?.onlyIfNotExists) {
       const existing = this.m.get(key);
       if (existing && !(existing.expiresAt && existing.expiresAt < Date.now())) return false;
@@ -57,6 +68,7 @@ export class MemoryKv implements Kv {
     return n;
   }
   async incr(key: string) {
+    this.sweep();
     // No awaits between read and write — atomic within the event loop
     const e = this.m.get(key);
     const n = Number(e?.value ?? 0) + 1;

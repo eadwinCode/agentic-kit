@@ -1,7 +1,7 @@
 import type { RuntimePorts, RunInput, RunResult } from '../ports/runtime.js';
 import type { RegisteredAgent } from './agent.js';
 import { reclaimIfOrphaned } from './reclaim.js';
-import { runIdKey } from './keys.js';
+import { runIdKey, THREAD_KEY_TTL_SECONDS } from './keys.js';
 import { recordStoppedRun } from './stop.js';
 import { randomUUID } from 'node:crypto';
 import { ACTIVE_STATES, publish, publishEvent, transition } from './publish.js';
@@ -83,7 +83,7 @@ export async function run(
 
   let installed = false;
   try {
-    await deps.kv.set(runIdKey(threadId), runId);
+    await deps.kv.set(runIdKey(threadId), runId, { exSeconds: THREAD_KEY_TTL_SECONDS });
     installed = true;
 
     // The run's durable record opens here (§2.9), QUEUED: no worker has it
@@ -197,7 +197,7 @@ async function dispatchActive(deps: RuntimePorts, threadId: string, runId: strin
   if (current === runId && thread?.state === 'QUEUED') return true;
   await recordStoppedRun(deps, runId, new Date());
   if (current === runId && thread?.state === 'CANCELLED') {
-    await deps.kv.set(`agent:state:${threadId}`, 'CANCELLED');
+    await deps.kv.set(`agent:state:${threadId}`, 'CANCELLED', { exSeconds: THREAD_KEY_TTL_SECONDS });
   }
   return false;
 }

@@ -105,11 +105,21 @@ describe('reconnecting mid-run (§2.2)', () => {
         (Array.isArray(m.content) ? m.content : []).map((p: any) => p?.text ?? '').join(''),
       )
       .join('');
-  const replayedText = (snap: any) =>
-    snap.activeEvents
+  const deltas = (events: any[]) =>
+    events
       .filter((e: any) => e.type === 'CHUNK' && e.payload?.type === 'text-delta')
       .map((e: any) => e.payload.textDelta)
       .join('');
+  /** What a client that reconnected at the snapshot holds once the in-flight
+   *  step commits: the snapshot's active events, then the step's chunks that
+   *  arrived live after it. Deltas are merged before they go out, so the
+   *  last few can land just after a snapshot taken while a tool runs — never
+   *  lost, only later. */
+  const replayedText = (snap: any, published: any[] = []) => {
+    const commit = published.find((e) => e.type === 'STEP_COMMITTED' && e.seq > snap.lastEventSeq);
+    const live = published.filter((e) => e.seq > snap.lastEventSeq && (!commit || e.seq < commit.seq));
+    return deltas(snap.activeEvents) + deltas(live);
+  };
 
   // A client rebuilds from durable messages and THEN replays activeEvents. So
   // a step whose messages are already committed must not have its chunks
@@ -148,9 +158,10 @@ describe('reconnecting mid-run (§2.2)', () => {
 
     expect(snap).not.toBeNull();
     // Step 1 is durable, step 2 is still in flight — each appears exactly once
+    const published = r.bus.published;
     expect(assistantText(snap)).toBe('PART ONE. ');
-    expect(replayedText(snap)).toBe('PART TWO. ');
-    expect(assistantText(snap) + replayedText(snap)).toBe('PART ONE. PART TWO. ');
+    expect(replayedText(snap, published)).toBe('PART TWO. ');
+    expect(assistantText(snap) + replayedText(snap, published)).toBe('PART ONE. PART TWO. ');
   });
 
   // Nothing is committed during the very first step, so its chunks are the
@@ -185,11 +196,11 @@ describe('reconnecting mid-run (§2.2)', () => {
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
     expect(assistantText(snap)).toBe('');
-    expect(replayedText(snap)).toBe('ONLY. ');
+    expect(replayedText(snap, r.bus.published)).toBe('ONLY. ');
   });
 
-  // A park is published DURING the step, before its messages commit. Slicing
-  // the whole window at the commit boundary would drop the very approval the
+  // A park is published right after its step commits. Slicing the whole
+  // window at the commit boundary would drop the very approval the
   // reconnecting client needs to render.
   it('keeps a pending approval that was raised before the step committed', async () => {
     const { runtime, queue } = await makeRuntime(

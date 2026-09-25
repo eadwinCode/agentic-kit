@@ -34,8 +34,25 @@ type memEntry struct {
 // lazily on read; Incr holds the lock, so concurrent callers can never
 // collide on the same counter (§3.4).
 type Kv struct {
-	mu sync.Mutex
-	m  map[string]memEntry
+	mu        sync.Mutex
+	m         map[string]memEntry
+	lastSweep time.Time
+}
+
+// sweep drops expired keys nobody reads again, as writes come in, at most
+// once a minute: no goroutine to leak, and the map does not grow for ever.
+// Called with k.mu held.
+func (k *Kv) sweep() {
+	now := time.Now()
+	if now.Sub(k.lastSweep) < time.Minute {
+		return
+	}
+	k.lastSweep = now
+	for key, e := range k.m {
+		if !e.expiresAt.IsZero() && now.After(e.expiresAt) {
+			delete(k.m, key)
+		}
+	}
 }
 
 // NewKv makes an empty Kv.
@@ -66,6 +83,7 @@ func (k *Kv) Get(_ context.Context, key string) (string, bool, error) {
 func (k *Kv) Set(_ context.Context, key, value string, opts ports.SetOptions) (bool, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	k.sweep()
 	if opts.OnlyIfNotExists {
 		if _, ok := k.live(key); ok {
 			return false, nil
@@ -93,6 +111,7 @@ func (k *Kv) Incr(_ context.Context, key string) (int64, error) {
 func (k *Kv) IncrWithExpiry(_ context.Context, key string, ttl time.Duration) (int64, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	k.sweep()
 	e, ok := k.live(key)
 	n, _ := strconv.ParseInt(e.value, 10, 64)
 	n++
