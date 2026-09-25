@@ -421,6 +421,43 @@ func (e events) ListByType(ctx context.Context, threadID, typ string, _ ports.St
 	return e.query(ctx, `SELECT `+eventCols+` FROM `+e.s.t("events")+` WHERE "threadId" = $1 AND type = $2 ORDER BY seq`, threadID, typ)
 }
 
+func (e events) Prune(ctx context.Context, types []string, limit int, dryRun bool) (map[string]int64, error) {
+	counts := map[string]int64{}
+	if len(types) == 0 {
+		return counts, nil
+	}
+	args := make([]any, len(types))
+	marks := make([]string, len(types))
+	for i, t := range types {
+		args[i], marks[i] = t, "$"+strconv.Itoa(i+1)
+	}
+	in := strings.Join(marks, ", ")
+	q := `SELECT type, COUNT(*) FROM ` + e.s.t("events") + ` WHERE type IN (` + in + `) GROUP BY type`
+	if !dryRun {
+		// One statement: pick a batch, delete it, count what went.
+		q = `WITH gone AS (
+		       DELETE FROM ` + e.s.t("events") + ` WHERE id IN (
+		         SELECT id FROM ` + e.s.t("events") + ` WHERE type IN (` + in + `) LIMIT $` + strconv.Itoa(len(types)+1) + `)
+		       RETURNING type)
+		     SELECT type, COUNT(*) FROM gone GROUP BY type`
+		args = append(args, limit)
+	}
+	rows, err := e.s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var typ string
+		var n int64
+		if err := rows.Scan(&typ, &n); err != nil {
+			return nil, err
+		}
+		counts[typ] = n
+	}
+	return counts, rows.Err()
+}
+
 type usage struct{ s *Storage }
 
 // usageGroup is the grouped read Total does: one row per agent and model,

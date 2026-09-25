@@ -22,6 +22,7 @@ export {
 } from './ports/streams.js';
 export * from './core/stream-events.js';
 export type { SnapshotStream } from './core/snapshot.js';
+export { pruneEvents, STREAM_ONLY_TYPES, type PruneOptions, type PruneReport } from './core/prune.js';
 export type {
   AgentCore,
   AgentHandle,

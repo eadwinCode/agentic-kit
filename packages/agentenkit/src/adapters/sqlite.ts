@@ -370,6 +370,21 @@ export class SqliteStorage implements Storage {
     listByType: async (threadId: string, type: string) =>
       this.all('SELECT * FROM events WHERE threadId = ? AND type = ? ORDER BY seq',
         threadId, type).map(this.toEvent),
+    prune: async (types: string[], opts: { limit: number; dryRun?: boolean }) => {
+      const counts: Record<string, number> = {};
+      const marks = types.map(() => '?').join(',') || 'NULL';
+      if (opts.dryRun) {
+        for (const r of this.all(`SELECT type, COUNT(*) AS n FROM events WHERE type IN (${marks}) GROUP BY type`, ...types) as Array<{ type: string; n: number }>) {
+          counts[r.type] = Number(r.n);
+        }
+        return counts;
+      }
+      const rows = this.all(`SELECT id, type FROM events WHERE type IN (${marks}) LIMIT ?`, ...types, opts.limit) as Array<{ id: string; type: string }>;
+      if (rows.length === 0) return counts;
+      this.write(`DELETE FROM events WHERE id IN (${rows.map(() => '?').join(',')})`, ...rows.map((r) => r.id));
+      for (const r of rows) counts[r.type] = (counts[r.type] ?? 0) + 1;
+      return counts;
+    },
   };
 
   usage = {

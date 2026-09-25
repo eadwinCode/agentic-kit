@@ -230,6 +230,25 @@ export class PrismaStorage implements Storage {
     },
     listByType: async (threadId: string, type: string) =>
       (await this.prisma.agentEvent.findMany({ where: { threadId, type }, orderBy: { seq: 'asc' } })).map(withRun),
+    prune: async (types: string[], opts: { limit: number; dryRun?: boolean }) => {
+      // Loosely typed: these reads span every thread, which the narrowed
+      // signatures above (one thread at a time) do not cover.
+      const events = this.prisma.agentEvent as any;
+      const counts: Record<string, number> = {};
+      if (opts.dryRun) {
+        for (const g of await events.groupBy({ by: ['type'], where: { type: { in: types } }, _count: { _all: true } })) {
+          counts[g.type] = g._count._all;
+        }
+        return counts;
+      }
+      const rows: Array<{ id: string; type: string }> = await events.findMany({
+        where: { type: { in: types } }, select: { id: true, type: true }, take: opts.limit,
+      });
+      if (rows.length === 0) return counts;
+      await events.deleteMany({ where: { id: { in: rows.map((r) => r.id) } } });
+      for (const r of rows) counts[r.type] = (counts[r.type] ?? 0) + 1;
+      return counts;
+    },
   };
 
   usage = {

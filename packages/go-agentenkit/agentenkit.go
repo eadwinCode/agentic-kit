@@ -216,6 +216,8 @@ type (
 	FollowFrame   = core.FollowFrame
 	FollowSSE     = core.FollowSSE
 	ThreadCursor  = core.ThreadCursor
+	PruneOptions  = core.PruneOptions
+	PruneReport   = core.PruneReport
 	SSEOptions    = core.SSEOptions
 	SSEStream     = core.SSEStream
 

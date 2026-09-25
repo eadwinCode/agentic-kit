@@ -22,6 +22,7 @@ import { createGenerateTextAgent, createStreamTextAgent } from './core/agent.js'
 import * as adminReads from './core/admin.js';
 import { bindStorage, type AgentRunState } from './core/state.js';
 import { threadSnapshot } from './core/snapshot.js';
+import { pruneEvents } from './core/prune.js';
 import { MemoryRunStreams } from './adapters/memory.js';
 import type { Logger } from './ports/runtime.js';
 import { currentRunId } from './core/keys.js';
@@ -212,6 +213,8 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
       publishEvent: (threadId, type, payload, options = {}) =>
         publishEvent(scope(options.state), threadId, type, payload, options),
     },
+
+    pruneEvents: (options) => pruneEvents(deps, options),
 
     streams: {
       read: (streamId, after, signal) => {

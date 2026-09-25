@@ -699,6 +699,29 @@ func (e events) ListByType(_ context.Context, threadID, typ string, sc ports.Sto
 	return out, nil
 }
 
+func (e events) Prune(_ context.Context, types []string, limit int, dryRun bool) (map[string]int64, error) {
+	e.s.mu.Lock()
+	defer e.s.mu.Unlock()
+	counts := map[string]int64{}
+	left := limit
+	for threadID, list := range e.s.events {
+		kept := list[:0:0]
+		for _, ev := range list {
+			if (!dryRun && left <= 0) || !slices.Contains(types, ev.Type) {
+				kept = append(kept, ev)
+				continue
+			}
+			counts[ev.Type]++
+			left--
+			if dryRun {
+				kept = append(kept, ev)
+			}
+		}
+		e.s.events[threadID] = kept
+	}
+	return counts, nil
+}
+
 type usage struct{ s *Storage }
 
 func (u usage) Record(_ context.Context, threadID string, n ports.NewUsage, sc ports.StorageContext) error {

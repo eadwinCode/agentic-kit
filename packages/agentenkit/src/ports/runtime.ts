@@ -25,6 +25,7 @@ import type { StreamItem } from '../core/stream-events.js';
 import type { StreamSnapshot } from './streams.js';
 import type { PublishEventOptions } from '../core/publish.js';
 import type { SnapshotStream } from '../core/snapshot.js';
+import type { PruneOptions, PruneReport } from '../core/prune.js';
 
 export type { AdminStore, NewStepRecord, RunFilter, StepRecord } from './admin.js';
 export type { AgentRunState, BoundStorage, StorageContext } from '../core/state.js';
@@ -486,6 +487,12 @@ export interface AgentCore {
       options?: PublishEventOptions & { state?: AgentRunState },
     ): Promise<AgentEvent>;
   };
+
+  /** Delete the stream-only rows (chunks, step markers, state changes…)
+   *  releases before run streams left in the event table, a batch at a
+   *  time. Nothing reads them any more; an app's own types are kept. Run it
+   *  when it suits you, after upgrading: `{ dryRun: true }` counts first. */
+  pruneEvents(options?: PruneOptions): Promise<PruneReport>;
 
   /** A run stream by id, for a caller that only cares about one run: its
    *  items after `after`, live until it closes. Throws StreamGoneError once

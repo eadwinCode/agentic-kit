@@ -92,6 +92,11 @@ export interface Storage {
     /** Every event of a type, ascending by seq. The open-approval set (§2.7)
      *  is derived from these. */
     listByType(threadId: string, type: string, ctx: StorageContext): Promise<AgentEvent[]>;
+    /** Optional: one batch of `runtime.pruneEvents`. Deletes up to `limit`
+     *  entries of these types, on every thread, and says how many of each
+     *  went. With `dryRun` it deletes nothing and counts every entry of
+     *  these types instead. */
+    prune?(types: string[], opts: { limit: number; dryRun?: boolean }): Promise<Record<string, number>>;
   };
   /** One row per model call (§4).
    *

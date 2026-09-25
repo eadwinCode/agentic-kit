@@ -300,6 +300,20 @@ export class MemoryStorage implements Storage {
       return (this.store.get(t) ?? []).filter((e) => e.type === type)
         .sort((a, b) => a.seq - b.seq);
     },
+    async prune(types: string[], opts: { limit: number; dryRun?: boolean }) {
+      const counts: Record<string, number> = {};
+      let left = opts.dryRun ? Infinity : opts.limit;
+      for (const [t, list] of this.store) {
+        const kept = list.filter((e) => {
+          if (left <= 0 || !types.includes(e.type)) return true;
+          counts[e.type] = (counts[e.type] ?? 0) + 1;
+          left--;
+          return !!opts.dryRun;
+        });
+        this.store.set(t, kept);
+      }
+      return counts;
+    },
   };
 
   usage = {

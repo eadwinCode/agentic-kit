@@ -494,6 +494,54 @@ func (e events) ListByType(ctx context.Context, threadID, typ string, _ ports.St
 	return e.query(ctx, `SELECT `+eventCols+` FROM events WHERE threadId = ? AND type = ? ORDER BY seq`, threadID, typ)
 }
 
+func (e events) Prune(ctx context.Context, types []string, limit int, dryRun bool) (map[string]int64, error) {
+	counts := map[string]int64{}
+	marks := strings.TrimSuffix(strings.Repeat("?,", len(types)), ",")
+	if marks == "" {
+		return counts, nil
+	}
+	args := make([]any, len(types))
+	for i, t := range types {
+		args[i] = t
+	}
+	if dryRun {
+		rows, err := e.db.QueryContext(ctx, `SELECT type, COUNT(*) FROM events WHERE type IN (`+marks+`) GROUP BY type`, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var typ string
+			var n int64
+			if err := rows.Scan(&typ, &n); err != nil {
+				return nil, err
+			}
+			counts[typ] = n
+		}
+		return counts, rows.Err()
+	}
+	rows, err := e.db.QueryContext(ctx, `SELECT id, type FROM events WHERE type IN (`+marks+`) LIMIT ?`, append(args, limit)...)
+	if err != nil {
+		return nil, err
+	}
+	var ids []any
+	for rows.Next() {
+		var id, typ string
+		if err := rows.Scan(&id, &typ); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+		counts[typ]++
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return counts, nil
+	}
+	_, err = e.db.ExecContext(ctx, `DELETE FROM events WHERE id IN (`+strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")+`)`, ids...)
+	return counts, err
+}
+
 type usage struct{ db *sql.DB }
 
 // usageGroup is the grouped read Total does: one row per agent and model,
