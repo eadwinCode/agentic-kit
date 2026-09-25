@@ -42,6 +42,7 @@ export {
   toolCallOutcomes,
 } from './format.js';
 export type { ToolCallOutcomes } from './format.js';
+export { formatCursor, streamItemEvents, type ThreadCursor } from './frames.js';
 
 export type {
   AgentState,
@@ -57,6 +58,9 @@ export type {
   SnapshotMessage,
   SnapshotRun,
   StreamEvent,
+  FollowFrame,
+  WireStreamItem,
+  SnapshotStream,
   SubagentStatus,
   SubagentView,
   ThreadListItem,

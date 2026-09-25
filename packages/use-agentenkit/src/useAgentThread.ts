@@ -10,6 +10,7 @@ import {
 } from './config.js';
 import { mergeConfig, useAgentRunConfig } from './context.js';
 import { isToolError, messageToEntries, messageToEntry, stateActivity, toolCallOutcomes } from './format.js';
+import { formatCursor, streamItemEvents } from './frames.js';
 import type {
   AgentActivity,
   AgentState,
@@ -18,8 +19,10 @@ import type {
   ConnectionState,
   EntryPart,
   MessageRole,
+  FollowFrame,
   PendingInput,
   RunResult,
+  SnapshotMessage,
   StreamEvent,
   SubagentStatus,
   SubagentView,
@@ -27,6 +30,7 @@ import type {
   ThreadRun,
   ThreadSnapshot,
   ThreadUsage,
+  WireStreamItem,
 } from './types.js';
 
 export interface UseAgentThreadOptions extends AgentRunConfig {
@@ -187,6 +191,16 @@ function nextFrame(fn: () => void): () => void {
  *
  *  Every endpoint, label and formatter is replaceable through the options or a
  *  surrounding provider; see `AgentRunConfig`. */
+/** The platform's own event types. Any other type on the thread is an
+ *  app's event, handed to `onCustom` as well. */
+const PLATFORM_TYPES: ReadonlySet<string> = new Set([
+  'CHUNK', 'STATE_CHANGE', 'STEP_COMMITTED', 'STEP_FINISHED', 'INPUT_REQUIRED', 'INPUT_EXPIRED',
+  'HITL_RESPONSE', 'MESSAGE_APPENDED', 'MESSAGES_DROPPED', 'CONTEXT_COMPACTED', 'SUBAGENT_STARTED',
+  'SUBAGENT_CHUNK', 'SUBAGENT_COMPLETED', 'SUBAGENT_FAILED', 'TEXT_RESULT', 'THREAD_DELETED', 'HEARTBEAT',
+  'RUN_REFUSED', 'TOKEN_BUDGET_EXHAUSTED', 'COST_BUDGET_EXHAUSTED', 'RUN_STARTED', 'RUN_ENDED',
+  'RECORD_CHANGED', 'SNAPSHOT',
+]);
+
 export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThread {
   const { initialThreadId, ...config } = options;
 
@@ -252,6 +266,14 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
    *  client already has — a replay, or a transport that resent — and is
    *  dropped before anything sees it. Notices (seq 0) always pass. */
   const lastSeqRef = useRef(-1);
+  /** The run stream being read: its id, the offset of the last item
+   *  applied, and every offset applied from it. An item already applied —
+   *  one a snapshot covered, or a transport resent — is dropped. A new stream
+   *  starts afresh. */
+  const streamRef = useRef<{ streamId?: string; offset?: string; seen: Set<string> }>({ seen: new Set() });
+  /** The messages the latest snapshot held, so a SNAPSHOT frame, which
+   *  carries only the newer ones, can be laid over them. */
+  const messagesRef = useRef<SnapshotMessage[]>([]);
   /** Streamed text waiting for the next frame. */
   const pendingDeltas = useRef<Pending[]>([]);
   const cancelFlush = useRef<(() => void) | null>(null);
@@ -295,6 +317,8 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
     cancelFlush.current = null;
     pendingDeltas.current = [];
     lastSeqRef.current = -1;
+    streamRef.current = { seen: new Set() };
+    messagesRef.current = [];
     // runEndings stays: it is keyed by run id, and a stop's end must outlive
     // a switch away and back.
     seenToolCalls.current = new Set();
@@ -741,6 +765,167 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
     [flushDeltas, loadThreads, loadUsage, newThread, queueDelta, setActivity],
   );
 
+  /** One item from a run stream. A new stream starts its own cursor; an
+   *  item already applied from this one is dropped. The reducer sees it as
+   *  the thread event it stands for (see streamItemEvents). */
+  const applyStreamItem = useCallback(
+    (streamId: string, item: WireStreamItem) => {
+      const at = streamRef.current;
+      if (at.streamId !== streamId) streamRef.current = { streamId, seen: new Set() };
+      const cur = streamRef.current;
+      if (cur.seen.has(item.offset)) return;
+      cur.seen.add(item.offset);
+      cur.offset = item.offset;
+      if (item.type === 'CUSTOM') cfgRef.current.onCustom?.(String(item.name), item.value);
+      for (const event of streamItemEvents(item)) applyEvent(event);
+    },
+    [applyEvent],
+  );
+
+  /** Show a snapshot: the durable messages, the subagent cards, the run's
+   *  clocks, the unfinished run's record entries and its run stream. The
+   *  history read and a SNAPSHOT frame both come through here. */
+  const hydrate = useCallback(
+    (snapshot: ThreadSnapshot, forThread: string) => {
+      const cfg = cfgRef.current;
+      // The snapshot is the whole durable truth: a re-read after a closed
+      // stream starts from it too, with nothing streamed half-shown.
+      cancelFlush.current?.();
+      cancelFlush.current = null;
+      pendingDeltas.current = [];
+
+      // A nested run's turns live in the same log under its own agentId.
+      // They are its transcript, not the main conversation's.
+      messagesRef.current = snapshot.messages;
+      const mainMessages = snapshot.messages.filter((m) => (m.agentId ?? null) === null);
+      // A durable result settles its call, as done or as failed: a denied
+      // approval or a stop never streams a result, so this is where a
+      // reload learns how those calls ended.
+      const outcomes = toolCallOutcomes(snapshot.messages);
+      setEntries(mainMessages.flatMap((m) => messageToEntries(m, cfg.format, outcomes)));
+
+      // Rebuild each child's card from what it actually wrote, so a reload
+      // does not lose a subagent's output.
+      const durableParts = snapshot.messages.flatMap((m) =>
+        Array.isArray(m.content) ? (m.content as any[]) : [],
+      );
+      seenToolCalls.current = new Set(
+        durableParts
+          .filter((part) => part?.type === 'tool-call')
+          .map((part) => part.toolCallId)
+          .filter((id: unknown): id is string => typeof id === 'string'),
+      );
+      seenToolResults.current = new Set(outcomes.keys());
+
+      // Name, depth and final state come from the durable run rows; the
+      // SUBAGENT_* events only replay while a run is unfinished, so on a
+      // completed thread they are all a client has.
+      const byAgent = new Map<string, SubagentView>(
+        // Nested runs only: depth 0 is this thread's own dispatched run,
+        // which the transcript already represents.
+        (snapshot.runs ?? [])
+          .filter((r) => r.depth > 0)
+          .map((r) => [
+            r.id,
+            // A nested run is never queued: it runs inside its parent's
+            // segment. The type allows QUEUED for the dispatched run only.
+            {
+              agentId: r.id,
+              name: r.agent,
+              depth: r.depth,
+              status: r.state === 'QUEUED' ? 'RUNNING' : r.state,
+              text: '',
+            },
+          ]),
+      );
+      for (const m of snapshot.messages) {
+        const id = m.agentId ?? null;
+        if (id === null) continue;
+        const view = byAgent.get(id) ?? {
+          agentId: id,
+          name: id.slice(0, 8),
+          depth: 1,
+          status: 'RUNNING' as const,
+          text: '',
+        };
+        if (m.role === 'assistant') {
+          const text = messageToEntry(m, cfg.format)?.text ?? '';
+          if (text) view.text = view.text ? `${view.text}\n${text}` : text;
+        }
+        byAgent.set(id, view);
+      }
+      // Trailing break so live deltas from a resumed child start on their
+      // own line instead of running into what it already wrote.
+      for (const view of byAgent.values()) if (view.text) view.text += '\n';
+      setSubagents([...byAgent.values()]);
+      setPendingInputs([]);
+      void loadUsage(forThread);
+      // The latest run's clocks. An end this client already saw on the
+      // wire stands over a snapshot that does not carry it yet.
+      const run = latestRun(snapshot.runs);
+      if (run && !run.endedAt) {
+        const ended = runEndings.current.get(run.id);
+        if (ended) run.endedAt = ended;
+      }
+      setCurrentRun(run);
+      setAgentState(snapshot.thread.state);
+      setActivity(stateActivity(snapshot.thread.state, cfg.labels));
+
+      // The active run's record entries are at or below the snapshot's
+      // cursor, so the cursor starts before them; after, it is the
+      // snapshot's.
+      lastSeqRef.current = -1;
+      for (const event of snapshot.activeEvents) applyEvent(event);
+      // The run stream's items the messages do not have yet, then the
+      // stream's own offset: a live read picks up after it.
+      streamRef.current = { seen: new Set() };
+      if (snapshot.stream) {
+        for (const item of snapshot.stream.items) applyStreamItem(snapshot.stream.streamId, item);
+        streamRef.current.streamId = snapshot.stream.streamId;
+        if (snapshot.stream.offset) streamRef.current.offset = snapshot.stream.offset;
+      }
+      flushDeltas();
+      lastSeqRef.current = Math.max(lastSeqRef.current, snapshot.lastEventSeq);
+    },
+    [applyEvent, applyStreamItem, flushDeltas, loadUsage, setActivity],
+  );
+
+  /** Where the hook is, as the server reads it. */
+  const cursor = useCallback(
+    () => formatCursor({ seq: lastSeqRef.current, streamId: streamRef.current.streamId, offset: streamRef.current.offset }),
+    [],
+  );
+
+  /** One frame off the wire: a thread event, a run stream item, or a
+   *  SNAPSHOT that lays the messages it carries over the ones on screen.
+   *  A plain event is what a server older than run streams sends. */
+  const applyFrame = useCallback(
+    (frame: FollowFrame | StreamEvent, forThread: string) => {
+      if (!('kind' in frame)) {
+        applyEvent(frame);
+        return;
+      }
+      switch (frame.kind) {
+        case 'thread':
+          if (!PLATFORM_TYPES.has(frame.event.type) && (frame.event.seq === 0 || frame.event.seq > lastSeqRef.current)) {
+            cfgRef.current.onCustom?.(frame.event.type, frame.event.payload);
+          }
+          applyEvent(frame.event);
+          return;
+        case 'stream':
+          applyStreamItem(frame.streamId, frame.item);
+          return;
+        case 'snapshot': {
+          const known = new Set(messagesRef.current.map((m) => m.id));
+          const messages = [...messagesRef.current, ...frame.snapshot.messages.filter((m) => !known.has(m.id))];
+          hydrate({ ...frame.snapshot, messages }, forThread);
+          return;
+        }
+      }
+    },
+    [applyEvent, applyStreamItem, hydrate],
+  );
+
   useEffect(() => {
     if (!threadId) return;
     const cfg = cfgRef.current;
@@ -780,106 +965,28 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
         const snapshot = (await res.json()) as ThreadSnapshot;
         if (cancelled) return;
 
-        // The snapshot is the whole durable truth: a re-read after a closed
-        // stream starts from it too, with nothing streamed half-shown.
-        cancelFlush.current?.();
-        cancelFlush.current = null;
-        pendingDeltas.current = [];
-
-        // A nested run's turns live in the same log under its own agentId.
-        // They are its transcript, not the main conversation's.
-        const mainMessages = snapshot.messages.filter((m) => (m.agentId ?? null) === null);
-        // A durable result settles its call, as done or as failed: a denied
-        // approval or a stop never streams a result, so this is where a
-        // reload learns how those calls ended.
-        const outcomes = toolCallOutcomes(snapshot.messages);
-        setEntries(mainMessages.flatMap((m) => messageToEntries(m, cfg.format, outcomes)));
-
-        // Rebuild each child's card from what it actually wrote, so a reload
-        // does not lose a subagent's output.
-        const durableParts = snapshot.messages.flatMap((m) =>
-          Array.isArray(m.content) ? (m.content as any[]) : [],
-        );
-        seenToolCalls.current = new Set(
-          durableParts
-            .filter((part) => part?.type === 'tool-call')
-            .map((part) => part.toolCallId)
-            .filter((id: unknown): id is string => typeof id === 'string'),
-        );
-        seenToolResults.current = new Set(outcomes.keys());
-
-        // Name, depth and final state come from the durable run rows; the
-        // SUBAGENT_* events only replay while a run is unfinished, so on a
-        // completed thread they are all a client has.
-        const byAgent = new Map<string, SubagentView>(
-          // Nested runs only: depth 0 is this thread's own dispatched run,
-          // which the transcript already represents.
-          (snapshot.runs ?? [])
-            .filter((r) => r.depth > 0)
-            .map((r) => [
-              r.id,
-              // A nested run is never queued: it runs inside its parent's
-              // segment. The type allows QUEUED for the dispatched run only.
-              {
-                agentId: r.id,
-                name: r.agent,
-                depth: r.depth,
-                status: r.state === 'QUEUED' ? 'RUNNING' : r.state,
-                text: '',
-              },
-            ]),
-        );
-        for (const m of snapshot.messages) {
-          const id = m.agentId ?? null;
-          if (id === null) continue;
-          const view = byAgent.get(id) ?? {
-            agentId: id,
-            name: id.slice(0, 8),
-            depth: 1,
-            status: 'RUNNING' as const,
-            text: '',
-          };
-          if (m.role === 'assistant') {
-            const text = messageToEntry(m, cfg.format)?.text ?? '';
-            if (text) view.text = view.text ? `${view.text}\n${text}` : text;
-          }
-          byAgent.set(id, view);
-        }
-        // Trailing break so live deltas from a resumed child start on their
-        // own line instead of running into what it already wrote.
-        for (const view of byAgent.values()) if (view.text) view.text += '\n';
-        setSubagents([...byAgent.values()]);
-        setPendingInputs([]);
-        void loadUsage(threadId);
-        // The latest run's clocks. An end this client already saw on the
-        // wire stands over a snapshot that does not carry it yet.
-        const run = latestRun(snapshot.runs);
-        if (run && !run.endedAt) {
-          const ended = runEndings.current.get(run.id);
-          if (ended) run.endedAt = ended;
-        }
-        setCurrentRun(run);
-        setAgentState(snapshot.thread.state);
-        setActivity(stateActivity(snapshot.thread.state, cfg.labels));
-
-        // The active run's events are at or below the snapshot's cursor, so
-        // the cursor starts before them; after, it is the snapshot's.
-        lastSeqRef.current = -1;
-        for (const event of snapshot.activeEvents) applyEvent(event);
-        flushDeltas();
-        lastSeqRef.current = Math.max(lastSeqRef.current, snapshot.lastEventSeq);
+        hydrate(snapshot, threadId);
 
         stream = cfg.openStream(
-          routeUrl(cfg.routes.stream, { threadId, since: lastSeqRef.current }, cfg.baseUrl),
+          routeUrl(
+            cfg.routes.stream,
+            {
+              threadId,
+              since: lastSeqRef.current,
+              cursor: cursor(),
+              lastMessageId: messagesRef.current.at(-1)?.id,
+            },
+            cfg.baseUrl,
+          ),
           {
             onMessage: (raw) => {
-              let event: StreamEvent;
+              let frame: FollowFrame | StreamEvent;
               try {
-                event = JSON.parse(raw) as StreamEvent;
+                frame = JSON.parse(raw) as FollowFrame | StreamEvent;
               } catch {
                 return; // a frame that is not an event: nothing to show
               }
-              applyEvent(event);
+              applyFrame(frame, threadId);
             },
             onError: () => {
               // The transport retries on its own; keep the last meaningful
@@ -901,7 +1008,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
               reconnectTries.current += 1;
               retry = setTimeout(() => setReloadKey((k) => k + 1), wait);
             },
-            getCursor: () => lastSeqRef.current,
+            getCursor: cursor,
           },
         );
         setConnection('open');
@@ -925,7 +1032,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
       stream?.close();
       flushDeltas();
     };
-  }, [applyEvent, clearThreadState, flushDeltas, loadUsage, request, setActivity, threadId, reloadKey]);
+  }, [applyFrame, clearThreadState, cursor, flushDeltas, hydrate, request, setActivity, threadId, reloadKey]);
 
   const run = useCallback(
     async (prompt: string, options: RunOptions = {}): Promise<RunResult> => {
