@@ -158,7 +158,7 @@ function latestRun(runs: readonly ThreadSnapshot['runs'][number][] | undefined):
 
 /** Streamed text not yet shown: deltas are gathered here and shown once per
  *  frame, rather than re-rendering the conversation on every token. */
-type Pending = { kind: 'text' | 'reasoning'; text: string; seq: number };
+type Pending = { kind: 'text' | 'reasoning'; text: string; serial: number };
 
 /** Add streamed text to the conversation: onto the live entry of its kind
  *  when that is the last one, as a new live entry otherwise. */
@@ -171,7 +171,7 @@ function appendDelta(prev: ChatEntry[], d: Pending): ChatEntry[] {
   }
   return [
     ...prev,
-    { id: `${prefix}${d.seq}`, kind: d.kind, role: 'assistant', text: d.text, parts: [{ type: d.kind, text: d.text }] },
+    { id: `${prefix}${d.serial}`, kind: d.kind, role: 'assistant', text: d.text, parts: [{ type: d.kind, text: d.text }] },
   ];
 }
 
@@ -266,6 +266,11 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
    *  client already has — a replay, or a transport that resent — and is
    *  dropped before anything sees it. Notices (seq 0) always pass. */
   const lastSeqRef = useRef(-1);
+  /** Numbers the live entries. Not the event's seq: a run stream item has
+   *  none (it arrives as seq 0), and two entries with one id share a React
+   *  key. */
+  const liveSerial = useRef(0);
+  const nextLive = () => ++liveSerial.current;
   /** The run stream being read: its id, the offset of the last item
    *  applied, and every offset applied from it. An item already applied —
    *  one a snapshot covered, or a transport resent — is dropped. A new stream
@@ -472,7 +477,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
         // Providers that do not expose reasoning send none; an empty one is
         // only a phase change.
         if (typeof p.textDelta === 'string' && p.textDelta) {
-          queueDelta({ kind, text: p.textDelta, seq: data.seq });
+          queueDelta({ kind, text: p.textDelta, serial: nextLive() });
         }
         return;
       }
@@ -575,7 +580,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
           setEntries((prev) => [
             ...prev,
             {
-              id: `live:text-result:${data.seq}`,
+              id: `live:text-result:${nextLive()}`,
               kind: 'text',
               role: 'assistant',
               text: p.text,
@@ -622,7 +627,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
             setEntries((prev) => [
               ...prev,
               {
-                id: `live:tool-call:${data.seq}`,
+                id: `live:tool-call:${nextLive()}`,
                 kind: 'tool',
                 role: 'tool',
                 text: format.toolCall(p.toolName, p.args ?? {}),
@@ -647,7 +652,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
             setEntries((prev) => [
               ...settleToolCall(prev, p.toolCallId, p.result),
               {
-                id: `live:tool-result:${data.seq}`,
+                id: `live:tool-result:${nextLive()}`,
                 kind: 'tool',
                 role: 'tool',
                 text: format.toolResult(p.toolName, p.result),
@@ -707,7 +712,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
           setEntries((prev) => [
             ...prev,
             {
-              id: `live:subagent:${p.agentId}:${data.seq}`,
+              id: `live:subagent:${p.agentId}:${nextLive()}`,
               kind: 'tool',
               role: 'tool',
               text: format.subagentStarted(p.name),

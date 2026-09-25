@@ -97,6 +97,25 @@ describe('run streams in the hook', () => {
     });
   });
 
+  it('live entries from stream items each get their own id', async () => {
+    // Stream items carry no record seq, so ids built from it were all
+    // `live:<kind>:0`: text, a tool call, then text again made two entries
+    // with one React key.
+    const { view, emit } = await mount({ snapshot: running });
+    await act(async () => {
+      emit({ kind: 'stream', streamId: 'r1:1', item: { type: 'TOOL_CALL_END', toolCallId: 'c1', toolName: 'look', args: {}, offset: '4' } });
+      emit({ kind: 'stream', streamId: 'r1:1', item: { type: 'TOOL_CALL_RESULT', toolCallId: 'c1', toolName: 'look', result: 'seen', offset: '5' } });
+      emit(text('r1:1', '6', 'more'));
+      emit({ kind: 'stream', streamId: 'r1:1', item: { type: 'TOOL_CALL_END', toolCallId: 'c2', toolName: 'look', args: {}, offset: '7' } });
+      emit({ kind: 'stream', streamId: 'r1:1', item: { type: 'TOOL_CALL_RESULT', toolCallId: 'c2', toolName: 'look', result: 'again', offset: '8' } });
+      emit(text('r1:1', '9', 'done'));
+    });
+    await waitFor(() => expect(view.result.current.entries.at(-1)!.text).toBe('done'));
+    const ids = view.result.current.entries.map((e) => e.id);
+    expect(ids.filter((id) => id.startsWith('live:assistant:'))).toHaveLength(3);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
   it('a SNAPSHOT merges in place and shows the text once', async () => {
     const { view, emit } = await mount({ snapshot: running });
     await act(async () => {
