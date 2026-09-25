@@ -38,14 +38,15 @@ export class SqliteAdminStore implements AdminStore {
    *  not it has migrating to do. */
   static open(db: SqliteLike, log?: { error(message: string, ...rest: unknown[]): void }): AdminStore {
     const store = new SqliteAdminStore(db);
-    const ready = runMigrations(store.driver(), dialect, migrations).catch((err) => {
-      // Loud, because everything downstream of this is silent: admin writes
-      // are best effort, so a failed migration shows up as a dashboard with
-      // nothing in it rather than as an error.
-      (log ?? console).error('admin migrations failed', err);
-      throw err;
-    });
-    return gatedAdminStore(store, ready);
+    return gatedAdminStore(store, () =>
+      runMigrations(store.driver(), dialect, migrations).catch((err) => {
+        // Loud, because everything downstream of this is silent: admin writes
+        // are best effort, so a failed migration shows up as a dashboard with
+        // nothing in it rather than as an error.
+        (log ?? console).error('admin migrations failed', err);
+        throw err;
+      }),
+    );
   }
 
   /** The two calls the migrator needs, over this store's handle. */

@@ -53,9 +53,13 @@ type QueueOptions struct {
 	// MaxPayloadBytes refuses a job whose encoded payload is larger
 	// (ports.ErrPayloadTooLarge). Zero means 1 MiB.
 	MaxPayloadBytes int
-	// MaxAge keeps a job from running once it has waited this long: the row
-	// is kept as dead instead, and the dead handler fails its run. Zero means
-	// a job waits for ever.
+	// MaxAge keeps a fresh dispatch from running once it has been ready for
+	// this long: the row is kept as dead instead, and the dead handler fails
+	// its run. The wait counts from when the job was due, not when it was
+	// written, so a delay never counts against it. Only JobDispatch is
+	// capped: a resume, an expiry or a reclaim is the platform finishing work
+	// it already took on, and failing it would lose that work. Zero means a
+	// job waits for ever.
 	MaxAge time.Duration
 	// RetryBackoff is the delay before a job whose handler failed is offered
 	// again, doubled on every further failure up to RetryBackoffMax. Zero
@@ -682,21 +686,32 @@ func (q *Queue) take(ctx context.Context, id string) (claimed, bool, error) {
 	defer func() { _ = tx.Rollback() }()
 	var c claimed
 	var payload []byte
+	var kind string
 	var ageMs float64
 	// The age is measured on the database's clock, the one that stamped the
-	// row: a worker's own clock can be seconds away from it.
+	// row: a worker's own clock can be seconds away from it. It counts from
+	// "runAt", when the job became due, so a delayed job starts at zero.
 	err = tx.QueryRowContext(ctx,
-		`SELECT id, payload, attempts, EXTRACT(EPOCH FROM now() - "createdAt") * 1000 FROM `+q.table+`
-		 WHERE id = $1 AND `+ready+` FOR UPDATE SKIP LOCKED`, id).Scan(&c.id, &payload, &c.attempts, &ageMs)
+		`SELECT id, payload, attempts, kind, EXTRACT(EPOCH FROM now() - "runAt") * 1000 FROM `+q.table+`
+		 WHERE id = $1 AND `+ready+` FOR UPDATE SKIP LOCKED`, id).Scan(&c.id, &payload, &c.attempts, &kind, &ageMs)
 	if errors.Is(err, sql.ErrNoRows) {
 		return claimed{}, false, nil // another consumer got here first
 	}
 	if err != nil {
 		return claimed{}, false, err
 	}
-	if age := time.Duration(ageMs) * time.Millisecond; q.opts.MaxAge > 0 && age > q.opts.MaxAge {
-		cause := fmt.Errorf("job waited %s, longer than the %s cap", age.Round(time.Second), q.opts.MaxAge)
-		if _, err := tx.ExecContext(ctx, `UPDATE `+q.table+` SET "deadAt" = now(), "lastError" = $2 WHERE id = $1`, c.id, cause.Error()); err != nil {
+	// Every earlier claim spent an attempt. A job that already has them all
+	// was claimed and never came back: its worker died with it (a panic past
+	// recovery, the OOM killer, a kill -9). Running it again is how one bad
+	// job takes down every worker in turn, so it is kept as dead instead.
+	var cause error
+	if c.attempts >= q.opts.MaxAttempts {
+		cause = fmt.Errorf("job was claimed %d times and its worker never finished it", c.attempts)
+	} else if age := time.Duration(ageMs) * time.Millisecond; q.opts.MaxAge > 0 && ports.JobKind(kind) == ports.JobDispatch && age > q.opts.MaxAge {
+		cause = fmt.Errorf("job waited %s, longer than the %s cap", age.Round(time.Second), q.opts.MaxAge)
+	}
+	if cause != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE `+q.table+` SET "deadAt" = now(), "lastError" = $2, "lockedUntil" = NULL WHERE id = $1`, c.id, cause.Error()); err != nil {
 			return claimed{}, false, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -704,7 +719,7 @@ func (q *Queue) take(ctx context.Context, id string) (claimed, bool, error) {
 		}
 		var job ports.RunJob
 		_ = json.Unmarshal(payload, &job)
-		q.log.Error("job too old to run; kept as dead", "id", c.id, "thread", job.ThreadID, "run", job.RunID, "err", cause)
+		q.log.Error("job kept as dead instead of run", "id", c.id, "thread", job.ThreadID, "run", job.RunID, "err", cause)
 		q.dead(job, c.attempts, cause)
 		return claimed{}, false, nil
 	}
@@ -769,9 +784,12 @@ func (q *Queue) execute(c claimed) {
 	q.mu.Unlock()
 	log := q.log.With("id", c.id, "thread", c.job.ThreadID, "run", c.job.RunID, "kind", string(c.job.Kind), "attempt", c.attempts)
 
-	hctx, cancelHandler := context.WithCancel(jobsCtx)
+	var hctx context.Context
+	var cancelHandler context.CancelFunc
 	if q.opts.MaxRunTime > 0 {
 		hctx, cancelHandler = context.WithTimeout(jobsCtx, q.opts.MaxRunTime)
+	} else {
+		hctx, cancelHandler = context.WithCancel(jobsCtx)
 	}
 	defer cancelHandler()
 	renewCtx, stopRenew := context.WithCancel(context.Background())
@@ -807,7 +825,13 @@ func (q *Queue) execute(c claimed) {
 			}
 		}
 	}()
-	err := handler(hctx, c.job)
+	// A panic in the handler is a failed attempt like any other error: it is
+	// retried with a backoff and kept as dead once the attempts are spent.
+	err := core.CallSafely(func() error { return handler(hctx, c.job) })
+	var panicked *core.PanicError
+	if errors.As(err, &panicked) {
+		log.Error("job handler panicked", "err", err, "stack", string(panicked.Stack))
+	}
 	stopRenew()
 	// Every write below must land even while the process is shutting down.
 	done, cancel := context.WithTimeout(context.WithoutCancel(hctx), 15*time.Second)

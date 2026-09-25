@@ -383,6 +383,11 @@ type LoopOutcome struct {
 	ParkedToolCallID string
 	// Aborted: the platform cancelled the run mid-loop, a user stop (§2.1).
 	Aborted bool
+	// Interrupted: the last model call ended without a finish and without a
+	// user stop, and no error said why. The caller works out the cause (a
+	// lost lock, a segment deadline, a stream the provider cut short); the
+	// run must not be taken as finished.
+	Interrupted bool
 	// Steps is the iterations this loop completed (§2.9).
 	Steps int
 	// CostExhausted: the run hit its money cap and stopped between steps (§4).
@@ -505,8 +510,12 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 				out.TokensUsed += u.TotalTokens()
 				ledger.Add(u.TotalTokens())
 			}
-			if err == nil || aborted() {
+			if aborted() {
 				break // user stop mid-step
+			}
+			if err == nil {
+				out.Interrupted = true
+				break
 			}
 			return out, err // real failure → §2.8 redrive policy
 		}

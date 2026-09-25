@@ -82,9 +82,10 @@ export class PostgresAdminStore implements AdminStore {
 
   /** The store with its schema migration already running behind it (§2.9).
    *
-   *  Connecting stays synchronous — a URL that cannot be reached is a
-   *  configuration problem worth failing on at startup. Only the schema moves
-   *  to the background, so a service starts at the same speed whether or not
+   *  Nothing here touches the network: a `pg` Pool connects lazily, so a
+   *  URL that cannot be reached shows up as a failed migration, logged, and
+   *  retried on a later admin call (see `gatedAdminStore`). The schema runs
+   *  in the background, so a service starts at the same speed whether or not
    *  it has migrating to do, and the returned store waits for it before its
    *  first call.
    *
@@ -96,14 +97,26 @@ export class PostgresAdminStore implements AdminStore {
     log?: { error(message: string, ...rest: unknown[]): void },
   ): AdminStore {
     const store = new PostgresAdminStore(db);
-    const ready = migrate(db).catch((err) => {
-      // Loud, because everything downstream of this is silent: admin writes
-      // are best effort, so a failed migration shows up as a dashboard with
-      // nothing in it rather than as an error.
-      (log ?? console).error('admin migrations failed', err);
-      throw err;
-    });
-    return gatedAdminStore(store, ready);
+    // A pg Pool emits 'error' when an idle connection drops (a failover, a
+    // server restart). An EventEmitter with no listener for it throws, which
+    // ends the process. The pool replaces the connection by itself, so a
+    // log line is all the error needs. A caller's own listener is left alone.
+    const emitter = db as unknown as {
+      on?(event: 'error', fn: (err: unknown) => void): unknown;
+      listenerCount?(event: 'error'): number;
+    };
+    if (typeof emitter.on === 'function' && (emitter.listenerCount?.('error') ?? 0) === 0) {
+      emitter.on('error', (err) => (log ?? console).error('admin postgres connection error', err));
+    }
+    return gatedAdminStore(store, () =>
+      migrate(db).catch((err) => {
+        // Loud, because everything downstream of this is silent: admin writes
+        // are best effort, so a failed migration shows up as a dashboard with
+        // nothing in it rather than as an error.
+        (log ?? console).error('admin migrations failed', err);
+        throw err;
+      }),
+    );
   }
 
   threads = {

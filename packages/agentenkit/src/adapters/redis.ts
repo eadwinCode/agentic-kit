@@ -71,19 +71,33 @@ export class RedisBus implements EventBus {
 
   async subscribe(threadId: string, handler: (event: AgentEvent) => void) {
     const sub = this.client.duplicate();
-    await sub.connect();
-    await sub.subscribe(THREAD_CHANNEL(threadId), (message: string) => {
-      try {
-        handler(JSON.parse(message) as AgentEvent);
-      } catch {
-        // malformed frame — never kill the subscription
-      }
-    });
+    // node-redis emits 'error' on a dropped connection and reconnects by
+    // itself. With no listener, the emit throws and ends the process, so one
+    // Redis failover would take down every worker and SSE server.
+    sub.on('error', (err: unknown) => console.error('redis subscriber error', err));
+    try {
+      await sub.connect();
+      await sub.subscribe(THREAD_CHANNEL(threadId), (message: string) => {
+        try {
+          handler(JSON.parse(message) as AgentEvent);
+        } catch {
+          // malformed frame — never kill the subscription
+        }
+      });
+    } catch (err) {
+      // The connection is ours; a failed subscribe must not leak it.
+      await Promise.resolve(sub.quit()).catch(() => undefined);
+      throw err;
+    }
 
     const heartbeat = setInterval(() => {
-      handler({
-        threadId, seq: 0, type: 'HEARTBEAT', payload: null, createdAt: new Date(),
-      } as AgentEvent);
+      try {
+        handler({
+          threadId, seq: 0, type: 'HEARTBEAT', payload: null, createdAt: new Date(),
+        } as AgentEvent);
+      } catch {
+        // a throwing handler must not become an uncaught timer error
+      }
     }, this.heartbeatMs);
 
     return async () => {

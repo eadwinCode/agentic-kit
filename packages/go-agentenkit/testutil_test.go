@@ -29,6 +29,9 @@ type step struct {
 	usage     *[2]int // prompt, completion; default 10, 5
 	delay     time.Duration
 	err       error
+	// noFinish ends the stream after the text with no finish chunk and no
+	// error: a provider that cut the stream short without saying so.
+	noFinish bool
 }
 
 // scriptedModel plays back one scripted step per round-trip. The platform
@@ -129,6 +132,9 @@ func (m *scriptedModel) DoStream(ctx context.Context, p provider.GenerateParams)
 		}
 		for _, c := range s.calls {
 			ch <- provider.StreamChunk{Type: provider.ChunkToolCall, ToolCallID: c.id, ToolName: c.name, ToolInput: c.args}
+		}
+		if s.noFinish {
+			return
 		}
 		ch <- provider.StreamChunk{Type: provider.ChunkFinish, FinishReason: finishOf(s), Usage: usageOf(s)}
 	}()

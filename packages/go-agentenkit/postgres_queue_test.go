@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -408,4 +409,86 @@ func TestPostgresQueue_AListenerWakesTheConsumerWithoutPolling(t *testing.T) {
 	_ = p.queue.Enqueue(ctx, ports.RunJob{ThreadID: "woken"}, nil)
 	seen := rec.waitFor(t, 1, 2*time.Second)
 	mustStrings(t, seen, []string{"woken"}, "delivered long before the 10s poll")
+}
+
+func TestPostgresQueue_ADelayedJobIsNotTooOldWhenItComesDue(t *testing.T) {
+	p := openPgPlatform(t, "qd_", pgstorage.QueueOptions{Poll: 20 * time.Millisecond, MaxAge: 50 * time.Millisecond})
+	ctx := context.Background()
+	rec := &recorder{}
+	var dead []string
+	var mu sync.Mutex
+	p.queue.Bind(func(_ context.Context, job ports.RunJob) error { rec.add(job.ThreadID); return nil },
+		pgstorage.WithDeadHandler(func(_ context.Context, job ports.RunJob, _ int, _ error) {
+			mu.Lock()
+			dead = append(dead, job.ThreadID)
+			mu.Unlock()
+		}))
+	// Delayed well past MaxAge: a park expiry, a retry backoff, a settle.
+	_ = p.queue.Enqueue(ctx, ports.RunJob{ThreadID: "expiry", RunID: "r1", Kind: ports.JobExpiry}, &ports.EnqueueOptions{Delay: 200 * time.Millisecond})
+	_ = p.queue.Enqueue(ctx, ports.RunJob{ThreadID: "fresh", RunID: "r2"}, &ports.EnqueueOptions{Delay: 200 * time.Millisecond})
+	seen := rec.waitFor(t, 2, 3*time.Second)
+	mustEqual(t, len(seen), 2, "both ran once due: the delay does not count as waiting")
+	mu.Lock()
+	mustEqual(t, len(dead), 0, "none kept dead")
+	mu.Unlock()
+}
+
+func TestPostgresQueue_MaxAgeOnlyCapsFreshDispatches(t *testing.T) {
+	p := openPgPlatform(t, "qf_", pgstorage.QueueOptions{Poll: 20 * time.Millisecond, MaxAge: 50 * time.Millisecond})
+	ctx := context.Background()
+	rec := &recorder{}
+	p.queue.Bind(func(_ context.Context, job ports.RunJob) error { rec.add(job.ThreadID); return nil })
+	_ = p.queue.Pause(ctx)
+	_ = p.queue.Enqueue(ctx, ports.RunJob{ThreadID: "resume", RunID: "r1", Kind: ports.JobResume}, nil)
+	time.Sleep(80 * time.Millisecond)
+	_ = p.queue.Resume(ctx)
+	seen := rec.waitFor(t, 1, 2*time.Second)
+	mustStrings(t, seen, []string{"resume"}, "a resume that waited past MaxAge still runs: failing it would lose the answer")
+}
+
+func TestPostgresQueue_AJobWhoseWorkerNeverFinishesIsKeptDead(t *testing.T) {
+	p := openPgPlatform(t, "qx_", pgstorage.QueueOptions{Poll: 20 * time.Millisecond, MaxAttempts: 3})
+	ctx := context.Background()
+	rec := &recorder{}
+	causes := make(chan string, 1)
+	// Every earlier claim crashed its worker: attempts are spent and the
+	// lease has lapsed, but no handler ever returned to mark it dead.
+	_ = p.queue.Enqueue(ctx, ports.RunJob{ThreadID: "poison", RunID: "r-poison"}, nil)
+	if _, err := p.db.ExecContext(ctx, `UPDATE qx_jobs SET attempts = 3, "lockedUntil" = now() - interval '1 second'`); err != nil {
+		t.Fatal(err)
+	}
+	p.queue.Bind(func(_ context.Context, job ports.RunJob) error { rec.add(job.ThreadID); return nil },
+		pgstorage.WithDeadHandler(func(_ context.Context, _ ports.RunJob, _ int, cause error) { causes <- cause.Error() }))
+	select {
+	case cause := <-causes:
+		if !strings.Contains(cause, "never finished") {
+			t.Fatalf("the dead handler is told why: %s", cause)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the job was never kept dead")
+	}
+	mustEqual(t, len(rec.list()), 0, "never run again")
+	rows, _ := p.queue.ListDead(ctx, 10)
+	mustEqual(t, len(rows), 1, "kept dead")
+}
+
+func TestPostgresQueue_APanickingHandlerIsRetriedThenKeptDead(t *testing.T) {
+	p := openPgPlatform(t, "qp_", pgstorage.QueueOptions{Poll: 20 * time.Millisecond, MaxAttempts: 2, RetryBackoff: 10 * time.Millisecond})
+	ctx := context.Background()
+	var calls atomic.Int32
+	causes := make(chan string, 1)
+	p.queue.Bind(func(context.Context, ports.RunJob) error {
+		calls.Add(1)
+		panic("bad payload")
+	}, pgstorage.WithDeadHandler(func(_ context.Context, _ ports.RunJob, _ int, cause error) { causes <- cause.Error() }))
+	_ = p.queue.Enqueue(ctx, ports.RunJob{ThreadID: "panics", RunID: "r-panic"}, nil)
+	select {
+	case cause := <-causes:
+		if !strings.Contains(cause, "bad payload") {
+			t.Fatalf("the panic reaches the dead handler: %s", cause)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the job was never kept dead")
+	}
+	mustEqual(t, int(calls.Load()), 2, "one call per attempt, and the process is still here")
 }

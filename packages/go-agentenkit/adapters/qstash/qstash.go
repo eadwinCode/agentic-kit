@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
@@ -24,7 +25,8 @@ type Client struct {
 	Token string
 	// BaseURL defaults to DefaultBaseURL.
 	BaseURL string
-	// HTTP defaults to http.DefaultClient.
+	// HTTP defaults to a client with a 30 second timeout. http.DefaultClient
+	// has none, and an enqueue that hangs holds the run that made it.
 	HTTP *http.Client
 }
 
@@ -48,7 +50,7 @@ func New(client Client, opts Options) *Queue {
 		client.BaseURL = DefaultBaseURL
 	}
 	if client.HTTP == nil {
-		client.HTTP = http.DefaultClient
+		client.HTTP = &http.Client{Timeout: 30 * time.Second}
 	}
 	if opts.QueueName == "" {
 		opts.QueueName = "agent-runs"
@@ -100,14 +102,26 @@ func (q *Queue) Enqueue(ctx context.Context, job ports.RunJob, opts *ports.Enque
 	if delay > 0 {
 		req.Header.Set("Upstash-Delay", strconv.FormatInt(delay, 10)+"s")
 	}
+	// The key dedupes on QStash's side. QStash remembers an id for ten
+	// minutes, not for as long as the message waits, so a key reused after
+	// that goes out again; every caller treats a second delivery as a no-op.
+	if opts != nil && opts.Key != "" {
+		req.Header.Set("Upstash-Deduplication-Id", opts.Key)
+	}
 	res, err := q.client.HTTP.Do(req)
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
+	body, _ = io.ReadAll(io.LimitReader(res.Body, 4096))
 	if res.StatusCode >= 300 {
-		msg, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
-		return fmt.Errorf("qstash: %s: %s", res.Status, string(msg))
+		return fmt.Errorf("qstash: %s: %s", res.Status, string(body))
+	}
+	var out struct {
+		Deduplicated bool `json:"deduplicated"`
+	}
+	if json.Unmarshal(body, &out) == nil && out.Deduplicated {
+		return ports.ErrDuplicateJob
 	}
 	return nil
 }

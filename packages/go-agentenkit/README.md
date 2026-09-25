@@ -126,6 +126,29 @@ rt, err := agentenkit.SetupAgentCore(ctx, agentenkit.RuntimeOptions{
 })
 ```
 
+The QStash consumer URL is public, so check that each delivery came from
+QStash before it reaches the worker. Otherwise anyone who finds the URL can run
+any agent under any tenant:
+
+```go
+keys := qstash.SigningKeys{
+	Current: os.Getenv("QSTASH_CURRENT_SIGNING_KEY"),
+	Next:    os.Getenv("QSTASH_NEXT_SIGNING_KEY"),
+}
+consumer := "https://app.example.com/api/queue/agent-run" // same as Options.URL
+http.Handle("/api/queue/agent-run", qstash.Middleware(keys, consumer, http.HandlerFunc(
+	func(w http.ResponseWriter, r *http.Request) {
+		var job agentenkit.RunJob
+		if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if _, err := rt.Worker.HandleJob(r.Context(), job); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	})))
+```
+
 Or one Postgres for all four, no Redis and no queue service:
 
 ```go
@@ -216,9 +239,9 @@ rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
 	},
 	// Runs after the last step and BEFORE the terminal state is written: commit
 	// what the run produced, bill it. An error fails the run; a stop arrives
-	// with Cancelled set on a cancelled ctx. Idempotent on RunID, please.
+	// with Cancelled set. Idempotent on RunID, please.
 	OnSettle: func(ctx context.Context, info agentenkit.RunFinishInfo) error {
-		return repo.Commit(context.WithoutCancel(ctx), info.RunID)
+		return repo.Commit(ctx, info.RunID)
 	},
 	OnFinish: func(info agentenkit.RunFinishInfo) { log.Println("done", info.RunID, info.State) },
 	Subagents: &agentenkit.SubagentsConfig{Profiles: map[string]agentenkit.SubagentProfile{

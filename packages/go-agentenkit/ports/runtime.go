@@ -140,8 +140,9 @@ type PrepareStepFunc func(ctx context.Context, threadID string, state AgentRunSt
 // SettleFunc runs after a run's last step and BEFORE its terminal
 // STATE_CHANGE is written (§5.6): the place to commit what the run produced
 // so every client sees it settled the moment the state flips. An error fails
-// the run. A user stop reaches it with a cancelled ctx and Cancelled set;
-// storage work in the hook should use context.WithoutCancel.
+// the run. A user stop reaches it with Cancelled set, on a ctx that is not
+// cancelled, so the hook's own writes land; tell a stop apart by Cancelled,
+// never by ctx.Err().
 //
 // It may run more than once for one run: a worker that dies inside it is
 // redelivered. Keep it idempotent on RunID.

@@ -13,6 +13,7 @@ import (
 	"github.com/zendev-sh/goai/provider"
 
 	agentenkit "github.com/eadwinCode/agentic-kit/packages/go-agentenkit"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
 
 // noCaching keeps the system prompt in GenerateParams.System, where a test
@@ -111,7 +112,7 @@ func TestOnSettle_AnErrorFailsTheRunAndKeepsWhy(t *testing.T) {
 	mustEqual(t, h.queue.Len(), 0, "a settle failure is not retried")
 }
 
-func TestOnSettle_SeesAStopAsCancelledOnACancelledContext(t *testing.T) {
+func TestOnSettle_SeesAStopAsCancelledOnALiveContext(t *testing.T) {
 	h := makeRuntime(t, scripted(step{text: "slow", delay: 500 * time.Millisecond}))
 	var seen agentenkit.RunFinishInfo
 	var ctxErr error
@@ -137,10 +138,77 @@ func TestOnSettle_SeesAStopAsCancelledOnACancelledContext(t *testing.T) {
 	wg.Wait()
 	mustEqual(t, seen.Cancelled, true, "cancelled")
 	mustEqual(t, seen.State, agentenkit.StateCancelled, "state")
-	if ctxErr == nil {
-		t.Fatal("a stop must reach the settle hook on a cancelled context")
+	if ctxErr != nil {
+		t.Fatalf("a stop reaches the settle hook on a live context, so its writes land: %v", ctxErr)
 	}
 	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCancelled, "a settle error cannot turn a stop into a failure")
+}
+
+// ctxRuns is a run store that fails a call made on a cancelled context, the
+// way the SQL admin stores do. The memory store ignores ctx, which is how a
+// settle on a cancelled context went unnoticed in the tests.
+type ctxRuns struct{ ports.RunStore }
+
+func (r ctxRuns) Get(ctx context.Context, id string) (*ports.RunRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return r.RunStore.Get(ctx, id)
+}
+
+func (r ctxRuns) Patch(ctx context.Context, id string, p ports.RunPatch) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return r.RunStore.Patch(ctx, id, p)
+}
+
+type ctxAdmin struct{ ports.AdminStore }
+
+func (a ctxAdmin) Runs() ports.RunStore { return ctxRuns{a.AdminStore.Runs()} }
+
+func TestOnSettle_AStoppedLiveRunIsMarkedSettledOnASQLLikeStore(t *testing.T) {
+	h := makeRuntimeOpts(t, scripted(step{text: "slow", delay: 500 * time.Millisecond}), func(o *agentenkit.RuntimeOptions) {
+		o.Admin = ctxAdmin{o.Admin}
+	})
+	settles := 0
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
+		Name:     "chat",
+		OnSettle: func(context.Context, agentenkit.RunFinishInfo) error { settles++; return nil },
+	})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
+	job, _ := h.queue.Shift()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = h.rt.Worker.HandleJob(h.ctx, job)
+	}()
+	time.Sleep(30 * time.Millisecond)
+	if _, err := chat.Stop(h.ctx, ran.ThreadID, nil); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	mustEqual(t, settles, 1, "settled once")
+	rec, err := h.admin.Runs().Get(h.ctx, ran.RunID)
+	if err != nil || rec == nil {
+		t.Fatalf("run record: %+v %v", rec, err)
+	}
+	if rec.SettledAt == nil {
+		t.Fatal("the settle is marked, so the late-settle sweep does not charge the run again")
+	}
+}
+
+func TestExecute_AStreamCutWithoutAFinishIsNotCompleted(t *testing.T) {
+	h := makeRuntime(t, scripted(step{text: "part", noFinish: true}, step{text: "whole"}))
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
+	h.handleNext(t)
+	if st := h.thread(t, ran.ThreadID).State; st == agentenkit.StateCompleted {
+		t.Fatal("a step that never finished must not complete the run")
+	}
+	h.handleNext(t) // the retry
+	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "the retry completes it")
 }
 
 func TestOnSettle_RunsWhenAttemptsAreExhausted(t *testing.T) {

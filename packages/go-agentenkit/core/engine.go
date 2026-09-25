@@ -213,25 +213,46 @@ func accrueRunRecord(ctx context.Context, deps ports.RuntimePorts, runID string,
 //
 // Returns the hook's error, and whether the hook was reached at all. A run
 // with no record (a foreign dispatch) settles unmarked, as it always did.
+//
+// Everything here runs on a context no stop or shutdown can cancel. A
+// stopped run reaches this with its generation context already cancelled;
+// reading the record on it fails, and a hook that ran without the record
+// could never be marked, so the late-settle sweep would bill it again. The
+// hook learns about a stop from info.Cancelled.
 func settleRun(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, info ports.RunFinishInfo) (bool, error) {
+	ctx = context.WithoutCancel(ctx)
+	log := Logger(deps).With("run", info.RunID)
 	var prior *ports.RunRecord
+	readFailed := false
 	if info.RunID != "" {
-		rec, err := deps.Admin.Runs().Get(ctx, info.RunID)
-		if err != nil {
-			Logger(deps).Error("run record not read before settle", "run", info.RunID, "err", err)
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			if attempt > 0 {
+				time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+			}
+			if prior, err = deps.Admin.Runs().Get(ctx, info.RunID); err == nil {
+				break
+			}
 		}
-		prior = rec
+		if err != nil {
+			// The hook still runs: a store that stays down (a failed admin
+			// migration keeps failing every call) must not mean the run is
+			// never charged. The mark is still tried below, so a store that
+			// was only slow keeps the sweep from charging again.
+			readFailed = true
+			log.Error("run record not read before settle; settling without the already-settled check", "err", err)
+		}
 	}
 	if prior != nil && prior.SettledAt != nil {
 		return false, nil // already settled, by a stop or an earlier worker
 	}
 	var hookErr error
 	if agent != nil && agent.Args.OnSettle != nil {
-		hookErr = agent.Args.OnSettle(ctx, info)
+		hookErr = CallSafely(func() error { return agent.Args.OnSettle(ctx, info) })
 	}
-	if prior != nil {
+	if prior != nil || readFailed {
 		if hookErr == nil {
-			_ = deps.Admin.Runs().Patch(context.WithoutCancel(ctx), info.RunID, ports.RunPatch{SettledAt: ports.Ptr(time.Now())})
+			markSettled(ctx, deps, info.RunID)
 		} else {
 			// The mark is only set once the hook has done its work. A hook
 			// that failed leaves the run unsettled, so a later stop, a later
@@ -240,6 +261,22 @@ func settleRun(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAg
 		}
 	}
 	return true, hookErr
+}
+
+// markSettled records that the settle hook ran. The hook has already
+// charged by now, so a lost mark means the sweep charges again: the write is
+// tried a few times before it is given up, loudly.
+func markSettled(ctx context.Context, deps ports.RuntimePorts, runID string) {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+		}
+		if err = deps.Admin.Runs().Patch(ctx, runID, ports.RunPatch{SettledAt: ports.Ptr(time.Now())}); err == nil {
+			return
+		}
+	}
+	Logger(deps).Error("settle mark not written; the late-settle sweep may settle this run again", "run", runID, "err", err)
 }
 
 // settleEndedRun settles a run whose record has ended but whose settle
@@ -803,21 +840,30 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			}
 		},
 	}, ledger)
+	// A lost lock ends the segment whatever the loop returned: another
+	// worker may own the thread now, so nothing below may write to it. A
+	// loop cut short by the lock loss can even come back without an error.
+	if lockLost.Load() {
+		// Every finished step is persisted; the job comes back once the
+		// lock is free and resumes from the last one.
+		log.Warn("segment ended early: run lock lost", "steps", loop.Steps)
+		return OutcomeLockLost, nil
+	}
 	timedOut := false
-	if err != nil {
-		if lockLost.Load() {
-			// Every finished step is persisted; the job comes back once the
-			// lock is free and resumes from the last one.
-			log.Warn("segment ended early: run lock lost", "steps", loop.Steps)
-			return OutcomeLockLost, nil
-		}
-		if errors.Is(genBase.Err(), context.DeadlineExceeded) {
+	if err != nil || loop.Interrupted {
+		switch {
+		case errors.Is(genBase.Err(), context.DeadlineExceeded):
 			// The segment's own deadline ended it, whatever the provider
 			// turned that into.
 			timedOut = true
 			log.Warn("segment timed out", "after", deps.Config.SegmentTimeout, "steps", loop.Steps)
-		} else {
+		case err != nil:
 			return "", err
+		default:
+			// The stream ended with no finish and no error. The step was
+			// not completed, so it goes to the retry policy rather than
+			// finalizing as COMPLETED.
+			return "", fmt.Errorf("step %d ended without a finish", loop.Steps+1)
 		}
 	}
 
@@ -860,14 +906,14 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	}
 	// The caller settles BEFORE the terminal state lands (§5.6): what the run
 	// produced is committed by the time any client sees it end. A settle
-	// failure is a run failure; a stop reaches the hook cancelled, on the
-	// generation context, so it can tell the two apart.
+	// failure is a run failure. A stop reaches the hook with Cancelled set,
+	// on a context that is not cancelled, so the hook's own writes land.
 	// The whole run's bill, read back from the rows the loop wrote (§4):
 	// every segment and every nested run, priced and grouped into lines, so a
 	// settle hook charges in one pass without keeping its own tally. Read
 	// once, handed to both hooks; a failed read is reported, not hidden.
 	bill, billErr := runBill(ctx, deps, threadID, runID)
-	if _, err := settleRun(genCtx, deps, agent, ports.RunFinishInfo{
+	if _, err := settleRun(ctx, deps, agent, ports.RunFinishInfo{
 		ThreadID: threadID, RunID: runID, State: state, StopReason: stopReason, Error: f.Error,
 		TokensUsed: f.TokensUsed, Attribution: f.Attribution, Steps: f.Steps,
 		Cancelled: state == ports.StateCancelled,

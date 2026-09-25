@@ -3,9 +3,11 @@ package inline
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/core"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
 
@@ -86,8 +88,11 @@ func (q *Queue) Enqueue(_ context.Context, job ports.RunJob, opts *ports.Enqueue
 			return
 		}
 		// Detached on purpose: a queue consumer's failure is the worker's
-		// business (§2.8 redrive), never the enqueuer's.
-		_ = handler(q.ctx, job)
+		// business (§2.8 redrive), never the enqueuer's. A panic is caught
+		// so it ends this job, not the process.
+		if err := core.CallSafely(func() error { return handler(q.ctx, job) }); err != nil {
+			slog.Error("inline job failed", "thread", job.ThreadID, "run", job.RunID, "kind", string(job.Kind), "err", err)
+		}
 	})
 	q.pending[timer] = pendingJob{job: job, key: key, runAt: time.Now().Add(delay)}
 	return nil

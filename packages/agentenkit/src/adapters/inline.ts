@@ -18,28 +18,47 @@ import type { EnqueueOptions, Queue } from '../ports/queue.js';
 export class InlineQueue implements Queue {
   private handler?: (job: RunJob) => Promise<unknown>;
   private readonly pending = new Set<ReturnType<typeof setTimeout>>();
+  /** Jobs that came due before `bind`: held, not dropped. */
+  private readonly unbound: RunJob[] = [];
 
-  /** Wired by setupAgentCore once the worker exists — the queue and the worker
-   *  each need the other, so one of them has to be attached afterwards. */
+  /** Attach the worker once the runtime exists — the queue and the worker each
+   *  need the other, so one of them has to be wired afterwards:
+   *  `queue.bind((job) => runtime.worker.handleJob(job))`. A job that came
+   *  due before this runs is delivered now rather than lost. */
   bind(handler: (job: RunJob) => Promise<unknown>): void {
     this.handler = handler;
+    for (const job of this.unbound.splice(0)) this.deliver(job);
   }
 
   async enqueue(job: RunJob, opts?: EnqueueOptions): Promise<void> {
     const timer = setTimeout(() => {
       this.pending.delete(timer);
-      // Detached on purpose: a queue consumer's failure is the worker's
-      // business (§2.8 redrive), never the enqueuer's.
-      void this.handler?.(job)?.catch(() => undefined);
+      this.deliver(job);
     }, (opts?.delaySeconds ?? 0) * 1000);
     // Never hold a process open just because an expiry is scheduled.
     (timer as unknown as { unref?: () => void }).unref?.();
     this.pending.add(timer);
   }
 
+  private deliver(job: RunJob): void {
+    if (!this.handler) {
+      this.unbound.push(job);
+      return;
+    }
+    // Detached on purpose: a queue consumer's failure is the worker's
+    // business (§2.8 redrive), never the enqueuer's. It is still logged:
+    // swallowed, a broken worker looks like a queue that does nothing.
+    void Promise.resolve()
+      .then(() => this.handler!(job))
+      .catch((err) =>
+        console.error('InlineQueue: job failed', { threadId: job.threadId, runId: job.runId }, err),
+      );
+  }
+
   /** Drop everything still scheduled — for tests and clean shutdown. */
   clear(): void {
     for (const t of this.pending) clearTimeout(t);
     this.pending.clear();
+    this.unbound.length = 0;
   }
 }

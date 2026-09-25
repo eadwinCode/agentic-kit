@@ -160,16 +160,56 @@ export async function runMigrations(
  *  that failed surfaces on the first call rather than as a mystery empty
  *  dashboard.
  *
+ *  A failed migration is never an unhandled rejection: nothing awaits it until
+ *  the first admin call, and Node ends the process on a rejection nobody
+ *  handled. Nor is it final: a database that was down at boot comes back, so
+ *  a call made after `retryMs` runs the migration again (the wait doubles on
+ *  each failure, up to a minute). Calls in between fail fast with the last
+ *  error.
+ *
  *  Written once here so every admin store, including one added later, gets the
  *  same behaviour for free. */
-export function gatedAdminStore(inner: AdminStore, ready: Promise<void>): AdminStore {
+export function gatedAdminStore(
+  inner: AdminStore,
+  migrate: () => Promise<void>,
+  opts: { retryMs?: number; maxRetryMs?: number; now?: () => number } = {},
+): AdminStore {
+  const now = opts.now ?? Date.now;
+  const maxRetryMs = opts.maxRetryMs ?? 60_000;
+  let wait = opts.retryMs ?? 1_000;
+  let failedAt = 0;
+  let lastError: unknown;
+  let ready: Promise<void> | null = null;
+  const start = () => {
+    const attempt = migrate().then(
+      () => {
+        lastError = undefined;
+      },
+      (err) => {
+        lastError = err;
+        failedAt = now();
+        ready = null;
+      },
+    );
+    ready = attempt;
+    return attempt;
+  };
+  void start();
+  const whenReady = async () => {
+    if (ready) await ready;
+    if (lastError === undefined) return;
+    if (now() - failedAt < wait) throw lastError;
+    wait = Math.min(wait * 2, maxRetryMs);
+    await start();
+    if (lastError !== undefined) throw lastError;
+  };
   const gate = <T extends Record<string, any>>(group: T): T => {
     const out: Record<string, unknown> = {};
     for (const [name, fn] of Object.entries(group)) {
       out[name] =
         typeof fn === 'function'
           ? async (...args: unknown[]) => {
-              await ready;
+              await whenReady();
               return fn.apply(group, args);
             }
           : fn;
