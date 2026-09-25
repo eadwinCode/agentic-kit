@@ -77,10 +77,65 @@ func PartsContent(parts []ContentPart) json.RawMessage {
 	return b
 }
 
-// ContextSummaryContent encodes a compaction summary envelope.
-func ContextSummaryContent(text string) json.RawMessage {
-	b, _ := json.Marshal(map[string]any{"type": ContextSummaryType, "text": text})
+// ContextSummaryContent encodes a compaction summary envelope. coversUpTo is
+// the id of the last message it summarizes: the prompt carries the summary
+// and only what came after that message (see PromptHistory).
+func ContextSummaryContent(text, coversUpTo string) json.RawMessage {
+	b, _ := json.Marshal(map[string]any{"type": ContextSummaryType, "text": text, "coversUpTo": coversUpTo})
 	return b
+}
+
+// summaryOf reads a stored message as a compaction summary: whether it is
+// one, and the last message it covers ("" on one written before the mark).
+func summaryOf(m ports.MessageDTO) (coversUpTo string, ok bool) {
+	var env struct {
+		Type       string `json:"type"`
+		CoversUpTo string `json:"coversUpTo"`
+	}
+	trimmed := bytes.TrimSpace(m.Content)
+	if len(trimmed) == 0 || trimmed[0] != '{' || json.Unmarshal(trimmed, &env) != nil || env.Type != ContextSummaryType {
+		return "", false
+	}
+	return env.CoversUpTo, true
+}
+
+// PromptHistory is the part of a stored history that goes to the model
+// (§2.6): the latest compaction summary, then only the messages after the
+// last one it covers. Everything before is in the summary already, and
+// sending it again would undo the compaction. A summary written before the
+// cover mark existed covers nothing known, so every summary is left out and
+// the whole history goes; the next compaction writes a proper one.
+func PromptHistory(history []ports.MessageDTO) []ports.MessageDTO {
+	latest, covers := -1, ""
+	for i := range history {
+		if c, ok := summaryOf(history[i]); ok {
+			latest, covers = i, c
+		}
+	}
+	if latest < 0 {
+		return history
+	}
+	from := -1
+	if covers != "" {
+		for i := range history {
+			if history[i].ID == covers {
+				from = i + 1
+				break
+			}
+		}
+	}
+	out := make([]ports.MessageDTO, 0, len(history))
+	if from >= 0 {
+		out = append(out, history[latest])
+	} else {
+		from = 0
+	}
+	for _, m := range history[from:] {
+		if _, isSummary := summaryOf(m); !isSummary {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // ToolResultContent is a tool message carrying one result, the shape the

@@ -9,10 +9,21 @@ budget; you never have to prune by hand.
 ```
 budget = min(model contextWindow, contextCeilingTokens) - contextOutputReserveTokens
 
-if estimate(history) > budget × compactionTrigger:
-    keep the last  budget × contextTailShare  verbatim
-    summarize everything before it into one system message
+prompt = the latest summary + the messages after the last one it covers
+if estimate(prompt) > budget × compactionTrigger:
+    keep the last  budget × contextTailShare  verbatim, starting at a user turn
+    summarize everything before it (the last summary included) into one new
+    system message that records the last message it covers
 ```
+
+The summary records which message it covers up to, and from then on the
+prompt carries the summary and only what came after. So a thread compacts
+once each time it grows past the trigger, never on every run after, and the
+summary call only ever reads the last summary plus the turns since. The kept
+tail always starts at a user turn, so it can never open on a tool result whose
+call went into the summary. A single turn larger than the whole window is sent
+as it is, with a warning logged: the estimate is rough, and the provider
+decides.
 
 | Setting | Default | Meaning |
 | :--- | :--- | :--- |
@@ -32,7 +43,9 @@ config: { compactionModel: 'claude-haiku' }
 
 The call is billed like any other, under `kind: 'compaction'`, so what the
 platform's own housekeeping costs is visible on its own (see
-[Cost and pricing](./cost-and-pricing.md)).
+[Cost and pricing](./cost-and-pricing.md)). It is billed to the run it served,
+so it is on that run's bill and counts toward its cost cap, and a stop cancels
+it like any other call of the run.
 
 The summary is persisted as a `system` message and a `CONTEXT_COMPACTED` event
 is published. Reading current load:

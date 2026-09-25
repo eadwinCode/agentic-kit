@@ -892,7 +892,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	}
 
 	// Durable compaction pass: history always fits the model budget (§2.6)
-	history, err := CompactContext(ctx, deps, threadID, input.Model)
+	history, err := CompactContext(ctx, deps, threadID, input.Model, CompactOptions{RunID: runID, GenCtx: genCtx})
 	if err != nil {
 		return "", err
 	}

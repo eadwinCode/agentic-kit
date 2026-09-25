@@ -606,7 +606,10 @@ export async function execute(
 
       // Durable compaction pass — history always fits the model budget (§2.6);
       // the budget uses the resolved model's contextWindow (§3.3)
-      const history = await compactContext(deps, threadId, input.model);
+      const history = await compactContext(deps, threadId, input.model, {
+        runId,
+        abortSignal: abort.signal,
+      });
       const model = deps.resolveModel(input.model);
 
       // Prompt caching (§2.6): stamp the stable prefix once — appended step

@@ -44,6 +44,38 @@ export function promptMessage(m: { role: string; content: unknown }): { role: st
   return { role: m.role, content: c };
 }
 
+const CONTEXT_SUMMARY = 'CONTEXT_SUMMARY';
+
+/** Reads a stored message as a compaction summary: whether it is one, and the
+ *  last message it covers (null on one written before the mark). */
+export function summaryOf(m: { content: unknown }): { coversUpTo: string | null } | null {
+  const c = m.content as { type?: unknown; coversUpTo?: unknown } | null;
+  if (!c || typeof c !== 'object' || Array.isArray(c) || c.type !== CONTEXT_SUMMARY) return null;
+  return { coversUpTo: typeof c.coversUpTo === 'string' ? c.coversUpTo : null };
+}
+
+/** The part of a stored history that goes to the model (§2.6): the latest
+ *  compaction summary, then only the messages after the last one it covers.
+ *  Everything before is in the summary already, and sending it again would
+ *  undo the compaction. A summary written before the cover mark existed covers
+ *  nothing known, so every summary is left out and the whole history goes; the
+ *  next compaction writes a proper one. */
+export function promptHistory<T extends { id: string; content: unknown }>(history: T[]): T[] {
+  let latest = -1;
+  let covers: string | null = null;
+  history.forEach((m, i) => {
+    const s = summaryOf(m);
+    if (s) {
+      latest = i;
+      covers = s.coversUpTo;
+    }
+  });
+  if (latest < 0) return history;
+  const coveredAt = covers === null ? -1 : history.findIndex((m) => m.id === covers);
+  const rest = history.slice(coveredAt + 1).filter((m) => !summaryOf(m));
+  return coveredAt >= 0 ? [history[latest]!, ...rest] : rest;
+}
+
 /** `promptMessage` over a whole history. */
 export const promptMessages = (messages: Array<{ role: string; content: unknown }>) =>
   messages.map(promptMessage);
