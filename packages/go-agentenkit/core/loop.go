@@ -165,7 +165,7 @@ func ExecuteStep(ctx context.Context, agent *RegisteredAgent, call StepCall) (*S
 		// The text is accumulated as it goes, so a call cut off half way still
 		// knows how much it produced and can be billed for it (§4).
 		var streamed strings.Builder
-		var finished, sawToolDelta bool
+		var sawFinish, sawReason, sawToolDelta bool
 		drainErr := drainStream(stream, func(chunk provider.StreamChunk) {
 			// Everything the model produced counts as output when a call is
 			// cut off: the answer, its thinking, and the tool arguments,
@@ -186,13 +186,18 @@ func ExecuteStep(ctx context.Context, agent *RegisteredAgent, call StepCall) (*S
 			// Whether the call ran to its end is decided by what this loop
 			// SAW, not by whether the stream reported an error: a stop that
 			// tears the provider down mid-call does not always surface as one
-			// (§4). The finish chunk arriving is the only reliable "this
-			// completed". A finish with no reason is goai's own, made up
-			// when the provider's stream closed without one: the call was
-			// cut short without saying so, which is not a finish either
-			// (the TS runtime reads the SDK's 'unknown' the same way).
-			if chunk.Type == provider.ChunkFinish && chunk.FinishReason != "" {
-				finished = true
+			// (§4). It completed when the finish chunk arrived AND the model
+			// gave a finish reason. goai's OpenAI stream puts that reason on
+			// the step_finish chunk and ends with a finish chunk that carries
+			// only the usage; its tool loop puts it on the finish chunk. A
+			// stream that closed with no reason anywhere was cut short
+			// without saying so, which is not a finish (the TS runtime reads
+			// the SDK's 'unknown' the same way).
+			if (chunk.Type == provider.ChunkFinish || chunk.Type == provider.ChunkStepFinish) && chunk.FinishReason != "" {
+				sawReason = true
+			}
+			if chunk.Type == provider.ChunkFinish {
+				sawFinish = true
 			}
 			if call.OnChunk != nil {
 				call.OnChunk(chunk)
@@ -203,7 +208,7 @@ func ExecuteStep(ctx context.Context, agent *RegisteredAgent, call StepCall) (*S
 		})
 		release()
 		streamedText = streamed.String()
-		if drainErr != nil || !finished {
+		if drainErr != nil || !sawFinish || !sawReason {
 			// The call ended without finishing: a provider failure, or a stop
 			// that tore it down mid-stream. goai ends every other path with a
 			// finish chunk, and drops that chunk exactly when its own context

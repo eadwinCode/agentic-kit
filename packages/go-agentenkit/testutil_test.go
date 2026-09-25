@@ -34,6 +34,13 @@ type step struct {
 	noFinish bool
 	// deltas streams the text as these separate chunks instead of one.
 	deltas []string
+	// reasonOnStepFinish ends the stream the way goai's OpenAI provider
+	// does: the finish reason on a step_finish chunk, then a finish chunk
+	// that carries the usage and no reason.
+	reasonOnStepFinish bool
+	// finishNoReason ends the stream with a finish chunk that has no reason
+	// and nothing before it saying why: a stream cut short.
+	finishNoReason bool
 }
 
 // scriptedModel plays back one scripted step per round-trip. The platform
@@ -140,6 +147,13 @@ func (m *scriptedModel) DoStream(ctx context.Context, p provider.GenerateParams)
 			ch <- provider.StreamChunk{Type: provider.ChunkToolCall, ToolCallID: c.id, ToolName: c.name, ToolInput: c.args}
 		}
 		if s.noFinish {
+			return
+		}
+		if s.reasonOnStepFinish {
+			ch <- provider.StreamChunk{Type: provider.ChunkStepFinish, FinishReason: finishOf(s)}
+		}
+		if s.reasonOnStepFinish || s.finishNoReason {
+			ch <- provider.StreamChunk{Type: provider.ChunkFinish, Usage: usageOf(s)}
 			return
 		}
 		ch <- provider.StreamChunk{Type: provider.ChunkFinish, FinishReason: finishOf(s), Usage: usageOf(s)}
