@@ -185,7 +185,10 @@ before `bind` rather than dropping it, and waits out a delay of any length (a
 single timer cannot hold more than about 24.8 days); `QStashQueue`, where a
 key becomes QStash's deduplication id (remembered for ten minutes), priority
 is ignored, `cancel` does nothing (a delivered job is a correct no-op) and
-`find` / `stats` are unsupported.
+`find` / `stats` are unsupported. Without `find`, the runtime cannot ask
+whether a job is still waiting, so it goes by time instead: a queued run with
+no lock is treated as lost once it has been quiet for longer than the lock
+lease, `maxQueueWaitMs` and the longest retry delay.
 
 An adapter that cannot honour `delaySeconds` may deliver immediately, but **must
 never throw for it** — a HITL expiry is scheduled from inside a parked tool call,

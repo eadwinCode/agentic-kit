@@ -45,6 +45,17 @@ periodic job. It re-dispatches a queued or running run that has no lock and no
 job, and settles an ended run whose settle never ran, paging through every
 such run.
 
+### A thread is stuck in `QUEUED` ("Waiting to start")
+
+Its job never reached a worker: the queue dropped it, or it was a local
+dev queue that lost its jobs on restart. The same sweep (and the stream
+route's `reclaimIfOrphaned`) sends it again. With a queue that can look up
+jobs, that happens once the lock lease has passed with no job. With one
+that cannot (QStash), it waits for the longest of the lock lease,
+`maxQueueWaitMs` and the longest retry delay (with defaults, 2 minutes),
+so a job that is only slow is not sent twice. Pressing Stop clears it at
+once.
+
 ### A worker died after the answer was saved
 
 The retry does not ask the model again. A run whose last saved turn is an

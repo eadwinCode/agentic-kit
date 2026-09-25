@@ -10,7 +10,7 @@ import { markRequiresConfirmation } from '../src/core/engine.js';
 import { runLockKey } from '../src/core/lease.js';
 import { attemptsKey, runIdKey } from '../src/core/keys.js';
 import { DEFAULT_CONFIG, resolveConfig, type AgentConfig } from '../src/core/types.js';
-import { PRIORITY_LOW } from '../src/ports/queue.js';
+import { PRIORITY_LOW, UnsupportedError } from '../src/ports/queue.js';
 import type { RunFinishInfo } from '../src/ports/runtime.js';
 import { subagents } from './stream-helpers.js';
 
@@ -461,6 +461,26 @@ describe('lost and dead jobs (§2.8)', () => {
     expect(h.queue.items[0]!.kind).toBe('reclaim');
     expect(h.queue.keyOf(h.queue.items[0]!)).toBe(`reclaim:${ran.runId}`);
     expect(h.queue.items[0]!.state).toEqual({ tenant: 'acme' });
+    await h.drain();
+    expect(h.lastTerminal(ran.threadId)?.state).toBe('COMPLETED');
+  });
+
+  it('a queue that cannot find jobs: a lost run is redispatched after the longest wait', async () => {
+    // QStash cannot look a job up, so only time says a job is lost: past the
+    // lock lease AND past the queue wait limit, whichever is longer.
+    const h = await harness([{ text: 'ok' }], { runLockLeaseSeconds: 1, maxQueueWaitMs: 2_000 });
+    h.queue.find = async () => { throw new UnsupportedError('find'); };
+    const chat = h.runtime.createStreamTextAgent({ name: 'chat' });
+    const ran = await chat.run({ prompt: 'go' });
+    h.queue.items.shift(); // the queue lost the job
+    h.queue.delays.shift();
+    await sleep(1_050);
+    let report = await h.runtime.reclaimStuckRuns(0);
+    expect(report.redispatched).toBe(0); // past the lease, but a job may still wait up to 2s
+    await sleep(1_000);
+    report = await h.runtime.reclaimStuckRuns(0);
+    expect(report.redispatched).toBe(1);
+    expect(h.queue.items[0]!.kind).toBe('reclaim');
     await h.drain();
     expect(h.lastTerminal(ran.threadId)?.state).toBe('COMPLETED');
   });
