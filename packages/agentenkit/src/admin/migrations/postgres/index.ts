@@ -7,7 +7,10 @@ import { sql as bigintCounters } from './0005-bigint-counters.js';
 
 /** The admin migrations for Postgres, in apply order. Append only. */
 export const migrations: Migration[] = [
-  { version: '0001_init', sql: init },
+  // The Go runtime's 0001 differs from this one only in its header comment;
+  // the SQL is the same. A released file is never edited, so each runtime
+  // accepts the other's checksum, and one admin database serves both.
+  { version: '0001_init', sql: init, equivalent: ['2e6ebddc37635c42e74e8c73bba63e0f01bdd8371d33698c50079ebfb8f6782c'] },
   // Named and worded exactly as the Go runtime's, so both record the same
   // version and checksum.
   { version: '0002_run_settled_at', sql: runSettledAt },

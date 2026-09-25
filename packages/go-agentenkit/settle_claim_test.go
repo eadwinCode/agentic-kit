@@ -40,9 +40,8 @@ func TestSettle_OnlyOneClaimWinsAndAStaleOneIsTakenOver(t *testing.T) {
 		},
 		"postgres": func(t *testing.T) ports.AdminStore {
 			db := openPostgres(t)
-			// A clean slate, as TestPostgresAdminStore_RoundTripsARun does:
-			// the TS suite may have migrated this database, and the two 0001
-			// migrations still differ.
+			// A clean slate, as TestPostgresAdminStore_RoundTripsARun does, so
+			// the claim runs against a freshly migrated schema.
 			for _, tbl := range []string{"agentic_steps", "agentic_runs", "agentic_threads", "agentic_migrations"} {
 				_, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+tbl)
 			}

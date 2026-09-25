@@ -2,7 +2,12 @@ package migrate_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"os"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -238,5 +243,61 @@ func TestGateReportsAFailedMigrationToEveryCaller(t *testing.T) {
 	}
 	if _, err := store.Runs().Get(context.Background(), "r1"); err == nil {
 		t.Fatal("want the migration failure surfaced on the first call")
+	}
+}
+
+// The end item of the hardening work: one admin database serves both
+// runtimes. Their 0001 files differ only in a header comment, so each
+// accepts the other's checksum for it. The same cases run in the TS package
+// (test/migrations.test.ts).
+func TestMigrate_ADatabaseMigratedByTheOtherRuntimeIsAccepted(t *testing.T) {
+	db := open(t)
+	ms, err := migrate.SQLiteMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialect := migrate.SQLite
+	dialect.Repair = sqliteadmin.AddMissingColumns
+	if err := migrate.Run(context.Background(), db, dialect, ms); err != nil {
+		t.Fatal(err)
+	}
+	// As the TS runtime would have recorded it.
+	ts := "9b61b4c0ae1e3cc0c3dc457b1ddb6afbaad1a2d136d3378e4675b10f51a9f341"
+	if _, err := db.Exec(`UPDATE agentic_migrations SET checksum = ? WHERE version = '0001_init'`, ts); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate.Run(context.Background(), db, dialect, ms); err != nil {
+		t.Fatalf("a database the TS runtime migrated is accepted: %v", err)
+	}
+	// Anything else is still a database that no longer matches the code.
+	if _, err := db.Exec(`UPDATE agentic_migrations SET checksum = 'edited' WHERE version = '0001_init'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate.Run(context.Background(), db, dialect, ms); err == nil || !strings.Contains(err.Error(), "changed after it was applied") {
+		t.Fatalf("a changed migration is still refused: %v", err)
+	}
+}
+
+// The checksums listed for the TS runtime are its files' real checksums, so
+// the two cannot drift apart unnoticed.
+func TestMigrate_TheOtherRuntimesChecksumsAreRight(t *testing.T) {
+	for _, dialect := range []string{"postgres", "sqlite"} {
+		raw, err := os.ReadFile("../../../agentenkit/src/admin/migrations/" + dialect + "/0001-init.ts")
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := regexp.MustCompile("(?s)export const sql = `(.*)`;").FindSubmatch(raw)
+		if m == nil {
+			t.Fatalf("%s: no sql in the TS file", dialect)
+		}
+		sum := sha256.Sum256([]byte(strings.ReplaceAll(string(m[1]), "\r\n", "\n")))
+		load := migrate.SQLiteMigrations
+		if dialect == "postgres" {
+			load = migrate.PostgresMigrations
+		}
+		ms, _ := load()
+		if !slices.Contains(ms[0].Equivalent, hex.EncodeToString(sum[:])) {
+			t.Fatalf("%s: the TS checksum %x is not listed", dialect, sum)
+		}
 	}
 }

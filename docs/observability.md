@@ -76,6 +76,12 @@ a later mismatch is refused — a database that no longer matches the code is
 precisely what an operational store should tell you about. To change the schema,
 add the next number.
 
+**One admin database serves both runtimes.** A Go service and a TypeScript
+service can point at the same `AGENTIC_KIT_ADMIN_DATABASE_URL`: the migrations
+are the same SQL under the same versions. The two `0001` files were written
+apart and differ only in their header comment, so each runtime accepts the
+other's checksum for that one step.
+
 ## The reads
 
 ```ts

@@ -26,6 +26,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io/fs"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -41,6 +42,10 @@ type Migration struct {
 	// Dialect.Skipped, the rest of the run goes on, and the step is tried
 	// again on the next start.
 	Optional bool
+	// Equivalent are other checksums this step is known to be the same as:
+	// the same SQL, recorded under a different text by the TS runtime. A
+	// database migrated by either runtime is then accepted by both.
+	Equivalent []string
 }
 
 // NewMigration is a migration built in code rather than read from a file,
@@ -211,7 +216,7 @@ func Run(ctx context.Context, db *sql.DB, d Dialect, ms []Migration) error {
 	}
 	for _, m := range ms {
 		if sum, ok := applied[m.Version]; ok {
-			if sum != m.Checksum {
+			if sum != m.Checksum && !slices.Contains(m.Equivalent, sum) {
 				return fmt.Errorf(
 					"%s migrations: %s changed after it was applied: the database no longer matches the code",
 					d.Name, m.Version)

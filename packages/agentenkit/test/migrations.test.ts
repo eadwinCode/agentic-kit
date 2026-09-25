@@ -119,3 +119,32 @@ CREATE INDEX i ON a(id);
     await expect(store.runs.get('r1')).rejects.toThrow();
   });
 });
+
+// The end item of the hardening work: one admin database serves both
+// runtimes. Their 0001 files differ only in a header comment, so each accepts
+// the other's checksum for it. The same cases run in the Go package
+// (admin/migrate/migrate_test.go).
+describe('one admin database for both runtimes', () => {
+  it('a database migrated by the other runtime is accepted', async () => {
+    const { driver } = db();
+    await runMigrations(driver, dialect, migrations);
+    // As the Go runtime would have recorded it.
+    const go = '800097b6ae76a1d130ca14c520f0789974051fb7275be0bcc1458a2e88aaa039';
+    await driver.exec("UPDATE agentic_migrations SET checksum = ? WHERE version = '0001_init'", [go]);
+    await runMigrations(driver, dialect, migrations); // accepted
+    // Anything else is still a database that no longer matches the code.
+    await driver.exec("UPDATE agentic_migrations SET checksum = 'edited' WHERE version = '0001_init'");
+    await expect(runMigrations(driver, dialect, migrations)).rejects.toThrow('changed after it was applied');
+  });
+
+  it("the other runtime's checksums are right", async () => {
+    const { createHash } = await import('node:crypto');
+    const { readFileSync } = await import('node:fs');
+    const { migrations: pg } = await import('../src/admin/migrations/postgres/index.js');
+    for (const [name, list] of [['sqlite', migrations], ['postgres', pg]] as const) {
+      const go = readFileSync(new URL(`../../go-agentenkit/admin/migrate/sql/${name}/0001_init.sql`, import.meta.url), 'utf8');
+      const sum = createHash('sha256').update(go.replace(/\r\n/g, '\n')).digest('hex');
+      expect(list[0]!.equivalent).toContain(sum);
+    }
+  });
+});

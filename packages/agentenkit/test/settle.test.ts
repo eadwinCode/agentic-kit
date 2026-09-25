@@ -369,8 +369,8 @@ describe('the settle claim (§5.6)', () => {
       const { Pool } = await import('pg');
       const pool = new Pool({ connectionString: process.env.TEST_ADMIN_PG });
       pools.push(pool);
-      // A clean slate, as test/postgres-admin.test.ts does: the Go suite may
-      // have migrated this database, and the two 0001 migrations still differ.
+      // A clean slate, as test/postgres-admin.test.ts does, so the claim runs
+      // against a freshly migrated schema.
       await pool.query('DROP TABLE IF EXISTS agentic_steps, agentic_runs, agentic_threads, agentic_migrations');
       return PostgresAdminStore.connect(pool as PgLike);
     },

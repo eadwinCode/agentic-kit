@@ -30,6 +30,10 @@ export interface Migration {
   /** Sorts and identifies it. Never reused, never renamed. */
   version: string;
   sql: string;
+  /** Other checksums this step is known to be the same as: the same SQL,
+   *  recorded under a different text by the Go runtime. A database migrated
+   *  by either runtime is then accepted by both. */
+  equivalent?: string[];
 }
 
 /** The two calls a migration runner needs. Both stores already have them. */
@@ -135,7 +139,7 @@ export async function runMigrations(
       const sum = checksum(m.sql);
       const already = applied.get(m.version);
       if (already !== undefined) {
-        if (already !== sum) {
+        if (already !== sum && !m.equivalent?.includes(already)) {
           throw new Error(
             `${m.version} changed after it was applied: the database no longer matches the code`,
           );

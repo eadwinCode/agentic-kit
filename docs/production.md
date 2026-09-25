@@ -52,6 +52,11 @@ the example's `20260926000000_message_seq` migration, which numbers the rows
 already there in their old order (`createdAt`, then `id`). Copy it into your
 own migrations and run `prisma generate`.
 
+The example's migrations create the whole schema the adapter writes to,
+including the usage table's billing columns
+(`20260927000000_token_usage_billing`): `prisma migrate deploy` on a fresh
+database is all a deploy needs.
+
 ## Deployment shapes
 
 **Serverless.** The natural fit: `run()` returns in milliseconds, and the queue
