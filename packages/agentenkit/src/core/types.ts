@@ -592,6 +592,19 @@ export interface AgentConfig {
    *  fails its run with the reason, instead of doing work nobody is waiting
    *  for any more. 0 means no limit. */
   maxQueueWaitMs: number;
+  /** How long a run stream is kept after its segment ends (ms). A tab that
+   *  reconnects within it resumes inside the stream; one that comes later
+   *  gets a snapshot, which has the final text in the messages. */
+  streamGraceMs: number;
+  /** How long a stream lives if nothing ever closes it (ms): the last guard
+   *  when the worker and the sweep both failed. */
+  streamTtlMs: number;
+  /** How long stream events wait to be appended together (ms). A step end,
+   *  a tool result, a park and a close go out at once. 0 sends every event
+   *  as it comes. */
+  streamFlushMs: number;
+  /** Append at once when this many stream events are waiting. */
+  streamFlushEvents: number;
   /** Refuse a new run (RUN_REFUSED, reason `queue_full`) once this many jobs
    *  are ready and waiting (§2.8). Needs a queue that can count; one that
    *  cannot is never refused on. 0 means no cap. */
@@ -665,6 +678,10 @@ export const DEFAULT_CONFIG: AgentConfig = {
   segmentTimeoutMs: 0,
   maxQueueWaitMs: 0,
   maxQueueDepth: 0,
+  streamGraceMs: 10 * 60_000,
+  streamTtlMs: 24 * 60 * 60_000,
+  streamFlushMs: 50,
+  streamFlushEvents: 32,
 };
 
 export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
@@ -696,7 +713,12 @@ export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
       `Invalid config: runRedriveDelaySeconds (${config.runRedriveDelaySeconds}) must be a non-negative integer`,
     );
   }
-  for (const key of ['stepTimeoutMs', 'segmentTimeoutMs', 'maxQueueWaitMs', 'maxQueueDepth'] as const) {
+  for (const key of ['streamGraceMs', 'streamTtlMs', 'streamFlushEvents'] as const) {
+    if (!Number.isInteger(config[key]) || config[key] < 1) {
+      throw new Error(`Invalid config: ${key} (${config[key]}) must be an integer of at least 1`);
+    }
+  }
+  for (const key of ['stepTimeoutMs', 'segmentTimeoutMs', 'maxQueueWaitMs', 'maxQueueDepth', 'streamFlushMs'] as const) {
     if (!Number.isFinite(config[key]) || config[key] < 0) {
       throw new Error(`Invalid config: ${key} (${config[key]}) must not be negative`);
     }

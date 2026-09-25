@@ -52,7 +52,18 @@ func Publish(ctx context.Context, deps ports.RuntimePorts, threadID, typ string,
 	if err != nil {
 		return event, err
 	}
-	return event, deps.Bus.Publish(ctx, threadID, event)
+	err = deps.Bus.Publish(ctx, threadID, event)
+	toSegment(ctx, deps, event)
+	return event, err
+}
+
+// toSegment hands an event to the run stream this process has open on the
+// thread, if any; the segment keeps what belongs in a stream (see
+// SegmentStream).
+func toSegment(ctx context.Context, deps ports.RuntimePorts, event ports.AgentEvent) {
+	if seg := ActiveSegment(deps, event.ThreadID); seg != nil {
+		seg.Forward(ctx, event.Type, event.Payload, ReservedEventTypes[event.Type])
+	}
 }
 
 // nextSeq takes the thread's next event seq. A counter that restarts at 1 on
@@ -126,7 +137,9 @@ func publishNotice(ctx context.Context, deps ports.RuntimePorts, threadID, typ s
 		ThreadID: threadID, Seq: 0, Type: typ,
 		Payload: MarshalPayload(payload), CreatedAt: time.Now(),
 	}
-	return event, deps.Bus.Publish(ctx, threadID, event)
+	err := deps.Bus.Publish(ctx, threadID, event)
+	toSegment(ctx, deps, event)
+	return event, err
 }
 
 // ReservedEventTypes are the event types the platform itself emits. An app

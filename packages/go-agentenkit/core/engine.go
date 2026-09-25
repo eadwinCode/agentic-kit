@@ -168,6 +168,7 @@ func unwindVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadI
 		}); err != nil {
 			return false, err
 		}
+		streamToolResult(ctx, deps, threadID, pending.AgentID, pending.ToolCallID, pending.ToolName, result)
 		if err := landVerdict(ctx, deps, threadID, pending, expired); err != nil {
 			return false, err
 		}
@@ -224,9 +225,26 @@ func unwindVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadI
 		}); err != nil {
 			return false, err
 		}
+		streamToolResult(ctx, deps, threadID, frame.AgentID, frame.ToolCallID, "spawnSubagent", handed)
 		producer = frame.Nested
 	}
 	return true, nil
+}
+
+// streamToolResult puts a result the resume saved on the resume's run
+// stream: a live tool's result goes out as its chunk, but a verdict's is
+// only ever saved.
+func streamToolResult(ctx context.Context, deps ports.RuntimePorts, threadID, agentID, toolCallID, toolName string, result any) {
+	seg := ActiveSegment(deps, threadID)
+	if seg == nil {
+		return
+	}
+	chunk := MarshalPayload(map[string]any{"type": "tool-result", "toolCallId": toolCallID, "toolName": toolName, "result": result})
+	if agentID != "" {
+		seg.Forward(ctx, "SUBAGENT_CHUNK", MarshalPayload(map[string]any{"agentId": agentID, "chunk": chunk}), true)
+		return
+	}
+	seg.Forward(ctx, "CHUNK", chunk, true)
 }
 
 // stopped reports a user stop on the hot cache (§2.1).
@@ -644,7 +662,7 @@ const (
 // work and renews it while the segment runs, so a held lock always means a
 // live worker. Two workers can never run one thread, and a crashed worker's
 // lock expires within a lease instead of blocking forever (§3.4).
-func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, input ExecuteInput) (ExecuteOutcome, error) {
+func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, input ExecuteInput) (outcome ExecuteOutcome, retErr error) {
 	threadID, runID := input.ThreadID, input.RunID
 	if err := ValidateTokenBudget(input.TokenBudget, "tokenBudget"); err != nil {
 		return "", err
@@ -758,6 +776,32 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	defer func() {
 		cancel()
 		<-pollDone
+	}()
+
+	// The segment's run stream, open from pickup (see SegmentStream), and how
+	// it ends: set where the segment's outcome is known, or worked out here
+	// from how it stopped. Closed before the lock goes, so the next
+	// segment's stream never starts while this one is still open.
+	var seg *SegmentStream
+	var segEnd ports.StreamEnd
+	defer func() {
+		if seg == nil || seg.Closed() {
+			return
+		}
+		end := segEnd
+		if end == nil {
+			switch {
+			case lockLost.Load() || outcome == OutcomeLockLost:
+				end = &ports.RunErrorEvent{Status: "lost", Error: "the worker lost the run lock"}
+			case ctx.Err() != nil:
+				end = &ports.RunErrorEvent{Status: "lost", Error: "the worker shut down mid-run"}
+			case retErr != nil:
+				end = &ports.RunErrorEvent{Status: "error", Error: retErr.Error()}
+			default:
+				end = &ports.RunErrorEvent{Status: "error", Error: "the segment ended"}
+			}
+		}
+		seg.Close(ctx, end)
 	}()
 
 	// A newer run already owns this thread: this job has nothing to do, and
@@ -890,6 +934,9 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		}
 	}
 
+	// From here on the segment does work, and says so on its own stream.
+	seg = OpenSegment(ctx, deps, threadID, runID)
+
 	// Platform-owned toolset: HITL (§2.5) over the user's set; spawnSubagent
 	// added ONLY when the spec opts in (§2.7). rawTools keeps the real
 	// implementations: the resolved park executes the approved tool.
@@ -938,6 +985,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			if err := CommitParks(ctx, deps, parks); err != nil {
 				return "", err
 			}
+			segEnd = &ports.RunFinishedEvent{Status: "parked"}
 			return OutcomeExecuted, nil
 		}
 	}
@@ -1023,6 +1071,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		if runID != "" {
 			accrueRunRecord(ctx, deps, runID, loop)
 		}
+		segEnd = &ports.RunFinishedEvent{Status: "parked"}
 		return OutcomeExecuted, nil
 	}
 
@@ -1073,6 +1122,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	if err := Finalize(ctx, deps, agent, threadID, f); err != nil {
 		return "", err
 	}
+	segEnd = segmentEnd(state, f.Error, bill, string(loop.FinishReason), seg)
 	if agent.Args.OnFinish != nil {
 		agent.Args.OnFinish(ports.RunFinishInfo{
 			ThreadID: threadID, RunID: runID, State: state, StopReason: stopReason,
@@ -1100,6 +1150,36 @@ type FinalizeInput struct {
 	Steps int
 	// Error is why it failed, when it did (§2.9).
 	Error string
+}
+
+// segmentEnd is how a finalized segment's stream ends.
+func segmentEnd(state ports.ExecutionState, failure string, bill ports.UsageTotals, finishReason string, seg *SegmentStream) ports.StreamEnd {
+	if state == ports.StateFailed {
+		if failure == "" {
+			failure = "the run failed"
+		}
+		return &ports.RunErrorEvent{Status: "error", Error: failure}
+	}
+	end := &ports.RunFinishedEvent{
+		Status: "finished",
+		Usage: &ports.StreamUsage{
+			InputTokens: int64(bill.InputTokens), CachedInputTokens: int64(bill.CachedInputTokens),
+			OutputTokens: int64(bill.OutputTokens), TotalTokens: int64(bill.TotalTokens),
+		},
+		FinishReason: finishReason,
+	}
+	if state == ports.StateCancelled {
+		end.Status = "stopped"
+	}
+	for _, c := range bill.Costs {
+		end.Costs = append(end.Costs, ports.StreamCost{Currency: c.Currency, Micros: c.CostMicros})
+	}
+	if seg != nil {
+		if text, ok := seg.OneShotText(); ok {
+			end.Text = text
+		}
+	}
+	return end
 }
 
 // Finalize finalizes a finished run (§5.6): attribute the segment's tokens
@@ -1457,7 +1537,11 @@ func FailLostRun(ctx context.Context, deps ports.RuntimePorts, agent *Registered
 	if thread.State == ports.StateWaitingForInput {
 		_ = closeOpenParks(ctx, deps, threadID)
 	}
-	return true, failRun(ctx, deps, agent, threadID, runID, reason)
+	err = failRun(ctx, deps, agent, threadID, runID, reason)
+	// The dead worker never closed its segment's stream: a reader waiting on
+	// it stops here.
+	CloseLostSegment(ctx, deps, runID, reason)
+	return true, err
 }
 
 // SettleLate settles an ended run whose settle never ran (§5.6), under the

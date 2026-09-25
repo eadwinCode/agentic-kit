@@ -1,5 +1,6 @@
 import type { RuntimePorts } from '../ports/runtime.js';
 import { THREAD_KEY_TTL_SECONDS } from './keys.js';
+import { activeSegment } from './segment.js';
 import type { ExecutionState, ThreadTransition } from './types.js';
 import type { AgentEvent } from './types.js';
 
@@ -54,7 +55,15 @@ export async function publish(
     return e;
   });
   await deps.bus.publish(threadId, event);
+  await toSegment(deps, threadId, type, payload);
   return event;
+}
+
+/** Hands an event to the run stream this process has open on the thread,
+ *  if any; the segment keeps what belongs in a stream (see SegmentStream). */
+async function toSegment(deps: RuntimePorts, threadId: string, type: string, payload: unknown) {
+  const seg = activeSegment(deps, threadId);
+  if (seg) await seg.forward(type, payload, RESERVED_EVENT_TYPES.has(type));
 }
 
 /** Publish a bus-only notice (never persisted) — e.g. HITL death notices (§2.5). */
@@ -66,6 +75,7 @@ export async function publishNotice(
 ): Promise<AgentEvent> {
   const event: AgentEvent = { threadId, seq: 0, type, payload, createdAt: new Date() };
   await deps.bus.publish(threadId, event);
+  await toSegment(deps, threadId, type, payload);
   return event;
 }
 

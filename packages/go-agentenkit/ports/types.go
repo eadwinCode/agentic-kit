@@ -855,6 +855,19 @@ type AgentConfig struct {
 	// RefusedQueueFull so a host can answer 503 with a Retry-After. Zero is
 	// no bound. A queue adapter may enforce its own cap on top.
 	MaxQueueDepth int
+	// StreamGrace is how long a run stream is kept after its segment ends.
+	// A tab that reconnects within it resumes inside the stream; one that
+	// comes later gets a snapshot, which has the final text in the messages.
+	StreamGrace time.Duration
+	// StreamTTL is how long a stream lives if nothing ever closes it: the
+	// last guard when the worker and the sweep both failed.
+	StreamTTL time.Duration
+	// StreamFlush is how long stream events wait to be appended together. A
+	// step end, a tool result, a park and a close go out at once. Zero sends
+	// every event as it comes.
+	StreamFlush time.Duration
+	// StreamFlushEvents appends at once when this many stream events wait.
+	StreamFlushEvents int
 	// TokenBudget is the default per-run token budget (input + output). Zero
 	// means unbounded apart from MaxSteps.
 	TokenBudget int
@@ -937,6 +950,9 @@ func mergeConfig(c, d AgentConfig) AgentConfig {
 	orInt(&c.SubagentMaxSteps, d.SubagentMaxSteps)
 	orInt(&c.SubagentResultCapChars, d.SubagentResultCapChars)
 	orInt(&c.PayloadCapChars, d.PayloadCapChars)
+	orDur(&c.StreamGrace, d.StreamGrace)
+	orDur(&c.StreamTTL, d.StreamTTL)
+	orInt(&c.StreamFlushEvents, d.StreamFlushEvents)
 	orInt(&c.ContextCeilingTokens, d.ContextCeilingTokens)
 	orFloat(&c.CompactionTrigger, d.CompactionTrigger)
 	orFloat(&c.ContextTailShare, d.ContextTailShare)
@@ -970,6 +986,10 @@ func DefaultConfig() AgentConfig {
 		RunLockLease:               2 * time.Minute,
 		RunRetryBackoff:            5 * time.Second,
 		RunRetryBackoffMax:         2 * time.Minute,
+		StreamGrace:                10 * time.Minute,
+		StreamTTL:                  24 * time.Hour,
+		StreamFlush:                50 * time.Millisecond,
+		StreamFlushEvents:          32,
 	}
 }
 
@@ -1006,6 +1026,12 @@ func ResolveConfig(partial *AgentConfig) (AgentConfig, error) {
 	}
 	if config.StepTimeout < 0 || config.SegmentTimeout < 0 || config.MaxQueueWait < 0 || config.MaxQueueDepth < 0 {
 		return config, errors.New("invalid config: StepTimeout, SegmentTimeout, MaxQueueWait and MaxQueueDepth must not be negative")
+	}
+	if config.StreamFlush < 0 {
+		return config, fmt.Errorf("invalid config: StreamFlush (%s) must not be negative", config.StreamFlush)
+	}
+	if config.StreamGrace < time.Millisecond || config.StreamTTL < time.Millisecond || config.StreamFlushEvents < 1 {
+		return config, errors.New("invalid config: StreamGrace and StreamTTL must be at least 1ms, StreamFlushEvents at least 1")
 	}
 	if config.RunLockLease < time.Second {
 		// The lease is the only thing that heals a crashed worker's lock (§3.4)

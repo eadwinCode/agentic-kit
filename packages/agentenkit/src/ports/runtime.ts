@@ -28,6 +28,7 @@ export type { AgentRunState, BoundStorage, StorageContext } from '../core/state.
 import type { EventBus } from './bus.js';
 import type { Queue } from './queue.js';
 import type { Kv } from './kv.js';
+import type { RunStreams } from './streams.js';
 import type { ExecuteInput, ExecuteOutcome } from '../core/engine.js';
 import type {
   AdminOverview,
@@ -59,6 +60,8 @@ export interface RuntimePorts {
   bus: EventBus;
   queue: Queue;
   kv: Kv;
+  /** Run streams, one per segment; absent, none are written. */
+  streams?: RunStreams;
   /** User-provided model resolution (§3.3): models can live in any shape on
    *  the consumer side — the platform only ever sees `ResolvedModel`. */
   resolveModel(modelName: string): ResolvedModel;
@@ -99,6 +102,9 @@ export interface RuntimeOptions {
   bus: EventBus;
   queue: Queue;
   kv: Kv;
+  /** Short-lived logs, one per run segment. Omitted, no run streams are
+   *  written. */
+  streams?: RunStreams;
   /** Models can come in any shape — config files, a database, provider SDKs.
    *  The platform only ever sees the resolved `ResolvedModel`. */
   resolveModel(modelName: string): ResolvedModel;

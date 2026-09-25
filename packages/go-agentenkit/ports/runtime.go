@@ -19,6 +19,8 @@ type RuntimePorts struct {
 	Bus     EventBus
 	Queue   Queue
 	Kv      Kv
+	// Streams holds the run streams, one per segment; nil writes none.
+	Streams RunStreams
 	// ResolveModel is user-provided model resolution (§3.3): models can live
 	// in any shape on the consumer side; the platform only sees ResolvedModel.
 	ResolveModel func(modelName string) (ResolvedModel, error)
@@ -61,6 +63,9 @@ type RuntimeOptions struct {
 	Bus   EventBus
 	Queue Queue
 	Kv    Kv
+	// Streams holds short-lived logs, one per run segment. Nil writes no
+	// run streams.
+	Streams RunStreams
 	// ResolveModel turns a registry key into a provider instance and a
 	// context window.
 	ResolveModel func(modelName string) (ResolvedModel, error)

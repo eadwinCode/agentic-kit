@@ -75,6 +75,7 @@ func (c *AgentCore) scope(state AgentRunState, runID string) ports.RuntimePorts 
 		Bus:          c.opts.Bus,
 		Queue:        c.opts.Queue,
 		Kv:           c.opts.Kv,
+		Streams:      c.opts.Streams,
 		ResolveModel: c.opts.ResolveModel,
 		Pricer:       c.opts.Pricer,
 		Log:          c.opts.Log,

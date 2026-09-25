@@ -55,6 +55,7 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
     bus: opts.bus,
     queue: opts.queue,
     kv: opts.kv,
+    streams: opts.streams,
     resolveModel: (modelName: string) => opts.resolveModel(modelName),
     pricer: opts.pricer,
     log: opts.log,
