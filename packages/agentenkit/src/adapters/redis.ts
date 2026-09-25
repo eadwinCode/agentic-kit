@@ -1,6 +1,7 @@
 import type { AgentEvent } from '../core/types.js';
 import type { Kv } from '../ports/kv.js';
 import type { EventBus } from '../ports/bus.js';
+import { compareEntryIds, ScriptedRunStreams, sleep } from './stream-scripts.js';
 import { DEL_IF_VALUE_SCRIPT, INCR_WITH_EXPIRY_SCRIPT, SET_IF_VALUE_SCRIPT, THREAD_CHANNEL } from './upstash.js';
 
 /** Minimal structural type of a node-redis (v4) client — the real client
@@ -17,6 +18,8 @@ export interface RedisClientLike {
   publish: any;
   /** node-redis v4: `eval(script, { keys, arguments })`. */
   eval: any;
+  /** Any command, raw: `sendCommand(['XREAD', ...])`. */
+  sendCommand?: any;
   duplicate(): any;
 }
 
@@ -187,5 +190,156 @@ export class RedisBus implements EventBus {
   private stopHeartbeat() {
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.heartbeat = undefined;
+  }
+}
+
+/** How long a stream key with no reader stays watched. */
+const TAIL_IDLE_MS = 10_000;
+
+/** An XREAD reply as [key, entries] pairs. RESP2 gives an array of pairs;
+ *  RESP3 clients give a map, as a Map or a plain object. */
+function xreadPairs(reply: unknown): Array<[string, Array<[string, unknown]>]> {
+  if (!reply) return [];
+  if (Array.isArray(reply)) return reply as Array<[string, Array<[string, unknown]>]>;
+  if (reply instanceof Map) return [...reply.entries()] as Array<[string, Array<[string, unknown]>]>;
+  return Object.entries(reply as object) as Array<[string, Array<[string, unknown]>]>;
+}
+
+/** One blocking `XREAD` per process, shared by every reader of every stream
+ *  here: a connection per reader would run a busy deployment into Redis's
+ *  `maxclients`, like a subscriber per viewer would. A reader registers the
+ *  stream key and the last id it has; the tail wakes it when an entry past
+ *  that id lands. When a key it does not watch yet arrives, the tail breaks
+ *  its own block with `CLIENT UNBLOCK` and starts again with the new key. */
+class StreamTail {
+  private conn: Promise<{ client: any; id: string }> | null = null;
+  /** Per key: the newest entry id the tail has seen, who waits, and when a
+   *  reader last waited. A key stays watched a while after its last reader
+   *  leaves, so a reader that waits again after each event does not break
+   *  the block every time. */
+  private readonly keys = new Map<string, { seen: string; waiters: Set<() => void>; used: number }>();
+  private running = false;
+
+  constructor(
+    private readonly client: RedisClientLike,
+    private readonly blockMs: number,
+  ) {}
+
+  private connection() {
+    if (!this.conn) {
+      const conn = this.client.duplicate();
+      conn.on?.('error', (err: unknown) => console.error('redis stream tail error', err));
+      this.conn = Promise.resolve(conn.connect())
+        .then(async () => ({ client: conn, id: String(await conn.sendCommand(['CLIENT', 'ID'])) }))
+        .catch((err) => {
+          this.conn = null;
+          void Promise.resolve(conn.quit?.()).catch(() => undefined);
+          throw err;
+        });
+    }
+    return this.conn;
+  }
+
+  /** Resolves when `key` may have an entry past `after`. */
+  wait(key: string, after: string, maxMs: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve) => {
+      let entry = this.keys.get(key);
+      // The tail already saw something past this reader: wake at once.
+      if (entry && compareEntryIds(entry.seen, after) > 0) return resolve();
+      let timer: ReturnType<typeof setTimeout>;
+      const done = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', done);
+        const e = this.keys.get(key);
+        if (e?.waiters.delete(done)) e.used = Date.now();
+        resolve();
+      };
+      timer = setTimeout(done, maxMs);
+      signal?.addEventListener('abort', done, { once: true });
+      const fresh = !entry;
+      if (!entry) {
+        entry = { seen: after, waiters: new Set(), used: Date.now() };
+        this.keys.set(key, entry);
+      }
+      entry.waiters.add(done);
+      entry.used = Date.now();
+      if (fresh) void this.restart();
+    });
+  }
+
+  /** Runs the loop, or breaks its current block so it takes the new keys. */
+  private async restart() {
+    if (!this.running) {
+      this.running = true;
+      void this.loop().finally(() => {
+        this.running = false;
+        // A key that came in while the loop was on its way out.
+        if (this.keys.size > 0) void this.restart();
+      });
+      return;
+    }
+    try {
+      const { id } = await this.connection();
+      await this.client.sendCommand?.(['CLIENT', 'UNBLOCK', id]);
+    } catch {
+      // The loop's own timeout picks the key up.
+    }
+  }
+
+  private async loop() {
+    for (;;) {
+      const now = Date.now();
+      for (const [key, e] of this.keys) {
+        if (e.waiters.size === 0 && now - e.used > TAIL_IDLE_MS) this.keys.delete(key);
+      }
+      if (this.keys.size === 0) return;
+      const keys = [...this.keys.keys()];
+      const ids = keys.map((k) => this.keys.get(k)!.seen);
+      let reply: unknown;
+      try {
+        const { client } = await this.connection();
+        reply = await client.sendCommand(['XREAD', 'BLOCK', String(this.blockMs), 'STREAMS', ...keys, ...ids]);
+      } catch {
+        // A dropped connection: readers fall back on their own poll until
+        // the next pass reconnects.
+        await sleep(200);
+        continue;
+      }
+      for (const [key, entries] of xreadPairs(reply)) {
+        const entry = this.keys.get(String(key));
+        const last = entries.at(-1)?.[0];
+        if (!entry || !last) continue;
+        entry.seen = String(last);
+        for (const wake of [...entry.waiters]) wake();
+      }
+    }
+  }
+
+  async close() {
+    const conn = this.conn;
+    this.conn = null;
+    if (conn) await conn.then(({ client }) => client.quit()).catch(() => undefined);
+  }
+}
+
+/** RunStreams over Redis Streams (see stream-scripts.ts for the keys and
+ *  scripts, the same ones the Go adapter runs). Readers in one process share
+ *  one blocking connection; `pollMs` is the floor under a missed wake-up. */
+export class RedisRunStreams extends ScriptedRunStreams {
+  private readonly tail: StreamTail;
+
+  constructor(client: RedisClientLike, opts: { pollMs?: number; blockMs?: number } = {}) {
+    const tail = new StreamTail(client, opts.blockMs ?? 5_000);
+    super(
+      (script, keys, args) => client.eval(script, { keys, arguments: args }),
+      (key, after, maxMs, signal) => tail.wait(key, after, maxMs, signal),
+      opts.pollMs ?? 1_000,
+    );
+    this.tail = tail;
+  }
+
+  /** Closes the shared tail connection. */
+  async shutdown(): Promise<void> {
+    await this.tail.close();
   }
 }

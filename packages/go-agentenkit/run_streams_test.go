@@ -10,7 +10,15 @@ import (
 	"testing"
 	"time"
 
+	"net/http"
+	"net/http/httptest"
+	"os"
+
+	goredis "github.com/redis/go-redis/v9"
+
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/memory"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/redis"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/upstash"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
 
@@ -324,4 +332,43 @@ func runStreamsSuite(t *testing.T, name string, make func(t *testing.T) ports.Ru
 
 func TestRunStreams(t *testing.T) {
 	runStreamsSuite(t, "memory", func(*testing.T) ports.RunStreams { return memory.NewRunStreams() }, streamsSuiteOptions{})
+
+	if os.Getenv("TEST_REDIS_ADDR") == "" {
+		t.Log("TEST_REDIS_ADDR not set: skipping the redis and upstash cases")
+		return
+	}
+	shared := goredis.NewClient(&goredis.Options{Addr: os.Getenv("TEST_REDIS_ADDR")})
+	t.Cleanup(func() { shared.Close() })
+	runStreamsSuite(t, "redis", func(*testing.T) ports.RunStreams {
+		return redis.NewRunStreams(shared, redis.StreamsOptions{})
+	}, streamsSuiteOptions{
+		// Another process: its own client, so no in-process wake-up reaches
+		// the reader. The tail still sees the XADD, as it would across
+		// processes.
+		other: func(t *testing.T) ports.RunStreams {
+			c := goredis.NewClient(&goredis.Options{Addr: os.Getenv("TEST_REDIS_ADDR")})
+			t.Cleanup(func() { c.Close() })
+			return redis.NewRunStreams(c, redis.StreamsOptions{})
+		},
+	})
+
+	// Upstash's REST API, played by a small server in front of the same
+	// Redis: a JSON command array in, {"result": ...} out.
+	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var cmd []any
+		if err := json.NewDecoder(r.Body).Decode(&cmd); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		res, err := shared.Do(r.Context(), cmd...).Result()
+		if err != nil && !errors.Is(err, goredis.Nil) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"result": res})
+	}))
+	t.Cleanup(rest.Close)
+	upstashRedis := &upstash.Redis{URL: rest.URL, Token: "test"}
+	makeUpstash := func(*testing.T) ports.RunStreams { return upstash.NewRunStreams(upstashRedis, 50*time.Millisecond) }
+	runStreamsSuite(t, "upstash", makeUpstash, streamsSuiteOptions{other: makeUpstash, settle: 100 * time.Millisecond})
 }
