@@ -8,6 +8,7 @@ const runtime = await setupAgentCore({
   queue,            // required — durable dispatch
   bus,              // required — live fan-out
   kv,               // required — hot state
+  streams,          // run streams; left out, kept in memory (one process only)
   resolveModel,     // required — registry key → { instance, contextWindow, modelId }
   admin,            // optional — defaults to SQLite, or Postgres via env
   pricer,           // optional — prices every model call (§4)
@@ -78,6 +79,21 @@ start from `DefaultConfig()` to keep them on.
 | `promptCaching` | `true` | Stamp cache breakpoints on the stable prefix. |
 | `nativeWindows` | — | Per-model windows below the ceiling. A `contextWindow` from `resolveModel` wins. |
 
+### Run streams
+
+Each run segment writes a short-lived [run stream](./run-streams.md). Go names
+in brackets, as durations.
+
+| Setting | Default | Meaning |
+| :--- | ---: | :--- |
+| `streamGraceMs` (`StreamGrace`) | `600000` (10 min) | How long a stream is kept after its segment ends. A tab that reconnects within it picks up inside the stream; one that comes later gets a snapshot, which has the final text in the messages. |
+| `streamTtlMs` (`StreamTTL`) | `86400000` (24 h) | How long a stream lives if nothing ever closes it. The last guard when the worker and the sweep both failed. |
+| `streamFlushMs` (`StreamFlush`) | `50` | How long stream events wait to be appended together. A step end, a tool result, a park and a close go out at once. `0` sends every event as it comes. |
+| `streamFlushEvents` (`StreamFlushEvents`) | `32` | Append at once when this many stream events are waiting. |
+
+Keep the grace short on Redis, where streams live in memory. On Postgres or
+SQLite it can be higher, since rows on disk cost little.
+
 ### Operational history
 
 | Setting | Default | Meaning |
@@ -117,5 +133,5 @@ by *your* code, not the library's.
 
 See [React](./react.md#everything-else-you-can-change) for the full table. In
 brief: `routes`, `baseUrl`, `fetch`, `headers`, `openStream`, `defaultModel`,
-`persistence`, `labels`, `format`, `onEvent`, `threadsRefreshMs`,
+`persistence`, `labels`, `format`, `onEvent`, `onCustom`, `threadsRefreshMs`,
 `loadThreadsOnMount`, `initialThreadId`.

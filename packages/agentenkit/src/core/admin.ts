@@ -1,6 +1,7 @@
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { RunFilter, StepRecord, ThreadStart } from '../ports/admin.js';
 import { UnsupportedError, type QueueStats } from '../ports/queue.js';
+import { STREAM_ONLY_TYPES } from './prune.js';
 import type {
   AgentEvent,
   ExecutionState,
@@ -93,8 +94,9 @@ export interface RunDetail {
   steps: StepRecord[];
   /** Nested runs spawned beneath it (§2.7) — the same RunRecord shape. */
   subagents: RunRecord[];
-  /** The run's events with CHUNKs stripped — the readable spine, not the
-   *  token-by-token firehose. */
+  /** The run's entries in the thread record — each segment's start and
+   *  end, its parks and their answers, a refusal, a budget stop: the
+   *  readable spine. Its steps are in `steps`. */
   events: AgentEvent[];
   /** What this run spent, nested runs included (§4): tokens, money, and a
    *  line per agent and model. Read from the usage rows, so it is the same
@@ -331,7 +333,7 @@ export async function getRun(deps: RuntimePorts, runId: string): Promise<RunDeta
   const [steps, siblings, events, usage] = await Promise.all([
     listSteps(deps, runId),
     deps.admin.runs.listByThread(run.threadId),
-    deps.storage.events.listSince(run.threadId, -1),
+    runEvents(deps, run),
     // Spend per run, from the one place money lives (§4). Best effort: a run
     // view must still render when the usage read fails.
     deps.storage.usage.total(run.threadId, { runId }).catch((err) => {
@@ -347,12 +349,22 @@ export async function getRun(deps: RuntimePorts, runId: string): Promise<RunDeta
     steps,
     // Its children: same table, distinguished by depth (§2.7).
     subagents: siblings.filter((c: RunRecord) => c.parentRunId === runId),
-    // CHUNK is the token firehose; a timeline wants the spine.
-    events: events.filter((e: AgentEvent) => {
-      if (e.type === 'CHUNK' || e.type === 'SUBAGENT_CHUNK') return false;
-      const at = new Date(e.createdAt).getTime();
-      return at >= from && at <= to;
-    }),
+    events,
     usage,
   };
+}
+
+/** A run's entries in the thread record. A thread written before entries
+ *  named their run has none by id; its log is read by the run's time
+ *  window instead, without the chunks. */
+async function runEvents(deps: RuntimePorts, run: RunRecord): Promise<AgentEvent[]> {
+  const own = await deps.storage.events.list(run.threadId, { runId: run.id });
+  if (own.length > 0) return own;
+  const from = new Date(run.startedAt).getTime();
+  const to = run.endedAt ? new Date(run.endedAt).getTime() : Infinity;
+  return (await deps.storage.events.listSince(run.threadId, -1)).filter((e) => {
+    if (STREAM_ONLY_TYPES.includes(e.type)) return false;
+    const at = new Date(e.createdAt).getTime();
+    return at >= from && at <= to;
+  });
 }

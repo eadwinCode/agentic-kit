@@ -3,6 +3,7 @@ import { StreamGoneError } from '../ports/streams.js';
 import { snapshotStream, threadSnapshot } from './snapshot.js';
 import type { StreamItem } from './stream-events.js';
 import type { AgentEvent } from './types.js';
+import { agUiState, toAgUi, type AgUiState, type WireFormat } from './agui.js';
 
 export interface FollowOptions {
   /** Resume after this seq. `-1` (the default) replays the thread from the
@@ -349,8 +350,20 @@ export async function* followThread(
   const cursor = options.cursor ?? null;
   try {
     if (deps.streams) {
-      if (cursor?.streamId) {
+      // A cursor comes from the client: its stream is read only when it is
+      // this thread's. Any other is treated as gone, so the client gets a
+      // SNAPSHOT of its own thread and never another thread's events.
+      const own = cursor?.streamId
+        ? (await deps.streams.snapshot(cursor.streamId).catch(() => null))?.meta.threadId === threadId
+        : false;
+      if (cursor?.streamId && own) {
         readStream(cursor.streamId, cursor.offset ?? null, true);
+      } else if (cursor?.streamId) {
+        const snapshot = await threadSnapshot(deps, threadId, { afterMessageId: options.lastMessageId });
+        if (snapshot) {
+          push({ kind: 'snapshot', snapshot });
+          if (snapshot.stream && !snapshot.stream.end) readStream(snapshot.stream.streamId, snapshot.stream.offset, false);
+        }
       } else {
         // No stream cursor: start from what the messages lack, as a
         // snapshot would.
@@ -420,14 +433,26 @@ export function followFrame(frame: FollowFrame, cursor: ThreadCursor): string {
   return moved ? `id: ${formatCursor(cursor)}\ndata: ${data}\n\n` : `data: ${data}\n\n`;
 }
 
-/** A thread's follow, encoded as Server-Sent Events (see followThread). */
+/** The same frame as AG-UI events, one SSE message each; the frame's cursor
+ *  rides on the first, so a reconnect resumes just as with our own frames. */
+export function agUiFrame(frame: FollowFrame, cursor: ThreadCursor, state: AgUiState): string {
+  const ours = followFrame(frame, cursor);
+  const id = ours.startsWith('id: ') ? ours.slice(0, ours.indexOf('\n') + 1) : '';
+  return toAgUi(frame, state)
+    .map((event, i) => `${i === 0 ? id : ''}data: ${JSON.stringify(event)}\n\n`)
+    .join('');
+}
+
+/** A thread's follow, encoded as Server-Sent Events (see followThread): our
+ *  own frames, or with `wireFormat: 'ag-ui'` AG-UI events. */
 export function toFollowSse(
   frames: AsyncGenerator<FollowFrame>,
   cursor: ThreadCursor | null,
-  options: { retryMs?: number } = {},
+  options: { retryMs?: number; wireFormat?: WireFormat; threadId?: string } = {},
 ): SseStream {
   const encoder = new TextEncoder();
   const at: ThreadCursor = cursor ? { ...cursor } : { seq: -1 };
+  const agUi = options.wireFormat === 'ag-ui' ? agUiState(options.threadId ?? '') : null;
   let started = false;
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
@@ -444,7 +469,8 @@ export function toFollowSse(
           controller.close();
           return;
         }
-        controller.enqueue(encoder.encode(followFrame(value, at)));
+        const text = agUi ? agUiFrame(value, at, agUi) : followFrame(value, at);
+        if (text) controller.enqueue(encoder.encode(text));
       } catch (error) {
         controller.error(error);
       }

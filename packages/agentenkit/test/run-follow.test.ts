@@ -113,6 +113,21 @@ describe('run follow', () => {
     expect(snap.snapshot.stream?.streamId).toBe(`${second.runId}:1`);
   });
 
+  it("a cursor naming another thread's stream is never read", async () => {
+    const r = await makeRuntime(textModel('secret', 'mine'));
+    const other = await r.chat.run({ prompt: 'a' });
+    await r.runtime.worker.handleJob(r.queue.items.shift()!);
+    const own = await r.chat.run({ prompt: 'b' }); // a thread of its own
+    await r.runtime.worker.handleJob(r.queue.items.shift()!);
+
+    const gen = r.runtime.events.follow(own.threadId, { cursor: `0 ${other.runId}:1 1` });
+    const frames = await readUntil(gen, (f) => f.some((x) => x.kind === 'snapshot'));
+    expect(texts(frames)).not.toContain('secret');
+    const snap = frames.find((f) => f.kind === 'snapshot');
+    if (snap?.kind !== 'snapshot') throw new Error('no snapshot');
+    expect(snap.snapshot.thread.id).toBe(own.threadId); // its own thread instead
+  });
+
   it('the sse id carries the record seq and the stream position', () => {
     const at = { seq: 4 };
     const thread = followFrame(

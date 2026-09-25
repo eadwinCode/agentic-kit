@@ -4,9 +4,9 @@
 bun add use-agentenkit
 ```
 
-A hook that owns the client state machine — hydrate from the durable snapshot,
-replay the active run, then tail the event stream — and leaves every endpoint,
-string and transport to you.
+A hook that owns the client state machine — hydrate from the snapshot, show
+the run stream in flight, then follow the thread record and the run streams —
+and leaves every endpoint, string and transport to you.
 
 ## The smallest thing that works
 
@@ -74,6 +74,14 @@ doubling, up to 30 s). An event the hook already has — a replay, or a
 transport that resent after reconnecting — is dropped before anything sees it,
 so text is never shown twice.
 
+The hook opens the stream with two query params: `cursor` (where it is,
+`<seq> <streamId> <offset>`) and `lastMessageId` (the last message it has). It
+also sends `since`, the record seq alone, for an older server. If the stream
+it was reading is gone by the time it reconnects, the server sends one
+`SNAPSHOT` frame on the same connection, and the hook merges its newer
+messages in place — no second request, no reload. See
+[HTTP API](./http-api.md#live-stream).
+
 **Actions**
 
 `run`, `stop`, `respondToInput`, `newThread`, `selectThread`, `deleteThread`,
@@ -117,7 +125,7 @@ type EntryPart =
 
 A tool call's `state` flips to `done` (or `error`) in place when its result
 arrives, live or on reload, so a card can settle without a second lookup.
-Live, the runtime publishes a `tool-result` chunk for every tool it ran,
+Live, the run stream carries a `TOOL_CALL_RESULT` for every tool it ran,
 before the step commits. On reload the state is derived from the durable tool
 messages, which is how a denied approval, a stop, or an approval that ran the
 tool later gets its state: those never stream a result. `error` means the
@@ -178,7 +186,7 @@ message can be edited.
 | `run` | POST | `/api/agent/run` |
 | `stop` | POST | `/api/agent/control` |
 | `respond` | POST | `/api/agent/respond` |
-| `stream` | GET (SSE) | `/api/agent/stream` |
+| `stream` | GET (SSE) | `/api/agent/stream` — params `{ threadId, since, cursor, lastMessageId }` |
 | `history` | GET | `/api/agent/history` |
 | `usage` | GET | `/api/agent/usage` |
 | `threads` | GET | `/api/threads` |
@@ -228,6 +236,7 @@ route without restating the rest.
 | `labels` | English | every user-facing string the hook produces |
 | `format` | plain text | how tool calls, results and subagent notices render |
 | `onEvent` | none | see every event first; return `true` to claim it |
+| `onCustom` | none | `(name, value)` for your own events, once each, live or durable |
 | `threadsRefreshMs` | `30000` | background thread-list refresh; `false` disables |
 | `loadThreadsOnMount` | `true` | off for a single-thread embed |
 
@@ -251,14 +260,31 @@ useAgentThread({
 ```
 
 The same hook takes a WebSocket or fetch-streaming transport. One that
-reconnects on its own should resume after `getCursor()`, the seq of the last
-event the hook applied; the hook drops anything at or below it anyway.
+reconnects on its own should resume from `getCursor()`: the cursor string
+`<seq> <streamId> <offset>`, the id of the last frame the hook applied. Send it
+as `Last-Event-ID` or as the `cursor` query param. The hook drops anything it
+already has anyway.
 
 The default persistence keeps the thread id in the URL with
 `history.replaceState`, passing the page's own history state through, so it
 does not disturb the Next.js router.
 
 ### Your own event types
+
+The simplest way is `onCustom`. It gets each of your events once, by name,
+whether it came live on the run stream or from the thread record:
+
+```ts
+useAgentThread({
+  onCustom: (name, value) => {
+    if (name === 'MY_APP_EVENT') handle(value);
+  },
+});
+```
+
+`onEvent` sees every event, the platform's too, before the built-in reducer.
+Your events reach it with `type` set to their name and `payload` set to their
+value:
 
 ```ts
 useAgentThread({
@@ -292,7 +318,7 @@ other, an edit truncates both, an approval answered in one drops its card in
 the other (`HITL_RESPONSE`), a thread deleted in one resets the other
 (`THREAD_DELETED`), and a tab opened mid-run rebuilds what has happened so far
 and then follows along. You do not have to do anything for this
-— it falls out of hydrate-then-tail.
+— it falls out of hydrate-then-follow.
 
 ## Notes
 

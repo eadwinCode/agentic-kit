@@ -8,6 +8,7 @@ const runtime = await setupAgentCore({
   queue,          // required
   bus,            // required
   kv,             // required
+  streams,        // needed when web servers and workers run apart
   resolveModel,   // required
   admin,          // optional
   config,         // optional
@@ -23,7 +24,7 @@ nothing looks exactly like no traffic.
 
 ## `storage` — your data
 
-Threads, messages, events and usage. See
+Threads, messages, the thread record and usage. See
 [Ports and adapters](./ports-and-adapters.md) for the full interface and its
 invariants.
 
@@ -73,9 +74,9 @@ Nothing dispatches until `bind` runs.
 bus: new RedisBus(redis)
 ```
 
-At-most-once, deliberately. A dropped frame is recovered by replaying the
-durable event log from the client's cursor — which is what lets the bus be Redis
-pub/sub, Upstash, Ably, or Postgres `LISTEN/NOTIFY`.
+At-most-once, deliberately. A dropped frame is recovered by reading the thread
+record and the run stream again from the client's cursor — which is what lets
+the bus be Redis pub/sub, Upstash, Ably, or Postgres `LISTEN/NOTIFY`.
 
 `RedisBus` takes an optional heartbeat interval, which drives the watchdog:
 
@@ -89,12 +90,34 @@ new RedisBus(redis, 60_000)   // default
 kv: new RedisKv(redis)
 ```
 
-Thread state cache, run identity, HITL handoff keys, and the per-thread `seq`
-counter. Everything here is reconstructible except while a run is in flight.
+Thread state cache, run identity, HITL handoff keys, and the segment and
+attempt counters. Everything here is reconstructible except while a run is in
+flight.
 
-The `seq` counter is the one to be careful about: `events.append` takes its
-`seq` from `kv.incr`, clients use it as a cursor, and a repeated or
-out-of-order value causes replay bugs that look like missing messages.
+The thread record's `seq` is not here any more: the store mints it when it
+stores an entry.
+
+## `streams` — run streams
+
+```ts
+streams: new RedisRunStreams(redis)
+```
+
+Each run segment writes its live events (text, reasoning, tool calls, step
+ends) to its own short-lived stream. A client reads it through
+`runtime.events.follow` or `sse`. See [Run streams](./run-streams.md).
+
+| Adapter | Use |
+| :--- | :--- |
+| `RedisRunStreams`, `UpstashRunStreams` | production; keep `streamGraceMs` short, since Redis holds it in memory |
+| `PrismaRunStreams` | production on your SQL database; needs the `RunStream` and `RunStreamEvent` models |
+| `SqliteRunStreams` | one machine, or development |
+| `MemoryRunStreams` | tests |
+
+Leave it out and the runtime keeps streams in memory, and logs a warning once.
+That is fine for one process. It is **not** fine when web servers and workers
+are separate processes: a web server could never read what a worker wrote, so
+a tab would see nothing until each step was saved. Pass a real one there.
 
 ## `resolveModel` — your models, your shape
 
@@ -158,15 +181,17 @@ This is not a port. You do not implement `AdminStore`; you read it back through
 Beyond the agent factories, the runtime exposes the reads and the event stream:
 
 ```ts
-runtime.events.sse(threadId, { since, signal })    // SSE stream + headers, any framework
-runtime.events.follow(threadId, { signal })        // the same events, as an async iterable
+runtime.events.sse(threadId, { cursor, lastMessageId, signal })  // SSE stream + headers, any framework
+runtime.events.follow(threadId, { cursor, signal })              // the same frames, as an async iterable
+runtime.streams.read(streamId, after, signal)                    // one run stream on its own
 runtime.getThreadSnapshot(threadId, state)         // hydrate a client
 runtime.admin.overview()                           // operational reads
 runtime.worker.handleJob(job)                      // the queue consumer
 ```
 
-The stream carries the replay-then-tail rules with it, so a route handler is a
-cursor and a response — see [HTTP API](./http-api.md#live-stream).
+The follow carries the replay-then-tail rules with it, and reads the thread
+record and the run streams as one, so a route handler is a cursor and a
+response — see [HTTP API](./http-api.md#live-stream).
 
 ## `config` — behaviour
 
@@ -203,7 +228,7 @@ worth deciding deliberately:
 ```ts
 import { Database } from 'bun:sqlite';
 import { setupAgentCore } from 'agentenkit';
-import { SqliteStorage } from 'agentenkit/adapters/sqlite';
+import { SqliteRunStreams, SqliteStorage } from 'agentenkit/adapters/sqlite';
 import { InlineQueue } from 'agentenkit/adapters/inline';
 import { MemoryBus, MemoryKv } from 'agentenkit/adapters/memory';
 import { SqliteAdminStore } from 'agentenkit/admin/sqlite';
@@ -213,6 +238,7 @@ const queue = new InlineQueue();
 
 export const runtime = await setupAgentCore({
   storage: new SqliteStorage(db),
+  streams: new SqliteRunStreams(db),
   admin: SqliteAdminStore.open(db),
   bus: new MemoryBus(),
   kv: new MemoryKv(),
@@ -232,6 +258,7 @@ export const runtime = await setupAgentCore({
   storage: new PrismaStorage(new PrismaClient()),
   bus: new RedisBus(redis),
   kv: new RedisKv(redis),
+  streams: new RedisRunStreams(redis),
   queue: new QStashQueue(
     new Client({ token: process.env.QSTASH_TOKEN! }),
     { url: `${process.env.APP_URL}/api/queue/agent-run` },
@@ -251,6 +278,7 @@ export async function testRuntime(model: LanguageModelV1) {
     storage: new MemoryStorage(),
     bus: new MemoryBus(),
     kv: new MemoryKv(),
+    streams: new MemoryRunStreams(),
     queue,
     admin: new MemoryAdminStore(),   // never touch the disk
     resolveModel: () => ({ instance: () => model, contextWindow: 128_000 }),

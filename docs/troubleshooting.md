@@ -177,7 +177,9 @@ you have added `externals` entries for it, try removing them.
 
 ## Still stuck
 
-Open an issue with the thread's event log (`runtime.events.since(threadId, -1)`)
-and the run record (`runtime.admin.getRun(runId)`). Between them they usually
-show exactly where a run stopped doing what you expected:
+Open an issue with the thread's record (`runtime.events.since(threadId, -1)`)
+and the run record (`runtime.admin.getRun(runId)`). Add the run's stream
+(`runtime.streams.snapshot('<runId>:<segment>')`) if it is still inside its
+grace window. Between them they usually show exactly where a run stopped doing
+what you expected:
 <https://github.com/eadwinCode/agentic-kit/issues>

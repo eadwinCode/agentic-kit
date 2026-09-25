@@ -285,12 +285,16 @@ func (e *EventsAPI) FollowRecord(ctx context.Context, threadID string, opts Foll
 	return core.FollowEvents(ctx, e.c.scope(opts.State, ""), threadID, opts.FollowOptions)
 }
 
-// SSEStateOptions is FollowStateOptions with the SSE retry hint.
+// SSEStateOptions is FollowStateOptions with the SSE retry hint and wire
+// format.
 type SSEStateOptions struct {
 	FollowStateOptions
 	// RetryMs is emitted once, up front: how long a browser waits before
 	// reconnecting. Zero omits it.
 	RetryMs int
+	// WireFormat is "agentenkit" (the default) or "ag-ui" to send AG-UI
+	// events instead of our frames (opt-in).
+	WireFormat string
 }
 
 // SSE is Follow, encoded as Server-Sent Events: each frame that moves the
@@ -300,7 +304,11 @@ func (e *EventsAPI) SSE(ctx context.Context, threadID string, opts SSEStateOptio
 	if err != nil {
 		return nil, err
 	}
-	return core.ToFollowSSE(frames, opts.cursor(), opts.RetryMs), nil
+	sse := core.ToFollowSSE(frames, opts.cursor(), opts.RetryMs)
+	if opts.WireFormat == core.WireAgUI {
+		sse.AsAgUI(threadID)
+	}
+	return sse, nil
 }
 
 // PruneEvents deletes the stream-only rows (chunks, step markers, state

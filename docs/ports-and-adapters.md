@@ -1,21 +1,23 @@
 # Ports and adapters
 
-The engine imports no database driver. Four interfaces stand between it and your
+The engine imports no database driver. Five interfaces stand between it and your
 stack; implement any of them for anything.
 
 | Port | Role | Reference adapters |
 | :--- | :--- | :--- |
-| `Storage` | threads, messages, events, usage | `PrismaStorage`, `SqliteStorage`, `MemoryStorage` |
+| `Storage` | threads, messages, the thread record, usage | `PrismaStorage`, `SqliteStorage`, `MemoryStorage` |
 | `Queue` | durable run dispatch | `QStashQueue`, `InlineQueue`, `MemoryQueue` |
 | `EventBus` | live fan-out | `RedisBus`, `UpstashBus`, `MemoryBus` |
 | `Kv` | hot state, handoff keys, counters | `RedisKv`, `UpstashKv`, `MemoryKv` |
+| `RunStreams` | one short-lived stream per run segment | `RedisRunStreams`, `UpstashRunStreams`, `PrismaRunStreams`, `SqliteRunStreams`, `MemoryRunStreams` |
 
 The `Memory*` adapters are a complete implementation used by the test suite, and
 double as a template.
 
-The Go runtime also ships all four over **one Postgres**
+The Go runtime also ships all five over **one Postgres**
 (`adapters/postgres`): the storage, a `Kv`, an `EventBus` over
-LISTEN/NOTIFY and a `Queue` over a jobs table. See
+LISTEN/NOTIFY, a `Queue` over a jobs table and `RunStreams` over two tables.
+See
 [One Postgres for everything](#one-postgres-for-everything-go).
 
 ## Storage
@@ -36,11 +38,14 @@ interface Storage {
     list(threadId, opts, ctx): Promise<MessageDTO[]>;
     deleteFrom(threadId, messageId, ctx): Promise<number>;
   };
+  // The thread record: only what must outlive a run.
   events: {
-    append(threadId, event, ctx): Promise<void>;
+    append(threadId, event: NewThreadEvent, ctx): Promise<AgentEvent>; // mints the seq
+    list(threadId, filter: ThreadEventFilter, ctx): Promise<AgentEvent[]>;
     listSince(threadId, sinceSeq, ctx): Promise<AgentEvent[]>;
     latest(threadId, type, ctx): Promise<AgentEvent | null>;
     listByType(threadId, type, ctx): Promise<AgentEvent[]>;
+    prune?(types, { limit, dryRun }): Promise<Record<string, number>>; // optional
   };
   usage: {
     // One row per MODEL CALL, priced before it reaches you (§4).
@@ -54,6 +59,27 @@ interface Storage {
 
 Every method takes a trailing `ctx` carrying the run's
 [state](./run-state.md) — that is how a query scopes itself to a tenant.
+
+### `events` — the thread record
+
+The events table is small now. It keeps only what must outlive a run:
+`INPUT_REQUIRED`, `INPUT_EXPIRED`, `HITL_RESPONSE`, `RUN_REFUSED`,
+`TOKEN_BUDGET_EXHAUSTED`, `COST_BUDGET_EXHAUSTED`, `CONTEXT_COMPACTED`,
+`MESSAGES_DROPPED`, `RUN_STARTED`, `RUN_ENDED`, and an app's events published
+with `durable: true`. Text chunks, step markers and state changes are live
+only: they go to the run stream or the bus, never here. So the table grows
+with runs, not with tokens.
+
+- `append` takes an entry **without** a `seq` (`{ type, payload, runId? }`)
+  and returns it with one. The store mints the seq: the thread's next, one
+  higher than any it holds. Two appends on one thread must never get the same
+  seq — take it inside the insert, under the thread's row lock or a unique
+  `(threadId, seq)` index with a retry. There is no kv counter any more.
+- Each entry carries the `runId` it belongs to, when it belongs to one.
+- `list(threadId, { types, runId, after, limit })` reads entries by filter,
+  oldest first.
+- `prune` is optional. It backs `runtime.pruneEvents`; a storage without it
+  cannot prune.
 
 ### `messages.list` scoping
 
@@ -180,8 +206,8 @@ interface EventBus {
 }
 ```
 
-At-most-once, deliberately. A dropped frame is recovered from the durable event
-log, so the bus does not need delivery guarantees — which is what lets it be
+At-most-once, deliberately. A dropped frame is recovered from the thread
+record and the run stream, so the bus does not need delivery guarantees — which is what lets it be
 Redis pub/sub, Ably, or Postgres `LISTEN/NOTIFY`. Nor does it need ordering: a
 follower that sees seq N+1 before N (another process published N and is still
 writing it, or the bus dropped it) reads the gap back from storage before it
@@ -189,8 +215,89 @@ yields N+1, so a client never misses an event and never sees one twice.
 
 The reference buses keep one subscriber connection per process, shared by every
 subscription, and give each subscription its own queue, so one slow client
-holds up nobody. Token deltas are merged before they are published (one event
-per 50 ms of text rather than one per token), in the same event shape.
+holds up nobody.
+
+During a run, the bus carries little: record entries and notices such as
+`STATE_CHANGE`. Text, reasoning and tool activity go to the run stream.
+
+## RunStreams
+
+```ts
+interface RunStreams {
+  open(streamId, meta: { threadId, runId }, ttlMs): Promise<void>;
+  append(streamId, events: StreamEvent[]): Promise<string[]>;   // one offset per event
+  read(streamId, after: string | null, signal?): AsyncIterable<StreamItem>;
+  snapshot(streamId, after?): Promise<StreamSnapshot | null>;
+  close(streamId, end: StreamEnd, graceMs): Promise<void>;
+  delete(streamId): Promise<void>;
+}
+```
+
+```go
+type RunStreams interface {
+	Open(ctx context.Context, streamID string, meta StreamMeta, ttl time.Duration) error
+	Append(ctx context.Context, streamID string, events []StreamEvent) ([]string, error)
+	Read(ctx context.Context, streamID, after string) iter.Seq2[StreamItem, error]
+	Snapshot(ctx context.Context, streamID, after string) (*StreamSnapshot, error)
+	Close(ctx context.Context, streamID string, end StreamEnd, grace time.Duration) error
+	Delete(ctx context.Context, streamID string) error
+}
+```
+
+One stream per run segment, with the id `<runId>:<n>`. It is opened when a
+worker picks the run up, closed with a `RUN_FINISHED` or `RUN_ERROR` item when
+the segment ends, and deleted `streamGraceMs` later. See
+[Run streams](./run-streams.md) for the design.
+
+Every adapter keeps these rules:
+
+- Offsets are opaque strings. Only the store compares them; a client echoes
+  the last one back and nothing else.
+- Offsets strictly increase within a stream. There is one writer per stream:
+  the run lock already makes sure of that.
+- `close` writes the end as the last item, so a reader that sees it stops, and
+  one that comes late still gets it.
+- A missed wake-up only delays a reader, never drops an event.
+- A stream that does not exist throws `StreamGoneError` (Go: `ErrStreamGone`)
+  on `read`, `append` and `close`; `append` to a closed one throws
+  `StreamClosedError` (Go: `ErrStreamClosed`).
+
+| Adapter | TypeScript | Go | Notes |
+| :--- | :--- | :--- | :--- |
+| Redis | `new RedisRunStreams(client)` | `redis.NewRunStreams(client, redis.StreamsOptions{})` | Redis Streams. Readers in one process share one blocking `XREAD`. Keep the grace short: it is memory. |
+| Upstash | `new UpstashRunStreams(redis)` | `upstash.NewRunStreams(redis, poll)` | The same scripts over REST; readers poll. |
+| Postgres | `new PrismaRunStreams(prisma)` | `postgres.NewRunStreams(ctx, db, postgres.StreamsOptions{Listener: …})` | Prisma needs the `RunStream` and `RunStreamEvent` models. In Go, a `Listener` wakes readers with `LISTEN`; without one they poll. |
+| SQLite | `new SqliteRunStreams(db)` | `sqlite.NewRunStreams(ctx, db, poll)` | Readers in this process wake at once; another process sees writes on its next poll. |
+| Memory | `new MemoryRunStreams()` | `memory.NewRunStreams()` | Tests, and the default when none is passed. One process only. |
+
+The Prisma models, as in `examples/nextjs-app/prisma/schema.prisma`:
+
+```prisma
+model RunStream {
+  id        String   @id
+  threadId  String
+  runId     String
+  closed    Boolean  @default(false)
+  endEvent  String?
+  expiresAt DateTime
+
+  @@index([expiresAt])
+  @@index([threadId])
+}
+
+model RunStreamEvent {
+  pos      BigInt @id @default(autoincrement())
+  streamId String
+  event    String
+
+  @@index([streamId, pos])
+}
+```
+
+Leave `streams` out of `setupAgentCore` (Go: `RuntimeOptions.Streams`) and the
+runtime keeps them in memory and logs a warning once. Only that process can
+read them, so a deployment where web servers and workers are separate
+processes must pass a real one.
 
 ## Kv
 
@@ -210,8 +317,8 @@ interface Kv {
 ```
 
 Hot cache and coordination: thread state, run identity, HITL handoff keys, and
-the per-thread `seq` counter. Everything here is reconstructible except while a
-run is in flight.
+the segment and retry counters. Everything here is reconstructible except while
+a run is in flight.
 
 `setIfValue` and `delIfValue` act only while the key still holds `expected`,
 and each must be **one atomic step**: a Lua script on Redis, a conditional
@@ -224,8 +331,8 @@ must add them.
 
 Break one of these and the failure is subtle rather than loud.
 
-1. `events.append` receives its `seq` from `kv.incr('agent:seq:{threadId}')` —
-   monotonic per thread. Clients use it as a cursor, so a repeated or
+1. `events.append` mints each entry's `seq` in the store — monotonic per
+   thread, never repeated. Clients use it as a cursor, so a repeated or
    out-of-order value causes replay bugs.
 2. `threads.claimState` and `threads.transition` are atomic — exactly one
    caller wins.
@@ -247,13 +354,14 @@ storage, _ := postgres.New(ctx, db)
 kv, _ := postgres.NewKv(ctx, db)
 queue, _ := postgres.NewQueue(ctx, db, postgres.QueueOptions{})
 bus := postgres.NewBus(db, pgxlisten.New(url), storage.Events(), kv, postgres.BusOptions{})
-// …SetupAgentCore, then:
+streams, _ := postgres.NewRunStreams(ctx, db, postgres.StreamsOptions{Listener: pgxlisten.New(url)})
+// …SetupAgentCore with Streams: streams, then:
 queue.Bind(rt.Worker.Handler())
 ```
 
 **Kv.** `SET NX` is one `INSERT … ON CONFLICT DO UPDATE … WHERE expired`
 and `Incr` increments inside the conflict clause, so two workers never both
-take a lock or the same seq. Expiry is enforced on read; `DeleteExpired` is
+take a lock or the same count. Expiry is enforced on read; `DeleteExpired` is
 housekeeping.
 
 **EventBus.** One `LISTEN` connection per process (`pgxlisten`, over pgx),
@@ -262,13 +370,20 @@ which a tool result can exceed: an event that does not fit, durable or not,
 is parked in the kv for a minute and travels as a reference to that key. The
 kv needs no storage scope to read back, so a storage that requires a tenant
 on every read still gets its oversized events. Each subscription keeps the
-last durable seq it delivered; when the `LISTEN` connection comes back after
+last record seq it delivered; when the `LISTEN` connection comes back after
 a drop, the bus replays what each subscriber missed from `Storage.Events`,
 scoped with the run state on the subscriber's own context, and delivers
 nothing twice. At-most-once still, and the client's cursor replay stays the
 last line.
 
-**Schema.** The storage, kv and queue tables are set up by the same migrator
+**RunStreams.** Two tables, `<prefix>streams` and `<prefix>stream_events`.
+A write sends `NOTIFY` in its transaction, so readers in other processes wake
+when it commits. One channel (`agentenkit_streams`) serves every stream, so a
+process holds one `LISTEN` connection however many streams it reads. Without a
+`Listener`, readers poll (`Poll`, default 1s). Rows on disk cost little, so
+`StreamGrace` can be longer here than on Redis.
+
+**Schema.** The storage, kv, queue and stream tables are set up by the same migrator
 as the admin store, once per database: each prefix has its own ledger,
 `<prefix>migrations`, and a start with nothing to do reads it and moves on.
 Before, every start ran its `ALTER TABLE` statements, and each one takes a lock

@@ -26,6 +26,7 @@ import type { StreamSnapshot } from './streams.js';
 import type { PublishEventOptions } from '../core/publish.js';
 import type { SnapshotStream } from '../core/snapshot.js';
 import type { PruneOptions, PruneReport } from '../core/prune.js';
+import type { WireFormat } from '../core/agui.js';
 
 export type { AdminStore, NewStepRecord, RunFilter, StepRecord } from './admin.js';
 export type { AgentRunState, BoundStorage, StorageContext } from '../core/state.js';
@@ -466,9 +467,13 @@ export interface AgentCore {
       options?: FollowStartOptions & { state?: AgentRunState },
     ): AsyncGenerator<FollowFrame>;
     /** `follow`, encoded as Server-Sent Events. Each frame that moves the
-     *  cursor carries it as its `id:`. Returns the stream and the headers
-     *  rather than a Response, because half the ecosystem has none. */
-    sse(threadId: string, options?: FollowStartOptions & { retryMs?: number; state?: AgentRunState }): SseStream;
+     *  cursor carries it as its `id:`. `wireFormat: 'ag-ui'` sends AG-UI
+     *  events instead of our frames (opt-in). Returns the stream and the
+     *  headers rather than a Response, because half the ecosystem has none. */
+    sse(
+      threadId: string,
+      options?: FollowStartOptions & { retryMs?: number; wireFormat?: WireFormat; state?: AgentRunState },
+    ): SseStream;
     /** The thread record and its notices alone, as before run streams: no
      *  stream frames. */
     followRecord(

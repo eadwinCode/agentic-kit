@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"slices"
 	"sort"
 	"time"
 
@@ -95,7 +96,9 @@ type RunDetail struct {
 	Steps []ports.StepRecord `json:"steps"`
 	// Subagents are the nested runs spawned beneath it (§2.7).
 	Subagents []ports.RunRecord `json:"subagents"`
-	// Events are the run's events with CHUNKs stripped: the readable spine.
+	// Events are the run's entries in the thread record: each segment's
+	// start and end, its parks and their answers, a refusal, a budget stop.
+	// The readable spine; its steps are in Steps.
 	Events []ports.AgentEvent `json:"events"`
 	// Usage is what this run spent, nested runs included (§4): tokens, money,
 	// and a line per agent and model. Read from the usage rows, so it is the
@@ -361,7 +364,7 @@ func GetRun(ctx context.Context, deps ports.RuntimePorts, runID string) (*RunDet
 	if err != nil {
 		return nil, err
 	}
-	events, err := deps.Storage.Events.ListSince(ctx, run.ThreadID, -1)
+	events, err := runEvents(ctx, deps, run)
 	if err != nil {
 		return nil, err
 	}
@@ -378,18 +381,31 @@ func GetRun(ctx context.Context, deps ports.RuntimePorts, runID string) (*RunDet
 			detail.Subagents = append(detail.Subagents, c) // its children: same table, by depth (§2.7)
 		}
 	}
-	from := run.StartedAt
-	for _, e := range events {
-		if e.Type == "CHUNK" || e.Type == "SUBAGENT_CHUNK" {
-			continue // the token firehose; a timeline wants the spine
-		}
-		if e.CreatedAt.Before(from) {
+	detail.Events = append(detail.Events, events...)
+	return detail, nil
+}
+
+// runEvents is a run's entries in the thread record. A thread written
+// before entries named their run has none by id; its log is read by the
+// run's time window instead, without the chunks.
+func runEvents(ctx context.Context, deps ports.RuntimePorts, run *ports.RunRecord) ([]ports.AgentEvent, error) {
+	own, err := deps.Storage.Events.List(ctx, run.ThreadID, ports.ThreadEventFilter{RunID: run.ID})
+	if err != nil || len(own) > 0 {
+		return own, err
+	}
+	all, err := deps.Storage.Events.ListSince(ctx, run.ThreadID, -1)
+	if err != nil {
+		return nil, err
+	}
+	var out []ports.AgentEvent
+	for _, e := range all {
+		if slices.Contains(StreamOnlyTypes, e.Type) || e.CreatedAt.Before(run.StartedAt) {
 			continue
 		}
 		if run.EndedAt != nil && e.CreatedAt.After(*run.EndedAt) {
 			continue
 		}
-		detail.Events = append(detail.Events, e)
+		out = append(out, e)
 	}
-	return detail, nil
+	return out, nil
 }

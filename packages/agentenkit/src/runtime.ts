@@ -206,7 +206,7 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
         followThread(scope(options.state), threadId, { ...options, cursor: cursorOf(options) }),
       sse: (threadId, options = {}) => {
         const cursor = cursorOf(options);
-        return toFollowSse(followThread(scope(options.state), threadId, { ...options, cursor }), cursor, options);
+        return toFollowSse(followThread(scope(options.state), threadId, { ...options, cursor }), cursor, { ...options, threadId });
       },
       followRecord: (threadId, options = {}) =>
         followEvents(scope(options.state), threadId, options),

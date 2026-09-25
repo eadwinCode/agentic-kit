@@ -141,6 +141,38 @@ func TestRunFollow(t *testing.T) {
 		mustEqual(t, got.Stream.StreamID, second.RunID+":1", "and run b's stream")
 	})
 
+	t.Run("a cursor naming another thread's stream is never read", func(t *testing.T) {
+		h, _ := streamRuntime(t, scripted(step{text: "secret"}, step{text: "mine"}))
+		chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat", Model: "gpt-4o"})
+		other := h.run(t, chat, agentenkit.RunInput{Prompt: "a"})
+		h.handleNext(t)
+		own := h.run(t, chat, agentenkit.RunInput{Prompt: "b"}) // a thread of its own
+		h.handleNext(t)
+
+		ctx, cancel := context.WithCancel(h.ctx)
+		defer cancel()
+		stream, err := h.rt.Events.Follow(ctx, own.ThreadID, agentenkit.FollowStateOptions{Cursor: "0 " + other.RunID + ":1 1"})
+		must(t, err)
+		frames := readUntil(t, stream, func(f []core.FollowFrame) bool {
+			for _, x := range f {
+				if x.Kind == core.FrameKindSnapshot {
+					return true
+				}
+			}
+			return false
+		})
+		for _, d := range frameTexts(frames) {
+			if d == "secret" {
+				t.Fatal("another thread's stream was read")
+			}
+		}
+		for _, f := range frames {
+			if f.Kind == core.FrameKindSnapshot {
+				mustEqual(t, f.Snapshot.Thread.ID, own.ThreadID, "its own thread instead")
+			}
+		}
+	})
+
 	t.Run("the sse id carries the record seq and the stream position", func(t *testing.T) {
 		at := core.ThreadCursor{Seq: 4}
 		thread := core.FollowFrameSSE(core.FollowFrame{Kind: core.FrameKindThread, Event: &ports.AgentEvent{ThreadID: "t", Seq: 5, Type: "X"}}, &at)

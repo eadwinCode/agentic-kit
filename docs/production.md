@@ -155,5 +155,7 @@ approvals hold no lock, so a long human wait does not enter into it.
 ## Upgrading
 
 Both packages are pre-1.0. Pin exact versions and read the release notes; the
-event log shape and the port signatures are the two surfaces most likely to
-move.
+wire frames and the port signatures are the two surfaces most likely to move.
+After upgrading to run streams, run `runtime.pruneEvents()` (Go:
+`rt.PruneEvents`) once to clear the old stream-only rows from the events
+table; see [Run streams](./run-streams.md).

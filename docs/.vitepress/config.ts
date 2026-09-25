@@ -62,6 +62,7 @@ export default defineConfig({
           { text: 'Context and tokens', link: '/context-and-tokens' },
           { text: 'Cost and pricing', link: '/cost-and-pricing' },
           { text: 'Provider options', link: '/provider-options' },
+          { text: 'Run streams', link: '/run-streams' },
           { text: 'Custom events', link: '/custom-events' },
         ],
       },

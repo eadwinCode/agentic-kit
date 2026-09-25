@@ -208,8 +208,32 @@ func FollowThread(ctx context.Context, deps ports.RuntimePorts, threadID string,
 		since = opts.Cursor.Seq
 	}
 	if deps.Streams != nil {
+		// A cursor comes from the client: its stream is read only when it is
+		// this thread's. Any other is treated as gone, so the client gets a
+		// SNAPSHOT of its own thread and never another thread's events.
+		own := false
 		if opts.Cursor != nil && opts.Cursor.StreamID != "" {
+			if snap, err := deps.Streams.Snapshot(ctx, opts.Cursor.StreamID, ""); err == nil && snap != nil {
+				own = snap.Meta.ThreadID == threadID
+			}
+		}
+		if own {
 			readStream(opts.Cursor.StreamID, opts.Cursor.Offset, true)
+		} else if opts.Cursor != nil && opts.Cursor.StreamID != "" {
+			snap, err := ThreadSnapshotOf(ctx, deps, threadID, opts.LastMessageID)
+			if err != nil {
+				cancel()
+				return nil, err
+			}
+			if snap != nil {
+				senders.Add(1)
+				go func() {
+					defer senders.Done()
+					if send(FollowFrame{Kind: FrameKindSnapshot, Snapshot: snap}) && snap.Stream != nil && snap.Stream.End == nil {
+						readStream(snap.Stream.StreamID, snap.Stream.Offset, false)
+					}
+				}()
+			}
 		} else {
 			// No stream cursor: start from what the messages lack, as a
 			// snapshot would.
@@ -303,6 +327,8 @@ type FollowSSE struct {
 	frames  *FrameStream
 	cursor  ThreadCursor
 	retryMs int
+	// agUI, when set, sends AG-UI events instead of our frames.
+	agUI *AgUIState
 }
 
 // ToFollowSSE wraps a FrameStream for SSE; cursor is where the client was.
@@ -312,6 +338,12 @@ func ToFollowSSE(frames *FrameStream, cursor *ThreadCursor, retryMs int) *Follow
 		at = *cursor
 	}
 	return &FollowSSE{Headers: SSEHeaders, frames: frames, cursor: at, retryMs: retryMs}
+}
+
+// AsAgUI sends the follow as AG-UI events (opt-in) for a thread.
+func (s *FollowSSE) AsAgUI(threadID string) *FollowSSE {
+	s.agUI = NewAgUIState(threadID)
+	return s
 }
 
 // Err reports why the underlying follow stopped.
@@ -339,7 +371,16 @@ func (s *FollowSSE) WriteTo(w io.Writer) (int64, error) {
 		}
 	}
 	for f := range s.frames.Frames() {
-		if err := write(FollowFrameSSE(f, &s.cursor)); err != nil {
+		frame := ""
+		if s.agUI != nil {
+			var err error
+			if frame, err = AgUIFrameSSE(f, &s.cursor, s.agUI); err != nil {
+				return total, err
+			}
+		} else {
+			frame = FollowFrameSSE(f, &s.cursor)
+		}
+		if err := write(frame); err != nil {
 			return total, err
 		}
 	}
