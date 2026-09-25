@@ -665,8 +665,14 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		// A replay boundary (§2.2): everything this step produced is durable
 		// history now, so a reconnecting client must NOT also replay its
 		// chunks. Persisted (not a notice) because the snapshot needs its seq.
+		// It carries the step's finish and usage: a run stream turns it into
+		// its STEP_FINISHED, at the moment the step is saved.
+		a := u.Totals()
 		if _, err := Publish(ctx, deps, threadID, "STEP_COMMITTED", map[string]any{
 			"index": out.Steps, "agentId": nullable(input.AgentID),
+			"step": out.Steps + 1, "finishReason": string(step.FinishReason),
+			"inputTokens": a.InputTokens, "cachedInputTokens": a.CachedInputTokens,
+			"outputTokens": a.OutputTokens, "totalTokens": a.TotalTokens,
 		}); err != nil {
 			return out, err
 		}
@@ -678,7 +684,6 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			}
 		}
 
-		a := u.Totals()
 		lastInput = u.InputTokens
 		out.Attribution.Add(a)
 		out.TokensUsed += a.TotalTokens

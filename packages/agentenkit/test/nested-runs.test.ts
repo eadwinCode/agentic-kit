@@ -11,6 +11,7 @@ import { markRequiresConfirmation } from '../src/core/engine.js';
 import { compactContext } from '../src/core/context.js';
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
 import type { RuntimeOptions } from '../src/ports/runtime.js';
+import { subagents } from './stream-helpers.js';
 
 const finish = (reason: string, usage = { promptTokens: 10, completionTokens: 5 }) =>
   ({ type: 'finish', finishReason: reason, usage }) as LanguageModelV1StreamPart;
@@ -557,8 +558,8 @@ describe('a nested run that fails (§2.7)', () => {
     expect((await r.storage.threads.get(ran.threadId))!.state).toBe('COMPLETED');
     expect(await r.kv.get(`agent:attempts:${ran.threadId}`)).toBeNull(); // never retried
     // The child is still recorded as failed, with its reason.
-    const failed = r.bus.published.find((e) => e.type === 'SUBAGENT_FAILED')!.payload as any;
-    expect(failed).toMatchObject({ state: 'FAILED', error: 'child provider exploded' });
+    const [failed] = (await subagents(r.runtime.ports(), ran.threadId)).failed;
+    expect(failed).toMatchObject({ status: 'failed', error: 'child provider exploded' });
   });
 
   it('a user stop still tears the whole run down', async () => {
@@ -585,8 +586,8 @@ describe('a nested run that fails (§2.7)', () => {
 
     await chat.executeWithPolicy({ threadId: ran.threadId, runId: ran.runId, model: 'gpt-4o' });
 
-    const failed = r.bus.published.find((e) => e.type === 'SUBAGENT_FAILED')!.payload as any;
-    expect(failed.state).toBe('CANCELLED');
+    const [failed] = (await subagents(r.runtime.ports(), ran.threadId)).failed;
+    expect(failed!.status).toBe('cancelled');
     // It propagated rather than being handed back as a result the model reads.
     expect(
       r.storage.messages.store.get(ran.threadId)!.some((m) => m.role === 'tool'),

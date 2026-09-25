@@ -255,7 +255,7 @@ func TestSegmentStreams(t *testing.T) {
 		seg := core.OpenSegment(h.ctx, h.rt.Ports(nil), "t1", "run1")
 		seg.Forward(h.ctx, "CHUNK", json.RawMessage(`{"type":"text-delta","textDelta":"a"}`), true)
 		mustStrings(t, itemTypes(streamItems(t, streams, "run1:1")), []string{"RUN_STARTED"}, "held")
-		seg.Forward(h.ctx, "STEP_FINISHED", json.RawMessage(`{"agentId":null,"index":1,"finishReason":"stop","totalTokens":3}`), true)
+		seg.Forward(h.ctx, "STEP_COMMITTED", json.RawMessage(`{"agentId":null,"index":0,"step":1,"finishReason":"stop","totalTokens":3}`), true)
 		mustStrings(t, itemTypes(streamItems(t, streams, "run1:1")), []string{
 			"RUN_STARTED", "TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END", "STEP_FINISHED",
 		}, "flushed")

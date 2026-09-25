@@ -281,7 +281,8 @@ type SubagentEventEvent struct {
 
 type SubagentFinishedEvent struct {
 	SubagentID string `json:"subagentId"`
-	// Status is "completed" or "failed".
+	// Status is "completed", "failed", or "cancelled" when a user stop
+	// reached the child.
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
 }

@@ -3,6 +3,7 @@ package agentenkit_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -263,7 +264,7 @@ func TestEvents_ReplaysSinceACursorAndSubscribesLive(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.handleNext(t)
-	if len(live) == 0 || live[len(live)-1] != "STATE_CHANGE" {
+	if !slices.Contains(live, "STATE_CHANGE") || live[len(live)-1] != "RUN_ENDED" {
 		t.Fatalf("live tail missing, got %v", live)
 	}
 	_ = unsub()

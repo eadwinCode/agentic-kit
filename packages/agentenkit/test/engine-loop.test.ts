@@ -439,7 +439,7 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
   });
 
   it('one-shot flavor publishes TEXT_RESULT and needs no CHUNK stream', async () => {
-    const { runtime, bus, queue } = await makeRuntime(scriptedModel([{ text: 'answer' }]));
+    const { runtime, bus, queue, streams } = await makeRuntime(scriptedModel([{ text: 'answer' }]));
     const agent = runtime.createGenerateTextAgent({ name: 'oneshot', model: 'gpt-4o' });
 
     const ran = await agent.run({ prompt: 'hi' });
@@ -447,9 +447,10 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
 
     expect(states(bus)).toEqual(['QUEUED', 'RUNNING', 'COMPLETED']);
     expect(lastTerminal(bus).payload).toMatchObject({ state: 'COMPLETED', stopReason: 'completed' });
-    const textResult = bus.published.find((e) => e.type === 'TEXT_RESULT');
-    expect((textResult!.payload as any).text).toBe('answer');
-    expect(bus.published.some((e) => e.type === 'CHUNK')).toBe(false);
+    // The text rides on the stream's end; there are no deltas to stream.
+    const items = (await streams.snapshot(`${ran.runId}:1`))!.items;
+    expect(items.at(-1)).toMatchObject({ type: 'RUN_FINISHED', text: 'answer' });
+    expect(items.some((i) => i.type === 'TEXT_MESSAGE_CONTENT')).toBe(false);
     expect(ran.accepted).toBe(true);
   });
 });

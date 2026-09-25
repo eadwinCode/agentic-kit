@@ -12,6 +12,7 @@ import { publishEvent, RESERVED_EVENT_TYPES } from '../src/core/publish.js';
 import { resolveConfig } from '../src/core/types.js';
 import { bindStorage } from '../src/core/state.js';
 import type { RuntimeOptions } from '../src/ports/runtime.js';
+import { ofType as streamOfType, runItems, threadItems } from './stream-helpers.js';
 
 interface ScriptedStep {
   text?: string;
@@ -92,7 +93,7 @@ describe('custom events', () => {
     expect(snap!.lastEventSeq).toBeGreaterThanOrEqual(preview.seq);
   });
 
-  it('by default an event is live only: a notice with seq 0, never stored', async () => {
+  it('by default an event is live only: on the run stream during a run, never stored', async () => {
     const r = await makeRuntime(
       scriptedModel([{ toolCalls: [{ toolCallId: 'c1', toolName: 'slow', args: {} }] }, { text: 'done' }]),
     );
@@ -110,9 +111,10 @@ describe('custom events', () => {
     });
     const ran = await chat.run({ prompt: 'hi' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
-    const notices = ofType(r.bus, 'PROGRESS');
-    expect(notices).toHaveLength(1);
-    expect(notices[0]!.seq).toBe(0);
+    // During a run it goes to the run's stream alone, as CUSTOM.
+    expect(ofType(r.bus, 'PROGRESS')).toHaveLength(0);
+    const custom = streamOfType(await runItems(r.runtime.ports(), ran.runId!), 'CUSTOM');
+    expect(custom).toMatchObject([{ name: 'PROGRESS', value: { label: 'Rendering…' } }]);
     const logged = await r.runtime.events.since(ran.threadId, -1);
     expect(logged.some((e) => e.type === 'PROGRESS')).toBe(false);
   });
@@ -173,7 +175,8 @@ describe('custom events', () => {
     await r.runtime.hitl.respond({ threadId: ran.threadId, toolCallId: 'd1', approved: true });
     await r.queue.drain((job) => r.runtime.worker.handleJob(job).then(() => undefined));
     expect(seen).toEqual(['wipe:acme']);
-    expect(ofType(r.bus, 'WIPED')).toHaveLength(1);
+    const custom = streamOfType(await threadItems(r.runtime.ports(), ran.threadId), 'CUSTOM');
+    expect(custom.filter((e) => e.name === 'WIPED')).toHaveLength(1);
     expect(ofType(r.bus, 'STATE_CHANGE').at(-1)!.payload).toMatchObject({ state: 'COMPLETED' });
   });
 });

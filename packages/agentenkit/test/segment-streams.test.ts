@@ -246,7 +246,7 @@ describe('segment streams', () => {
     const seg = (await openSegment(r.runtime.ports(), 't1', 'run1'))!;
     await seg.forward('CHUNK', { type: 'text-delta', textDelta: 'a' }, true);
     expect(types(await items(r.streams, 'run1:1'))).toEqual(['RUN_STARTED']); // held
-    await seg.forward('STEP_FINISHED', { agentId: null, index: 1, finishReason: 'stop', totalTokens: 3 }, true);
+    await seg.forward('STEP_COMMITTED', { agentId: null, index: 0, step: 1, finishReason: 'stop', totalTokens: 3 }, true);
     expect(types(await items(r.streams, 'run1:1'))).toEqual([
       'RUN_STARTED', 'TEXT_MESSAGE_START', 'TEXT_MESSAGE_CONTENT', 'TEXT_MESSAGE_END', 'STEP_FINISHED',
     ]);

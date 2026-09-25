@@ -273,7 +273,9 @@ func (s *SegmentStream) mapLocked(typ string, p map[string]any, payload json.Raw
 			chunk = map[string]any{}
 		}
 		return wrap(agentID, s.mapChunkLocked(agentID, chunk))
-	case "STEP_FINISHED":
+	// The step is saved: the stream's STEP_FINISHED says so, right here,
+	// ahead of any park the step raised.
+	case "STEP_COMMITTED":
 		var agentID *string
 		var ending []ports.StreamEvent
 		if a, ok := p["agentId"].(string); ok && a != "" {
@@ -283,7 +285,7 @@ func (s *SegmentStream) mapLocked(typ string, p map[string]any, payload json.Raw
 			ending = s.endBlocksLocked("")
 		}
 		return append(ending, &ports.StepFinishedEvent{
-			Step: int(num(p["index"])), AgentID: agentID, FinishReason: str(p["finishReason"]),
+			Step: int(num(p["step"])), AgentID: agentID, FinishReason: str(p["finishReason"]),
 			Usage: ports.StreamUsage{
 				InputTokens: num(p["inputTokens"]), CachedInputTokens: num(p["cachedInputTokens"]),
 				OutputTokens: num(p["outputTokens"]), TotalTokens: num(p["totalTokens"]),
@@ -311,6 +313,9 @@ func (s *SegmentStream) mapLocked(typ string, p map[string]any, payload json.Raw
 		done := &ports.SubagentFinishedEvent{SubagentID: agentID, Status: "completed"}
 		if typ == "SUBAGENT_FAILED" {
 			done.Status = "failed"
+			if str(p["state"]) == "CANCELLED" {
+				done.Status = "cancelled"
+			}
 			if e, ok := p["error"]; ok && e != nil {
 				done.Error = str(e)
 			}

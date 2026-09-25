@@ -93,7 +93,7 @@ func TestSubagents_NestedSpawnsAtTheDefaultLimitDoNotDeadlock(t *testing.T) {
 		t.Fatal("the run deadlocked on the subagent cap")
 	}
 	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "completed")
-	mustEqual(t, len(h.events(ran.ThreadID, "SUBAGENT_COMPLETED")), 6, "three children, three grandchildren")
+	mustEqual(t, len(subagentsOf(t, h, ran.ThreadID).completed), 6, "three children, three grandchildren")
 }
 
 func TestSubagents_SlotsArePerDepth(t *testing.T) {
@@ -143,8 +143,8 @@ func TestSubagents_AChildCutOffByAStopIsRecordedCancelled(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-done
-	mustEqual(t, len(h.events(ran.ThreadID, "SUBAGENT_COMPLETED")), 0, "never completed")
-	childID := payload(h.events(ran.ThreadID, "SUBAGENT_STARTED")[0])["agentId"].(string)
+	mustEqual(t, len(subagentsOf(t, h, ran.ThreadID).completed), 0, "never completed")
+	childID := subagentsOf(t, h, ran.ThreadID).started[0].SubagentID
 	rec, _ := h.admin.Runs().Get(h.ctx, childID)
 	mustEqual(t, rec.State, agentenkit.StateCancelled, "the child is recorded cancelled")
 }
@@ -163,10 +163,10 @@ func TestSubagents_AChildWhoseStreamEndsWithoutAFinishFails(t *testing.T) {
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
 	h.handleNext(t)
 	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "the parent goes on")
-	failed := h.events(ran.ThreadID, "SUBAGENT_FAILED")
+	failed := subagentsOf(t, h, ran.ThreadID).failed
 	mustEqual(t, len(failed), 1, "the child failed")
-	if !strings.Contains(payload(failed[0])["error"].(string), "without a finish") {
-		t.Fatalf("with why: %v", payload(failed[0]))
+	if !strings.Contains(failed[0].Error, "without a finish") {
+		t.Fatalf("with why: %+v", failed[0])
 	}
-	mustEqual(t, len(h.events(ran.ThreadID, "SUBAGENT_COMPLETED")), 0, "its partial text is not a result")
+	mustEqual(t, len(subagentsOf(t, h, ran.ThreadID).completed), 0, "its partial text is not a result")
 }

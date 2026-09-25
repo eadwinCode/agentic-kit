@@ -55,9 +55,24 @@ async function record(
 ): Promise<AgentEvent> {
   const event = await deps.storage.events.append(threadId, { type, payload, runId });
   await deps.bus.publish(threadId, event);
-  await toSegment(deps, threadId, type, payload);
+  // A platform entry the stream shows too (a park). An app's durable event
+  // is delivered as this entry alone, so a tab never sees it twice.
+  if (RESERVED_EVENT_TYPES.has(type)) await toSegment(deps, threadId, type, payload);
   return event;
 }
+
+/** What a run stream carries in place of the bus while a segment is open:
+ *  a tab reads these from the stream, so the bus sending them too would
+ *  show them twice. */
+const STREAM_CONTENT: ReadonlySet<string> = new Set([
+  'CHUNK',
+  'SUBAGENT_CHUNK',
+  'TEXT_RESULT',
+  'STEP_COMMITTED',
+  'SUBAGENT_STARTED',
+  'SUBAGENT_COMPLETED',
+  'SUBAGENT_FAILED',
+]);
 
 /** Hands an event to the run stream this process has open on the thread,
  *  if any; the segment keeps what belongs in a stream (see SegmentStream). */
@@ -66,7 +81,10 @@ async function toSegment(deps: RuntimePorts, threadId: string, type: string, pay
   if (seg) await seg.forward(type, payload, RESERVED_EVENT_TYPES.has(type));
 }
 
-/** Publish a bus-only notice (never persisted) — e.g. HITL death notices (§2.5). */
+/** Publish a live-only event (never stored). While this process has a
+ *  segment open on the thread, stream content and an app's own events go to
+ *  the run stream alone; everything else goes on the bus, and to the stream
+ *  when the stream has a shape for it (a step's end). */
 export async function publishNotice(
   deps: RuntimePorts,
   threadId: string,
@@ -74,8 +92,14 @@ export async function publishNotice(
   payload: unknown,
 ): Promise<AgentEvent> {
   const event: AgentEvent = { threadId, seq: 0, type, payload, createdAt: new Date() };
+  const seg = activeSegment(deps, threadId);
+  const custom = !RESERVED_EVENT_TYPES.has(type);
+  if (seg && (custom || STREAM_CONTENT.has(type))) {
+    await seg.forward(type, payload, !custom);
+    return event;
+  }
   await deps.bus.publish(threadId, event);
-  await toSegment(deps, threadId, type, payload);
+  if (seg) await seg.forward(type, payload, true);
   return event;
 }
 

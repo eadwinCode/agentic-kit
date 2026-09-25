@@ -64,8 +64,10 @@ type RuntimeOptions struct {
 	Bus   EventBus
 	Queue Queue
 	Kv    Kv
-	// Streams holds short-lived logs, one per run segment. Nil writes no
-	// run streams.
+	// Streams holds short-lived logs, one per run segment: where a run's
+	// live events go. Nil keeps them in memory, which only this process can
+	// read: fine for one process, not for web servers and workers that run
+	// apart.
 	Streams RunStreams
 	// ResolveModel turns a registry key into a provider instance and a
 	// context window.

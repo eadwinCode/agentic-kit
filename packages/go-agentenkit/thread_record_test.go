@@ -144,7 +144,7 @@ func TestThreadRecord(t *testing.T) {
 		mustEqual(t, snap.Stream.Offset != "", true, "an offset to read on from")
 	})
 
-	t.Run("a durable CUSTOM is also in the thread record; a plain one is not", func(t *testing.T) {
+	t.Run("a durable CUSTOM goes to the thread record; a plain one to the stream", func(t *testing.T) {
 		h, streams := streamRuntime(t, scripted(step{calls: []call{{"c1", "go", `{}`}}}, step{text: "done"}))
 		chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
 			Name: "chat", Model: "gpt-4o",
@@ -170,6 +170,8 @@ func TestThreadRecord(t *testing.T) {
 				custom = append(custom, c.Name)
 			}
 		}
-		mustStrings(t, custom, []string{"INVOICE_CREATED", "PROGRESS"}, "both are on the stream")
+		// Each reaches a tab once: the durable one as its record entry, the
+		// plain one on the stream.
+		mustStrings(t, custom, []string{"PROGRESS"}, "only the plain one is on the stream")
 	})
 }

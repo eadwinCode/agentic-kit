@@ -12,6 +12,7 @@ import { attemptsKey, runIdKey } from '../src/core/keys.js';
 import { DEFAULT_CONFIG, resolveConfig, type AgentConfig } from '../src/core/types.js';
 import { PRIORITY_LOW } from '../src/ports/queue.js';
 import type { RunFinishInfo } from '../src/ports/runtime.js';
+import { subagents } from './stream-helpers.js';
 
 // Workstream K: the features the Go runtime had and this one did not, under
 // the same test names as their Go cases (spec_hooks_test.go,
@@ -248,7 +249,7 @@ describe('subagent profiles (§2.7)', () => {
     const spawn = h.calls[0]!.tools.find((t: any) => t.name === 'spawnSubagent');
     expect(spawn.description).toContain('researcher (finds facts)');
     expect(spawn.description).toContain('writer (writes copy)');
-    const childId = (h.events(ran.threadId, 'SUBAGENT_STARTED')[0]!.payload as any).agentId;
+    const childId = (await subagents(h.runtime.ports(), ran.threadId)).started[0]!.subagentId;
     expect(await h.admin.runs.get(childId)).toMatchObject({ model: 'gpt-4o-mini', agent: 'researcher' });
   });
 

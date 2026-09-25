@@ -423,19 +423,19 @@ describe('budgets and retries (§2.1, §2.8)', () => {
   });
 
   it('a run whose last step was saved is not asked again', async () => {
-    // The worker dies right after the step's messages and usage are saved:
-    // sending the step's commit is the first thing after that.
-    const bus = new MemoryBus();
-    const send = bus.publish.bind(bus);
+    // The worker dies after the step's messages and usage are saved, as it
+    // moves the run to COMPLETED.
+    const storage = new MemoryStorage();
+    const transition = storage.threads.transition.bind(storage.threads);
     let failed = false;
-    bus.publish = async (t, e) => {
-      if (e.type === 'STEP_COMMITTED' && !failed) {
+    storage.threads.transition = async (t, tr) => {
+      if (tr.to === 'COMPLETED' && !failed) {
         failed = true;
         throw new Error('worker died');
       }
-      return send(t, e);
+      return transition(t, tr);
     };
-    const r = await makeRuntime([{ text: 'the answer' }, { text: 'a second answer' }], { bus });
+    const r = await makeRuntime([{ text: 'the answer' }, { text: 'a second answer' }], { storage });
     const { spy, onSettle } = settleSpy();
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', onSettle });
     const ran = await chat.run({ prompt: 'hi' });

@@ -115,7 +115,7 @@ describe('thread record', () => {
     expect(snap!.stream!.offset).not.toBeNull();
   });
 
-  it('a durable CUSTOM is also in the thread record; a plain one is not', async () => {
+  it('a durable CUSTOM goes to the thread record; a plain one to the stream', async () => {
     const r = await makeRuntime(scriptedModel([{ call: { id: 'c1', name: 'go' } }, { text: 'done' }]));
     const chat = r.runtime.createStreamTextAgent({
       name: 'chat', model: 'gpt-4o',
@@ -135,8 +135,10 @@ describe('thread record', () => {
     const record = (await r.storage.events.listSince(ran.threadId, -1)).map((e) => e.type);
     expect(record).toContain('INVOICE_CREATED');
     expect(record).not.toContain('PROGRESS');
+    // Each reaches a tab once: the durable one as its record entry, the
+    // plain one on the stream.
     const custom = (await r.streams.snapshot(`${ran.runId}:1`))!.items
       .filter((i) => i.type === 'CUSTOM').map((i: any) => i.name);
-    expect(custom).toEqual(['INVOICE_CREATED', 'PROGRESS']); // both are on the stream
+    expect(custom).toEqual(['PROGRESS']);
   });
 });

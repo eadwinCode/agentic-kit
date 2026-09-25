@@ -143,7 +143,8 @@ export interface SubagentEventEvent {
 export interface SubagentFinishedEvent {
   type: 'SUBAGENT_FINISHED';
   subagentId: string;
-  status: 'completed' | 'failed';
+  /** `cancelled`: a user stop reached the child. */
+  status: 'completed' | 'failed' | 'cancelled';
   error?: string;
 }
 

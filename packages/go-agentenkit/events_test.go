@@ -94,9 +94,9 @@ func TestChunks_ConsecutiveDeltasGoOutAsOneEvent(t *testing.T) {
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
 	h.handleNext(t)
 	var deltas []string
-	for _, e := range h.events(ran.ThreadID, "CHUNK") {
-		if p := payload(e); p["type"] == "text-delta" {
-			deltas = append(deltas, p["textDelta"].(string))
+	for _, i := range runItems(t, h, ran.RunID) {
+		if c, ok := i.Event.(*ports.TextMessageContentEvent); ok {
+			deltas = append(deltas, c.Delta)
 		}
 	}
 	mustEqual(t, strings.Join(deltas, ""), "one two three", "the text arrives whole")

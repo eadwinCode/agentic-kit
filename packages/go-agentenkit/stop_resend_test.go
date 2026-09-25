@@ -183,7 +183,7 @@ func TestStop_WhileANestedRunIsParkedClosesTheWholeChain(t *testing.T) {
 	h := nestedParkSetup(t)
 	ran := h.run(t, h.chat, agentenkit.RunInput{Prompt: "go"})
 	h.handleNext(t)
-	childID := payload(h.events(ran.ThreadID, "SUBAGENT_STARTED")[0])["agentId"].(string)
+	childID := subagentsOf(t, h.harness, ran.ThreadID).started[0].SubagentID
 	if _, err := h.chat.Stop(h.ctx, ran.ThreadID, nil); err != nil {
 		t.Fatal(err)
 	}

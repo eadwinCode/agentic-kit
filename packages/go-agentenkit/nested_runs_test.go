@@ -2,6 +2,7 @@ package agentenkit_test
 
 import (
 	"context"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 	"strings"
 	"testing"
 
@@ -27,11 +28,11 @@ func TestNested_DelegatesInAnIsolatedStreamAndReportsBack(t *testing.T) {
 	// The run-wide ledger counts the child's spend: 15 + 30 + 15
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["tokensUsed"], float64(60), "tokensUsed")
 
-	started := h.events(ran.ThreadID, "SUBAGENT_STARTED")
-	mustEqual(t, len(started), 1, "SUBAGENT_STARTED")
-	childID := payload(started[0])["agentId"].(string)
-	mustEqual(t, payload(started[0])["name"], "researcher", "name")
-	mustEqual(t, len(h.events(ran.ThreadID, "SUBAGENT_COMPLETED")), 1, "SUBAGENT_COMPLETED")
+	subs := subagentsOf(t, h, ran.ThreadID)
+	mustEqual(t, len(subs.started), 1, "SUBAGENT_STARTED")
+	childID := subs.started[0].SubagentID
+	mustEqual(t, subs.started[0].Name, "researcher", "name")
+	mustEqual(t, len(subs.completed), 1, "SUBAGENT_FINISHED")
 
 	// The child's turns live in its own stream; the parent's history never sees them
 	parent, _ := h.storage.Messages().List(h.ctx, ran.ThreadID, agentenkit.MainAgent, agentenkit.StorageContext{})
@@ -51,9 +52,15 @@ func TestNested_DelegatesInAnIsolatedStreamAndReportsBack(t *testing.T) {
 	if !strings.Contains(string(part.Result), `"result":"child says 42"`) {
 		t.Fatalf("parent tool result: %s", part.Result)
 	}
-	// The child's chunks are namespaced into the same event log
-	if len(h.events(ran.ThreadID, "SUBAGENT_CHUNK")) == 0 {
-		t.Fatal("no SUBAGENT_CHUNK")
+	// The child's events are wrapped into the run's own stream
+	nested := false
+	for _, i := range threadItems(t, h, ran.ThreadID) {
+		if w, ok := i.Event.(*ports.SubagentEventEvent); ok && w.SubagentID == childID {
+			nested = true
+		}
+	}
+	if !nested {
+		t.Fatal("no SUBAGENT_EVENT")
 	}
 	// A nested run is a run (§2.9)
 	rec, _ := h.admin.Runs().Get(h.ctx, childID)
@@ -117,7 +124,7 @@ func TestNested_AParkSuspendsTheWholeThreadAndRecordsTheChain(t *testing.T) {
 	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateWaitingForInput, "state")
 	mustEqual(t, len(*h.executed), 0, "tool never ran")
 	req := payload(h.events(ran.ThreadID, "INPUT_REQUIRED")[0])
-	childID := payload(h.events(ran.ThreadID, "SUBAGENT_STARTED")[0])["agentId"].(string)
+	childID := subagentsOf(t, h.harness, ran.ThreadID).started[0].SubagentID
 	mustEqual(t, req["agentId"], childID, "the child asked")
 	mustEqual(t, req["toolName"], "wipe", "toolName")
 	frames := req["frames"].([]any)
@@ -151,7 +158,7 @@ func TestNested_ApprovingReEntersTheChildAndUnwindsToTheParent(t *testing.T) {
 
 	mustStrings(t, *h.executed, []string{"prod"}, "the approved tool ran, in the child's stream")
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "state")
-	childID := payload(h.events(ran.ThreadID, "SUBAGENT_STARTED")[0])["agentId"].(string)
+	childID := subagentsOf(t, h.harness, ran.ThreadID).started[0].SubagentID
 	child, _ := h.storage.Messages().List(h.ctx, ran.ThreadID, agentenkit.AgentScope(childID), agentenkit.StorageContext{})
 	var childRoles []string
 	for _, m := range child {
@@ -209,8 +216,8 @@ func TestNested_TheDepthCapTellsTheModelWhy(t *testing.T) {
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
 	h.handleNext(t)
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "state")
-	mustEqual(t, len(h.events(ran.ThreadID, "SUBAGENT_STARTED")), 1, "only one child started")
-	childID := payload(h.events(ran.ThreadID, "SUBAGENT_STARTED")[0])["agentId"].(string)
+	mustEqual(t, len(subagentsOf(t, h, ran.ThreadID).started), 1, "only one child started")
+	childID := subagentsOf(t, h, ran.ThreadID).started[0].SubagentID
 	child, _ := h.storage.Messages().List(h.ctx, ran.ThreadID, agentenkit.AgentScope(childID), agentenkit.StorageContext{})
 	refusal := agentenkit.ParseContent(child[2].Content)[0]
 	if !strings.Contains(string(refusal.Result), "Max subagent depth (1) reached") {
@@ -228,13 +235,13 @@ func TestNested_AFailingChildIsReportedToTheParentNotThrown(t *testing.T) {
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
 	h.handleNext(t)
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "the run survived")
-	failed := h.events(ran.ThreadID, "SUBAGENT_FAILED")
-	mustEqual(t, len(failed), 1, "SUBAGENT_FAILED")
-	mustEqual(t, payload(failed[0])["state"], "FAILED", "state")
-	if !strings.Contains(payload(failed[0])["error"].(string), "boom") {
-		t.Fatalf("error: %v", payload(failed[0])["error"])
+	failed := subagentsOf(t, h, ran.ThreadID).failed
+	mustEqual(t, len(failed), 1, "SUBAGENT_FINISHED failed")
+	mustEqual(t, failed[0].Status, "failed", "status")
+	if !strings.Contains(failed[0].Error, "boom") {
+		t.Fatalf("error: %v", failed[0].Error)
 	}
-	childID := payload(failed[0])["agentId"].(string)
+	childID := failed[0].SubagentID
 	rec, _ := h.admin.Runs().Get(h.ctx, childID)
 	mustEqual(t, rec.State, agentenkit.StateFailed, "child record")
 	parent, _ := h.storage.Messages().List(h.ctx, ran.ThreadID, agentenkit.MainAgent, agentenkit.StorageContext{})
@@ -254,7 +261,7 @@ func TestNested_AnInventedModelNameFallsBackToTheParents(t *testing.T) {
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
 	h.handleNext(t)
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "state")
-	mustEqual(t, len(h.events(ran.ThreadID, "SUBAGENT_COMPLETED")), 1, "child completed")
+	mustEqual(t, len(subagentsOf(t, h, ran.ThreadID).completed), 1, "child completed")
 }
 
 func TestNested_TheChildsSpendCanStopTheRun(t *testing.T) {

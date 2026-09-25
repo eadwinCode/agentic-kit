@@ -46,16 +46,18 @@ func TestPark_IsWrittenOnlyAfterItsStepIsSaved(t *testing.T) {
 	h, chat, _ := approvalSetup(t, step{calls: []call{{"a1", "send", `{}`}}})
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
 	h.handleNext(t)
-	// In the order they were sent: the commit is live only, the park is in
-	// the record too.
-	sent := h.events(ran.ThreadID, "")
+	// On the run's stream, in the order they happened.
 	committed, requested := -1, -1
-	for i, e := range sent {
-		if e.Type == "STEP_COMMITTED" && committed < 0 {
-			committed = i
-		}
-		if e.Type == "INPUT_REQUIRED" && requested < 0 {
-			requested = i
+	for i, item := range runItems(t, h, ran.RunID) {
+		switch item.Event.(type) {
+		case *ports.StepFinishedEvent:
+			if committed < 0 {
+				committed = i
+			}
+		case *ports.InputRequiredEvent:
+			if requested < 0 {
+				requested = i
+			}
 		}
 	}
 	if committed < 0 || requested < 0 || requested < committed {
@@ -192,7 +194,7 @@ func TestHitl_AChildThatFailsWhileUnwindingIsReportedToItsParent(t *testing.T) {
 	h.handleNext(t)
 	mustStrings(t, *h.executed, []string{"prod"}, "the approved tool ran")
 	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "the thread is not stuck")
-	mustEqual(t, len(h.events(ran.ThreadID, "SUBAGENT_FAILED")), 1, "the child is recorded as failed")
+	mustEqual(t, len(subagentsOf(t, h.harness, ran.ThreadID).failed), 1, "the child is recorded as failed")
 	parent, _ := h.storage.Messages().List(h.ctx, ran.ThreadID, agentenkit.MainAgent, agentenkit.StorageContext{})
 	spawn := agentenkit.ParseContent(parent[2].Content)[0]
 	mustEqual(t, spawn.ToolCallID, "s1", "the waiting spawn call is answered")
@@ -205,7 +207,7 @@ func TestHitl_AnUnwindCutShortCarriesOnFromTheLevelStillWaiting(t *testing.T) {
 	h := nestedParkSetup(t, step{text: "child: done"}, step{text: "parent: done"})
 	ran := h.run(t, h.chat, agentenkit.RunInput{Prompt: "go"})
 	h.handleNext(t)
-	childID := payload(h.events(ran.ThreadID, "SUBAGENT_STARTED")[0])["agentId"].(string)
+	childID := subagentsOf(t, h.harness, ran.ThreadID).started[0].SubagentID
 	// A worker landed the child's verdict, then died before the level above.
 	if _, err := h.storage.Messages().Append(h.ctx, ran.ThreadID, ports.NewMessage{
 		Role: ports.RoleTool, AgentID: childID,

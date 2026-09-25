@@ -45,7 +45,8 @@ func TestCustomEvents_AToolPublishesADurableEvent(t *testing.T) {
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "run completed")
 }
 
-// By default an event is live only: a notice with seq 0, never stored.
+// By default an event is live only: on the run stream during a run, never
+// stored.
 func TestCustomEvents_ANoticeReachesTheBusOnly(t *testing.T) {
 	h := makeRuntime(t, scripted(step{calls: []call{{"c1", "slow", `{}`}}}, step{text: "done"}))
 	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
@@ -60,9 +61,11 @@ func TestCustomEvents_ANoticeReachesTheBusOnly(t *testing.T) {
 	})
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
 	h.handleNext(t)
-	notices := h.events(ran.ThreadID, "PROGRESS")
-	mustEqual(t, len(notices), 1, "one notice")
-	mustEqual(t, notices[0].Seq, int64(0), "seq 0")
+	// During a run it goes to the run's stream alone, as CUSTOM.
+	mustEqual(t, len(h.events(ran.ThreadID, "PROGRESS")), 0, "not on the bus")
+	progress := customOf(t, h, ran.ThreadID, "PROGRESS")
+	mustEqual(t, len(progress), 1, "one CUSTOM on the stream")
+	mustEqual(t, string(progress[0].Value), `{"label":"Rendering…"}`, "value")
 	logged, _ := h.rt.Events.Since(h.ctx, ran.ThreadID, -1, nil)
 	for _, e := range logged {
 		if e.Type == "PROGRESS" {
@@ -126,9 +129,9 @@ func TestCustomEvents_NestedAndResumedToolsPublishToo(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.drain(t)
-	wiped := h.events(ran.ThreadID, "WIPED")
+	wiped := customOf(t, h, ran.ThreadID, "WIPED")
 	mustEqual(t, len(wiped), 1, "the resumed nested tool published")
-	mustEqual(t, payload(wiped[0])["org"], "acme", "with the run state")
+	mustEqual(t, string(wiped[0].Value), `{"org":"acme"}`, "with the run state")
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "completed")
 }
 

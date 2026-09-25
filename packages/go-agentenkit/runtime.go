@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/memory"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/admin"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/core"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
@@ -31,6 +33,8 @@ type AgentCore struct {
 	Admin *AdminAPI
 	// Worker is the queue dispatch side (§2.8).
 	Worker *WorkerAPI
+	// Streams reads run streams by id.
+	Streams *StreamsAPI
 }
 
 // SetupAgentCore binds the ports to the core behaviors (§3.3). This is the
@@ -50,6 +54,9 @@ func SetupAgentCore(ctx context.Context, opts RuntimeOptions) (*AgentCore, error
 	if err != nil {
 		return nil, err
 	}
+	if opts.Streams == nil {
+		opts.Streams = inMemoryStreams(opts.Log)
+	}
 	store := opts.Admin
 	if store == nil {
 		store, err = admin.OpenDefaultAdminStore(ctx, opts.Log)
@@ -62,7 +69,25 @@ func SetupAgentCore(ctx context.Context, opts RuntimeOptions) (*AgentCore, error
 	c.Events = &EventsAPI{c}
 	c.Admin = &AdminAPI{c}
 	c.Worker = &WorkerAPI{c}
+	c.Streams = &StreamsAPI{c}
 	return c, nil
+}
+
+var warnedInMemory sync.Once
+
+// inMemoryStreams is the run streams when none were passed: in memory,
+// which only this process can read. Said once, loudly, since a web server
+// and a worker in separate processes would each see only their own.
+func inMemoryStreams(log *slog.Logger) ports.RunStreams {
+	warnedInMemory.Do(func() {
+		if log == nil {
+			log = slog.Default()
+		}
+		log.Warn("agentenkit: no Streams port was passed, so run streams are kept in memory and only this " +
+			"process can read them. Pass one (redis.NewRunStreams, a Postgres or SQLite store) when web " +
+			"servers and workers run apart.")
+	})
+	return memory.NewRunStreams()
 }
 
 // scope builds the ports for ONE call: the caller's storage with that call's
@@ -121,52 +146,7 @@ func (c *AgentCore) DeleteThread(ctx context.Context, threadID string, state Age
 // unfinished run's record entries + its run stream. Nil when the thread is
 // gone.
 func (c *AgentCore) GetThreadSnapshot(ctx context.Context, threadID string, state AgentRunState) (*ThreadSnapshot, error) {
-	deps := c.scope(state, "")
-	thread, err := deps.Storage.Threads.Get(ctx, threadID)
-	if err != nil || thread == nil {
-		return nil, err
-	}
-	messages, err := deps.Storage.Messages.List(ctx, threadID, nil)
-	if err != nil {
-		return nil, err
-	}
-	runs, err := deps.Admin.Runs().ListByThread(ctx, threadID)
-	if err != nil {
-		return nil, err
-	}
-	events, err := deps.Storage.Events.ListSince(ctx, threadID, -1)
-	if err != nil {
-		return nil, err
-	}
-	snap := &ThreadSnapshot{Thread: *thread, Messages: messages, Runs: runs, LastEventSeq: -1, ActiveEvents: []AgentEvent{}}
-	if messages == nil {
-		snap.Messages = []MessageDTO{}
-	}
-	if runs == nil {
-		snap.Runs = []RunRecord{}
-	}
-	if len(events) > 0 {
-		snap.LastEventSeq = events[len(events)-1].Seq
-	}
-	// The unfinished run's record entries: its open park, a refusal. The
-	// run's live events come from its stream, not from here.
-	if core.IsActive(thread.State) {
-		runID, err := core.CurrentRunID(ctx, deps, threadID)
-		if err != nil {
-			return nil, err
-		}
-		for _, e := range events {
-			if runID != "" && e.RunID == runID {
-				snap.ActiveEvents = append(snap.ActiveEvents, e)
-			}
-		}
-	}
-	stream, err := core.SnapshotStreamOf(ctx, deps, threadID)
-	if err != nil {
-		return nil, err
-	}
-	snap.Stream = stream
-	return snap, nil
+	return core.ThreadSnapshotOf(ctx, c.scope(state, ""), threadID, "")
 }
 
 // GetThreadUsage is tokens spent so far and the §2.6 context load. Nil when
@@ -259,36 +239,83 @@ func (e *EventsAPI) Subscribe(ctx context.Context, threadID string, handler func
 	return e.c.opts.Bus.Subscribe(ctx, threadID, handler)
 }
 
-// FollowStateOptions carries the run state alongside the follow options.
+// FollowStateOptions says where a follow starts, with the run state.
 type FollowStateOptions struct {
+	// Since is a bare record seq, as older clients send; used when Cursor
+	// is empty.
 	FollowOptions
-	State AgentRunState
+	// Cursor is where the client is: the SSE id it last saw
+	// (Last-Event-ID), "<seq> <streamId> <offset>".
+	Cursor string
+	// LastMessageID is the last message the client has, so a SNAPSHOT
+	// carries only newer ones.
+	LastMessageID string
+	State         AgentRunState
 }
 
-// Follow is replay then live, as one sequence, with the cursor discipline
-// already applied (§2.2). Cancel ctx, or the subscription outlives the client.
-func (e *EventsAPI) Follow(ctx context.Context, threadID string, opts FollowStateOptions) (*EventStream, error) {
+// cursor is where the follow starts: Cursor, else a bare Since.
+func (o FollowStateOptions) cursor() *core.ThreadCursor {
+	if c, ok := core.ParseCursor(o.Cursor); ok {
+		return &c
+	}
+	if o.Since != 0 {
+		return &core.ThreadCursor{Seq: o.Since}
+	}
+	return nil
+}
+
+// Follow is a thread live, as one sequence of frames (§2.2): its record
+// entries and notices, and its run streams — the stream the cursor names
+// read on from its offset, the next segment's from its RUN_STARTED, and one
+// SNAPSHOT frame when the stream the client was reading is gone. Cancel
+// ctx, or the follow outlives the client.
+func (e *EventsAPI) Follow(ctx context.Context, threadID string, opts FollowStateOptions) (*core.FrameStream, error) {
 	// The state rides the context too: a bus that reads storage itself (the
 	// Postgres bus replays after a reconnect) needs the same scope.
+	ctx = core.ContextWithRunState(ctx, opts.State)
+	return core.FollowThread(ctx, e.c.scope(opts.State, ""), threadID, core.FollowThreadOptions{
+		Cursor: opts.cursor(), LastMessageID: opts.LastMessageID,
+	})
+}
+
+// FollowRecord is the thread record and its notices alone, as before run
+// streams: no stream frames.
+func (e *EventsAPI) FollowRecord(ctx context.Context, threadID string, opts FollowStateOptions) (*EventStream, error) {
 	ctx = core.ContextWithRunState(ctx, opts.State)
 	return core.FollowEvents(ctx, e.c.scope(opts.State, ""), threadID, opts.FollowOptions)
 }
 
-// SSEStateOptions carries the run state alongside the SSE options.
+// SSEStateOptions is FollowStateOptions with the SSE retry hint.
 type SSEStateOptions struct {
-	SSEOptions
-	State AgentRunState
+	FollowStateOptions
+	// RetryMs is emitted once, up front: how long a browser waits before
+	// reconnecting. Zero omits it.
+	RetryMs int
 }
 
-// SSE is Follow, encoded as Server-Sent Events. Serve it with ServeHTTP or
-// WriteTo.
-func (e *EventsAPI) SSE(ctx context.Context, threadID string, opts SSEStateOptions) (*SSEStream, error) {
-	ctx = core.ContextWithRunState(ctx, opts.State) // see Follow
-	stream, err := core.FollowEvents(ctx, e.c.scope(opts.State, ""), threadID, opts.FollowOptions)
+// SSE is Follow, encoded as Server-Sent Events: each frame that moves the
+// cursor carries it as its id:. Serve it with ServeHTTP or WriteTo.
+func (e *EventsAPI) SSE(ctx context.Context, threadID string, opts SSEStateOptions) (*core.FollowSSE, error) {
+	frames, err := e.Follow(ctx, threadID, opts.FollowStateOptions)
 	if err != nil {
 		return nil, err
 	}
-	return core.ToSSEStream(stream, opts.SSEOptions), nil
+	return core.ToFollowSSE(frames, opts.cursor(), opts.RetryMs), nil
+}
+
+// StreamsAPI reads run streams by id, for a caller that only cares about
+// one run.
+type StreamsAPI struct{ c *AgentCore }
+
+// Read yields a run stream's items after `after`, live until it closes. It
+// yields ErrStreamGone once the stream is past its grace window.
+func (s *StreamsAPI) Read(ctx context.Context, streamID, after string) iter.Seq2[ports.StreamItem, error] {
+	return s.c.opts.Streams.Read(ctx, streamID, after)
+}
+
+// Snapshot is a run stream as it stands now; nil when it is gone.
+func (s *StreamsAPI) Snapshot(ctx context.Context, streamID, after string) (*ports.StreamSnapshot, error) {
+	return s.c.opts.Streams.Snapshot(ctx, streamID, after)
 }
 
 // PublishStateOptions carries the run state alongside the publish options.

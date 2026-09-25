@@ -82,8 +82,20 @@ func record(ctx context.Context, deps ports.RuntimePorts, threadID, runID, typ s
 		return event, err
 	}
 	err = deps.Bus.Publish(ctx, threadID, event)
-	toSegment(ctx, deps, event)
+	// A platform entry the stream shows too (a park). An app's durable event
+	// is delivered as this entry alone, so a tab never sees it twice.
+	if ReservedEventTypes[typ] {
+		toSegment(ctx, deps, event)
+	}
 	return event, err
+}
+
+// streamContent is what a run stream carries in place of the bus while a
+// segment is open: a tab reads these from the stream, so the bus sending
+// them too would show them twice.
+var streamContent = map[string]bool{
+	"CHUNK": true, "SUBAGENT_CHUNK": true, "TEXT_RESULT": true, "STEP_COMMITTED": true,
+	"SUBAGENT_STARTED": true, "SUBAGENT_COMPLETED": true, "SUBAGENT_FAILED": true,
 }
 
 // toSegment hands an event to the run stream this process has open on the
@@ -107,8 +119,19 @@ func publishNotice(ctx context.Context, deps ports.RuntimePorts, threadID, typ s
 		ThreadID: threadID, Seq: 0, Type: typ,
 		Payload: MarshalPayload(payload), CreatedAt: time.Now(),
 	}
+	// While this process has a segment open on the thread, stream content
+	// and an app's own events go to the run stream alone; everything else
+	// goes on the bus, and to the stream when it has a shape for it.
+	seg := ActiveSegment(deps, threadID)
+	custom := !ReservedEventTypes[typ]
+	if seg != nil && (custom || streamContent[typ]) {
+		seg.Forward(ctx, typ, event.Payload, !custom)
+		return event, nil
+	}
 	err := deps.Bus.Publish(ctx, threadID, event)
-	toSegment(ctx, deps, event)
+	if seg != nil {
+		seg.Forward(ctx, typ, event.Payload, true)
+	}
 	return event, err
 }
 

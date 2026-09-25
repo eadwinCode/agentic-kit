@@ -183,14 +183,16 @@ export class SegmentStream {
         const agentId = String(p.agentId);
         return this.push(this.wrap(agentId, this.mapChunk(agentId, p.chunk ?? {})));
       }
-      case 'STEP_FINISHED': {
+      // The step is saved: the stream's STEP_FINISHED says so, right here,
+      // ahead of any park the step raised.
+      case 'STEP_COMMITTED': {
         const agentId: string | null = p.agentId ?? null;
         const ending = agentId === null ? this.endBlocks('') : this.wrap(agentId, this.endBlocks(agentId));
         return this.push([
           ...ending,
           {
             type: 'STEP_FINISHED',
-            step: Number(p.index ?? 0),
+            step: Number(p.step ?? 0),
             agentId,
             finishReason: String(p.finishReason ?? ''),
             usage: {
@@ -213,12 +215,13 @@ export class SegmentStream {
       case 'SUBAGENT_FAILED': {
         const agentId = String(p.agentId);
         const failed = type === 'SUBAGENT_FAILED';
+        const status = !failed ? 'completed' : p.state === 'CANCELLED' ? 'cancelled' : 'failed';
         return this.push([
           ...this.wrap(agentId, this.endBlocks(agentId)),
           {
             type: 'SUBAGENT_FINISHED',
             subagentId: agentId,
-            status: failed ? 'failed' : 'completed',
+            status,
             ...(failed && p.error !== undefined ? { error: String(p.error) } : {}),
           },
         ]);

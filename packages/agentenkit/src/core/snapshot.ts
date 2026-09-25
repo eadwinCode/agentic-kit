@@ -1,5 +1,8 @@
-import type { RuntimePorts } from '../ports/runtime.js';
+import type { RuntimePorts, ThreadSnapshot } from '../ports/runtime.js';
+import { currentRunId } from './keys.js';
+import { ACTIVE_STATES } from './publish.js';
 import type { StreamEnd, StreamItem } from './stream-events.js';
+import type { AgentEvent } from './types.js';
 
 /** The run stream a snapshot carries: the segment in flight, or one that
  *  ended a moment ago, so a tab that loads just as a run ends still sees
@@ -73,4 +76,37 @@ export async function snapshotStream(deps: RuntimePorts, threadId: string): Prom
     end: snap.end,
     offset: snap.items.at(-1)?.offset ?? null,
   };
+}
+
+/** One read for a UI: the thread, its messages, its runs, the unfinished
+ *  run's record entries and its run stream. Null when the thread is gone.
+ *  `afterMessageId` keeps only the messages after that one: what a tab that
+ *  already has it is missing (a SNAPSHOT frame). An id the thread does not
+ *  have keeps them all. */
+export async function threadSnapshot(
+  deps: RuntimePorts,
+  threadId: string,
+  opts: { afterMessageId?: string } = {},
+): Promise<ThreadSnapshot | null> {
+  const thread = await deps.storage.threads.get(threadId);
+  if (!thread) return null;
+
+  let messages = await deps.storage.messages.list(threadId, undefined);
+  if (opts.afterMessageId) {
+    const at = messages.findIndex((m) => m.id === opts.afterMessageId);
+    if (at >= 0) messages = messages.slice(at + 1);
+  }
+  const runs = await deps.admin.runs.listByThread(threadId);
+  // The record is small (parks, refusals, each segment's start and end),
+  // and the run's live events come from its stream, not from here.
+  const events = await deps.storage.events.listSince(threadId, -1);
+  const lastEventSeq = events.at(-1)?.seq ?? -1;
+  // The unfinished run's record entries: its open park, a refusal.
+  let activeEvents: AgentEvent[] = [];
+  if (ACTIVE_STATES.includes(thread.state)) {
+    const runId = await currentRunId(deps, threadId);
+    activeEvents = runId ? events.filter((e) => e.runId === runId) : [];
+  }
+  const stream = await snapshotStream(deps, threadId);
+  return { thread, messages, runs, lastEventSeq, activeEvents, stream };
 }

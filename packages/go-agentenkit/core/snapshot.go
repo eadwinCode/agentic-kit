@@ -92,3 +92,63 @@ func SnapshotStreamOf(ctx context.Context, deps ports.RuntimePorts, threadID str
 	}
 	return out, nil
 }
+
+// ThreadSnapshotOf is one read for a UI: the thread, its messages, its runs,
+// the unfinished run's record entries and its run stream. Nil when the
+// thread is gone. afterMessageID keeps only the messages after that one:
+// what a tab that already has it is missing (a SNAPSHOT frame). An id the
+// thread does not have keeps them all.
+func ThreadSnapshotOf(ctx context.Context, deps ports.RuntimePorts, threadID, afterMessageID string) (*ports.ThreadSnapshot, error) {
+	thread, err := deps.Storage.Threads.Get(ctx, threadID)
+	if err != nil || thread == nil {
+		return nil, err
+	}
+	messages, err := deps.Storage.Messages.List(ctx, threadID, nil)
+	if err != nil {
+		return nil, err
+	}
+	if afterMessageID != "" {
+		for i, m := range messages {
+			if m.ID == afterMessageID {
+				messages = messages[i+1:]
+				break
+			}
+		}
+	}
+	runs, err := deps.Admin.Runs().ListByThread(ctx, threadID)
+	if err != nil {
+		return nil, err
+	}
+	// The record is small (parks, refusals, each segment's start and end),
+	// and the run's live events come from its stream, not from here.
+	events, err := deps.Storage.Events.ListSince(ctx, threadID, -1)
+	if err != nil {
+		return nil, err
+	}
+	snap := &ports.ThreadSnapshot{Thread: *thread, Messages: messages, Runs: runs, LastEventSeq: -1, ActiveEvents: []ports.AgentEvent{}}
+	if snap.Messages == nil {
+		snap.Messages = []ports.MessageDTO{}
+	}
+	if snap.Runs == nil {
+		snap.Runs = []ports.RunRecord{}
+	}
+	if len(events) > 0 {
+		snap.LastEventSeq = events[len(events)-1].Seq
+	}
+	// The unfinished run's record entries: its open park, a refusal.
+	if IsActive(thread.State) {
+		runID, err := CurrentRunID(ctx, deps, threadID)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range events {
+			if runID != "" && e.RunID == runID {
+				snap.ActiveEvents = append(snap.ActiveEvents, e)
+			}
+		}
+	}
+	if snap.Stream, err = SnapshotStreamOf(ctx, deps, threadID); err != nil {
+		return nil, err
+	}
+	return snap, nil
+}

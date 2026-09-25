@@ -41,6 +41,7 @@ export type {
   StreamTextAgentSpec,
   SubagentsConfig,
   ThreadSnapshot,
+  FollowStartOptions,
   ThreadUsage,
   Pricer,
   Logger,
@@ -69,12 +70,20 @@ export {
 export { agentTool, type ToolContext } from './core/tools.js';
 export {
   followEvents,
+  followThread,
+  followFrame,
+  formatCursor,
+  parseCursor,
+  toFollowSse,
   toSseStream,
   sseFrame,
   SSE_HEADERS,
+  type FollowFrame,
   type FollowOptions,
+  type FollowThreadOptions,
   type SseOptions,
   type SseStream,
+  type ThreadCursor,
 } from './core/follow.js';
 // The run-state types, named here so they are discoverable rather than
 // reachable only by chance through another module's re-export.
@@ -155,8 +164,8 @@ export {
 } from './core/types.js';
 
 // reference adapters
-export { PrismaStorage, type PrismaLike } from './adapters/prisma.js';
-export { UpstashBus, UpstashKv, THREAD_CHANNEL, type UpstashRedisLike, type UpstashSubscriberLike } from './adapters/upstash.js';
-export { RedisBus, RedisKv, type RedisClientLike, type RedisSubscriberLike } from './adapters/redis.js';
+export { PrismaStorage, PrismaRunStreams, type PrismaLike, type PrismaStreamsLike } from './adapters/prisma.js';
+export { UpstashBus, UpstashKv, UpstashRunStreams, THREAD_CHANNEL, type UpstashRedisLike, type UpstashSubscriberLike } from './adapters/upstash.js';
+export { RedisBus, RedisKv, RedisRunStreams, type RedisClientLike, type RedisSubscriberLike } from './adapters/redis.js';
 export { QStashQueue, type QStashLike, type QStashQueueOptions } from './adapters/qstash.js';
 export { MemoryStorage, MemoryBus, MemoryQueue, MemoryKv, MemoryRunStreams } from './adapters/memory.js';

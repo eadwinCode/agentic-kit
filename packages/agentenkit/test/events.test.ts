@@ -12,6 +12,7 @@ import { publish } from '../src/core/publish.js';
 import { resolveConfig } from '../src/core/types.js';
 import type { AgentEvent } from '../src/core/types.js';
 import type { RuntimePorts } from '../src/ports/runtime.js';
+import { ofType, runItems } from './stream-helpers.js';
 
 // Workstream G: a follower never skips a seq, a lost seq counter carries on
 // from the log, token deltas go out merged, and the platform's own event
@@ -93,10 +94,7 @@ describe('events (§2.2)', () => {
     const r = await makeRuntime(model([[say('one '), say('two '), say('three'), finish()]]));
     const ran = await r.chat.run({ prompt: 'go' });
     await r.runtime.worker.handleJob(r.queue.items.shift()!);
-    const deltas = r.events(ran.threadId, 'CHUNK')
-      .map((e) => e.payload as any)
-      .filter((p) => p.type === 'text-delta')
-      .map((p) => p.textDelta);
+    const deltas = ofType(await runItems(r.runtime.ports(), ran.runId!), 'TEXT_MESSAGE_CONTENT').map((e) => e.delta);
     expect(deltas.join('')).toBe('one two three'); // the text arrives whole
     expect(deltas).toHaveLength(1); // as one event
   });
@@ -127,12 +125,9 @@ describe('events (§2.2)', () => {
     const ran = await r.chat.run({ prompt: 'go' });
     await r.runtime.worker.handleJob(r.queue.items.shift()!);
     const results = new Map(
-      r.events(ran.threadId, 'CHUNK')
-        .map((e) => e.payload as any)
-        .filter((p) => p.type === 'tool-result')
-        .map((p) => [p.toolCallId, p]),
+      ofType(await runItems(r.runtime.ports(), ran.runId!), 'TOOL_CALL_RESULT').map((e) => [e.toolCallId, e]),
     );
-    expect(results.get('c1')).toEqual({ type: 'tool-result', toolCallId: 'c1', toolName: 'lookup', result: { found: true } });
-    expect(results.get('c2').result).toEqual({ error: 'boom' }); // a failed tool names its error
+    expect(results.get('c1')).toEqual({ type: 'TOOL_CALL_RESULT', toolCallId: 'c1', toolName: 'lookup', result: { found: true }, offset: expect.any(String) } as any);
+    expect(results.get('c2')!.result).toEqual({ error: 'boom' }); // a failed tool names its error
   });
 });

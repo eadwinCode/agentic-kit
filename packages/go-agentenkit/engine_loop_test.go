@@ -125,10 +125,15 @@ func TestEngineLoop_OneShotPublishesTextResult(t *testing.T) {
 	one := h.rt.CreateGenerateTextAgent(agentenkit.GenerateTextAgentSpec{Name: "one", Model: "gpt-4o"})
 	ran := h.run(t, one, agentenkit.RunInput{Prompt: "q"})
 	h.handleNext(t)
-	mustEqual(t, len(h.events(ran.ThreadID, "CHUNK")), 0, "chunks")
-	results := h.events(ran.ThreadID, "TEXT_RESULT")
-	mustEqual(t, len(results), 1, "TEXT_RESULT events")
-	mustEqual(t, payload(results[0])["text"], "final answer", "text")
+	// The text rides on the stream's end; there are no deltas to stream.
+	items := runItems(t, h, ran.RunID)
+	for _, i := range items {
+		if _, ok := i.Event.(*ports.TextMessageContentEvent); ok {
+			t.Fatal("a one-shot agent streams no deltas")
+		}
+	}
+	end := items[len(items)-1].Event.(*ports.RunFinishedEvent)
+	mustEqual(t, end.Text, "final answer", "text")
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "state")
 	mustStrings(t, h.roles(ran.ThreadID), []string{"user", "assistant"}, "roles")
 }
@@ -142,13 +147,13 @@ func TestEngineLoop_StreamPublishesChunksInAISDKShape(t *testing.T) {
 	})
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
 	h.handleNext(t)
-	chunks := h.events(ran.ThreadID, "CHUNK")
-	if len(chunks) == 0 {
-		t.Fatal("no CHUNK events")
+	var text []string
+	for _, i := range runItems(t, h, ran.RunID) {
+		if c, ok := i.Event.(*ports.TextMessageContentEvent); ok {
+			text = append(text, c.Delta)
+		}
 	}
-	first := payload(chunks[0])
-	mustEqual(t, first["type"], "text-delta", "first chunk type")
-	mustEqual(t, first["textDelta"], "hello", "textDelta")
+	mustStrings(t, text, []string{"hello"}, "the text on the run stream")
 	if len(seen) == 0 {
 		t.Fatal("user OnChunk never fired")
 	}

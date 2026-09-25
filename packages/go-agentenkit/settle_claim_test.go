@@ -211,20 +211,27 @@ func TestBudget_ARunThatParksThreeTimesCountsEverySegment(t *testing.T) {
 	mustEqual(t, term["tokensUsed"], float64(60), "the whole run's tokens")
 }
 
-// failStepCommitOnce fails the first STEP_COMMITTED write: the worker dies
-// right after the step's messages and usage are saved.
-type failStepCommitOnce struct {
-	ports.EventBus
+// failFinishOnce fails the first move to COMPLETED: the worker dies after
+// the step's messages and usage are saved, before the run ends.
+type failFinishOnce struct {
+	ports.Storage
 	failed atomic.Bool
 }
 
-// Publish fails the first STEP_COMMITTED: sending the step's commit is the
-// first thing after its messages and usage are saved.
-func (b *failStepCommitOnce) Publish(ctx context.Context, threadID string, e ports.AgentEvent) error {
-	if e.Type == "STEP_COMMITTED" && b.failed.CompareAndSwap(false, true) {
-		return errors.New("worker died")
+type failFinishThreads struct {
+	ports.ThreadStore
+	s *failFinishOnce
+}
+
+func (s *failFinishOnce) Threads() ports.ThreadStore {
+	return failFinishThreads{s.Storage.Threads(), s}
+}
+
+func (t failFinishThreads) Transition(ctx context.Context, threadID string, tr ports.ThreadTransition, sc ports.StorageContext) (bool, error) {
+	if tr.To == ports.StateCompleted && t.s.failed.CompareAndSwap(false, true) {
+		return false, errors.New("worker died")
 	}
-	return b.EventBus.Publish(ctx, threadID, e)
+	return t.ThreadStore.Transition(ctx, threadID, tr, sc)
 }
 
 // A retry after the run's last step was saved finalizes from the saved
@@ -232,7 +239,7 @@ func (b *failStepCommitOnce) Publish(ctx context.Context, threadID string, e por
 func TestRetry_ARunWhoseLastStepWasSavedIsNotAskedAgain(t *testing.T) {
 	var settles atomic.Int32
 	h := makeRuntimeOpts(t, scripted(step{text: "the answer"}, step{text: "a second answer"}), func(o *agentenkit.RuntimeOptions) {
-		o.Bus = &failStepCommitOnce{EventBus: o.Bus}
+		o.Storage = &failFinishOnce{Storage: o.Storage}
 	}, func(c *agentenkit.AgentConfig) { c.RunRetryBackoff = 0 })
 	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
 		Name:     "chat",
