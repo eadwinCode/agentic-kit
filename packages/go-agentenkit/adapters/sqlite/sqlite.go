@@ -39,6 +39,10 @@ func Open(filename string) (*sql.DB, error) {
 			// SQLite serialises writers anyway, and an in-memory database is
 			// per connection: one connection is the only correct pool size.
 			db.SetMaxOpenConns(1)
+			if err := Tune(db); err != nil {
+				_ = db.Close()
+				return nil, err
+			}
 			return db, nil
 		}
 	}
@@ -98,6 +102,22 @@ var usageColumns = map[string]string{
 }
 
 // addMissing adds any of cols the table does not have yet.
+// Tune sets a file up for more than one process (§3.4): WAL lets readers
+// run beside the one writer, and busy_timeout makes a writer wait up to five
+// seconds for the lock rather than fail at once with SQLITE_BUSY. Open calls
+// it; call it yourself on a handle you opened some other way. An in-memory
+// database keeps its own journal mode, which is fine.
+func Tune(db *sql.DB) error {
+	for _, pragma := range []string{`PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=5000`} {
+		rows, err := db.Query(pragma) // both answer with a row
+		if err != nil {
+			return fmt.Errorf("sqlite %s: %w", pragma, err)
+		}
+		_ = rows.Close()
+	}
+	return nil
+}
+
 func addMissing(db *sql.DB, table string, cols map[string]string) error {
 	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
 	if err != nil {
@@ -149,6 +169,12 @@ func New(db *sql.DB) (*Storage, error) {
 	// then left off and said so, rather than refusing to start.
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS events_thread_seq_unique ON events(threadId, seq)`); err != nil {
 		slog.Warn("event seq uniqueness not enforced: the log already holds duplicate seqs", "err", err)
+	}
+	// The same for messages: two appends that raced to one seq must not both
+	// land, or a turn's order would depend on which row the database returns
+	// first.
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS messages_thread_seq_unique ON messages(threadId, seq)`); err != nil {
+		slog.Warn("message seq uniqueness not enforced: the table already holds duplicate seqs", "err", err)
 	}
 	if err := addMissing(db, "usage", usageColumns); err != nil {
 		return nil, err
@@ -225,21 +251,27 @@ func (t threads) SetState(ctx context.Context, threadID string, state ports.Exec
 }
 
 func (t threads) Delete(ctx context.Context, threadID string, _ ports.StorageContext) error {
-	res, err := t.db.ExecContext(ctx, `DELETE FROM threads WHERE id = ?`, threadID)
+	// One transaction: a thread is gone with everything it owned, or not at
+	// all. No FK cascade here: the cascade is spelled out, so a caller can
+	// read exactly what is removed.
+	tx, err := t.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, `DELETE FROM threads WHERE id = ?`, threadID)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("unknown thread %s", threadID)
 	}
-	// No FK cascade here: the cascade is spelled out, so a caller can read
-	// exactly what is removed.
 	for _, table := range []string{"messages", "events", "usage"} {
-		if _, err := t.db.ExecContext(ctx, `DELETE FROM `+table+` WHERE threadId = ?`, threadID); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE threadId = ?`, threadID); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (t threads) ClaimState(ctx context.Context, threadID string, from, to ports.ExecutionState, _ ports.StorageContext) (bool, error) {

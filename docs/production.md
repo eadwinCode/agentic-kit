@@ -45,6 +45,13 @@ export const runtime = await setupAgentCore({
 export const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 ```
 
+`PrismaStorage` orders a thread's messages by a `seq` column (`BigInt
+@default(autoincrement())` on `Message`), not by `createdAt`: a tool call and
+its result can share a millisecond. An existing database gets the column from
+the example's `20260926000000_message_seq` migration, which numbers the rows
+already there in their old order (`createdAt`, then `id`). Copy it into your
+own migrations and run `prisma generate`.
+
 ## Deployment shapes
 
 **Serverless.** The natural fit: `run()` returns in milliseconds, and the queue

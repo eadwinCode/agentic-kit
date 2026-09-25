@@ -149,6 +149,11 @@ func (k *Kv) DelIfValue(_ context.Context, key, expected string) (bool, error) {
 	return true, nil
 }
 
+// PublishedKept is how many of the latest published events a memory Bus
+// keeps for Published: enough for any test, bounded for a dev server that
+// runs for days.
+const PublishedKept = 10_000
+
 // Bus is a synchronous in-memory bus. Publishes are delivered to subscribers
 // in order, on the publisher's goroutine.
 type Bus struct {
@@ -164,6 +169,9 @@ func NewBus() *Bus { return &Bus{subs: map[string]map[int]func(ports.AgentEvent)
 func (b *Bus) Publish(_ context.Context, threadID string, event ports.AgentEvent) error {
 	b.mu.Lock()
 	b.published = append(b.published, event)
+	if len(b.published) > PublishedKept {
+		b.published = append([]ports.AgentEvent(nil), b.published[len(b.published)-PublishedKept:]...)
+	}
 	handlers := make([]func(ports.AgentEvent), 0, len(b.subs[threadID]))
 	for _, h := range b.subs[threadID] {
 		handlers = append(handlers, h)
@@ -187,12 +195,15 @@ func (b *Bus) Subscribe(_ context.Context, threadID string, handler func(ports.A
 	return func() error {
 		b.mu.Lock()
 		delete(b.subs[threadID], id)
+		if len(b.subs[threadID]) == 0 {
+			delete(b.subs, threadID) // a thread nobody watches holds nothing
+		}
 		b.mu.Unlock()
 		return nil
 	}, nil
 }
 
-// Published is every event ever published, in order.
+// Published is the latest PublishedKept events published, in order.
 func (b *Bus) Published() []ports.AgentEvent {
 	b.mu.Lock()
 	defer b.mu.Unlock()

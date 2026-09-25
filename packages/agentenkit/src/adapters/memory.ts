@@ -2,7 +2,7 @@ import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewUsage, RunJ
 import { sumUsage } from '../core/usage.js';
 import type { Storage } from '../ports/storage.js';
 import type { EventBus } from '../ports/bus.js';
-import type { EnqueueOptions, Queue } from '../ports/queue.js';
+import { DuplicateJobError, QueueFullError, type EnqueueOptions, type Queue, type QueueStats, type QueuedJob } from '../ports/queue.js';
 import type { Kv } from '../ports/kv.js';
 
 const id = () => Math.random().toString(36).slice(2, 12);
@@ -77,20 +77,32 @@ export class MemoryKv implements Kv {
   }
 }
 
+/** How many of the latest published events a MemoryBus keeps in `published`:
+ *  enough for any test, bounded for a dev server that runs for days. */
+export const PUBLISHED_KEPT = 10_000;
+
 /** Synchronous in-memory bus. Publishes are delivered to subscribers in order. */
 export class MemoryBus implements EventBus {
   private subs = new Map<string, Set<(e: AgentEvent) => void>>();
+  /** The latest PUBLISHED_KEPT events published, in order. */
   readonly published: AgentEvent[] = [];
 
   async publish(threadId: string, event: AgentEvent) {
     this.published.push(event);
+    if (this.published.length > PUBLISHED_KEPT) {
+      this.published.splice(0, this.published.length - PUBLISHED_KEPT);
+    }
     for (const h of this.subs.get(threadId) ?? []) h(event);
   }
   async subscribe(threadId: string, handler: (e: AgentEvent) => void) {
     let set = this.subs.get(threadId);
     if (!set) { set = new Set(); this.subs.set(threadId, set); }
     set.add(handler);
-    return () => { set!.delete(handler); };
+    return () => {
+      set!.delete(handler);
+      // A thread nobody watches holds nothing.
+      if (set!.size === 0 && this.subs.get(threadId) === set) this.subs.delete(threadId);
+    };
   }
   /** Live subscriptions on a thread — lets a test prove a stream cleaned up
    *  after itself rather than leaking one per reconnect. */
@@ -105,10 +117,65 @@ export class MemoryQueue implements Queue {
   readonly items: RunJob[] = [];
   /** Delivery delay requested per enqueue, index-aligned with `items`. */
   readonly delays: Array<number | undefined> = [];
+  /** Each job's key and priority, kept on the job itself so a test that
+   *  shifts `items` by hand leaves nothing out of step. */
+  private readonly meta = new WeakMap<RunJob, { key?: string; priority: number; delaySeconds?: number }>();
+  /** Refuses a fresh dispatch past this many waiting jobs; 0 is unbounded. */
+  maxDepth = 0;
+
   async enqueue(job: RunJob, opts?: EnqueueOptions) {
-    this.items.push(job);
+    if (opts?.key && this.items.some((j) => this.meta.get(j)?.key === opts.key)) {
+      throw new DuplicateJobError(opts.key);
+    }
+    // The cap counts everything ready to run, but refuses only new work: a
+    // retry, a resume or an expiry belongs to a run already under way.
+    if (this.maxDepth > 0 && !job.kind) {
+      const ready = this.items.filter((j) => !this.meta.get(j)?.delaySeconds).length;
+      if (ready >= this.maxDepth) throw new QueueFullError();
+    }
+    const item = { ...job };
+    this.meta.set(item, { key: opts?.key, priority: opts?.priority ?? 0, delaySeconds: opts?.delaySeconds });
+    this.items.push(item);
     this.delays.push(opts?.delaySeconds);
   }
+
+  /** The key a queued job was enqueued under. */
+  keyOf(job: RunJob): string | undefined {
+    return this.meta.get(job)?.key;
+  }
+
+  /** The priority a queued job was enqueued with. */
+  priorityOf(job: RunJob): number {
+    return this.meta.get(job)?.priority ?? 0;
+  }
+
+  async cancel(key: string) {
+    for (let i = this.items.length - 1; i >= 0; i--) {
+      if (key && this.meta.get(this.items[i]!)?.key === key) {
+        this.items.splice(i, 1);
+        this.delays.splice(i, 1);
+      }
+    }
+  }
+
+  async find(runId: string): Promise<QueuedJob | null> {
+    const i = this.items.findIndex((j) => runId && j.runId === runId);
+    if (i === -1) return null;
+    const job = this.items[i]!;
+    return {
+      id: String(i), runId, threadId: job.threadId, kind: job.kind, attempts: 0,
+      runAt: new Date(Date.now() + (this.meta.get(job)?.delaySeconds ?? 0) * 1000), position: i,
+    };
+  }
+
+  async stats(): Promise<QueueStats> {
+    const delayed = this.items.filter((j) => (this.meta.get(j)?.delaySeconds ?? 0) > 0).length;
+    return {
+      ready: this.items.length - delayed, delayed, inFlight: 0, dead: 0,
+      oldestReadyMs: 0, paused: false, claimErrors: 0,
+    };
+  }
+
   async drain(handler: (job: RunJob) => Promise<void>): Promise<number> {
     let n = 0;
     while (this.items.length) {

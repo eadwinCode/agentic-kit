@@ -485,9 +485,11 @@ func TestDispatch_AnUnknownAgentIsAnErrorNotASilentSuccess(t *testing.T) {
 	}
 }
 
-// Deleting a parked thread closes its open run record, and the expiry that
-// later finds no thread does nothing.
-func TestDelete_AParkedThreadsOpenRunRecordIsClosed(t *testing.T) {
+// Deleting a parked thread takes its operational history with it (§3.2):
+// no run, step or thread row is left in the admin store, and the expiry that
+// later finds no thread does nothing. The same case runs in the TS package
+// (test/admin-store.test.ts).
+func TestDelete_ADeletedThreadLeavesNothingInTheAdminStore(t *testing.T) {
 	h := hitlSetup(t)
 	ran := h.run(t, h.chat, agentenkit.RunInput{Prompt: "delete"})
 	h.handleNext(t)
@@ -495,12 +497,15 @@ func TestDelete_AParkedThreadsOpenRunRecordIsClosed(t *testing.T) {
 	if err != nil || !res.Accepted {
 		t.Fatalf("delete: %v %+v", err, res)
 	}
-	rec, _ := h.admin.Runs().Get(h.ctx, ran.RunID)
-	if rec.EndedAt == nil {
-		t.Fatal("the open record is closed with the thread")
+	if rec, _ := h.admin.Runs().Get(h.ctx, ran.RunID); rec != nil {
+		t.Fatalf("the run record is gone with the thread: %+v", rec)
 	}
-	mustEqual(t, rec.State, agentenkit.StateCancelled, "state")
-	mustEqual(t, rec.StopReason, "deleted", "why")
+	if th, _ := h.admin.Threads().Get(h.ctx, ran.ThreadID); th != nil {
+		t.Fatal("the admin thread row is gone too")
+	}
+	if steps, _ := h.admin.Steps().ListByThread(h.ctx, ran.ThreadID); len(steps) != 0 {
+		t.Fatalf("and its steps: %d left", len(steps))
+	}
 	h.drain(t) // the expiry finds no thread
 	mustEqual(t, h.model.Calls(), 1, "nothing ran after the delete")
 }

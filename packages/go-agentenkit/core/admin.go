@@ -32,6 +32,10 @@ type RunStats struct {
 	// Waiting is how many runs in the window are still QUEUED.
 	Waiting int `json:"waiting"`
 	Failed  int `json:"failed"`
+	// Sampled is true when the window held more runs than the percentiles
+	// were worked out over. The counts and token sums are exact either way;
+	// the percentiles are then over the newest runs only.
+	Sampled bool `json:"sampled,omitempty"`
 }
 
 // AdminOverview is the top of an operational view.
@@ -173,11 +177,30 @@ func RunStatsFor(ctx context.Context, deps ports.RuntimePorts, r StatsRange) (Ru
 	if limit <= 0 {
 		limit = 1_000
 	}
-	runs, err := ListRuns(ctx, deps, ports.RunFilter{Since: r.Since, Until: r.Until, Limit: limit})
+	return statsOver(ctx, deps, ports.RunFilter{Since: r.Since, Until: r.Until}, limit)
+}
+
+// statsOver is Summarise over the newest sample runs, with the counts and
+// token sums taken exact from the store, whatever the window holds.
+func statsOver(ctx context.Context, deps ports.RuntimePorts, f ports.RunFilter, sample int) (RunStats, error) {
+	f.Limit = sample
+	runs, err := ListRuns(ctx, deps, f)
 	if err != nil {
 		return RunStats{}, err
 	}
-	return Summarise(runs), nil
+	out := Summarise(runs)
+	totals, err := deps.Admin.Runs().Totals(ctx, f)
+	if err != nil {
+		return RunStats{}, err
+	}
+	out.Total, out.ByState, out.ByStopReason = totals.Runs, totals.ByState, totals.ByStopReason
+	out.Failed, out.Waiting = totals.ByState[ports.StateFailed], totals.ByState[ports.StateQueued]
+	out.Tokens = ports.UsageTotals{
+		InputTokens: totals.InputTokens, CachedInputTokens: totals.CachedInputTokens,
+		OutputTokens: totals.OutputTokens, TotalTokens: totals.TotalTokens,
+	}
+	out.Sampled = totals.Runs > len(runs)
+	return out, nil
 }
 
 // activeLimit caps the Active sample in an overview.
@@ -193,7 +216,7 @@ func Overview(ctx context.Context, deps ports.RuntimePorts, since *time.Time) (A
 	if err != nil {
 		return AdminOverview{}, err
 	}
-	recent, err := ListRuns(ctx, deps, ports.RunFilter{Since: since, Limit: 1_000})
+	recent, err := statsOver(ctx, deps, ports.RunFilter{Since: since}, 1_000)
 	if err != nil {
 		return AdminOverview{}, err
 	}
@@ -204,7 +227,7 @@ func Overview(ctx context.Context, deps ports.RuntimePorts, since *time.Time) (A
 		return AdminOverview{}, err
 	}
 	out := AdminOverview{
-		Runs: Summarise(recent), Threads: threads, RunsByState: runsByState, Active: active, ActiveLimit: activeLimit,
+		Runs: recent, Threads: threads, RunsByState: runsByState, Active: active, ActiveLimit: activeLimit,
 		ActiveTotal: runsByState[ports.StateQueued] + runsByState[ports.StateRunning] + runsByState[ports.StateWaitingForInput],
 	}
 	// The queue's own numbers ride the same response every dashboard
@@ -255,7 +278,7 @@ func rollUp(t ports.AdminThread, runs []ports.RunRecord) ThreadSummary {
 }
 
 // ListThreads lists threads with their runs rolled up, newest activity first
-// (§2.9). One pass over the window's runs rather than a query per thread.
+// (§2.9). One read of those threads' runs rather than a query per thread.
 func ListThreads(ctx context.Context, deps ports.RuntimePorts, filter ports.AdminThreadFilter) ([]ThreadSummary, error) {
 	if filter.Limit <= 0 {
 		filter.Limit = defaultLimit
@@ -264,9 +287,17 @@ func ListThreads(ctx context.Context, deps ports.RuntimePorts, filter ports.Admi
 	if err != nil {
 		return nil, err
 	}
-	runs, err := deps.Admin.Runs().List(ctx, ports.RunFilter{Since: filter.Since, Limit: 5_000})
-	if err != nil {
-		return nil, err
+	// The runs of exactly the threads listed, not the latest few thousand
+	// overall: a busy system would otherwise roll some threads up short.
+	ids := make([]string, 0, len(threads))
+	for _, t := range threads {
+		ids = append(ids, t.ID)
+	}
+	var runs []ports.RunRecord
+	if len(ids) > 0 {
+		if runs, err = deps.Admin.Runs().List(ctx, ports.RunFilter{ThreadIDs: ids, Limit: 100_000}); err != nil {
+			return nil, err
+		}
 	}
 	byThread := map[string][]ports.RunRecord{}
 	for _, r := range runs {
@@ -290,16 +321,9 @@ func GetThread(ctx context.Context, deps ports.RuntimePorts, threadID string) (*
 	if err != nil {
 		return nil, err
 	}
-	rows, err := deps.Admin.Threads().List(ctx, ports.AdminThreadFilter{Limit: 5_000})
+	thread, err := deps.Admin.Threads().Get(ctx, threadID)
 	if err != nil {
 		return nil, err
-	}
-	var thread *ports.AdminThread
-	for i := range rows {
-		if rows[i].ID == threadID {
-			thread = &rows[i]
-			break
-		}
 	}
 	if thread == nil && len(runs) == 0 {
 		return nil, nil

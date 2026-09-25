@@ -47,6 +47,11 @@ export interface MigrationDialect {
   insert: string;
   /** Reads one version back. One bind parameter. */
   selectOne: string;
+  /** Opens the migration's transaction; `BEGIN` when omitted. SQLite's is
+   *  `BEGIN IMMEDIATE`: a plain BEGIN takes the write lock only at the first
+   *  write, so two processes that both read the ledger first both fail with
+   *  SQLITE_BUSY instead of one waiting for the other. */
+  begin?: string;
   /** Taken first inside each migration's transaction, so two workers starting
    *  together queue rather than both applying the same file. Omitted for a
    *  database that serialises writers by itself. */
@@ -115,7 +120,7 @@ export async function runMigrations(
 ): Promise<void> {
   const where = (msg: string) => `${dialect.name} migrations: ${msg}`;
 
-  await db.exec('BEGIN');
+  await db.exec(dialect.begin ?? 'BEGIN');
   try {
     if (dialect.lock) await db.exec(dialect.lock);
     await db.exec(dialect.ledger);

@@ -13,9 +13,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strings"
 
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/admin/migrate"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/core"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
@@ -38,17 +38,20 @@ func New(ctx context.Context, db *sql.DB, opts ...Option) (*Storage, error) {
 	for _, o := range opts {
 		o(s)
 	}
-	for _, stmt := range s.schema() {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return nil, fmt.Errorf("postgres storage schema: %w", err)
-		}
-	}
-	// One event per seq on a thread: a counter that restarted must fail its
-	// write, never land a second event under a seq clients already have. A
-	// log from before this check may already hold duplicates; the index is
-	// then left off and said so, rather than refusing to start.
-	if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS `+s.t("events_thread_seq_unique")+` ON `+s.t("events")+`("threadId", seq)`); err != nil {
-		slog.Warn("event seq uniqueness not enforced: the log already holds duplicate seqs", "table", s.t("events"), "err", err)
+	if err := migrateSchema(ctx, db, s.prefix, "storage", []migrate.Migration{
+		migrate.NewMigration("storage_0001_init", s.schema()...),
+		// One event per seq on a thread: a counter that restarted must fail
+		// its write, never land a second event under a seq clients already
+		// have. A log from before this check may hold duplicates; the index
+		// is then left off, said so, and tried again on the next start.
+		optional(migrate.NewMigration("storage_0002_events_seq_unique",
+			`CREATE UNIQUE INDEX IF NOT EXISTS `+s.t("events_thread_seq_unique")+` ON `+s.t("events")+`("threadId", seq)`)),
+		// The same for messages, so two appends that raced to one seq cannot
+		// both land (Append retries the loser).
+		optional(migrate.NewMigration("storage_0003_messages_seq_unique",
+			`CREATE UNIQUE INDEX IF NOT EXISTS `+s.t("messages_thread_seq_unique")+` ON `+s.t("messages")+`("threadId", seq)`)),
+	}); err != nil {
+		return nil, err
 	}
 	return s, nil
 }
@@ -231,11 +234,45 @@ func (m messages) Append(ctx context.Context, threadID string, msg ports.NewMess
 		content = json.RawMessage("null")
 	}
 	// An explicit seq keeps insertion order stable inside one millisecond.
-	return scanMessage(m.s.db.QueryRowContext(ctx,
+	// Under READ COMMITTED two appends could read the same MAX, so appends to
+	// one thread take its row lock first and go one at a time; the unique
+	// index is the backstop, and a clash that still gets through is retried.
+	for attempt := 0; ; attempt++ {
+		out, err := m.append(ctx, threadID, msg.AgentID, string(msg.Role), string(content))
+		if err == nil || attempt == 4 || !isUniqueViolation(err) {
+			return out, err
+		}
+	}
+}
+
+func (m messages) append(ctx context.Context, threadID, agentID, role, content string) (*ports.MessageDTO, error) {
+	tx, err := m.s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SELECT 1 FROM `+m.s.t("threads")+` WHERE id = $1 FOR UPDATE`, threadID); err != nil {
+		return nil, err
+	}
+	out, err := scanMessage(tx.QueryRowContext(ctx,
 		`INSERT INTO `+m.s.t("messages")+` (id, "threadId", "agentId", role, content, seq)
 		 VALUES ($1, $2, $3, $4, $5, (SELECT COALESCE(MAX(seq),0)+1 FROM `+m.s.t("messages")+` WHERE "threadId" = $2))
 		 RETURNING `+messageCols,
-		core.NewID(), threadID, nullStr(msg.AgentID), string(msg.Role), string(content)))
+		core.NewID(), threadID, nullStr(agentID), role, content))
+	if err != nil {
+		return nil, err
+	}
+	return out, tx.Commit()
+}
+
+// isUniqueViolation reports a unique-index clash (SQLSTATE 23505), from any
+// Postgres driver.
+func isUniqueViolation(err error) bool {
+	var coded interface{ SQLState() string }
+	if errors.As(err, &coded) {
+		return coded.SQLState() == "23505"
+	}
+	return strings.Contains(err.Error(), "23505") || strings.Contains(err.Error(), "duplicate key")
 }
 
 func (m messages) List(ctx context.Context, threadID string, scope *ports.MessageScope, _ ports.StorageContext) ([]ports.MessageDTO, error) {

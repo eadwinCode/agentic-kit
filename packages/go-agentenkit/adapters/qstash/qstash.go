@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -87,10 +88,9 @@ func (q *Queue) Enqueue(ctx context.Context, job ports.RunJob, opts *ports.Enque
 	endpoint := q.client.BaseURL + "/v2/enqueue/" + url.PathEscape(q.opts.QueueName) + "/" + target
 	var delay int64
 	if opts != nil && opts.Delay > 0 {
-		delay = int64(opts.Delay.Seconds())
-		if delay < 1 {
-			delay = 1
-		}
+		// Rounded up, never down: a delay is a "not before", and 1.9s cut
+		// to 1s would deliver early.
+		delay = max(int64(math.Ceil(opts.Delay.Seconds())), 1)
 		endpoint = q.client.BaseURL + "/v2/publish/" + target
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))

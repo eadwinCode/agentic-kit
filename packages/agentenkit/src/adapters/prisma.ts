@@ -1,4 +1,4 @@
-import type { AgentEvent, ExecutionState, NewMessage, NewUsage, ThreadDTO, ThreadTransition, UsageFilter, UsageTotals } from '../core/types.js';
+import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewUsage, ThreadDTO, ThreadTransition, UsageFilter, UsageTotals } from '../core/types.js';
 import { UsageMerger } from '../core/usage.js';
 import type { Storage } from '../ports/storage.js';
 
@@ -27,9 +27,10 @@ export interface PrismaLike {
     create(a: { data: { threadId: string; agentId?: string | null; role: string; content: any } }): Promise<any>;
     findMany(a: {
       where: { threadId: string; agentId?: string | null };
-      orderBy: { createdAt: 'asc' };
+      orderBy: { seq: 'asc' };
     }): Promise<any[]>;
-    deleteMany(a: { where: { id: { in: string[] } } }): Promise<{ count: number }>;
+    findFirst(a: { where: { id: string; threadId: string }; select: { seq: true } }): Promise<{ seq: bigint | number } | null>;
+    deleteMany(a: { where: { threadId: string; seq: { gte: bigint | number } } }): Promise<{ count: number }>;
   };
   agentEvent: {
     create(a: { data: { threadId: string; seq: number; type: string; payload: any } }): Promise<unknown>;
@@ -102,6 +103,13 @@ export interface UsageGroupRow {
   _sum: Record<string, number | bigint | null>;
 }
 
+/** A message row without its `seq`: a BigInt, which JSON cannot carry, and
+ *  an ordering detail no caller needs. */
+function toMessage(row: any): MessageDTO {
+  const { seq: _seq, ...rest } = row ?? {};
+  return rest as MessageDTO;
+}
+
 /** Reference Storage adapter over PostgreSQL/Prisma (schema in the README / spec §2.4). */
 export class PrismaStorage implements Storage {
   constructor(private readonly prisma: PrismaLike) {}
@@ -144,10 +152,10 @@ export class PrismaStorage implements Storage {
   };
 
   messages = {
-    append: (threadId: string, m: NewMessage) =>
-      this.prisma.message.create({
+    append: async (threadId: string, m: NewMessage) =>
+      toMessage(await this.prisma.message.create({
         data: { threadId, agentId: m.agentId ?? null, role: m.role, content: m.content },
-      }),
+      })),
     list: (threadId: string, opts?: { agentId?: string | null }) =>
       this.prisma.message.findMany({
         // `agentId: null` is a real filter (IS NULL), not an absent one — the
@@ -156,20 +164,20 @@ export class PrismaStorage implements Storage {
           threadId,
           ...(opts && 'agentId' in opts ? { agentId: opts.agentId } : {}),
         },
-        orderBy: { createdAt: 'asc' },
-      }),
+        // By seq, the order they were written: a tool call and its result
+        // can share a millisecond, and createdAt would let them swap.
+        orderBy: { seq: 'asc' },
+      }).then((rows) => rows.map(toMessage)),
     deleteFrom: async (threadId: string, messageId: string) => {
-      // Delete by id over the same ordering `list` uses, rather than a
-      // `createdAt >=` range: a run appends several messages inside one
-      // millisecond, and a range would take neighbours with it.
-      const rows = await this.prisma.message.findMany({
-        where: { threadId },
-        orderBy: { createdAt: 'asc' },
+      // One delete over the same order `list` uses: the message and every
+      // one written after it.
+      const target = await this.prisma.message.findFirst({
+        where: { id: messageId, threadId },
+        select: { seq: true },
       });
-      const from = rows.findIndex((m: { id: string }) => m.id === messageId);
-      if (from === -1) return 0;
+      if (!target) return 0;
       const { count } = await this.prisma.message.deleteMany({
-        where: { id: { in: rows.slice(from).map((m: { id: string }) => m.id) } },
+        where: { threadId, seq: { gte: target.seq } },
       });
       return count;
     },

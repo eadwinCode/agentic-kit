@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/admin/migrate"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
 
@@ -30,14 +31,13 @@ func NewKv(ctx context.Context, db *sql.DB, opts ...Option) (*Kv, error) {
 		o(s)
 	}
 	k := &Kv{db: db, table: s.prefix + "kv"}
-	for _, stmt := range []string{
-		`CREATE TABLE IF NOT EXISTS ` + k.table + ` (
-		   key TEXT PRIMARY KEY, value TEXT NOT NULL, "expiresAt" TIMESTAMPTZ)`,
-		`CREATE INDEX IF NOT EXISTS ` + k.table + `_expires ON ` + k.table + `("expiresAt") WHERE "expiresAt" IS NOT NULL`,
-	} {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return nil, fmt.Errorf("postgres kv schema: %w", err)
-		}
+	if err := migrateSchema(ctx, db, s.prefix, "kv", []migrate.Migration{
+		migrate.NewMigration("kv_0001_init",
+			`CREATE TABLE IF NOT EXISTS `+k.table+` (
+			   key TEXT PRIMARY KEY, value TEXT NOT NULL, "expiresAt" TIMESTAMPTZ)`,
+			`CREATE INDEX IF NOT EXISTS `+k.table+`_expires ON `+k.table+`("expiresAt") WHERE "expiresAt" IS NOT NULL`),
+	}); err != nil {
+		return nil, err
 	}
 	return k, nil
 }

@@ -6,6 +6,7 @@ package memory
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -75,6 +76,37 @@ func (t threadStore) List(_ context.Context, f ports.AdminThreadFilter) ([]ports
 	}
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].UpdatedAt.After(rows[j].UpdatedAt) })
 	return limit(rows, f.Limit), nil
+}
+
+func (t threadStore) Get(_ context.Context, threadID string) (*ports.AdminThread, error) {
+	t.s.mu.Lock()
+	defer t.s.mu.Unlock()
+	th, ok := t.s.threads[threadID]
+	if !ok {
+		return nil, nil
+	}
+	copy := *th
+	return &copy, nil
+}
+
+func (t threadStore) Delete(_ context.Context, threadID string) error {
+	t.s.mu.Lock()
+	defer t.s.mu.Unlock()
+	delete(t.s.threads, threadID)
+	for id, r := range t.s.runs {
+		if r.ThreadID == threadID {
+			delete(t.s.runs, id)
+			delete(t.s.settleTokens, id)
+		}
+	}
+	kept := t.s.steps[:0]
+	for _, st := range t.s.steps {
+		if st.ThreadID != threadID {
+			kept = append(kept, st)
+		}
+	}
+	t.s.steps = kept
+	return nil
 }
 
 func contains(states []ports.ExecutionState, s ports.ExecutionState) bool {
@@ -209,31 +241,9 @@ func (r runStore) List(_ context.Context, f ports.RunFilter) ([]ports.RunRecord,
 	defer r.s.mu.Unlock()
 	var rows []ports.RunRecord
 	for _, rec := range r.s.runs {
-		if len(f.State) > 0 && !contains(f.State, rec.State) {
-			continue
+		if matches(rec, f) {
+			rows = append(rows, *rec)
 		}
-		if f.Agent != "" && rec.Agent != f.Agent {
-			continue
-		}
-		if f.ThreadID != "" && rec.ThreadID != f.ThreadID {
-			continue
-		}
-		if f.Since != nil && rec.StartedAt.Before(*f.Since) {
-			continue
-		}
-		if f.Until != nil && rec.StartedAt.After(*f.Until) {
-			continue
-		}
-		if f.Unsettled && (rec.EndedAt == nil || rec.SettledAt != nil) {
-			continue
-		}
-		if f.Depth != nil && rec.Depth != *f.Depth {
-			continue
-		}
-		if c := f.Before; c != nil && !(rec.StartedAt.Before(c.StartedAt) || rec.StartedAt.Equal(c.StartedAt) && rec.ID < c.ID) {
-			continue
-		}
-		rows = append(rows, *rec)
 	}
 	sort.SliceStable(rows, func(i, j int) bool {
 		if !rows[i].StartedAt.Equal(rows[j].StartedAt) {
@@ -242,6 +252,61 @@ func (r runStore) List(_ context.Context, f ports.RunFilter) ([]ports.RunRecord,
 		return rows[i].ID > rows[j].ID
 	})
 	return limit(rows, f.Limit), nil
+}
+
+// matches is the RunFilter, Limit aside.
+func matches(rec *ports.RunRecord, f ports.RunFilter) bool {
+	switch {
+	case len(f.State) > 0 && !contains(f.State, rec.State),
+		f.Agent != "" && rec.Agent != f.Agent,
+		f.ThreadID != "" && rec.ThreadID != f.ThreadID,
+		len(f.ThreadIDs) > 0 && !slices.Contains(f.ThreadIDs, rec.ThreadID),
+		f.Since != nil && rec.StartedAt.Before(*f.Since),
+		f.Until != nil && rec.StartedAt.After(*f.Until),
+		f.Unsettled && (rec.EndedAt == nil || rec.SettledAt != nil),
+		f.Depth != nil && rec.Depth != *f.Depth:
+		return false
+	}
+	if c := f.Before; c != nil && !(rec.StartedAt.Before(c.StartedAt) || rec.StartedAt.Equal(c.StartedAt) && rec.ID < c.ID) {
+		return false
+	}
+	return true
+}
+
+func (r runStore) Increment(_ context.Context, runID string, d ports.RunDeltas) error {
+	r.s.mu.Lock()
+	defer r.s.mu.Unlock()
+	if cur, ok := r.s.runs[runID]; ok {
+		cur.Steps += d.Steps
+		cur.InputTokens += d.InputTokens
+		cur.CachedInputTokens += d.CachedInputTokens
+		cur.OutputTokens += d.OutputTokens
+		cur.TotalTokens += d.TotalTokens
+	}
+	return nil
+}
+
+func (r runStore) Totals(_ context.Context, f ports.RunFilter) (ports.RunTotals, error) {
+	r.s.mu.Lock()
+	defer r.s.mu.Unlock()
+	f.Before = nil
+	out := ports.RunTotals{ByState: map[ports.ExecutionState]int{}, ByStopReason: map[string]int{}}
+	for _, rec := range r.s.runs {
+		if !matches(rec, f) {
+			continue
+		}
+		out.Runs++
+		out.ByState[rec.State]++
+		if rec.StopReason != "" {
+			out.ByStopReason[rec.StopReason]++
+		}
+		out.Steps += rec.Steps
+		out.InputTokens += rec.InputTokens
+		out.CachedInputTokens += rec.CachedInputTokens
+		out.OutputTokens += rec.OutputTokens
+		out.TotalTokens += rec.TotalTokens
+	}
+	return out, nil
 }
 
 func (r runStore) ClaimSettle(_ context.Context, runID, token string, staleBefore time.Time) (bool, error) {

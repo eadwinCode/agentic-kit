@@ -1,5 +1,5 @@
 import type { RunFinishInfo, RuntimePorts } from '../ports/runtime.js';
-import type { ExecutionState, ProviderOptions, ResumeInfo, RunPatch, UsageTotals } from './types.js';
+import type { ExecutionState, JobKind, ProviderOptions, ResumeInfo, RunPatch, UsageTotals } from './types.js';
 import { wireId } from './types.js';
 import { compactContext } from './context.js';
 import type { TokenAttribution } from './usage.js';
@@ -7,6 +7,7 @@ import { markPromptCaching } from './cache.js';
 import { promptMessages, repairDanglingToolCalls } from './messages.js';
 import { mergeProviderOptions } from './types.js';
 import type { RegisteredAgent } from './agent.js';
+import type { RunDeltas } from '../ports/admin.js';
 import {
   hitlDoneKey,
   hitlKey,
@@ -24,6 +25,7 @@ import { withRunState, type AgentRunState } from './state.js';
 import { runLoop, seedRunLedger, type LoopOutcome } from './loop.js';
 import { enqueueJob, Lease, parseLockValue, runLockKey, RunLockLostError } from './lease.js';
 import { callOnFinish, isTerminal, runBill, settleEndedRun, settleRun } from './settle.js';
+import { DuplicateJobError, PRIORITY_LOW } from '../ports/queue.js';
 
 export { countTokens } from './usage.js';
 // executeStep and the loop live in ./loop.js so a nested run can share them
@@ -248,16 +250,22 @@ async function closeRunRecord(
       ...(f.error ? { error: f.error } : {}),
       endedAt,
       durationMs: endedAt.getTime() - new Date(prior.startedAt).getTime(),
-      steps: prior.steps + (f.steps ?? 0),
-      inputTokens: prior.inputTokens + f.attribution.inputTokens,
-      cachedInputTokens: prior.cachedInputTokens + f.attribution.cachedInputTokens,
-      outputTokens: prior.outputTokens + f.attribution.outputTokens,
-      totalTokens: prior.totalTokens + f.attribution.totalTokens,
     });
+    // The counters are added in the store, not read and written back here: a
+    // nested run and its parent can close at the same moment.
+    await deps.admin.runs.increment(runId, deltasOf(f.steps ?? 0, f.attribution));
   } catch {
     // Observability must never be able to fail a run that otherwise succeeded.
   }
   return endedAt;
+}
+
+/** A segment's steps and tokens as counters to add to its run. */
+function deltasOf(steps: number, a: TokenAttribution): RunDeltas {
+  return {
+    steps, inputTokens: a.inputTokens, cachedInputTokens: a.cachedInputTokens,
+    outputTokens: a.outputTokens, totalTokens: a.totalTokens,
+  };
 }
 
 /** Close a run record that can never be worked on again (§2.9): the thread is
@@ -747,16 +755,9 @@ export async function execute(
         // bill here. NO state flip: WAITING_FOR_INPUT (or CANCELLED if the user
         // stopped meanwhile) stands.
         if (runId) {
-          try {
-            const prior = await deps.admin.runs.get(runId);
-            if (prior) await deps.admin.runs.patch(runId, {
-              steps: prior.steps + loop.steps,
-              inputTokens: prior.inputTokens + attribution.inputTokens,
-              cachedInputTokens: prior.cachedInputTokens + attribution.cachedInputTokens,
-              outputTokens: prior.outputTokens + attribution.outputTokens,
-              totalTokens: prior.totalTokens + attribution.totalTokens,
-            });
-          } catch { /* Operational history must not fail a parked run. */ }
+          await deps.admin.runs
+            .increment(runId, deltasOf(loop.steps, attribution))
+            .catch(() => undefined); // operational history must not fail a parked run
         }
         return 'executed';
       }
@@ -936,7 +937,11 @@ async function redriveOnLockConflict(
           'run ended under a held lock and is not settled; settle retried once the lock clears',
           { threadId: input.threadId, runId: input.runId },
         );
-        await enqueueJob(deps, jobOf(agent, input), { delaySeconds: deps.config.runLockLeaseSeconds });
+        await enqueueJob(deps, jobOf(agent, input, 'redrive'), {
+          delaySeconds: deps.config.runLockLeaseSeconds, key: `settle:${input.runId}`, priority: PRIORITY_LOW,
+        }).catch((err) => {
+          if (!(err instanceof DuplicateJobError)) throw err; // once per run
+        });
       }
       return;
     } else if (holder.dispatchId === null || !input.dispatchId) {
@@ -952,7 +957,7 @@ async function redriveOnLockConflict(
   const tries = await deps.kv.incrWithExpiry(redriveKey(scope), COUNTER_TTL_SECONDS);
   const { delaySeconds, waitedSeconds } = redriveDelay(deps, tries);
   if (tries <= maxAttempts || waitedSeconds < deps.config.runLockLeaseSeconds) {
-    return enqueueJob(deps, jobOf(agent, input), { delaySeconds });
+    return enqueueJob(deps, jobOf(agent, input, 'redrive'), { delaySeconds });
   }
 
   await deps.kv.del(redriveKey(scope));
@@ -1048,7 +1053,7 @@ async function requeue(
   if (input.runId) await markQueued(deps, input.threadId, input.runId, input.model);
   await enqueueJob(
     deps,
-    jobOf(agent, input),
+    jobOf(agent, input, 'retry'),
     delayMs > 0 ? { delaySeconds: Math.ceil(delayMs / 1000) } : undefined,
   );
 }
@@ -1056,8 +1061,9 @@ async function requeue(
 /** The job that runs the same run again: a retry or a redrive. It keeps the
  *  caps the run was dispatched with — a retry that lost its money cap would be
  *  unbounded. */
-function jobOf(agent: RegisteredAgent, input: ExecuteInput) {
+function jobOf(agent: RegisteredAgent, input: ExecuteInput, kind: JobKind) {
   return {
+    kind,
     threadId: input.threadId,
     runId: input.runId,
     enqueuedAt: Date.now(),

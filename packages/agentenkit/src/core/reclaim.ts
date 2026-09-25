@@ -3,6 +3,7 @@ import type { ResumeInfo } from './types.js';
 import { currentRunId } from './keys.js';
 import { hitlDeadline, loadOpenHitls } from './hitl.js';
 import { enqueueJob } from './lease.js';
+import { DuplicateJobError, PRIORITY_LOW } from '../ports/queue.js';
 
 // Small grace so an in-flight /respond delivery always lands first —
 // reclamation only ever sees true orphans.
@@ -45,21 +46,33 @@ export async function reclaimIfOrphaned(deps: RuntimePorts, threadId: string): P
   const requested = await deps.storage.events.listByType(threadId, 'INPUT_REQUIRED');
   const resume = (requested.at(-1)?.payload as { resume?: ResumeInfo } | null)?.resume;
 
-  await enqueueJob(deps, {
-    threadId,
-    // Resuming a parked run REUSES its id — it is the same run continuing,
-    // and the park's own expiry job must stay a duplicate of this one (§2.1).
-    runId: await currentRunId(deps, threadId),
-    model: resume?.model ?? thread.model,
-    ...(resume
-      ? {
-          agent: resume.agent,
-          ...(resume.tokenBudget !== undefined ? { tokenBudget: resume.tokenBudget } : {}),
-          ...(resume.providerOptions ? { providerOptions: resume.providerOptions } : {}),
-          ...(resume.state ? { state: resume.state } : {}),
-          ...(resume.costBudgetMicros !== undefined ? { costBudgetMicros: resume.costBudgetMicros } : {}),
-        }
-      : {}),
-  });
+  // Resuming a parked run REUSES its id — it is the same run continuing, and
+  // the park's own expiry job must stay a duplicate of this one (§2.1). Keyed
+  // on the run, so two callers that heal the thread at once queue one job.
+  const runId = await currentRunId(deps, threadId);
+  try {
+    await enqueueJob(
+      deps,
+      {
+        kind: 'reclaim',
+        threadId,
+        runId,
+        model: resume?.model ?? thread.model,
+        ...(resume
+          ? {
+              agent: resume.agent,
+              ...(resume.tokenBudget !== undefined ? { tokenBudget: resume.tokenBudget } : {}),
+              ...(resume.providerOptions ? { providerOptions: resume.providerOptions } : {}),
+              ...(resume.state ? { state: resume.state } : {}),
+              ...(resume.costBudgetMicros !== undefined ? { costBudgetMicros: resume.costBudgetMicros } : {}),
+            }
+          : {}),
+      },
+      { key: `reclaim:${runId}`, priority: PRIORITY_LOW },
+    );
+  } catch (err) {
+    if (err instanceof DuplicateJobError) return false; // someone else got there first
+    throw err;
+  }
   return true;
 }

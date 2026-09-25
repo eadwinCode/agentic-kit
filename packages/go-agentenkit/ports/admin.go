@@ -29,6 +29,12 @@ type AdminThreadStore interface {
 	Upsert(ctx context.Context, t NewAdminThread) error
 	CountByState(ctx context.Context) (map[ExecutionState]int, error)
 	List(ctx context.Context, f AdminThreadFilter) ([]AdminThread, error)
+	// Get returns one thread, or nil, nil when it was never seen.
+	Get(ctx context.Context, threadID string) (*AdminThread, error)
+	// Delete removes a thread with its runs and steps: what a deleted
+	// thread leaves behind in operational history (§3.2). An unknown thread
+	// is not an error.
+	Delete(ctx context.Context, threadID string) error
 }
 
 // RunStore holds run records.
@@ -42,6 +48,14 @@ type RunStore interface {
 	ListByThread(ctx context.Context, threadID string) ([]RunRecord, error)
 	List(ctx context.Context, f RunFilter) ([]RunRecord, error)
 	CountByState(ctx context.Context) (map[ExecutionState]int, error)
+	// Increment adds to a run's counters in one write (SET steps = steps +
+	// n), so two segments that close together both count. An unknown run
+	// is not an error.
+	Increment(ctx context.Context, runID string, d RunDeltas) error
+	// Totals counts and sums every run the filter matches, grouped in the
+	// store: exact however many runs there are. Limit and Before are
+	// ignored.
+	Totals(ctx context.Context, f RunFilter) (RunTotals, error)
 	// ClaimSettle claims the right to run a run's settle hook (§5.6), in one
 	// conditional write: it wins only while the run is not settled and no
 	// other claim on it is newer than staleBefore. A claim older than that
@@ -150,6 +164,8 @@ type RunFilter struct {
 	ThreadID string
 	Since    *time.Time
 	Until    *time.Time
+	// ThreadIDs keeps only runs on these threads. Empty means every thread.
+	ThreadIDs []string
 	// Unsettled keeps only runs that have ended and whose settle has not
 	// run (§5.6): what the late-settle sweep looks for.
 	Unsettled bool
@@ -162,6 +178,28 @@ type RunFilter struct {
 	Before *RunCursor
 	// Limit: newest first. Implementations cap this; core passes a bounded value.
 	Limit int
+}
+
+// RunDeltas are amounts to add to a run's counters (see RunStore.Increment).
+type RunDeltas struct {
+	Steps             int
+	InputTokens       int
+	CachedInputTokens int
+	OutputTokens      int
+	TotalTokens       int
+}
+
+// RunTotals is what RunStore.Totals counts over a set of runs.
+type RunTotals struct {
+	Runs         int                    `json:"runs"`
+	ByState      map[ExecutionState]int `json:"byState"`
+	ByStopReason map[string]int         `json:"byStopReason"`
+	Steps        int                    `json:"steps"`
+	// Tokens are summed from the run records: tokens only, no money.
+	InputTokens       int `json:"inputTokens"`
+	CachedInputTokens int `json:"cachedInputTokens"`
+	OutputTokens      int `json:"outputTokens"`
+	TotalTokens       int `json:"totalTokens"`
 }
 
 // RunCursor is a place in a run listing (see RunFilter.Before).

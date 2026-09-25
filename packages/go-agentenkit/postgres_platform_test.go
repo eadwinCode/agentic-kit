@@ -36,7 +36,7 @@ func openPgPlatform(t *testing.T, prefix string, queueOpts pgstorage.QueueOption
 	t.Helper()
 	db := openPostgres(t)
 	ctx := context.Background()
-	for _, tbl := range []string{"jobs_control", "jobs", "kv", "usage", "events", "messages", "threads"} {
+	for _, tbl := range []string{"jobs_control", "jobs", "kv", "usage", "events", "messages", "threads", "migrations"} {
 		_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS "+prefix+tbl)
 	}
 	storage, err := pgstorage.New(ctx, db, pgstorage.WithPrefix(prefix))

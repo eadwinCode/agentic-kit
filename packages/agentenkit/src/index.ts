@@ -1,7 +1,17 @@
 // ports — the interfaces users implement
 export type { Storage } from './ports/storage.js';
 export type { EventBus } from './ports/bus.js';
-export type { EnqueueOptions, Queue } from './ports/queue.js';
+export {
+  PRIORITY_LOW,
+  QueueFullError,
+  PayloadTooLargeError,
+  DuplicateJobError,
+  UnsupportedError,
+  type EnqueueOptions,
+  type Queue,
+  type QueueStats,
+  type QueuedJob,
+} from './ports/queue.js';
 export type { Kv } from './ports/kv.js';
 export type {
   AgentCore,
@@ -56,7 +66,7 @@ export {
 // The run-state types, named here so they are discoverable rather than
 // reachable only by chance through another module's re-export.
 export type { AgentRunState, BoundStorage, StorageContext } from './core/state.js';
-export type { AdminThread, ThreadStart, StepRecord, RunFilter, AdminThreadFilter } from './ports/admin.js';
+export type { AdminThread, ThreadStart, StepRecord, RunFilter, AdminThreadFilter, RunCursor, RunDeltas, RunTotals } from './ports/admin.js';
 export type { BillingCheck } from './core/types.js';
 export { claimRun, redriveKey, runIdKey } from './core/keys.js';
 export { countTokens, sumUsage, emptyTotals, UsageMerger, type UsageGroup } from './core/usage.js';
@@ -121,6 +131,7 @@ export {
   type RunPatch,
   type RunRecord,
   type RunJob,
+  type JobKind,
   type ResumeInfo,
   type ContextUsage,
   type NestedDescriptor,

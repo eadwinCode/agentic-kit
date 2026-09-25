@@ -65,7 +65,7 @@ func TestTransition_SqliteStorage(t *testing.T) { transitionContract(t, openSqli
 func TestTransition_PostgresStorage(t *testing.T) {
 	db := openPostgres(t)
 	ctx := context.Background()
-	for _, tbl := range []string{"usage", "events", "messages", "threads"} {
+	for _, tbl := range []string{"usage", "events", "messages", "threads", "migrations"} {
 		_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS tr_"+tbl)
 	}
 	s, err := pgstorage.New(ctx, db, pgstorage.WithPrefix("tr_"))

@@ -355,6 +355,14 @@ export function mergeProviderOptions(
 /** Dispatch ticket for the queue (§2.8). At-least-once — consumers must be
  *  idempotent. `agent` resolves via `AgentCore.getAgent`; when missing, the
  *  default handle executes. */
+/** Why a job was enqueued (see `RunJob.kind`):
+ *  - `retry`: the same run trying again after a failure (§2.8);
+ *  - `redrive`: a job that found the run lock held by an older run;
+ *  - `resume`: a parked run continuing after an answer (§2.5);
+ *  - `expiry`: a park's own deadline (§2.5);
+ *  - `reclaim`: an orphaned thread re-dispatched (§2.5). */
+export type JobKind = 'retry' | 'redrive' | 'resume' | 'expiry' | 'reclaim';
+
 export interface RunJob {
   threadId: string;
   model: string;
@@ -373,6 +381,10 @@ export interface RunJob {
   /** Epoch ms at enqueue. The worker subtracts it on pickup to record how long
    *  the job waited — the number that says whether workers keep up (§2.9). */
   enqueuedAt?: number;
+  /** Why the job exists, so a queue can log it, order it and cap only the
+   *  kind that brings new work in. Absent is a fresh dispatch from `run`, the
+   *  only kind a depth cap refuses. */
+  kind?: JobKind;
   /** The run's state (§2.10), so a worker rehydrates exactly what the caller
    *  attached — hours later, in another process, after an approval. */
   state?: AgentRunState;

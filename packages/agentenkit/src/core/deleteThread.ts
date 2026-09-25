@@ -34,6 +34,13 @@ export async function deleteThread(
   // Cascade: messages, events, usage, runs follow the thread (§3.2)
   await deps.storage.threads.delete(threadId);
 
+  // The platform's own history of the thread goes with it: a deleted thread
+  // must not live on in operational views. Best effort, like every admin
+  // write; the caller's data is already gone.
+  await deps.admin.threads.delete(threadId).catch((err) => {
+    (deps.log ?? console).error('admin history of a deleted thread not removed', { threadId, err });
+  });
+
   // Live UIs subscribed to the thread channel learn it ceased to exist —
   // bus-only notice (seq 0, never persisted: the event log is gone with it)
   await publishNotice(deps, threadId, 'THREAD_DELETED', { threadId });

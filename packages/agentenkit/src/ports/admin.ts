@@ -20,6 +20,12 @@ export interface AdminStore {
     upsert(thread: NewAdminThread): Promise<void>;
     countByState(): Promise<Partial<Record<ExecutionState, number>>>;
     list(filter: AdminThreadFilter): Promise<AdminThread[]>;
+    /** One thread, or null when it was never seen. */
+    get(threadId: string): Promise<AdminThread | null>;
+    /** Remove a thread with its runs and steps: what a deleted thread leaves
+     *  behind in operational history (§3.2). An unknown thread is not an
+     *  error. */
+    delete(threadId: string): Promise<void>;
   };
   runs: {
     start(run: NewRunRecord): Promise<RunRecord>;
@@ -37,6 +43,13 @@ export interface AdminStore {
      *  settler that died, and is taken over. False when the run is unknown,
      *  settled, or claimed by someone else. */
     claimSettle(runId: string, token: string, staleBefore: Date): Promise<boolean>;
+    /** Add to a run's counters in one write (`SET steps = steps + n`), so two
+     *  segments that close together both count. An unknown run is not an
+     *  error. */
+    increment(runId: string, deltas: RunDeltas): Promise<void>;
+    /** Count and sum every run the filter matches, grouped in the store:
+     *  exact however many runs there are. `limit` and `before` are ignored. */
+    totals(filter: RunFilter): Promise<RunTotals>;
     /** End a claim made with `token`. `settled` marks the run settled for
      *  good; otherwise the claim is dropped so a later settle can run the hook
      *  again. A claim that was taken over is left alone. */
@@ -124,6 +137,8 @@ export interface RunFilter {
   state?: ExecutionState[];
   agent?: string;
   threadId?: string;
+  /** Only runs on these threads. Omitted or empty means every thread. */
+  threadIds?: string[];
   since?: Date;
   until?: Date;
   /** Only runs that have ended and whose settle has not run (§5.6): what the
@@ -137,6 +152,28 @@ export interface RunFilter {
   before?: RunCursor;
   /** Newest first. Implementations cap this — core passes a bounded value. */
   limit?: number;
+}
+
+/** Amounts to add to a run's counters (see `runs.increment`). */
+export interface RunDeltas {
+  steps: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+/** What `runs.totals` counts over a set of runs. Tokens are summed from the
+ *  run records: tokens only, no money. */
+export interface RunTotals {
+  runs: number;
+  byState: Partial<Record<ExecutionState, number>>;
+  byStopReason: Record<string, number>;
+  steps: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
 }
 
 /** A place in a run listing (see `RunFilter.before`). */

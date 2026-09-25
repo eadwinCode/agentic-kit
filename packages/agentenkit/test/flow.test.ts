@@ -220,10 +220,10 @@ describe('reclaimIfOrphaned (§2.5)', () => {
     // Resuming reuses the parked run's id (§2.1)
     expect(queue.items[0]).toMatchObject({ threadId: thread.id, runId: 'run-1' });
 
-    // A duplicate re-dispatch is safe — the run lock and the engine's
-    // readiness check make it a no-op, so it is not suppressed here.
-    expect(await runtime.hitl.reclaimIfOrphaned(thread.id)).toBe(true);
-    expect(queue.items).toHaveLength(2);
+    // A second re-dispatch while the first is still queued is refused by the
+    // queue: one reclaim row per run, as in the Go runtime.
+    expect(await runtime.hitl.reclaimIfOrphaned(thread.id)).toBe(false);
+    expect(queue.items).toHaveLength(1);
   });
 
   it('waits while ANY open approval is still answerable (§2.7)', async () => {

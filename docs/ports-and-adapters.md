@@ -108,6 +108,12 @@ A custom storage written before `transition` existed must add it, and a
 ```ts
 interface Queue {
   enqueue(job: RunJob, opts?: EnqueueOptions): Promise<void>;
+  /** Drop every waiting job enqueued under a key. */
+  cancel(key: string): Promise<void>;
+  /** A run's waiting or running job, or null. */
+  find(runId: string): Promise<QueuedJob | null>;
+  /** Count what waits, runs and died. */
+  stats(): Promise<QueueStats>;
 }
 ```
 
@@ -126,24 +132,34 @@ type Queue interface {
 At-least-once. The engine is idempotent under redelivery through the per-thread
 run lock.
 
-The Go port carries a little more than `Enqueue`, because an engine that
-cannot see its queue cannot refuse work, withdraw a park's expiry once the
-park is answered, or tell a dead worker's run from a live one:
+The port carries a little more than `enqueue`, because an engine that cannot
+see its queue cannot refuse work, withdraw a park's expiry once the park is
+answered, or tell a dead worker's run from a live one. Both runtimes have the
+same port:
 
-- `EnqueueOptions.Key` dedupes: at most one live job per key
-  (`ErrDuplicateJob` for a second), and `Cancel(key)` withdraws it. The
-  engine keys a park's expiry and its resume, and a thread's reclaim.
-- `EnqueueOptions.Priority` orders ready jobs: higher first. The engine's own
-  housekeeping (expiries, reclaims, redrives) goes in at `PriorityLow`, so a
-  user's message never queues behind it.
-- `RunJob.Kind` says why a job exists (dispatch, retry, redrive, resume,
-  expiry, reclaim); `RunJob.PartitionKey` is the caller's tenant;
-  `RunJob.DispatchedAt` is the run's first dispatch, carried onto every
-  retry so the run keeps its place in line.
-- `Stats` and `Find` feed the engine's overload refusal
-  (`AgentConfig.MaxQueueDepth`), the admin overview, and the stuck-run sweep.
-  An adapter with no read side answers `ErrUnsupported` and the engine treats
-  that as "unknown", never as a failure.
+- `EnqueueOptions.key` (Go: `Key`) dedupes: at most one live job per key
+  (`DuplicateJobError` / `ErrDuplicateJob` for a second), and `cancel(key)`
+  withdraws it. The engine keys a park's expiry and its resume, a thread's
+  reclaim, and the late settle of a run.
+- `EnqueueOptions.priority` orders ready jobs: higher first. The engine's own
+  housekeeping (expiries, reclaims, redrives) goes in at `PRIORITY_LOW`
+  (Go: `PriorityLow`), so a user's message never queues behind it.
+- `RunJob.kind` says why a job exists (absent for a fresh dispatch; `retry`,
+  `redrive`, `resume`, `expiry`, `reclaim`). In Go, `RunJob.PartitionKey` is
+  the caller's tenant and `RunJob.DispatchedAt` is the run's first dispatch,
+  carried onto every retry so the run keeps its place in line.
+- `stats` and `find` feed the admin overview and the stuck-run sweep (and, in
+  Go, the overload refusal, `AgentConfig.MaxQueueDepth`). An adapter with no
+  read side throws `UnsupportedError` (Go: `ErrUnsupported`) and the engine
+  treats that as "unknown", never as a failure.
+
+The shipped queues: `MemoryQueue` for tests; `InlineQueue` for development,
+which keys, cancels and counts like a real queue, holds a job that comes due
+before `bind` rather than dropping it, and waits out a delay of any length (a
+single timer cannot hold more than about 24.8 days); `QStashQueue`, where a
+key becomes QStash's deduplication id (remembered for ten minutes), priority
+is ignored, `cancel` does nothing (a delivered job is a correct no-op) and
+`find` / `stats` are unsupported.
 
 An adapter that cannot honour `delaySeconds` may deliver immediately, but **must
 never throw for it** — a HITL expiry is scheduled from inside a parked tool call,
@@ -252,7 +268,17 @@ scoped with the run state on the subscriber's own context, and delivers
 nothing twice. At-most-once still, and the client's cursor replay stays the
 last line.
 
-**Queue.** `Enqueue` is one insert; a delay is a future `runAt`. The consumer
+**Schema.** The storage, kv and queue tables are set up by the same migrator
+as the admin store, once per database: each prefix has its own ledger,
+`<prefix>migrations`, and a start with nothing to do reads it and moves on.
+Before, every start ran its `ALTER TABLE` statements, and each one takes a lock
+on the whole table even when the column is already there. A unique index that
+old duplicate rows block (events, messages by `(threadId, seq)`) is skipped
+with a warning and tried again on the next start. Appends to one thread's
+messages take the thread's row lock, so two cannot take the same seq.
+
+**Queue.** `Enqueue` is one statement: it counts, inserts and notifies, so
+`MaxDepth` is checked against the table the insert sees. The consumer
 claims with `SELECT … FOR UPDATE SKIP LOCKED`, so several processes can
 share the table, and renews the row's lease while the job runs. A worker
 that dies mid-job loses its lease and the job is redelivered — at-least-once,
@@ -262,7 +288,12 @@ back after a growing backoff (`RetryBackoff`, `RetryBackoffMax`); after
 bound with the worker fails its run, and an operator can list, redrive or
 purge it. The claim spreads across partitions: the partition with the fewest
 jobs in flight goes first, then priority, then dispatch time, so one tenant's
-burst cannot hold the head of the line. Every consumer of a `Namespace` takes
+burst cannot hold the head of the line. It never sorts the backlog: the
+partitions are walked through an index and each partition's head is an index
+lookup, so a claim costs the same with ten waiting jobs as with a million. A
+row whose payload cannot be read is kept dead and reaches the `DeadHandler`
+like any other, with the thread and run from its own columns. `Cancel` and
+`Purge` leave dead rows alone (`PurgeFilter.IncludeDead` asks for them). Every consumer of a `Namespace` takes
 only that namespace's rows, and `Pause`/`Resume` hold every consumer of it
 through a control row. With a `Listener` the consumer wakes on an enqueue
 instead of polling; `Poll` is then the backstop. `MaxDepth` refuses a fresh
@@ -283,3 +314,14 @@ the adapters.
 
 The one thing to test that unit tests rarely reach: two workers calling
 `claimState` on the same thread at the same moment. Exactly one must win.
+
+**SQLite.** `openSqlite` (Go: `sqlite.Open`) turns on WAL and a five-second
+`busy_timeout`, so a second process waits for the write lock instead of
+failing with `SQLITE_BUSY`; call `tuneSqlite` (Go: `sqlite.Tune`) on a handle
+you open yourself. A message's seq is taken inside its insert, a thread's
+delete is one transaction that fails for a thread that is not there, and the
+admin migrations take their lock up front (`BEGIN IMMEDIATE`).
+
+**Memory.** `MemoryBus` keeps the latest 10,000 published events for tests to
+read, not every event ever, and drops a thread's subscriber list when the
+last one leaves.

@@ -43,10 +43,14 @@ model Message {
   role      String   // 'user' | 'assistant' | 'system' | 'tool'
   content   Json
   createdAt DateTime @default(now())
+  // Insertion order: a tool call and its result can share a millisecond, so
+  // messages are ordered by this, never by createdAt.
+  seq       BigInt   @default(autoincrement())
 
   thread Thread @relation(fields: [threadId], references: [id], onDelete: Cascade)
 
   @@index([threadId, createdAt])
+  @@index([threadId, seq])
 }
 
 model AgentEvent {

@@ -39,6 +39,12 @@ func DeleteThread(ctx context.Context, deps ports.RuntimePorts, threadID string)
 	if err := deps.Storage.Threads.Delete(ctx, threadID); err != nil {
 		return ports.DeleteThreadResult{}, err
 	}
+	// The platform's own history of the thread goes with it: a deleted thread
+	// must not live on in operational views. Best effort, like every admin
+	// write; the caller's data is already gone.
+	if err := deps.Admin.Threads().Delete(ctx, threadID); err != nil {
+		Logger(deps).Error("admin history of a deleted thread not removed", "thread", threadID, "err", err)
+	}
 	// Live UIs subscribed to the thread learn it ceased to exist: bus-only
 	// notice, the event log is gone with it.
 	_ = PublishNotice(ctx, deps, threadID, "THREAD_DELETED", map[string]any{"threadId": threadID})

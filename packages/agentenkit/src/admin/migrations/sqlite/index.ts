@@ -39,8 +39,8 @@ async function repair(db: MigrationDriver): Promise<void> {
   }
 }
 
-/** SQLite needs no lock: the driver holds one connection and the database
- *  takes one writer at a time. */
+/** SQLite needs no lock: the database takes one writer at a time, and
+ *  BEGIN IMMEDIATE makes a second process wait for it. */
 export const dialect: MigrationDialect = {
   name: 'sqlite',
   ledger: `CREATE TABLE IF NOT EXISTS agentic_migrations (
@@ -48,5 +48,6 @@ export const dialect: MigrationDialect = {
   insert: `INSERT INTO agentic_migrations (version, checksum, appliedAt)
            VALUES (?, ?, CAST(strftime('%s','now') AS INTEGER) * 1000)`,
   selectOne: 'SELECT version FROM agentic_migrations WHERE version = ?',
+  begin: 'BEGIN IMMEDIATE',
   repair,
 };

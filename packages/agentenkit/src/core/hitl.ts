@@ -6,6 +6,7 @@ import { publish, runStatePayload, transition } from './publish.js';
 import { currentRunId } from './keys.js';
 import { reclaimIfOrphaned } from './reclaim.js';
 import { enqueueJob } from './lease.js';
+import { DuplicateJobError, PRIORITY_LOW } from '../ports/queue.js';
 
 export const HITL_TTL_MS = 15 * 60_000;
 
@@ -16,6 +17,11 @@ export const HITL_TTL_MS = 15 * 60_000;
 export const HITL_PARKED = '__hitl_parked__';
 
 export const hitlKey = (toolCallId: string) => `agent:hitl:${toolCallId}`;
+/** A park's expiry row on the queue, so an answer can withdraw it. */
+export const expiryJobKey = (toolCallId: string) => `hitl-expiry:${toolCallId}`;
+/** A park's resume row on the queue: one per answer, so the queue itself
+ *  refuses a second resume for the same call. */
+export const resumeJobKey = (toolCallId: string) => `hitl-resume:${toolCallId}`;
 
 /** Keeps an approved tool's output until its result is saved (§2.5), so a
  *  retry lands the same output instead of running the tool again. */
@@ -285,11 +291,14 @@ export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise
   // tool call and fail the run. Reclamation (§2.5) covers the thread instead.
   //
   // Arriving early is equally harmless: an unexpired, unanswered request
-  // resolves to nothing and the job is a no-op (see resumePendingHitl).
+  // resolves to nothing and the job is a no-op (see resumePendingHitl). The
+  // row is keyed so an answer can withdraw it, and it queues behind every user
+  // message: an expiry that came due is never urgent.
   try {
     await enqueueJob(
       deps,
       {
+        kind: 'expiry',
         threadId: i.threadId,
         runId,
         model: i.resume.model,
@@ -301,10 +310,18 @@ export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise
         ...(i.resume.providerOptions ? { providerOptions: i.resume.providerOptions } : {}),
         ...(i.resume.state ? { state: i.resume.state } : {}),
       },
-      { delaySeconds: Math.ceil((ttlMs + deps.config.reclaimGraceMs) / 1000) },
+      {
+        delaySeconds: Math.ceil((ttlMs + deps.config.reclaimGraceMs) / 1000),
+        key: expiryJobKey(i.toolCallId), priority: PRIORITY_LOW,
+      },
     );
-  } catch {
+  } catch (err) {
     // No expiry scheduled — the thread still heals on first touch (§2.5).
+    if (!(err instanceof DuplicateJobError)) {
+      ((deps.log ?? console) as { warn?: (m: string, ...r: unknown[]) => void }).warn?.(
+        'park expiry not scheduled; reclamation covers the thread', { threadId: i.threadId, toolCallId: i.toolCallId, err },
+      );
+    }
   }
 }
 
@@ -488,6 +505,7 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
   const runId = await currentRunId(deps, input.threadId);
   try {
     await enqueueJob(deps, {
+      kind: 'resume',
       threadId: input.threadId,
       runId,
       model: resume?.model ?? thread.model,
@@ -504,12 +522,22 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
             ...(resume.state ? { state: resume.state } : {}),
           }
         : {}),
-    });
+    // One resume row per answer, keyed on the call: a second enqueue for the
+    // same answer is refused by the queue itself.
+    }, { key: resumeJobKey(input.toolCallId) });
   } catch (err) {
+    if (err instanceof DuplicateJobError) return { delivered: false, error: 'This request was already answered' };
     // The answer is withdrawn so a retry of the request can land it.
     await deps.kv.del(hitlKey(input.toolCallId)).catch(() => undefined);
     throw new Error(`resume dispatch: ${err instanceof Error ? err.message : String(err)}`);
   }
+  // The park's own deadline is answered for: its row is withdrawn rather than
+  // left to be delivered as a no-op. Best-effort, like the row itself.
+  await deps.queue.cancel(expiryJobKey(input.toolCallId)).catch((err) => {
+    ((deps.log ?? console) as { warn?: (m: string, ...r: unknown[]) => void }).warn?.(
+      'park expiry row not withdrawn', { threadId: input.threadId, toolCallId: input.toolCallId, err },
+    );
+  });
 
   return { delivered: true };
 }

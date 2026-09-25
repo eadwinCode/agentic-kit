@@ -102,7 +102,20 @@ await runtime.admin.listSteps(runId);
 ```
 
 Percentiles are computed in the library, not in SQL, so every backing store
-reports them the same way.
+reports them the same way. Counts and token sums are grouped in the store and
+exact however many runs the window holds; the percentiles are over the newest
+runs (1,000 by default, `limit` to change it), and `sampled` says when the
+window held more. A thread listing reads the runs of exactly the threads it
+lists.
+
+Run counters are added in the store (`steps = steps + n`), so a nested run and
+its parent that close together both count. Durations and token counters are
+64-bit, so a run parked on an approval for weeks still has a correct
+`durationMs`.
+
+**Deleting a thread deletes its operational history.** `deleteThread` removes
+the thread's admin row, its runs and its steps with it, so a deleted thread
+does not live on in a dashboard.
 
 ## What started a thread
 

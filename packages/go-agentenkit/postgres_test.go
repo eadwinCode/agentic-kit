@@ -53,7 +53,7 @@ func TestPostgresAdminStore_RoundTripsARun(t *testing.T) {
 func TestPostgresStorage_BehavesLikeTheOthers(t *testing.T) {
 	db := openPostgres(t)
 	ctx := context.Background()
-	for _, tbl := range []string{"t_usage", "t_events", "t_messages", "t_threads"} {
+	for _, tbl := range []string{"t_usage", "t_events", "t_messages", "t_threads", "t_migrations"} {
 		_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl)
 	}
 	s, err := pgstorage.New(ctx, db, pgstorage.WithPrefix("t_"))

@@ -40,7 +40,7 @@ export async function openSqlite(filename = 'agentic-kit.sqlite'): Promise<Sqlit
       // inside a Next.js server build.
       const mod: any = await import(/* webpackIgnore: true */ /* @vite-ignore */ specifier);
       const Ctor = mod.Database ?? mod.DatabaseSync;
-      if (Ctor) return new Ctor(filename) as SqliteLike;
+      if (Ctor) return tuneSqlite(new Ctor(filename) as SqliteLike);
     } catch (err) {
       tried.push(`${specifier}: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -51,6 +51,18 @@ export async function openSqlite(filename = 'agentic-kit.sqlite'): Promise<Sqlit
   );
 }
 
+
+/** Set a file up for more than one process (§3.4): WAL lets readers run beside
+ *  the one writer, and busy_timeout makes a writer wait up to five seconds for
+ *  the lock rather than fail at once with SQLITE_BUSY. `openSqlite` calls it;
+ *  call it yourself on a handle you opened some other way. An in-memory
+ *  database keeps its own journal mode, which is fine. */
+export function tuneSqlite<T extends SqliteLike>(db: T): T {
+  for (const pragma of ['PRAGMA journal_mode=WAL', 'PRAGMA busy_timeout=5000']) {
+    db.prepare(pragma).all(); // both answer with a row
+  }
+  return db;
+}
 
 // SQLite has no date or JSON type: times are epoch milliseconds so they sort
 // and compare as integers, and structured columns are TEXT holding JSON.
@@ -151,6 +163,33 @@ export class SqliteStorage implements Storage {
     } catch (err) {
       console.warn('event seq uniqueness not enforced: the log already holds duplicate seqs', err);
     }
+    // The same for messages: two appends that raced to one seq must not both
+    // land, or a turn's order would depend on which row the database returns
+    // first.
+    try {
+      this.db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS messages_thread_seq_unique ON messages(threadId, seq)').run();
+    } catch (err) {
+      console.warn('message seq uniqueness not enforced: the table already holds duplicate seqs', err);
+    }
+  }
+
+  /** Run `fn` in one write transaction. IMMEDIATE takes the write lock up
+   *  front, so another process waits (busy_timeout) rather than failing half
+   *  way through. */
+  private tx<T>(fn: () => T): T {
+    this.write('BEGIN IMMEDIATE');
+    try {
+      const out = fn();
+      this.write('COMMIT');
+      return out;
+    } catch (err) {
+      try { this.write('ROLLBACK'); } catch { /* already gone */ }
+      throw err;
+    }
+  }
+
+  private changes(res: unknown): number {
+    return Number((res as { changes?: number | bigint } | undefined)?.changes ?? 0);
   }
 
   private addMissing(table: string, cols: Record<string, string>) {
@@ -207,12 +246,16 @@ export class SqliteStorage implements Storage {
         state, Date.now(), threadId);
     },
     delete: async (threadId: string) => {
-      // No FK cascade here: the schema is created by this adapter and the
+      // One transaction: a thread is gone with everything it owned, or not at
+      // all. No FK cascade here: the schema is created by this adapter and the
       // cascade is spelled out, so a caller can read exactly what is removed.
-      for (const t of ['messages', 'events', 'usage', 'runs']) {
-        this.write(`DELETE FROM ${t} WHERE threadId = ?`, threadId);
-      }
-      this.write('DELETE FROM threads WHERE id = ?', threadId);
+      this.tx(() => {
+        const res = this.db.prepare('DELETE FROM threads WHERE id = ?').run(threadId);
+        if (this.changes(res) === 0) throw new Error(`Unknown thread ${threadId}`);
+        for (const t of ['messages', 'events', 'usage', 'runs']) {
+          this.write(`DELETE FROM ${t} WHERE threadId = ?`, threadId);
+        }
+      });
     },
     transition: async (threadId: string, tr: ThreadTransition) => {
       if (tr.from.length === 0) return false;
@@ -230,13 +273,12 @@ export class SqliteStorage implements Storage {
     },
     claimState: async (threadId: string, from: ExecutionState, to: ExecutionState) => {
       // The §3.4 compare-and-set: one conditional UPDATE, so exactly one
-      // caller can win. SQLite serialises writers, which is enough.
-      const before = this.one('SELECT state FROM threads WHERE id = ?', threadId);
-      if (!before || before.state !== from) return false;
-      this.write('UPDATE threads SET state = ?, updatedAt = ? WHERE id = ? AND state = ?',
-        to, Date.now(), threadId, from);
-      const after = this.one('SELECT state FROM threads WHERE id = ?', threadId);
-      return after?.state === to;
+      // caller can win, and the driver's change count says whether it was
+      // this one. A read before or after would race another process.
+      const res = this.db
+        .prepare('UPDATE threads SET state = ?, updatedAt = ? WHERE id = ? AND state = ?')
+        .run(to, Date.now(), threadId, from);
+      return this.changes(res) > 0;
     },
   };
 
@@ -246,12 +288,12 @@ export class SqliteStorage implements Storage {
       const id = randomUUID();
       // An explicit seq keeps insertion order stable: several messages land
       // inside the same millisecond, so createdAt alone cannot order them.
-      const seq = (this.one(
-        'SELECT COALESCE(MAX(seq),0) AS n FROM messages WHERE threadId = ?', threadId,
-      )?.n ?? 0) + 1;
+      // Taken inside the INSERT, one statement, so another process cannot
+      // read the same MAX in between; the unique index backs that up.
       this.write(
-        'INSERT INTO messages (id,threadId,agentId,role,content,createdAt,seq) VALUES (?,?,?,?,?,?,?)',
-        id, threadId, m.agentId ?? null, m.role, json(m.content), now, seq,
+        `INSERT INTO messages (id,threadId,agentId,role,content,createdAt,seq)
+         VALUES (?,?,?,?,?,?,(SELECT COALESCE(MAX(seq),0)+1 FROM messages WHERE threadId = ?))`,
+        id, threadId, m.agentId ?? null, m.role, json(m.content), now, threadId,
       );
       return this.toMessage({
         id, threadId, agentId: m.agentId ?? null, role: m.role,

@@ -254,35 +254,30 @@ func closeRunRecord(ctx context.Context, deps ports.RuntimePorts, runID string, 
 	}
 	patch := ports.RunPatch{
 		State: &f.State, StopReason: ports.Ptr(f.StopReason), EndedAt: &endedAt,
-		DurationMs:        ports.Ptr(endedAt.Sub(prior.StartedAt).Milliseconds()),
-		Steps:             ports.Ptr(prior.Steps + f.Steps),
-		InputTokens:       ports.Ptr(prior.InputTokens + f.Attribution.InputTokens),
-		CachedInputTokens: ports.Ptr(prior.CachedInputTokens + f.Attribution.CachedInputTokens),
-		OutputTokens:      ports.Ptr(prior.OutputTokens + f.Attribution.OutputTokens),
-		TotalTokens:       ports.Ptr(prior.TotalTokens + f.Attribution.TotalTokens),
+		DurationMs: ports.Ptr(endedAt.Sub(prior.StartedAt).Milliseconds()),
 	}
 	if f.Error != "" {
 		patch.Error = ports.Ptr(f.Error)
 	}
 	_ = deps.Admin.Runs().Patch(ctx, runID, patch)
+	// The counters are added in the store, not read and written back here:
+	// a nested run and its parent can close at the same moment.
+	_ = deps.Admin.Runs().Increment(ctx, runID, deltasOf(f.Steps, f.Attribution))
 	return endedAt
+}
+
+// deltasOf is a segment's steps and tokens as counters to add to its run.
+func deltasOf(steps int, a TokenAttribution) ports.RunDeltas {
+	return ports.RunDeltas{
+		Steps: steps, InputTokens: a.InputTokens, CachedInputTokens: a.CachedInputTokens,
+		OutputTokens: a.OutputTokens, TotalTokens: a.TotalTokens,
+	}
 }
 
 // accrueRunRecord adds a parked segment's steps and tokens onto the run's
 // record (§2.9) without closing it. Best effort, like every admin write.
 func accrueRunRecord(ctx context.Context, deps ports.RuntimePorts, runID string, loop *LoopOutcome) {
-	prior, err := deps.Admin.Runs().Get(ctx, runID)
-	if err != nil || prior == nil {
-		return
-	}
-	patch := ports.RunPatch{
-		Steps:             ports.Ptr(prior.Steps + loop.Steps),
-		InputTokens:       ports.Ptr(prior.InputTokens + loop.Attribution.InputTokens),
-		CachedInputTokens: ports.Ptr(prior.CachedInputTokens + loop.Attribution.CachedInputTokens),
-		OutputTokens:      ports.Ptr(prior.OutputTokens + loop.Attribution.OutputTokens),
-		TotalTokens:       ports.Ptr(prior.TotalTokens + loop.Attribution.TotalTokens),
-	}
-	_ = deps.Admin.Runs().Patch(ctx, runID, patch)
+	_ = deps.Admin.Runs().Increment(ctx, runID, deltasOf(loop.Steps, loop.Attribution))
 }
 
 // SettleClaimTTL is how long a settle claim holds (§5.6). A claim older

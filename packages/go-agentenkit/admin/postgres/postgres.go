@@ -140,7 +140,37 @@ func (t threadStore) List(ctx context.Context, f ports.AdminThreadFilter) ([]por
 		limit = 100
 	}
 	q += ` ORDER BY "updatedAt" DESC LIMIT ` + a.add(limit)
-	rows, err := t.db.QueryContext(ctx, q, a.vals...)
+	return t.query(ctx, q, a.vals...)
+}
+
+func (t threadStore) Get(ctx context.Context, threadID string) (*ports.AdminThread, error) {
+	rows, err := t.query(ctx, `SELECT id, state, model, "firstSeenAt", "updatedAt", "startedWith" FROM agentic_threads WHERE id = $1`, threadID)
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	return &rows[0], nil
+}
+
+func (t threadStore) Delete(ctx context.Context, threadID string) error {
+	tx, err := t.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, q := range []string{
+		`DELETE FROM agentic_steps WHERE "threadId" = $1`,
+		`DELETE FROM agentic_runs WHERE "threadId" = $1`,
+		`DELETE FROM agentic_threads WHERE id = $1`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, threadID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (t threadStore) query(ctx context.Context, q string, vals ...any) ([]ports.AdminThread, error) {
+	rows, err := t.db.QueryContext(ctx, q, vals...)
 	if err != nil {
 		return nil, err
 	}
@@ -338,8 +368,8 @@ func (r runStore) ListByThread(ctx context.Context, threadID string) ([]ports.Ru
 	return r.query(ctx, `SELECT `+runCols+` FROM agentic_runs WHERE "threadId" = $1 ORDER BY "startedAt" DESC`, threadID)
 }
 
-func (r runStore) List(ctx context.Context, f ports.RunFilter) ([]ports.RunRecord, error) {
-	var a args
+// runWhere is the RunFilter as a WHERE clause, Limit aside.
+func runWhere(f ports.RunFilter, a *args) string {
 	var where []string
 	if len(f.State) > 0 {
 		where = append(where, `state IN `+a.in(f.State))
@@ -349,6 +379,13 @@ func (r runStore) List(ctx context.Context, f ports.RunFilter) ([]ports.RunRecor
 	}
 	if f.ThreadID != "" {
 		where = append(where, `"threadId" = `+a.add(f.ThreadID))
+	}
+	if len(f.ThreadIDs) > 0 {
+		parts := make([]string, 0, len(f.ThreadIDs))
+		for _, id := range f.ThreadIDs {
+			parts = append(parts, a.add(id))
+		}
+		where = append(where, `"threadId" IN (`+strings.Join(parts, ",")+`)`)
 	}
 	if f.Since != nil {
 		where = append(where, `"startedAt" >= `+a.add(*f.Since))
@@ -365,10 +402,15 @@ func (r runStore) List(ctx context.Context, f ports.RunFilter) ([]ports.RunRecor
 	if c := f.Before; c != nil {
 		where = append(where, `("startedAt", id) < (`+a.add(c.StartedAt)+`, `+a.add(c.ID)+`)`)
 	}
-	q := `SELECT ` + runCols + ` FROM agentic_runs`
-	if len(where) > 0 {
-		q += ` WHERE ` + strings.Join(where, " AND ")
+	if len(where) == 0 {
+		return ""
 	}
+	return ` WHERE ` + strings.Join(where, " AND ")
+}
+
+func (r runStore) List(ctx context.Context, f ports.RunFilter) ([]ports.RunRecord, error) {
+	var a args
+	q := `SELECT ` + runCols + ` FROM agentic_runs` + runWhere(f, &a)
 	limit := f.Limit
 	if limit <= 0 {
 		limit = 100
@@ -377,6 +419,44 @@ func (r runStore) List(ctx context.Context, f ports.RunFilter) ([]ports.RunRecor
 	// cursor that splits the listing exactly (RunFilter.Before).
 	q += ` ORDER BY "startedAt" DESC, id DESC LIMIT ` + a.add(limit)
 	return r.query(ctx, q, a.vals...)
+}
+
+func (r runStore) Increment(ctx context.Context, runID string, d ports.RunDeltas) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE agentic_runs SET steps = steps + $1, "inputTokens" = "inputTokens" + $2,
+		"cachedInputTokens" = "cachedInputTokens" + $3, "outputTokens" = "outputTokens" + $4, "totalTokens" = "totalTokens" + $5
+		WHERE id = $6`, d.Steps, d.InputTokens, d.CachedInputTokens, d.OutputTokens, d.TotalTokens, runID)
+	return err
+}
+
+func (r runStore) Totals(ctx context.Context, f ports.RunFilter) (ports.RunTotals, error) {
+	f.Before = nil
+	var a args
+	rows, err := r.db.QueryContext(ctx, `SELECT state, COALESCE("stopReason",''), COUNT(*), COALESCE(SUM(steps),0),
+		COALESCE(SUM("inputTokens"),0), COALESCE(SUM("cachedInputTokens"),0), COALESCE(SUM("outputTokens"),0),
+		COALESCE(SUM("totalTokens"),0) FROM agentic_runs`+runWhere(f, &a)+` GROUP BY state, "stopReason"`, a.vals...)
+	if err != nil {
+		return ports.RunTotals{}, err
+	}
+	defer rows.Close()
+	out := ports.RunTotals{ByState: map[ports.ExecutionState]int{}, ByStopReason: map[string]int{}}
+	for rows.Next() {
+		var state, reason string
+		var n, steps, in, cached, outTok, total int64
+		if err := rows.Scan(&state, &reason, &n, &steps, &in, &cached, &outTok, &total); err != nil {
+			return out, err
+		}
+		out.Runs += int(n)
+		out.ByState[ports.ExecutionState(state)] += int(n)
+		if reason != "" {
+			out.ByStopReason[reason] += int(n)
+		}
+		out.Steps += int(steps)
+		out.InputTokens += int(in)
+		out.CachedInputTokens += int(cached)
+		out.OutputTokens += int(outTok)
+		out.TotalTokens += int(total)
+	}
+	return out, rows.Err()
 }
 
 func (r runStore) ClaimSettle(ctx context.Context, runID, token string, staleBefore time.Time) (bool, error) {
