@@ -134,6 +134,10 @@ export interface RunRecord {
   providerOptions?: Record<string, unknown> | null;
   /** A nested run's capped result, handed back to its parent (§2.7). */
   result?: unknown;
+  /** The caps the run was dispatched with (§4, §2.1), kept so a run
+   *  re-dispatched from its record keeps them. */
+  costBudgetMicros?: number | null;
+  maxSteps?: number | null;
 }
 
 export interface NewRunRecord {
@@ -153,6 +157,10 @@ export interface NewRunRecord {
   state?: ExecutionState;
   /** When a dispatched run was accepted. */
   enqueuedAt?: Date | null;
+  /** The caps the run was dispatched with (§4, §2.1), kept so a run
+   *  re-dispatched from its record keeps them. */
+  costBudgetMicros?: number | null;
+  maxSteps?: number | null;
 }
 
 export type RunPatch = Partial<Omit<RunRecord, 'id' | 'threadId'>>;
@@ -393,6 +401,15 @@ export interface RunJob {
    *  cap the caller asked for. */
   costBudgetMicros?: number;
   providerOptions?: ProviderOptions;
+  /** The run's own step cap, when the caller set one (§2.1). */
+  maxSteps?: number;
+  /** The caller's tenant, opaque to the platform. A queue that spreads its
+   *  claims across partitions keeps one tenant's backlog from starving the
+   *  others. */
+  partitionKey?: string;
+  /** Epoch ms of the run's first dispatch, carried onto every retry and
+   *  resume so the run keeps its place in line. */
+  dispatchedAt?: number;
 }
 
 /** Identifies a nested run well enough to re-enter its loop (§2.7). Persisted
@@ -420,6 +437,11 @@ export interface ResumeInfo {
    *  closure that is long gone. Without it every storage call after an
    *  approval loses whatever the caller attached, tenant scope included. */
   state?: AgentRunState;
+  /** The run's own step cap (§2.1), so a resumed segment keeps it. */
+  maxSteps?: number;
+  /** Epoch ms of the run's first dispatch, so a resume keeps its place in
+   *  line. */
+  dispatchedAt?: number;
 }
 
 /** A model identity after resolution: the real provider instance (created
@@ -451,6 +473,30 @@ export interface SubagentsConfig {
   /** Extra tools merged into every spawned subagent's toolset
    *  (HITL-wrapped identically to the parent's tools). */
   tools?: ToolSet;
+  /** Named specialists (§2.7). When set, `spawnSubagent` must name one of
+   *  them: the child takes the profile's persona, model, tools and step cap
+   *  instead of the shared defaults above. The model still writes the brief;
+   *  the profile says who reads it. */
+  profiles?: Record<string, SubagentProfile>;
+}
+
+/** One named specialist a run may delegate to. */
+export interface SubagentProfile {
+  /** Shown to the model beside the name, so it can choose. */
+  description?: string;
+  /** The child's static persona; `systemFn` wins when set. */
+  system?: string;
+  systemFn?: import('../ports/runtime.js').SystemFn;
+  /** Edits the child's prompt per step; see PrepareStepFn. */
+  prepareStep?: import('../ports/runtime.js').PrepareStepFn;
+  /** Registry key; absent falls back to the config's `model`, then the
+   *  default. */
+  model?: string;
+  /** The child's own tools, HITL-wrapped like the parent's. They replace the
+   *  shared `tools` above. */
+  tools?: ToolSet;
+  /** Caps the child's round trips; 0 or absent keeps `subagentMaxSteps`. */
+  maxSteps?: number;
 }
 
 export interface AgentConfig {
@@ -534,11 +580,29 @@ export interface AgentConfig {
    *  sixth of the lease while it holds it, so an expired lock means a dead
    *  worker; parked HITL waits hold NO lock (§2.8, §3.4). */
   runLockLeaseSeconds: number;
+  /** Bounds one model round trip in wall time (ms). A model that accepts the
+   *  call and never answers ends that step like any failed step, and the run
+   *  takes the retry policy (§2.8). 0 means no bound. */
+  stepTimeoutMs: number;
+  /** Bounds one worker segment in wall time (ms). Past it the run ends FAILED
+   *  with stopReason `timeout`, rather than holding the worker. 0 means no
+   *  bound. */
+  segmentTimeoutMs: number;
+  /** The longest a job may wait in the queue (ms). A job picked up later
+   *  fails its run with the reason, instead of doing work nobody is waiting
+   *  for any more. 0 means no limit. */
+  maxQueueWaitMs: number;
+  /** Refuse a new run (RUN_REFUSED, reason `queue_full`) once this many jobs
+   *  are ready and waiting (§2.8). Needs a queue that can count; one that
+   *  cannot is never refused on. 0 means no cap. */
+  maxQueueDepth: number;
   /** Billing pre-execution check (§4). Return `{ ok: false, error }` to reject
    *  a run. The check can publish on the thread (a credit warning, a reset
    *  date) so every client sees why; the platform also publishes RUN_REFUSED
    *  with the error. */
   billingPreCheck?: (check: BillingCheck) => Promise<{ ok: boolean; error?: string }>;
+  // It runs twice for a run: at dispatch, before anything is written, and
+  // again at pickup, however long the job waited — see BillingCheck.stage.
   /** Provider-specific options applied to EVERY run (§3.1) — a reasoning
    *  budget, a service tier, a safety identifier. The lowest of three levels:
    *  an agent spec overrides this, and a run input overrides both, per
@@ -551,12 +615,28 @@ export interface AgentConfig {
  *  caller. `publishEvent(type, payload, { durable })` — durable by default. */
 export interface BillingCheck {
   threadId: string;
+  /** Set at pickup; absent at dispatch, where the run has no id yet. */
+  runId?: string;
   state: AgentRunState;
+  /** When the check runs. `dispatch` is inside `run`, before anything is
+   *  written: a refusal means the run never exists. `pickup` is when a worker
+   *  takes the job (a first dispatch, a retry, a resume): a refusal fails the
+   *  run. */
+  stage: 'dispatch' | 'pickup';
+  /** The caps the job carries, at pickup only. The check may LOWER either and
+   *  the segment runs with the lowered cap; raising is ignored. */
+  budget?: RunBudget;
   publishEvent: (
     type: string,
     payload: unknown,
     options?: { durable?: boolean },
   ) => Promise<AgentEvent>;
+}
+
+/** The money and step cap a segment runs with. 0 is no cap from this level. */
+export interface RunBudget {
+  costBudgetMicros: number;
+  maxSteps: number;
 }
 
 export const DEFAULT_CONFIG: AgentConfig = {
@@ -581,6 +661,10 @@ export const DEFAULT_CONFIG: AgentConfig = {
   compactionModel: 'gpt-4o-mini',
   promptCaching: true,
   runLockLeaseSeconds: 2 * 60,
+  stepTimeoutMs: 0,
+  segmentTimeoutMs: 0,
+  maxQueueWaitMs: 0,
+  maxQueueDepth: 0,
 };
 
 export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
@@ -611,6 +695,11 @@ export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
     throw new Error(
       `Invalid config: runRedriveDelaySeconds (${config.runRedriveDelaySeconds}) must be a non-negative integer`,
     );
+  }
+  for (const key of ['stepTimeoutMs', 'segmentTimeoutMs', 'maxQueueWaitMs', 'maxQueueDepth'] as const) {
+    if (!Number.isFinite(config[key]) || config[key] < 0) {
+      throw new Error(`Invalid config: ${key} (${config[key]}) must not be negative`);
+    }
   }
   if (!Number.isInteger(config.runLockLeaseSeconds) || config.runLockLeaseSeconds < 1) {
     // The lease is the only thing that heals a crashed worker's lock — a

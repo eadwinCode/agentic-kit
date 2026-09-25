@@ -910,6 +910,42 @@ type AgentConfig struct {
 	ProviderOptions ProviderOptions
 }
 
+// mergeConfig fills c's never-zero fields from d.
+func mergeConfig(c, d AgentConfig) AgentConfig {
+	orDur := func(v *time.Duration, def time.Duration) {
+		if *v == 0 {
+			*v = def
+		}
+	}
+	orInt := func(v *int, def int) {
+		if *v == 0 {
+			*v = def
+		}
+	}
+	orFloat := func(v *float64, def float64) {
+		if *v == 0 {
+			*v = def
+		}
+	}
+	orDur(&c.HITLTTL, d.HITLTTL)
+	orDur(&c.StopPoll, d.StopPoll)
+	orDur(&c.RunLockLease, d.RunLockLease)
+	orInt(&c.MaxSteps, d.MaxSteps)
+	orInt(&c.RunMaxAttempts, d.RunMaxAttempts)
+	orInt(&c.SubagentMaxDepth, d.SubagentMaxDepth)
+	orInt(&c.SubagentMaxConcurrent, d.SubagentMaxConcurrent)
+	orInt(&c.SubagentMaxSteps, d.SubagentMaxSteps)
+	orInt(&c.SubagentResultCapChars, d.SubagentResultCapChars)
+	orInt(&c.PayloadCapChars, d.PayloadCapChars)
+	orInt(&c.ContextCeilingTokens, d.ContextCeilingTokens)
+	orFloat(&c.CompactionTrigger, d.CompactionTrigger)
+	orFloat(&c.ContextTailShare, d.ContextTailShare)
+	if c.CompactionModel == "" {
+		c.CompactionModel = d.CompactionModel
+	}
+	return c
+}
+
 // DefaultConfig returns the defaults the TypeScript package ships with.
 func DefaultConfig() AgentConfig {
 	return AgentConfig{
@@ -937,11 +973,20 @@ func DefaultConfig() AgentConfig {
 	}
 }
 
-// ResolveConfig validates a config. A nil config means the defaults.
+// ResolveConfig merges a config over the defaults and validates it. A nil
+// config means the defaults.
+//
+// A field left at its zero value takes the default when zero can never be a
+// working value for it (a step cap, a lease, a poll, a window): a partial
+// config such as &AgentConfig{MaxSteps: 5} keeps every other default rather
+// than turning them all to zero. A field where zero is a real choice (no
+// retry backoff, no timeout, no budget) keeps what was given. The two
+// booleans, RecordPayloads and PromptCaching, cannot tell "false" from "left
+// out": start from DefaultConfig to keep them on.
 func ResolveConfig(partial *AgentConfig) (AgentConfig, error) {
 	config := DefaultConfig()
 	if partial != nil {
-		config = *partial
+		config = mergeConfig(*partial, config)
 	}
 	if config.SubagentMaxSteps < 1 || config.SubagentMaxSteps > config.MaxSteps {
 		// A subagent must never get a looser step ceiling than its parent run (§2.7)

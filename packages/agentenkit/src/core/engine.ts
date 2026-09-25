@@ -19,11 +19,12 @@ import {
   ParkBox,
 } from './hitl.js';
 import { ACTIVE_STATES, publish, publishEvent, runStatePayload, transition, withPublishEvent } from './publish.js';
-import { closeNested, RunSlots, runNestedAgent, spawnSubagentTool, type SubagentCtx } from './subagent.js';
+import { closeNested, nestedRawTools, RunSlots, runNestedAgent, spawnSubagentTool, type SubagentCtx } from './subagent.js';
 import { attemptsKey, COUNTER_TTL_SECONDS, counterScope, redriveKey, runIdKey } from './keys.js';
 import { withRunState, type AgentRunState } from './state.js';
 import { runLoop, seedRunLedger, type LoopOutcome } from './loop.js';
 import { enqueueJob, Lease, parseLockValue, runLockKey, RunLockLostError } from './lease.js';
+import { closeOpenParks } from './stop.js';
 import { callOnFinish, isTerminal, runBill, settleEndedRun, settleRun } from './settle.js';
 import { DuplicateJobError, PRIORITY_LOW } from '../ports/queue.js';
 
@@ -33,13 +34,20 @@ export { countTokens } from './usage.js';
 export { executeStep, isParked, runLoop, type LoopInput, type LoopOutcome, type RunLedger, type StepResult } from './loop.js';
 
 
-/** The safety cap (§2.1) must be either absent (unbounded apart from
- *  maxSteps) or a positive number — `0`/negative/NaN would silently disable
- *  the cap and let a run spend without bound. */
+/** A cap (§2.1, §4) is absent, 0 (no cap from this level: the next level's
+ *  applies), or a positive number. A negative or non-finite one is a bug in
+ *  the caller and is refused, never read as "no cap". The same rule as the Go
+ *  runtime, whose zero value can only mean "not set". */
 export function validateTokenBudget(value: number | undefined, label: string): void {
-  if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
-    throw new Error(`${label} must be a positive finite number`);
+  if (value !== undefined && (!Number.isFinite(value) || value < 0)) {
+    throw new Error(`${label} must be zero or a positive number`);
   }
+}
+
+/** The first cap set, widest last: run input → agent spec → config. 0 and
+ *  absent both fall through to the next level. */
+function firstCap(...levels: Array<number | undefined>): number | undefined {
+  return levels.find((v) => v !== undefined && v > 0);
 }
 
 /** Tools the engine treats as destructive: parked behind parkForApproval
@@ -386,7 +394,9 @@ async function resumePendingHitl(
     const target =
       pending.agentId === null
         ? rawTools[pending.toolName]
-        : (subCtx?.sub.tools as Record<string, any> | undefined)?.[pending.toolName];
+        : subCtx
+          ? nestedRawTools(subCtx, pending.nested)[pending.toolName]
+          : undefined;
 
     const settled = pending.landed
       ? null
@@ -444,6 +454,18 @@ export interface ExecuteInput {
    *  what the caller asked for. */
   costBudgetMicros?: number;
   providerOptions?: ProviderOptions;
+  /** The run's own step cap (§2.1); 0 or absent keeps the config's. */
+  maxSteps?: number;
+  /** Epoch ms of the run's first dispatch (see RunJob.dispatchedAt). */
+  dispatchedAt?: number;
+  /** The caller's tenant (see RunJob.partitionKey). */
+  partitionKey?: string;
+  /** Why the job exists (see RunJob.kind). */
+  kind?: JobKind;
+  /** Aborted when the worker is shutting down. The segment stops at once and
+   *  the job goes back on the queue without spending an attempt: a shutdown
+   *  is not the run's fault. */
+  signal?: AbortSignal;
 }
 
 /** 'executed'      — this worker ran the segment (or it was a legitimate no-op).
@@ -463,6 +485,7 @@ export async function execute(
   const abort = new AbortController();
 
   validateTokenBudget(input.tokenBudget, 'tokenBudget');
+  validateTokenBudget(input.costBudgetMicros, 'costBudgetMicros');
 
   /** True once the thread has started a NEWER run than this one (§2.1). */
   const stale = async () =>
@@ -481,10 +504,26 @@ export async function execute(
   // Token budget (§2.1 safety cap) — precedence: execute input → spec →
   // config. Checked BETWEEN steps: the finished step is always kept in full,
   // nothing is aborted mid-generation. This is NOT a user stop.
-  const tokenBudget = input.tokenBudget ?? agent.spec.tokenBudget ?? deps.config.tokenBudget;
-  // The money cap (§4) resolves the same way, widest last.
-  const costBudget =
-    input.costBudgetMicros ?? agent.spec.costBudgetMicros ?? deps.config.costBudgetMicros;
+  const tokenBudget = firstCap(input.tokenBudget, agent.spec.tokenBudget, deps.config.tokenBudget);
+  // The money cap (§4) resolves the same way, widest last. A billing check at
+  // pickup may still lower it.
+  let costBudget = firstCap(input.costBudgetMicros, agent.spec.costBudgetMicros, deps.config.costBudgetMicros);
+  // The run's own step cap, lowered by a billing check the same way.
+  let runMaxSteps = input.maxSteps ?? 0;
+
+  // A segmentTimeoutMs bounds the segment in wall time: past it everything
+  // tears down as for a stop, and the run ends FAILED ('timeout') rather than
+  // holding the worker.
+  // A shutdown ends the segment as a stop does, but it is not a stop: the
+  // policy hands the job back (see executeWithPolicy).
+  let shutdown = false;
+  const onShutdown = () => { shutdown = true; abort.abort(); };
+  if (input.signal?.aborted) onShutdown();
+  else input.signal?.addEventListener('abort', onShutdown, { once: true });
+  let segmentTimedOut = false;
+  const segmentTimer = deps.config.segmentTimeoutMs > 0
+    ? setTimeout(() => { segmentTimedOut = true; abort.abort(); }, deps.config.segmentTimeoutMs)
+    : undefined;
 
   // Provider-specific options (§3.1): spec default <- execute input,
   // shallow per-provider namespace; the execute input wins.
@@ -536,9 +575,56 @@ export async function execute(
         return 'executed';
       }
 
+      // A wait has a ceiling (§2.8): a job picked up long past it fails with
+      // the reason, instead of doing work nobody is waiting for any more.
+      if (deps.config.maxQueueWaitMs > 0 && input.enqueuedAt) {
+        const waited = Date.now() - input.enqueuedAt;
+        if (waited > deps.config.maxQueueWaitMs) {
+          const reason =
+            `the run waited ${Math.round(waited / 1000)}s in the queue, past the ${Math.round(deps.config.maxQueueWaitMs / 1000)}s limit`;
+          ((deps.log ?? console) as { warn?: (m: string, ...r: unknown[]) => void }).warn?.(
+            'run queued too long; failing it', { threadId, runId, waited },
+          );
+          if (durable.state === 'WAITING_FOR_INPUT') await closeOpenParks(deps, threadId).catch(() => undefined);
+          await failRun(deps, agent, threadId, runId, reason);
+          return 'executed';
+        }
+      }
+
+      // Billing at pickup (§4): the dispatch check ran before the wait; the
+      // balance may have moved since. A refusal here fails the run with the
+      // reason; a lowered cap applies to this segment.
+      if (deps.config.billingPreCheck && runId) {
+        const budget = { costBudgetMicros: costBudget ?? 0, maxSteps: runMaxSteps };
+        const check = await deps.config.billingPreCheck({
+          threadId, runId, state: input.state ?? {}, stage: 'pickup', budget,
+          publishEvent: (type, payload, options) => publishEvent(deps, threadId, type, payload, options),
+        });
+        if (!check.ok) {
+          const error = check.error ?? 'Billing check failed';
+          (deps.log ?? console).error('run refused at pickup', { threadId, runId, error });
+          await publish(deps, threadId, 'RUN_REFUSED', { reason: 'billing', error, runId });
+          if (durable.state === 'WAITING_FOR_INPUT') await closeOpenParks(deps, threadId).catch(() => undefined);
+          await failRun(deps, agent, threadId, runId, error);
+          return 'executed';
+        }
+        if (budget.costBudgetMicros > 0 && (!costBudget || budget.costBudgetMicros < costBudget)) {
+          costBudget = budget.costBudgetMicros;
+        }
+        if (budget.maxSteps > 0 && (!runMaxSteps || budget.maxSteps < runMaxSteps)) {
+          runMaxSteps = budget.maxSteps;
+        }
+      }
+
+      // Step ceiling (§2.1): the run's own cap when it set one, the config's
+      // otherwise, and never above the config's.
+      const maxSteps = runMaxSteps > 0 && runMaxSteps < deps.config.maxSteps ? runMaxSteps : deps.config.maxSteps;
+
       const resume: ResumeInfo = {
         agent: agent.name,
         model: input.model,
+        ...(input.maxSteps ? { maxSteps: input.maxSteps } : {}),
+        ...(input.dispatchedAt ? { dispatchedAt: input.dispatchedAt } : {}),
         ...(runId ? { runId } : {}),
         ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
         ...(input.costBudgetMicros !== undefined
@@ -711,10 +797,13 @@ export async function execute(
             model: model.instance(),
             messages,
             tools,
-            maxSteps: deps.config.maxSteps,
+            maxSteps,
             abortSignal: abort.signal,
             providerOptions,
             tokenBudget,
+            systemFn: userArgs.systemFn,
+            prepareStep: userArgs.prepareStep,
+            state: input.state ?? {},
             costBudgetMicros: costBudget,
             billingRunId: runId,
             modelKey: input.model,
@@ -739,6 +828,9 @@ export async function execute(
         // A lost lock aborts the run the way a stop does, but it is not a stop:
         // another worker may own the thread now, so nothing below may write.
         if (lease.lost) return 'lock-lost';
+        // Nor is a shutdown: every finished step is saved, and the job comes
+        // back to carry on from the last one.
+        if (shutdown) throw new Error('the worker shut down mid-run');
         // The stream ended with no finish and no error: the step was not
         // completed, so it goes to the retry policy rather than finalizing.
         if (loop.interrupted) throw new Error(`step ${loop.steps + 1} ended without a finish`);
@@ -762,7 +854,11 @@ export async function execute(
         return 'executed';
       }
 
-      const stopReason = abort.signal.aborted
+      // The segment's own deadline ended it: not a stop, a failure that says
+      // so.
+      const stopReason: FinalizeInput['stopReason'] = segmentTimedOut
+        ? 'timeout'
+        : abort.signal.aborted
         ? 'cancelled'
         : loop.costExhausted
           ? 'cost_budget' // the money cap (§4)
@@ -772,8 +868,13 @@ export async function execute(
               ? 'max_steps' // step ceiling hit (§2.1)
               : 'completed';
 
-      let state: ExecutionState = abort.signal.aborted ? 'CANCELLED' : 'COMPLETED';
-      let error: string | undefined;
+      let state: ExecutionState = segmentTimedOut ? 'FAILED' : abort.signal.aborted ? 'CANCELLED' : 'COMPLETED';
+      let error: string | undefined = segmentTimedOut
+        ? `the run ran longer than ${deps.config.segmentTimeoutMs}ms and was stopped`
+        : undefined;
+      if (segmentTimedOut) {
+        (deps.log ?? console).error('segment timed out', { threadId, runId, steps: loop.steps });
+      }
       // The caller settles BEFORE the terminal state lands (§5.6): what the run
       // produced is committed by the time any client sees it end. A settle
       // failure is a run failure. A stop reaches the hook with `cancelled`
@@ -799,7 +900,7 @@ export async function execute(
         stopReason,
         tokensUsed,
         attribution,
-        oneShotText: agent.kind === 'generate-text' ? lastText : undefined,
+        oneShotText: agent.kind === 'generate-text' && !segmentTimedOut ? lastText : undefined,
         runId,
         steps: loop.steps,
         ...(error ? { error } : {}),
@@ -816,6 +917,8 @@ export async function execute(
     }
   } finally {
     clearInterval(controlPoll);
+    clearTimeout(segmentTimer);
+    input.signal?.removeEventListener('abort', onShutdown);
     // Release — success, failure, or stop — only while the lock is still this
     // worker's. One another worker took after this one's lapsed is theirs.
     await lease.release();
@@ -828,7 +931,7 @@ export interface FinalizeInput {
    *  'deleted' close a record that can never be worked on again. */
   stopReason:
     | 'completed' | 'token_budget' | 'cost_budget' | 'max_steps' | 'cancelled'
-    | 'failed' | 'replaced' | 'orphaned' | 'deleted';
+    | 'failed' | 'timeout' | 'replaced' | 'orphaned' | 'deleted';
   tokensUsed: number;
   attribution: TokenAttribution;
   /** generate-text flavor only: publish the final text as one TEXT_RESULT. */
@@ -888,6 +991,32 @@ export async function finalize(
     ...(f.runId ? { runId: f.runId } : {}),
     ...(f.error ? { error: f.error } : {}),
   });
+}
+
+/** Fail a run the queue gave up on (§2.8), when it is still the thread's
+ *  current run and the thread is still waiting on it. False when the run had
+ *  already moved on. Runs under the run lock like every other terminal write. */
+export async function failLostRun(
+  deps: RuntimePorts,
+  agent: RegisteredAgent,
+  threadId: string,
+  runId: string | undefined,
+  reason: string,
+): Promise<boolean> {
+  if (!runId) return false;
+  if ((await deps.kv.get(runIdKey(threadId))) !== runId) return false;
+  const thread = await deps.storage.threads.get(threadId);
+  if (!thread || !ACTIVE_STATES.includes(thread.state)) return false;
+  const lease = await Lease.acquire(deps, threadId, runId, undefined);
+  if (!lease) return false; // a worker still holds it; the run is not lost
+  lease.keep(); // the settle hook in failRun can be slow
+  try {
+    if (thread.state === 'WAITING_FOR_INPUT') await closeOpenParks(deps, threadId).catch(() => undefined);
+    await failRun(deps, agent, threadId, runId, reason);
+    return true;
+  } finally {
+    await lease.release();
+  }
 }
 
 /** A lock conflict (§2.8). The lock names the run and the delivery that hold
@@ -1009,6 +1138,15 @@ export async function executeWithPolicy(
     await redriveOnLockConflict(deps, agent, input, maxAttempts);
   } catch (err) {
     const log = deps.log ?? console;
+    // The worker was cut off: a shutdown. That is not the run's fault, so the
+    // job goes back at once and the attempt is not counted.
+    if (input.signal?.aborted) {
+      ((log as { info?: (m: string, ...r: unknown[]) => void }).info)?.('run interrupted; requeued', {
+        threadId: input.threadId, runId: input.runId, err: String(err),
+      });
+      await requeue(deps, agent, { ...input, signal: undefined }, 0);
+      return;
+    }
     // A user stop already finalized the thread — never retry a stop
     if ((await deps.kv.get(`agent:state:${input.threadId}`)) === 'CANCELLED') return;
     // A run that a newer one replaced failed after it stopped mattering: its
@@ -1073,6 +1211,9 @@ function jobOf(agent: RegisteredAgent, input: ExecuteInput, kind: JobKind) {
     costBudgetMicros: input.costBudgetMicros,
     providerOptions: input.providerOptions,
     state: input.state,
+    ...(input.maxSteps ? { maxSteps: input.maxSteps } : {}),
+    ...(input.dispatchedAt ? { dispatchedAt: input.dispatchedAt } : {}),
+    ...(input.partitionKey ? { partitionKey: input.partitionKey } : {}),
   };
 }
 

@@ -84,6 +84,7 @@ export class SqliteAdminStore implements AdminStore {
     result: parse(r.result),
     prompt: r.prompt ?? null, tokenBudget: r.tokenBudget ?? null,
     runState: parse(r.runState), providerOptions: parse(r.providerOptions),
+    costBudgetMicros: r.costBudgetMicros ?? null, maxSteps: r.maxSteps ?? null,
   });
 
   threads = {
@@ -176,10 +177,11 @@ export class SqliteAdminStore implements AdminStore {
     start: async (run: NewRunRecord) => {
       const startedAt = Date.now();
       this.write(
-        'INSERT INTO agentic_runs (id,threadId,parentRunId,depth,agent,model,state,startedAt,enqueuedAt,prompt,tokenBudget,runState,providerOptions) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        'INSERT INTO agentic_runs (id,threadId,parentRunId,depth,agent,model,state,startedAt,enqueuedAt,prompt,tokenBudget,runState,providerOptions,costBudgetMicros,maxSteps) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         run.id, run.threadId, run.parentRunId ?? null, run.depth ?? 0,
         run.agent, run.model, run.state ?? 'RUNNING', startedAt, run.enqueuedAt?.getTime() ?? null,
         run.prompt ?? null, run.tokenBudget ?? null, json(run.runState), json(run.providerOptions),
+        run.costBudgetMicros ?? null, run.maxSteps ?? null,
       );
       return this.toRun({
         ...run, parentRunId: run.parentRunId ?? null, depth: run.depth ?? 0,

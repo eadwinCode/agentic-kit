@@ -103,6 +103,7 @@ const toRun = (r: any): RunRecord => ({
   result: r.result ?? null,
   prompt: r.prompt ?? null, tokenBudget: r.tokenBudget ?? null,
   runState: r.runState ?? null, providerOptions: r.providerOptions ?? null,
+  costBudgetMicros: num(r.costBudgetMicros), maxSteps: num(r.maxSteps),
 });
 
 /** Operational history in Postgres — the production store (§2.9), reached
@@ -219,14 +220,15 @@ export class PostgresAdminStore implements AdminStore {
       const { rows } = await this.db.query(
         `INSERT INTO agentic_runs
            (id, "threadId", "parentRunId", depth, agent, model, state,
-            prompt, "tokenBudget", "runState", "providerOptions", "enqueuedAt")
-         VALUES ($1, $2, $3, $4, $5, $6, $11, $7, $8, $9, $10, $12) RETURNING *`,
+            prompt, "tokenBudget", "runState", "providerOptions", "enqueuedAt", "costBudgetMicros", "maxSteps")
+         VALUES ($1, $2, $3, $4, $5, $6, $11, $7, $8, $9, $10, $12, $13, $14) RETURNING *`,
         [
           run.id, run.threadId, run.parentRunId ?? null, run.depth ?? 0,
           run.agent, run.model, run.prompt ?? null, run.tokenBudget ?? null,
           run.runState ? JSON.stringify(run.runState) : null,
           run.providerOptions ? JSON.stringify(run.providerOptions) : null,
           run.state ?? 'RUNNING', run.enqueuedAt ?? null,
+          run.costBudgetMicros ?? null, run.maxSteps ?? null,
         ],
       );
       return toRun(rows[0]);

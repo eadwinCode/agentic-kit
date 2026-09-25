@@ -28,16 +28,21 @@ be opened should be a startup error.
 | `hitlTtlMs` | `900000` (15 min) | How long a parked approval stays answerable. On expiry it resolves as a timeout denial and the run continues. |
 | `reclaimGraceMs` | `60000` | Grace beyond the TTL before orphan reclamation may claim a thread. |
 
-### Run limits (Go runtime additions)
+### Deadlines and overload
 
-| Key | Default | What it does |
-| :--- | :--- | :--- |
-| `RunLockLease` | `2m` | The per-thread run lock's lease. The worker renews it every sixth of the lease while it holds it, so an expired lock means a dead worker. A worker whose renewals have failed for two thirds of the lease stops. A job blocked by a held lock is redriven with a growing delay and gives up only after waiting at least one lease. |
-| `RunRetryBackoff` / `RunRetryBackoffMax` | `5s` / `2m` | A failed run waits this long before its first retry, twice as long each time after, with jitter. |
-| `StepTimeout` | off | Bounds one model round trip; a step past it fails and the run takes the retry policy. |
-| `SegmentTimeout` | off | Bounds one worker segment; a segment past it settles the run `FAILED` with a reason. |
-| `MaxQueueWait` | off | A job picked up later than this fails with the reason instead of running. |
-| `MaxQueueDepth` | off | A new run is refused (`RefusedQueueFull`) before anything is written once this many jobs are ready and waiting. |
+The same four settings in both runtimes (Go names in brackets, as durations):
+
+| Setting | Default | Meaning |
+| :--- | ---: | :--- |
+| `stepTimeoutMs` (`StepTimeout`) | `0` (off) | Bounds one model round trip; a step past it fails and the run takes the retry policy. |
+| `segmentTimeoutMs` (`SegmentTimeout`) | `0` (off) | Bounds one worker segment; a segment past it settles the run `FAILED` with stopReason `timeout`. |
+| `maxQueueWaitMs` (`MaxQueueWait`) | `0` (off) | A job picked up later than this fails with the reason instead of running. |
+| `maxQueueDepth` (`MaxQueueDepth`) | `0` (off) | A new run is refused (reason `queue_full`) before anything is written once this many jobs are ready and waiting. Needs a queue that can count. |
+
+In Go, a config built by hand keeps the default of every field left at zero
+where zero could never work (a step cap, a poll, a lease). The two booleans,
+`RecordPayloads` and `PromptCaching`, cannot tell "false" from "left out":
+start from `DefaultConfig()` to keep them on.
 
 ### Run limits
 
@@ -90,7 +95,7 @@ be opened should be a startup error.
 
 | Setting | Default | Meaning |
 | :--- | ---: | :--- |
-| `billingPreCheck` | — | `({ threadId, state, publishEvent }) => { ok, error? }`. Reject a run before it costs anything; the check can publish on the thread, and the platform publishes `RUN_REFUSED`. |
+| `billingPreCheck` | — | `({ threadId, runId?, state, stage, budget?, publishEvent }) => { ok, error? }`. Runs at `stage: 'dispatch'`, before anything is written (a refusal means the run never exists), and again at `'pickup'`, when a worker takes the job (a refusal fails the run; lowering `budget.costBudgetMicros` or `budget.maxSteps` caps this segment). The check can publish on the thread, and the platform publishes `RUN_REFUSED`. |
 
 Pricing is not a `config` setting — `pricer` sits on `setupAgentCore` beside the
 ports, because it decides what goes into the store rather than how the loop

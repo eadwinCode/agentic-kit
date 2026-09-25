@@ -2,6 +2,8 @@ import { generateText, streamText } from 'ai';
 import type { LanguageModel } from 'ai';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { AgentKind, ProviderOptions } from './types.js';
+import type { AgentRunState } from './state.js';
+import type { PrepareStepFn, SystemFn } from '../ports/runtime.js';
 import type { RegisteredAgent } from './agent.js';
 import { systemCacheMessage } from './cache.js';
 import {
@@ -83,6 +85,10 @@ export async function executeStep(
     onFinish: _userOnFinish,
     onStepFinish: userOnStepFinish,
     system: specSystem,
+    // Platform hooks, not SDK options: the engine calls these itself.
+    systemFn: _systemFn,
+    prepareStep: _prepareStep,
+    onSettle: _onSettle,
     ...userArgs
   } = agent.args as Record<string, any>;
 
@@ -233,6 +239,13 @@ export interface LoopInput {
   toolErrors?: Map<string, string>;
   /** Persona for a nested run; omitted, the agent's own spec `system` stands. */
   system?: string;
+  /** Builds the persona per step with the run's state (§3.1); wins over
+   *  `system`. What the agent is acting on may change between steps. */
+  systemFn?: SystemFn;
+  /** Edits the prompt for one step, just before it is sent. See PrepareStepFn. */
+  prepareStep?: PrepareStepFn;
+  /** The run's state (§2.10), handed to `systemFn` and `prepareStep`. */
+  state?: AgentRunState;
   /** Carry the system prompt as a stamped message rather than the SDK's
    *  `system:` string, so it can hold a cache breakpoint (§2.6). */
   cacheSystemPrompt?: boolean;
@@ -298,6 +311,25 @@ export async function runLoop(
   while (stepsLeft > 0 && !input.abortSignal.aborted) {
     stepsLeft--;
     const stepStartedAt = Date.now();
+    // Built per step with the run's state (§3.1): what the agent is acting
+    // on may have changed since the last step. A throw fails the step.
+    const system = input.systemFn ? await input.systemFn(threadId, input.state ?? {}) : input.system;
+    const prompt = input.prepareStep
+      ? await input.prepareStep(threadId, input.state ?? {}, input.messages)
+      : input.messages;
+    // One round trip is bounded in wall time when stepTimeoutMs is set: a
+    // model that accepts the call and never answers ends this step like any
+    // failed step, and the run takes the retry policy (§2.8).
+    const stepAbort = new AbortController();
+    const onRunAbort = () => stepAbort.abort(input.abortSignal.reason);
+    input.abortSignal.addEventListener('abort', onRunAbort, { once: true });
+    let stepTimedOut = false;
+    const stepLimit = deps.config.stepTimeoutMs;
+    const stepTimer = stepLimit > 0
+      ? setTimeout(() => { stepTimedOut = true; stepAbort.abort(new Error('step timed out')); }, stepLimit)
+      : undefined;
+    const timeoutError = () =>
+      new Error(`step ${stepsRun + 1} ran longer than ${stepLimit}ms`);
     const partial = { text: '' };
     let step: StepResult;
     const batcher = input.publishChunk ? new ChunkBatcher(input.publishChunk) : null;
@@ -305,10 +337,10 @@ export async function runLoop(
       step = await executeStep(agent, {
         kind: input.kind,
         model: input.model,
-        messages: input.messages,
+        messages: prompt,
         tools: input.tools,
         providerOptions: input.providerOptions,
-        abortSignal: input.abortSignal,
+        abortSignal: stepAbort.signal,
         onChunk:
           input.kind === 'stream-text'
             ? async (chunk: unknown) => {
@@ -317,13 +349,15 @@ export async function runLoop(
                 await input.onChunk?.(chunk);
               }
             : undefined,
-        system: input.system,
+        system,
         cacheSystemPrompt: input.cacheSystemPrompt,
         partial,
       });
       await batcher?.flush(); // the step's text is out before anything below
     } catch (err) {
       await batcher?.flush();
+      clearTimeout(stepTimer);
+      input.abortSignal.removeEventListener('abort', onRunAbort);
       // The call ended without a finish: a user stop, or the provider failing
       // part way. Either way the provider billed for what it had already
       // produced, so the call is recorded rather than dropped — with
@@ -343,7 +377,21 @@ export async function runLoop(
         tokensUsed += priced.totalTokens;
       }
       if (input.abortSignal.aborted) break; // user stop mid-step
+      if (stepTimedOut) throw timeoutError(); // → §2.8 retry policy
       throw err; // real failure → §2.8 redrive policy
+    }
+    clearTimeout(stepTimer);
+    input.abortSignal.removeEventListener('abort', onRunAbort);
+    if (stepTimedOut && !step.finished && !input.abortSignal.aborted) {
+      // The step's own deadline cut the stream: billed like any cut call,
+      // then a failure for the retry policy.
+      const cut = unfinishedUsage(input, stepsRun + 1, partial.text, 'error', lastInput || estimateTokens(input.messages));
+      if (cut.totalTokens > 0) {
+        const priced = await ledger.record(deps, threadId, cut);
+        addAttribution(attribution, priced);
+        tokensUsed += priced.totalTokens;
+      }
+      throw timeoutError();
     }
     if (!step.finished) {
       // The stream ended with no finish and no error. Billed like any call cut

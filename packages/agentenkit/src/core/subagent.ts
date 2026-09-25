@@ -9,7 +9,7 @@ import type {
   RunRecord,
   SubagentsConfig,
 } from './types.js';
-import { wireId } from './types.js';
+import { wireId, type SubagentProfile } from './types.js';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { RegisteredAgent } from './agent.js';
 import { publish, withPublishEvent } from './publish.js';
@@ -126,9 +126,47 @@ export class RunSlots {
   }
 }
 
+/** A named specialist (§2.7), or undefined when the config has no profiles
+ *  or none by that name. */
+function profileFor(ctx: SubagentCtx, name: string | undefined): SubagentProfile | undefined {
+  const profiles = ctx.sub.profiles;
+  return name && profiles && Object.hasOwn(profiles, name) ? profiles[name] : undefined;
+}
+
+/** The unwrapped toolset a nested run owns: its profile's when it has one,
+ *  the shared delegation tools otherwise. The resolved park executes the
+ *  approved tool from here. */
+export function nestedRawTools(ctx: SubagentCtx, d: NestedDescriptor | undefined): Record<string, any> {
+  return ((d && profileFor(ctx, d.name)?.tools) ?? ctx.sub.tools ?? {}) as Record<string, any>;
+}
+
+function nestedModelName(ctx: SubagentCtx, profile: SubagentProfile | undefined, requested?: string): string {
+  return requested || profile?.model || ctx.sub.model || 'gpt-4o';
+}
+
+/** The specialists, sorted, for the tool's description and its errors. */
+function profileNames(ctx: SubagentCtx): string[] {
+  return Object.keys(ctx.sub.profiles ?? {}).sort();
+}
+
+/** The delegation tool's description. With profiles, the model is told
+ *  exactly who it can delegate to. */
+function spawnDescription(ctx: SubagentCtx): string {
+  const desc = 'Delegates a self-contained task to a subagent with an isolated context';
+  const names = profileNames(ctx);
+  if (names.length === 0) return desc;
+  const list = names
+    .map((name) => {
+      const d = ctx.sub.profiles![name]!.description;
+      return d ? `${name} (${d})` : name;
+    })
+    .join('; ');
+  return `${desc}. name MUST be one of the available subagents: ${list}`;
+}
+
 export function spawnSubagentTool(ctx: SubagentCtx) {
   return tool({
-    description: 'Delegates a self-contained task to a subagent with an isolated context',
+    description: spawnDescription(ctx),
     parameters: z.object({
       name: z.string().describe('Short name for the sub-task'),
       instructions: z
@@ -145,6 +183,12 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
       if (depth > ctx.ports.config.subagentMaxDepth) {
         return { error: `Max subagent depth (${ctx.ports.config.subagentMaxDepth}) reached` };
       }
+      // With profiles, an unknown name is ordinary bad input reported to the
+      // model, never a crash (§2.7).
+      const profile = profileFor(ctx, name);
+      if (profileNames(ctx).length > 0 && !profile) {
+        return { error: `Unknown subagent ${JSON.stringify(name)}; use one of: ${profileNames(ctx).join(', ')}` };
+      }
 
       const release = await ctx.slots.acquire(depth, opts.abortSignal ?? ctx.abortSignal);
       try {
@@ -157,7 +201,7 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
           parentRunId: ctx.agentId ?? ctx.resume.runId ?? null,
           depth,
           agent: name,
-          model: model ?? ctx.sub.model ?? 'gpt-4o',
+          model: nestedModelName(ctx, profile, model),
           // A nested run's "prompt" is the brief it was delegated (§2.7).
           ...(ctx.ports.config.recordPayloads
             ? {
@@ -176,7 +220,7 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
         const descriptor: NestedDescriptor = {
           agentId: run.id,
           name,
-          model: model ?? ctx.sub.model ?? 'gpt-4o',
+          model: nestedModelName(ctx, profile, model),
           depth,
         };
 
@@ -299,7 +343,7 @@ function nestedTools(
   abortSignal?: AbortSignal,
 ): Record<string, any> {
   const raw: Record<string, any> = {
-    ...(ctx.sub.tools ?? {}),
+    ...nestedRawTools(ctx, d),
     spawnSubagent: spawnSubagentTool({
       ...ctx,
       depth: d.depth,
@@ -379,6 +423,11 @@ export async function runNestedAgent(
   }
 
   const { resolved, modelKey } = resolveNestedModel(ctx, d.model);
+  // A profile brings its own persona and step cap (§2.7); the descriptor
+  // carries the name, so a re-entry after an approval finds the same one.
+  const profile = profileFor(ctx, d.name);
+  let maxSteps = ports.config.subagentMaxSteps;
+  if (profile?.maxSteps && profile.maxSteps > 0 && profile.maxSteps < maxSteps) maxSteps = profile.maxSteps;
   const outcome = await runLoop(
     ports,
     ctx.agent,
@@ -399,7 +448,7 @@ export async function runNestedAgent(
         repairDanglingToolCalls(promptMessages(persisted) as any[]),
       ),
       tools: nestedTools(ctx, d, frames, abortSignal),
-      maxSteps: ports.config.subagentMaxSteps,
+      maxSteps,
       abortSignal: abortSignal ?? new AbortController().signal,
       fenced: ctx.fenced,
       providerOptions: ctx.providerOptions,
@@ -412,7 +461,10 @@ export async function runNestedAgent(
       modelKey,
       modelId: wireId(resolved, modelKey),
       agentName: d.name,
-      system: `You are the "${d.name}" subagent. Complete the task, then stop.`,
+      system: profile?.system || `You are the "${d.name}" subagent. Complete the task, then stop.`,
+      ...(profile?.systemFn ? { systemFn: profile.systemFn } : {}),
+      ...(profile?.prepareStep ? { prepareStep: profile.prepareStep } : {}),
+      state: ctx.state ?? {},
       cacheSystemPrompt: ports.config.promptCaching,
       toolErrors: ctx.toolErrors,
       publishChunk: async (chunk) => {

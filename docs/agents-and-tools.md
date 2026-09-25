@@ -28,12 +28,21 @@ module everywhere.
 
 ### A system prompt built per step
 
-> Go runtime. The TypeScript package will follow.
-
 `system` is a string. When the persona depends on what the run is acting on
-— a project, a page, a user's settings — give the spec a `SystemFn` instead.
-It is called once per step with the thread id and the run's
-[state](./run-state.md), and wins over `system`:
+— a project, a page, a user's settings — give the spec a `systemFn` (Go:
+`SystemFn`) instead. It is called once per step with the thread id and the
+run's [state](./run-state.md), and wins over `system`. A throw (Go: an error)
+fails the step, like a model error:
+
+```ts
+runtime.createStreamTextAgent({
+  name: 'designer',
+  systemFn: async (threadId, state) => {
+    const project = await projects.load(state.projectId as string);
+    return `${stablePersona}\n\n${project.brief()}`;
+  },
+});
+```
 
 ```go
 rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
@@ -51,6 +60,21 @@ rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
 Keep the stable part first. Prompt caching stamps the system message as a
 cached prefix, and a prefix that moves every step is a prefix that never
 hits.
+
+### Context for one step only
+
+`prepareStep` (Go: `PrepareStep`) edits the prompt just before each step is
+sent. It gets the thread id, the run's state and the messages the platform
+assembled, and what it returns is what the model sees. It is the place for
+context that must not be saved — a screenshot to look at once, an editor
+snapshot — because nothing added here reaches the stored history:
+
+```ts
+prepareStep: (threadId, state, messages) => [
+  ...messages,
+  { role: 'user', content: [{ type: 'image', image: currentScreenshot() }] },
+],
+```
 
 ## Models
 
@@ -233,13 +257,27 @@ Model resolution order: run input → agent spec → `'gpt-4o'`.
 `accepted: false` means the thread already has an active run, or your
 `billingPreCheck` rejected it. Nothing was written.
 
-Three more fields, Go runtime for now:
+Four more fields:
 
 | Field | What it does |
 | :--- | :--- |
-| `RunID` | Name the run yourself. Your own records (a workspace, a billing line) can be keyed by it *before* dispatch, and the worker sees the same id. A reused id is refused with `accepted: false`. |
-| `MaxSteps` | Cap this run's round trips below the config's `MaxSteps`. Zero keeps the config value; more is clamped to it. |
-| `Attachments` | Images sent with the prompt (`{URL, MediaType}`). Stored as image parts on the user turn and handed to the model natively. |
+| `runId` | Name the run yourself. Your own records (a workspace, a billing line) can be keyed by it *before* dispatch, and the worker sees the same id. A reused id is refused with `accepted: false`. |
+| `maxSteps` | Cap this run's round trips below the config's `maxSteps`. 0 keeps the config value; more is clamped to it; a negative one is refused. |
+| `attachments` | Images sent with the prompt (`{ url, mediaType }`). Stored as image parts on the user turn and handed to the model natively. |
+| `partitionKey` | Your tenant, written on the dispatch ticket so a queue that spreads its claims across partitions keeps one tenant's backlog from starving the others. |
+
+A refusal carries a `reason` a host can act on: `active_run`, `queue_full`
+(try again shortly) or `billing`.
+
+A budget (`tokenBudget`, `costBudgetMicros`) of `0` means "no cap from this
+level": the agent spec's applies, then the config's. A negative one is refused.
+
+```ts
+await chat.run({
+  prompt: 'what is in this picture?', runId, maxSteps: 8,
+  attachments: [{ url: 'https://cdn.example/cat.png', mediaType: 'image/png' }],
+});
+```
 
 ```go
 chat.Run(ctx, agentenkit.RunInput{

@@ -304,6 +304,7 @@ describe('runtime.deleteThread (§3.2)', () => {
 
   it('a late resume dispatch after deletion is a no-op — no resurrection', async () => {
     const { deps, store, kv, runtime } = await makeDeps();
+    runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
     const thread = await store.threads.create(undefined);
     await store.threads.setState(thread.id, 'WAITING_FOR_INPUT');
     await store.events.append(thread.id, {

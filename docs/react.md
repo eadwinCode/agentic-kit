@@ -164,8 +164,8 @@ await run('…', { runId: myRunId, maxSteps: 8 });
 
 `attachments` show on the optimistic turn as image parts and reach the model
 natively. `runId` names the run so your own records can be keyed by it before
-the server answers; `maxSteps` caps the run below the server's ceiling. Both
-need a server that accepts them (the Go runtime does).
+the server answers; `maxSteps` caps the run below the server's ceiling. Your
+run route must pass them through to `run()`; both runtimes accept them.
 
 The hook adds the user's turn locally before the request goes out, then replaces
 it with the durable one when the server confirms — so the id is real and the

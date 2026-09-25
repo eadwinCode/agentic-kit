@@ -63,7 +63,7 @@ knows the moment:
 
 | Event | When | Payload |
 | :--- | :--- | :--- |
-| `RUN_REFUSED` | `billingPreCheck` said no | `{ reason: 'billing', error }` |
+| `RUN_REFUSED` | `billingPreCheck` said no, at dispatch or at pickup, or the queue is at `maxQueueDepth` | `{ reason: 'billing' \| 'queue_full', error, runId? }` |
 | `TOKEN_BUDGET_EXHAUSTED` | the run's spend crossed `tokenBudget` between steps, just before it stops | `{ agentId, tokensUsed, tokenBudget }` |
 | `COST_BUDGET_EXHAUSTED` | the run's spend crossed `costBudgetMicros` between steps, just before it stops | `{ agentId, costMicros, costBudgetMicros, currency }` |
 

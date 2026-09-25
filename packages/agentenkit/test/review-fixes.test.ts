@@ -1,3 +1,4 @@
+import { UnknownAgentError } from '../src/runtime.js';
 import { DEL_IF_VALUE_SCRIPT, SET_IF_VALUE_SCRIPT } from '../src/adapters/upstash.js';
 import { describe, expect, it } from 'bun:test';
 import { setupAgentCore } from '../src/runtime.js';
@@ -191,13 +192,14 @@ describe('MemoryKv.incr atomicity (§3.4)', () => {
 });
 
 describe('runtime.worker.handleJob (§2.8)', () => {
-  it('rejects unknown agents', async () => {
+  // A job for an agent this process does not have is an error the queue
+  // keeps and retries, never a silent success that deletes the job. The same
+  // case runs in the Go package.
+  it('an unknown agent is an error, not a silent success', async () => {
     const { runtime } = await makeDeps();
-    const res = await runtime.worker.handleJob({
-      threadId: 't1', model: 'gpt-4o', agent: 'nope',
-    });
-    expect(res.accepted).toBe(false);
-    expect(res.reason).toBe('unknown-agent');
+    await expect(
+      runtime.worker.handleJob({ threadId: 't1', model: 'gpt-4o', agent: 'nope' }),
+    ).rejects.toBeInstanceOf(UnknownAgentError);
   });
 
   it('dispatches to the default handle when agent is omitted', async () => {

@@ -36,7 +36,7 @@ export async function POST(req: NextRequest) {
 `202`, not `200`: the run has been accepted, not completed. A `409` means the
 thread already has an active run — stop it first, or wait.
 
-The Go runtime also accepts `runId` (name the run yourself; a reused id is a
+`run()` also accepts `runId` (name the run yourself; a reused id is a
 `409`), `maxSteps` (cap the run below the config's ceiling) and `attachments`
 (`[{url, mediaType}]`, images on the user turn).
 
@@ -314,6 +314,17 @@ approval, outlives this HTTP response.
 Delivery is at-least-once, so double dispatch is possible; the per-thread run
 lock makes it a no-op.
 
+`handleJob` throws `UnknownAgentError` for a job naming an agent this process
+does not have, so a queue that retries on failure keeps the job rather than
+losing it. A long-lived worker passes `{ signal }` and aborts it on shutdown:
+the segment stops at once and the job goes back on the queue without spending
+an attempt.
+
+When your queue gives up on a job (its attempts are spent), call
+`runtime.worker.handleDeadJob(job, attempts, cause)`: the run behind it is
+failed with the reason and settled, so its thread does not read `QUEUED` or
+`RUNNING` for ever. A job whose run has already moved on is left alone.
+
 > **This endpoint must be authenticated.** It executes agents. See
 > [Production](./production.md#security).
 
@@ -327,7 +338,7 @@ if (process.env.INLINE_WORKER === '1') {
   waitUntil(runtime.worker.handleJob({
     threadId: result.threadId,
     runId: result.runId,        // the run id run() enqueued — required
-    model: model ?? 'gpt-4o',
+    model: model ?? 'gpt-4o',   // the agent's own model when the client sent none
     agent: chat.name,
   }));
 }

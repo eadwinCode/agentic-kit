@@ -16,6 +16,7 @@ import type { RunFilter } from './ports/admin.js';
 import type { RunRecord } from './core/types.js';
 import type { RegisteredAgent } from './core/agent.js';
 import { settleLate } from './core/settle.js';
+import { failLostRun } from './core/engine.js';
 import { contextUsage } from './core/context.js';
 import { createGenerateTextAgent, createStreamTextAgent } from './core/agent.js';
 import * as adminReads from './core/admin.js';
@@ -26,6 +27,15 @@ import { reclaimIfOrphaned } from './core/reclaim.js';
 import { respond } from './core/hitl.js';
 import { deleteThread } from './core/deleteThread.js';
 import { publishEvent, ACTIVE_STATES } from './core/publish.js';
+
+/** A job named an agent this process does not have. Thrown, not answered, so
+ *  a queue that retries on failure keeps the job. */
+export class UnknownAgentError extends Error {
+  constructor(readonly agent?: string) {
+    super(`no agent registered for this job: ${JSON.stringify(agent ?? '')}`);
+    this.name = 'UnknownAgentError';
+  }
+}
 
 /** Bind the ports to the core behaviors (§3.3). This is the package's public
  *  entry point — the only place where anything is wired together. */
@@ -256,12 +266,14 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
     },
 
     worker: {
-      handleJob: async (job: RunJob) => {
+      handleJob: async (job: RunJob, options: { signal?: AbortSignal } = {}) => {
         // Missing `agent` → the default handle (first registered stream-text)
         const agent =
           (job.agent ? registry.get(job.agent) : null) ??
           (defaultAgent ? registry.get(defaultAgent) : null);
-        if (!agent) return { accepted: false, reason: 'unknown-agent' };
+        // An error, not a quiet refusal: a queue that retries on failure keeps
+        // the job for a process that has the agent, rather than deleting it.
+        if (!agent) throw new UnknownAgentError(job.agent);
 
         // executeWithPolicy: run lock (idempotent under at-least-once
         // delivery, §3.4) + §2.8 failure policy — redrive < maxAttempts,
@@ -280,10 +292,38 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
           tokenBudget: job.tokenBudget,
           costBudgetMicros: job.costBudgetMicros,
           providerOptions: job.providerOptions,
+          maxSteps: job.maxSteps,
+          dispatchedAt: job.dispatchedAt,
+          partitionKey: job.partitionKey,
+          kind: job.kind,
+          // A shutdown hands the job back without spending an attempt.
+          ...(options.signal ? { signal: options.signal } : {}),
         });
         return { accepted: true };
       },
+
+      handleDeadJob: async (job: RunJob, attempts: number, cause: unknown) => {
+        const log = deps.log ?? console;
+        const agent = agents.get(job.agent ?? '') ?? (defaultAgent ? agents.get(defaultAgent) : undefined);
+        if (!agent) {
+          log.error("dead job for an unknown agent; its run cannot be failed", { job, cause: String(cause) });
+          return;
+        }
+        const why = cause instanceof Error ? cause.message : String(cause);
+        const reason = `the run's job was dropped by the queue after ${attempts} deliveries: ${why}`;
+        try {
+          const failed = await failLostRun(scope(job.state ?? {}, job.runId), agent, job.threadId, job.runId, reason);
+          if (failed) log.error('dead job: run failed', { threadId: job.threadId, runId: job.runId, cause: why });
+          else ((log as { warn?: (m: string, ...r: unknown[]) => void }).warn)?.(
+            'dead job: run had already moved on; nothing to fail', { threadId: job.threadId, runId: job.runId },
+          );
+        } catch (err) {
+          log.error('dead job: run not failed', { threadId: job.threadId, runId: job.runId, err });
+        }
+      },
     },
+
+    ports: (state?: AgentRunState) => scope(state ?? {}),
   };
   return core;
 }

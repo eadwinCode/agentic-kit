@@ -309,6 +309,8 @@ export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise
           : {}),
         ...(i.resume.providerOptions ? { providerOptions: i.resume.providerOptions } : {}),
         ...(i.resume.state ? { state: i.resume.state } : {}),
+        ...(i.resume.maxSteps ? { maxSteps: i.resume.maxSteps } : {}),
+        ...(i.resume.dispatchedAt ? { dispatchedAt: i.resume.dispatchedAt } : {}),
       },
       {
         delaySeconds: Math.ceil((ttlMs + deps.config.reclaimGraceMs) / 1000),
@@ -520,6 +522,8 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
             // The answer resumes the SAME run, so it must scope storage the same
             // way the parked segment did (§2.10).
             ...(resume.state ? { state: resume.state } : {}),
+            ...(resume.maxSteps ? { maxSteps: resume.maxSteps } : {}),
+            ...(resume.dispatchedAt ? { dispatchedAt: resume.dispatchedAt } : {}),
           }
         : {}),
     // One resume row per answer, keyed on the call: a second enqueue for the

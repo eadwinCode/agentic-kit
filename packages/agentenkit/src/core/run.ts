@@ -1,4 +1,5 @@
-import type { RuntimePorts, RunInput, RunResult } from '../ports/runtime.js';
+import type { Attachment, RuntimePorts, RunInput, RunResult } from '../ports/runtime.js';
+import { QueueFullError, UnsupportedError } from '../ports/queue.js';
 import type { RegisteredAgent } from './agent.js';
 import { reclaimIfOrphaned } from './reclaim.js';
 import { runIdKey, THREAD_KEY_TTL_SECONDS } from './keys.js';
@@ -35,7 +36,7 @@ export async function run(
   if (!thread) return { accepted: false, threadId, error: 'Thread not found' };
   const initialState = thread.state;
   if (ACTIVE_STATES.includes(state as ExecutionState) || ACTIVE_STATES.includes(thread.state)) {
-    return { accepted: false, threadId, error: 'Thread has an active run' };
+    return { accepted: false, threadId, reason: 'active_run', error: 'Thread has an active run' };
   }
 
   // Billing pre-execution check (§4) — user-injected hook. A refusal is
@@ -45,14 +46,47 @@ export async function run(
     const check = await deps.config.billingPreCheck({
       threadId,
       state: input.state ?? {},
+      stage: 'dispatch',
       publishEvent: (type, payload, options) => publishEvent(deps, threadId, type, payload, options),
     });
     if (!check.ok) {
       const error = check.error ?? 'Billing check failed';
       await publish(deps, threadId, 'RUN_REFUSED', { reason: 'billing', error });
-      return { accepted: false, threadId, error };
+      return { accepted: false, threadId, reason: 'billing', error };
     }
   }
+
+  // Overload check (§2.8), BEFORE anything is written: a queue at its depth
+  // cap refuses the run outright, the thread stays as it was, and the caller
+  // can say "try again shortly". Only new work is refused here; a retry, a
+  // resume or an expiry belongs to a run already under way and always goes in.
+  if (deps.config.maxQueueDepth > 0) {
+    let ready: number | undefined;
+    try {
+      ready = (await deps.queue.stats()).ready;
+    } catch (err) {
+      if (!(err instanceof UnsupportedError)) throw err;
+    }
+    if (ready !== undefined && ready >= deps.config.maxQueueDepth) {
+      ((deps.log ?? console) as { warn?: (m: string, ...r: unknown[]) => void }).warn?.(
+        'run refused: queue full', { threadId, ready, maxQueueDepth: deps.config.maxQueueDepth },
+      );
+      await publish(deps, threadId, 'RUN_REFUSED', { reason: 'queue_full', error: new QueueFullError().message });
+      return { accepted: false, threadId, reason: 'queue_full', error: 'The assistant is busy right now. Try again shortly.' };
+    }
+  }
+
+  // A caller-named run (§2.1) is checked before anything is written: a reused
+  // id must refuse, never resend.
+  if (input.runId && (await deps.admin.runs.get(input.runId))) {
+    return { accepted: false, threadId, error: 'Run id already used' };
+  }
+  if (input.maxSteps !== undefined && (!Number.isInteger(input.maxSteps) || input.maxSteps < 0)) {
+    return { accepted: false, threadId, error: 'maxSteps must be zero or a positive number' };
+  }
+  // A run may cap itself below the config, never above it. 0 keeps the
+  // config's.
+  const maxSteps = Math.min(input.maxSteps ?? 0, deps.config.maxSteps);
 
   // Edit + resend (§5.1): the edited turn and everything it led to are
   // dropped, then the new text is appended in its place — one thread, no
@@ -72,14 +106,14 @@ export async function run(
 
   // The durable store already provides an atomic state claim. Do this before
   // editing or appending history, so only the winning send changes the thread.
-  const runId = randomUUID();
+  const runId = input.runId || randomUUID();
   const previousRunId = await deps.kv.get(runIdKey(threadId));
   // The thread now belongs to this run: every later state change names it, so
   // a run that is stopped or replaced can never move the thread (§3.4).
   const admitted = await transition(deps, threadId, {
     from: [initialState], to: 'QUEUED', newRunId: runId, model,
   });
-  if (!admitted) return { accepted: false, threadId, error: 'Thread has an active run' };
+  if (!admitted) return { accepted: false, threadId, reason: 'active_run', error: 'Thread has an active run' };
 
   let installed = false;
   try {
@@ -94,6 +128,7 @@ export async function run(
     const enqueuedAt = new Date();
     await deps.admin.runs.start({
       id: runId, threadId, agent: agent.name, model, state: 'QUEUED', enqueuedAt,
+      costBudgetMicros: input.costBudgetMicros ?? 0, maxSteps,
       // What this run was asked to do (§2.9) — without it a dashboard can show
       // that a run was slow but not what it was slow at.
       ...(deps.config.recordPayloads
@@ -122,7 +157,7 @@ export async function run(
 
     const userMessage = await deps.storage.messages.append(threadId, {
       role: 'user',
-      content: input.prompt,
+      content: userContent(input.prompt, input.attachments),
     });
 
     // The user's turn goes on the bus like everything else (§2.2). Without it a
@@ -176,6 +211,9 @@ export async function run(
     await enqueueJob(deps, {
       threadId, runId, model, agent: agent.name,
       enqueuedAt: enqueuedAt.getTime(),
+      dispatchedAt: enqueuedAt.getTime(),
+      ...(maxSteps ? { maxSteps } : {}),
+      ...(input.partitionKey ? { partitionKey: input.partitionKey } : {}),
       // Persisted on the ticket so a worker — or a resume after an approval,
       // hours later, in another process — rehydrates the same state (§2.10).
       ...(input.state ? { state: input.state } : {}),
@@ -188,7 +226,10 @@ export async function run(
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     await failDispatch(deps, threadId, runId, model, error, installed ? undefined : previousRunId);
-    return { accepted: false, threadId, runId, error };
+    return {
+      accepted: false, threadId, runId, error,
+      ...(err instanceof QueueFullError ? { reason: 'queue_full' as const } : {}),
+    };
   }
 }
 
@@ -244,6 +285,17 @@ function providerOptionsFor(
     input.providerOptions,
   );
   return merged && Object.keys(merged).length > 0 ? merged : null;
+}
+
+/** A user turn: plain text alone, or text plus the images attached to it
+ *  (§5.1), in the shape the model reads natively. */
+export function userContent(text: string, attachments?: Attachment[]): unknown {
+  const images = (attachments ?? []).filter((a) => a.url);
+  if (images.length === 0) return text;
+  return [
+    ...(text ? [{ type: 'text', text }] : []),
+    ...images.map((a) => ({ type: 'image', image: a.url, ...(a.mediaType ? { mimeType: a.mediaType } : {}) })),
+  ];
 }
 
 function capText(text: string, limit: number): string {

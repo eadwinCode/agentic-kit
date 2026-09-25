@@ -18,6 +18,9 @@ runs, the problem is delivery, not the runtime.
 
 ### Every job resolves to an unknown agent
 
+`handleJob` throws `UnknownAgentError` (Go: `ErrUnknownAgent`) for these, so the
+queue keeps retrying them.
+
 The worker route imported the runtime from a module that does not also register
 the agents. The registry lives in the runtime's closure, and frameworks that
 give each route its own module instance will hand you a runtime with an empty

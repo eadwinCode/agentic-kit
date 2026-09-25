@@ -142,6 +142,20 @@ export interface RunInput {
    *  from the AI SDK (§3.1). Merged over the spec default: the execute
    *  input wins per provider namespace. */
   providerOptions?: ProviderOptions;
+  /** Name the run yourself (§2.1): your own records can be keyed by it
+   *  before dispatch, and the worker sees the same id. Reusing one is
+   *  refused, never silently re-run. */
+  runId?: string;
+  /** Cap this run's round trips below the config's `maxSteps`; a larger
+   *  value is clamped to it. */
+  maxSteps?: number;
+  /** Images the user sent with the prompt. They are stored as image parts on
+   *  the user message and reach the model natively. */
+  attachments?: Attachment[];
+  /** The caller's tenant, written on the dispatch ticket so a queue that
+   *  spreads its claims across partitions can keep one tenant's backlog from
+   *  starving the others. Opaque to the platform. */
+  partitionKey?: string;
   /** The sending client's own name for the user turn. It comes back on the
    *  turn's MESSAGE_APPENDED, so the client that sent it can swap its
    *  optimistic copy for the real one by id, never by matching text. Opaque
@@ -149,9 +163,22 @@ export interface RunInput {
   clientMessageId?: string;
 }
 
+/** An image on a user turn: a URL the provider can fetch, or a data: URL. */
+export interface Attachment {
+  url: string;
+  mediaType?: string;
+}
+
+/** Why a run was refused, for a host that answers differently to each:
+ *  `active_run` (the thread already has one), `queue_full` (try again
+ *  shortly), `billing` (the billing check said no). */
+export type RefusedReason = 'active_run' | 'queue_full' | 'billing';
+
 export interface RunResult {
   accepted: boolean;
   threadId: string;
+  /** For the refusals a host acts on. */
+  reason?: RefusedReason;
   /** This run's id (§2.1) — the same one carried by the enqueued job. An
    *  in-process worker must pass it back, or its dispatch has no identity. */
   runId?: string;
@@ -237,6 +264,22 @@ export interface RunFinishInfo {
  *  written, can see the same run twice. */
 export type SettleFn = (info: RunFinishInfo) => void | Promise<void>;
 
+/** Builds the persona per step with the run's state (§3.1). It wins over the
+ *  static `system` when set. A throw fails the step, like a model error. */
+export type SystemFn = (threadId: string, state: AgentRunState) => string | Promise<string>;
+
+/** Edits the prompt for one step, just before it is sent (§3.1): `messages` is
+ *  the history the platform assembled (compacted, repaired, cache-stamped) and
+ *  what comes back is what the model sees. It is the place for context that
+ *  must NOT be saved — a screenshot the model should look at once, an editor
+ *  snapshot — because anything added here is gone on the next step unless it
+ *  is added again. */
+export type PrepareStepFn = (
+  threadId: string,
+  state: AgentRunState,
+  messages: Array<any>,
+) => Array<any> | Promise<Array<any>>;
+
 /** Durable state used to hydrate a client before it starts live event replay. */
 export interface ThreadSnapshot {
   thread: ThreadDTO;
@@ -276,6 +319,10 @@ export type StreamTextAgentSpec = {
     | 'maxSteps' | 'onStepFinish' | 'onError' | 'onFinish' | 'onChunk'> & {
   /** `system` is allowed here (static persona); per-run system is not. */
   system?: string;
+  /** The persona built per step with the run's state; wins over `system`. */
+  systemFn?: SystemFn;
+  /** Edits the prompt per step, for context that must not be saved. */
+  prepareStep?: PrepareStepFn;
   tools?: ToolSet;
   onChunk?: (para: any) => void | Promise<void>;   // chained after platform persistence
   /** Charges the run (§5.6). See SettleFn. */
@@ -296,6 +343,10 @@ export type GenerateTextAgentSpec = {
 } & Omit<Parameters<typeof import('ai').generateText>[0],
     'model' | 'messages' | 'prompt' | 'abortSignal' | 'onFinish' | 'onStepFinish'> & {
   tools?: ToolSet;
+  /** The persona built per step with the run's state; wins over `system`. */
+  systemFn?: SystemFn;
+  /** Edits the prompt per step, for context that must not be saved. */
+  prepareStep?: PrepareStepFn;
   /** Charges the run (§5.6). See SettleFn. */
   onSettle?: SettleFn;
   /** Fires once, after the platform finalized the run (§4). */
@@ -438,6 +489,20 @@ export interface AgentCore {
    *  delivery (the per-thread run lock, §3.4). The HTTP layer only verifies
    *  signatures, parses JSON, and calls this. */
   worker: {
-    handleJob(job: RunJob): Promise<{ accepted: boolean; reason?: string }>;
+    /** Run one job. Throws `UnknownAgentError` for a job naming an agent this
+     *  process does not have, so a queue that retries on failure keeps it.
+     *  Abort `signal` on shutdown: the segment stops at once and the job goes
+     *  back on the queue without spending an attempt. */
+    handleJob(job: RunJob, options?: { signal?: AbortSignal }): Promise<{ accepted: boolean; reason?: string }>;
+    /** What a queue calls when it gives up on a job (§2.8): the run behind it
+     *  is failed with the reason and settled, so its thread does not read
+     *  QUEUED or RUNNING for ever. A job whose run has already moved on is
+     *  left alone. */
+    handleDeadJob(job: RunJob, attempts: number, cause: unknown): Promise<void>;
   };
+
+  /** The ports bundle, scoped to a run's state when one is given (§2.10): for
+   *  a host that reads storage, publishes or checks the kv the way the
+   *  platform does. */
+  ports(state?: AgentRunState): RuntimePorts;
 }

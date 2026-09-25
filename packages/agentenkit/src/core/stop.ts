@@ -106,7 +106,7 @@ async function settleAfterStop(
  *  and a dangling call is a prompt no strict provider accepts. Nested parks
  *  close their whole chain: the child's call and every spawnSubagent call
  *  waiting on it (§2.7), whose run records end CANCELLED too. */
-async function closeOpenParks(deps: RuntimePorts, threadId: string): Promise<void> {
+export async function closeOpenParks(deps: RuntimePorts, threadId: string): Promise<void> {
   const result = { cancelled: true, reason: 'stopped' };
   const toolResult = (toolCallId: string, toolName: string) => [
     { type: 'tool-result', toolCallId, toolName, result },

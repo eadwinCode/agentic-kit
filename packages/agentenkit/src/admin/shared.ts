@@ -31,7 +31,7 @@ export function addRunTotals(
 export const RUN_COLUMNS = new Set([
   'state', 'stopReason', 'error', 'startedAt', 'endedAt', 'enqueuedAt', 'durationMs', 'queuedMs',
   'settledAt', 'steps', 'inputTokens', 'cachedInputTokens', 'outputTokens', 'totalTokens',
-  'attempts', 'result', 'prompt', 'tokenBudget', 'runState', 'providerOptions',
+  'attempts', 'result', 'prompt', 'tokenBudget', 'runState', 'providerOptions', 'costBudgetMicros', 'maxSteps',
 ]);
 /** The run columns that hold JSON. */
 export const JSON_COLUMNS = new Set(['result', 'runState', 'providerOptions']);

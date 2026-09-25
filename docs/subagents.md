@@ -42,11 +42,24 @@ and is resumed where it stopped rather than restarted.
 
 ## Named profiles
 
-> Go runtime.
-
 The default child is a generalist with one persona and the shared tools.
 When delegation should go to specialists — a page manager, a copywriter, an
 analyst — name them:
+
+```ts
+subagents: {
+  profiles: {
+    'page-manager': {
+      description: 'edits and reorders the pages of the site',
+      systemFn: pageManagerPrompt,
+      model: 'gpt-4o-mini',
+      tools: pageTools,
+      maxSteps: 20,
+    },
+    copywriter: { description: 'writes headings and body copy', system: 'You write clean copy.' },
+  },
+},
+```
 
 ```go
 Subagents: &agentenkit.SubagentsConfig{
@@ -66,7 +79,7 @@ Subagents: &agentenkit.SubagentsConfig{
 With profiles set, `spawnSubagent`'s description lists the names and what
 each one does, and `name` must be one of them; an unknown name comes back to
 the model as a tool error, not a crash. The child takes the profile's
-persona (`SystemFn` wins over `System`), model, tools and step cap. Everything
+persona (`systemFn` wins over `system`), model, tools and step cap. Everything
 else is unchanged: it is still a run, it still parks for approval, and it is
 re-entered under the same profile after one.
 

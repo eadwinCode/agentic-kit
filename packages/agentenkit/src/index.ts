@@ -24,6 +24,8 @@ export type {
   ResolvedModel,
   RunInput,
   RunResult,
+  Attachment,
+  RefusedReason,
   RuntimeOptions,
   RuntimePorts,
   StopResult,
@@ -35,11 +37,13 @@ export type {
   Logger,
   RunFinishInfo,
   SettleFn,
+  SystemFn,
+  PrepareStepFn,
   ReclaimReport,
 } from './ports/runtime.js';
 
 // runtime — the factory that binds ports to behaviors
-export { setupAgentCore } from './runtime.js';
+export { setupAgentCore, UnknownAgentError } from './runtime.js';
 
 // core — behaviors, all ports-only
 export {
@@ -114,6 +118,7 @@ export {
   DEFAULT_CONFIG,
   resolveConfig,
   type AgentConfig,
+  type RunBudget,
   type AgentEvent,
   type ExecutionState,
   type MessageDTO,
@@ -122,6 +127,7 @@ export {
   type NewRunRecord,
   type NewUsage,
   type UsageLine,
+  type SubagentProfile,
   type CurrencyCost,
   type UsageFilter,
   type UsageKind,
