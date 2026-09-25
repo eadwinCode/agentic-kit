@@ -42,6 +42,9 @@ func RequireConfirmation(t goai.Tool) ports.Tool {
 // one is ready, or a redelivery would run half of them and then leave the
 // thread parked with those verdicts already consumed.
 func verdictReady(ctx context.Context, deps ports.RuntimePorts, pending PendingHitl) (string, error) {
+	if pending.Landed {
+		return "answered", nil // its result is in the history already
+	}
 	if _, found, err := deps.Kv.Get(ctx, HitlKey(pending.ToolCallID)); err != nil {
 		return "", err
 	} else if found {
@@ -55,22 +58,23 @@ func verdictReady(ctx context.Context, deps ports.RuntimePorts, pending PendingH
 
 // settleVerdict turns a settled approval into the tool result the
 // conversation will carry (§2.5): run the approved tool, record the denial,
-// or convert an expired request into the timeout denial.
+// or convert an expired request into the timeout denial. It reports whether
+// the request expired.
 //
-// A tool failure is surfaced TO THE MODEL as the tool result, so the
-// conversation always stays executable.
+// Nothing here is consumed: the answer stays until its result is in the
+// history (see landVerdict). An approved tool's output is kept under
+// HitlDoneKey the moment it returns, so a worker that dies before the result
+// is saved does not run the tool a second time on the retry: the retry
+// reuses the output.
+//
+// A tool failure, or a panic, is surfaced TO THE MODEL as the tool result,
+// so the conversation always stays executable.
 func settleVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadID string, pending PendingHitl, target *ports.Tool, state ports.AgentRunState) (json.RawMessage, bool, error) {
 	raw, found, err := deps.Kv.Get(ctx, HitlKey(pending.ToolCallID))
 	if err != nil {
 		return nil, false, err
 	}
-	if err := deps.Kv.Del(ctx, HitlKey(pending.ToolCallID)); err != nil {
-		return nil, false, err
-	}
 	if !found {
-		if _, err := Publish(ctx, deps, threadID, "INPUT_EXPIRED", map[string]any{"toolCallId": pending.ToolCallID}); err != nil {
-			return nil, false, err
-		}
 		return MarshalPayload(map[string]any{"responded": false, "cancelled": true, "reason": "timeout"}), true, nil
 	}
 	var answer struct {
@@ -86,6 +90,11 @@ func settleVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadI
 	if target == nil || target.Execute == nil {
 		return MarshalPayload(map[string]any{"error": "Unknown tool: " + pending.ToolName}), false, nil
 	}
+	if done, found, err := deps.Kv.Get(ctx, HitlDoneKey(pending.ToolCallID)); err != nil {
+		return nil, false, err
+	} else if found {
+		return json.RawMessage(done), false, nil // it already ran; its result was never saved
+	}
 	args := pending.Arguments
 	if len(args) == 0 {
 		args = json.RawMessage("{}")
@@ -94,11 +103,40 @@ func settleVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadI
 	// what the human sent back with the approval.
 	toolCtx := ContextWithPublisher(ContextWithRunState(genCtx, state), ThreadPublisher(deps, threadID))
 	toolCtx = ContextWithApproval(ContextWithToolCallID(toolCtx, pending.ToolCallID), Approval{Payload: answer.Payload})
-	output, err := target.Execute(toolCtx, args)
-	if err != nil {
-		return MarshalPayload(map[string]any{"error": err.Error()}), false, nil
+	var output string
+	result := json.RawMessage(nil)
+	if err := CallSafely(func() error {
+		var err error
+		output, err = target.Execute(toolCtx, args)
+		return err
+	}); err != nil {
+		result = MarshalPayload(map[string]any{"error": err.Error()})
+	} else {
+		result = jsonOrString(output)
 	}
-	return jsonOrString(output), false, nil
+	if _, err := deps.Kv.Set(ctx, HitlDoneKey(pending.ToolCallID), string(result), ports.SetOptions{Expiry: hitlDoneTTL}); err != nil {
+		return nil, false, err
+	}
+	return result, false, nil
+}
+
+// hitlDoneTTL is how long an approved tool's output is kept for a retry
+// that has to land it: far past any retry backoff.
+const hitlDoneTTL = 24 * time.Hour
+
+// landVerdict clears a verdict once its result is in the history (§2.5):
+// the answer and the kept output go, and an expiry is published. Before
+// that, a retry must still find both.
+func landVerdict(ctx context.Context, deps ports.RuntimePorts, threadID string, pending PendingHitl, expired bool) error {
+	if expired {
+		if _, err := Publish(ctx, deps, threadID, "INPUT_EXPIRED", map[string]any{"toolCallId": pending.ToolCallID}); err != nil {
+			return err
+		}
+	}
+	if err := deps.Kv.Del(ctx, HitlKey(pending.ToolCallID)); err != nil {
+		return err
+	}
+	return deps.Kv.Del(ctx, HitlDoneKey(pending.ToolCallID))
 }
 
 // unwindVerdict lands a settled verdict and unwinds whatever was waiting on
@@ -106,52 +144,91 @@ func settleVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadI
 // or a nested run's. When a nested run asked, its own loop is re-entered
 // from its persisted turns and its result is handed to the call waiting one
 // level up, repeating until the main agent's spawnSubagent call is answered.
+// A park that already landed (see PendingHitl.Landed) carries on from the
+// first level still waiting.
 //
-// Returns false when the unwind parked again: the thread stays
-// WAITING_FOR_INPUT and a later dispatch picks up from the new request.
-func unwindVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadID string, pending PendingHitl, result json.RawMessage, subCtx *SubagentCtx) (bool, error) {
-	if _, err := deps.Storage.Messages.Append(ctx, threadID, ports.NewMessage{
-		Role: ports.RoleTool, AgentID: pending.AgentID,
-		Content: ToolResultContent(pending.ToolCallID, pending.ToolName, result),
-	}); err != nil {
-		return false, err
+// A child that fails on the way up is reported to the level above as the
+// delegation's result, exactly as a live spawnSubagent reports it, so one
+// failed child never leaves the whole thread stuck waiting.
+//
+// Returns false when the unwind parked again, or a user stopped it: the
+// thread stays as it is and a later dispatch picks up from there.
+func unwindVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadID string, pending PendingHitl, result json.RawMessage, expired bool, subCtx *SubagentCtx) (bool, error) {
+	start := 0
+	producer := pending.Nested
+	if pending.Landed {
+		start = pending.ResumeFrame
+		if start > 0 {
+			producer = pending.Frames[start-1].Nested
+		}
+	} else {
+		if _, err := deps.Storage.Messages.Append(ctx, threadID, ports.NewMessage{
+			Role: ports.RoleTool, AgentID: pending.AgentID,
+			Content: ToolResultContent(pending.ToolCallID, pending.ToolName, result),
+		}); err != nil {
+			return false, err
+		}
+		if err := landVerdict(ctx, deps, threadID, pending, expired); err != nil {
+			return false, err
+		}
 	}
 	// producer is whoever must now run to produce the next result. Nil means
 	// the main agent, whose loop the caller re-enters itself.
-	producer := pending.Nested
-	for i, frame := range pending.Frames {
+	for i := start; i < len(pending.Frames); i++ {
+		frame := pending.Frames[i]
 		if producer == nil || subCtx == nil {
 			break
 		}
+		var handed any
 		outcome, err := RunNestedAgent(genCtx, subCtx, *producer, nil, pending.Frames[i:])
-		if err != nil {
-			return false, err
-		}
-		if outcome.Parked || outcome.Aborted {
-			return false, nil // parked again one level down, or a user stop mid-unwind (§2.1)
-		}
-		if run, err := deps.Admin.Runs().Get(ctx, producer.AgentID); err == nil && run != nil {
-			completed := ports.StateCompleted
-			closeNested(ctx, subCtx, run, outcome, ports.RunPatch{
-				State: &completed, Result: MarshalPayload(map[string]any{"text": outcome.Text}),
-			})
-		}
-		if _, err := Publish(ctx, deps, threadID, "SUBAGENT_COMPLETED", map[string]any{"agentId": producer.AgentID}); err != nil {
-			return false, err
-		}
-		// Hand the capped result to the call one level up (§2.6)
-		if _, err := deps.Storage.Messages.Append(ctx, threadID, ports.NewMessage{
-			Role: ports.RoleTool, AgentID: frame.AgentID,
-			Content: ToolResultContent(frame.ToolCallID, "spawnSubagent", map[string]any{
+		switch {
+		case err == nil && outcome.Parked:
+			return false, nil // parked again one level down
+		case (err == nil && outcome.Aborted) || genCtx.Err() != nil || stopped(ctx, deps, threadID):
+			return false, nil // a user stop mid-unwind (§2.1)
+		case err != nil:
+			msg := err.Error()
+			if run, gerr := deps.Admin.Runs().Get(ctx, producer.AgentID); gerr == nil && run != nil {
+				failed := ports.StateFailed
+				closeNested(ctx, subCtx, run, nil, ports.RunPatch{State: &failed, Error: &msg})
+			}
+			if _, err := Publish(ctx, deps, threadID, "SUBAGENT_FAILED", map[string]any{
+				"agentId": producer.AgentID, "state": ports.StateFailed, "error": msg,
+			}); err != nil {
+				return false, err
+			}
+			handed = map[string]any{"agentId": producer.AgentID, "error": msg}
+		default:
+			if run, err := deps.Admin.Runs().Get(ctx, producer.AgentID); err == nil && run != nil {
+				completed := ports.StateCompleted
+				closeNested(ctx, subCtx, run, outcome, ports.RunPatch{
+					State: &completed, Result: MarshalPayload(map[string]any{"text": outcome.Text}),
+				})
+			}
+			if _, err := Publish(ctx, deps, threadID, "SUBAGENT_COMPLETED", map[string]any{"agentId": producer.AgentID}); err != nil {
+				return false, err
+			}
+			// Hand the capped result to the call one level up (§2.6)
+			handed = map[string]any{
 				"agentId": producer.AgentID,
 				"result":  capRunes(outcome.Text, deps.Config.SubagentResultCapChars),
-			}),
+			}
+		}
+		if _, err := deps.Storage.Messages.Append(ctx, threadID, ports.NewMessage{
+			Role: ports.RoleTool, AgentID: frame.AgentID,
+			Content: ToolResultContent(frame.ToolCallID, "spawnSubagent", handed),
 		}); err != nil {
 			return false, err
 		}
 		producer = frame.Nested
 	}
 	return true, nil
+}
+
+// stopped reports a user stop on the hot cache (§2.1).
+func stopped(ctx context.Context, deps ports.RuntimePorts, threadID string) bool {
+	st, _, _ := deps.Kv.Get(ctx, StateKey(threadID))
+	return st == string(ports.StateCancelled)
 }
 
 // closeRunRecord sums this segment onto the run's record and stamps how it
@@ -408,11 +485,15 @@ func resumePendingHitl(ctx, genCtx context.Context, deps ports.RuntimePorts, thr
 		} else if subCtx != nil {
 			target = findTool(nestedRawTools(subCtx, pending.Nested), pending.ToolName)
 		}
-		result, _, err := settleVerdict(ctx, genCtx, deps, threadID, pending, target, state)
-		if err != nil {
-			return false, err
+		var result json.RawMessage
+		expired := false
+		if !pending.Landed {
+			var err error
+			if result, expired, err = settleVerdict(ctx, genCtx, deps, threadID, pending, target, state); err != nil {
+				return false, err
+			}
 		}
-		ok, err := unwindVerdict(ctx, genCtx, deps, threadID, pending, result, subCtx)
+		ok, err := unwindVerdict(ctx, genCtx, deps, threadID, pending, result, expired, subCtx)
 		if err != nil || !ok {
 			return false, err
 		}
@@ -763,13 +844,16 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	// Platform-owned toolset: HITL (§2.5) over the user's set; spawnSubagent
 	// added ONLY when the spec opts in (§2.7). rawTools keeps the real
 	// implementations: the resolved park executes the approved tool.
+	// Parks raised during this segment wait here until the step that raised
+	// them is saved (see ParkBox).
+	parks := &ParkBox{}
 	var subCtx *SubagentCtx
 	if agent.Spec.Subagents != nil {
 		subCtx = &SubagentCtx{
 			IOCtx: ctx, ThreadID: threadID, Depth: 0, Sem: agent.Sem, Ports: deps,
 			Sub: *agent.Spec.Subagents, Agent: agent, Ledger: ledger, Resume: resume,
 			TokenBudget: tokenBudget, CostBudgetMicros: costBudget, BillingRunID: runID,
-			ProviderOptions: providerOptions, Aborted: aborted, Fenced: lease.Lost, State: input.State,
+			ProviderOptions: providerOptions, Aborted: aborted, Fenced: lease.Lost, Parks: parks, State: input.State,
 		}
 	}
 	rawTools := slices.Clone(agent.Args.Tools)
@@ -779,7 +863,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	// The main agent's own toolset: nothing is waiting on its parks (§2.7).
 	// Every tool also sees the run's state (§2.10) and can publish its own
 	// events on the thread.
-	tools := WithRunState(WithPublishEvent(deps, threadID, WithHitl(deps, threadID, rawTools, HitlCtx{Resume: resume})), input.State)
+	tools := WithRunState(WithPublishEvent(deps, threadID, WithHitl(deps, threadID, rawTools, HitlCtx{Resume: resume, Parks: parks})), input.State)
 
 	// §2.5 resume: a WAITING thread at segment start is either the /respond
 	// continuation or a redelivery of the original job while still parked.
@@ -798,7 +882,12 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			return "", err
 		}
 		if !resumed {
-			return OutcomeExecuted, nil // still parked, nothing to do yet
+			// Still parked, or parked again one level down while unwinding:
+			// the new park's step is saved by now, so it is written here.
+			if err := CommitParks(ctx, deps, parks); err != nil {
+				return "", err
+			}
+			return OutcomeExecuted, nil
 		}
 	}
 
@@ -822,6 +911,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		AgentID: "", RunID: runID, Kind: agent.Kind, Model: model.Instance(),
 		Messages: messages, Tools: tools, MaxSteps: maxSteps,
 		GenCtx: genCtx, Aborted: aborted, Fenced: lease.Lost,
+		CommitParks:     func(c context.Context) error { return CommitParks(c, deps, parks) },
 		ProviderOptions: providerOptions, TokenBudget: tokenBudget,
 		SystemFn: agent.Args.SystemFn, PrepareStep: agent.Args.PrepareStep, State: input.State,
 		CostBudgetMicros: costBudget, BillingRunID: runID,

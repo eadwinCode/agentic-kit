@@ -65,16 +65,25 @@ async function closeOpenParks(deps: RuntimePorts, threadId: string): Promise<voi
   const toolResult = (toolCallId: string, toolName: string) => [
     { type: 'tool-result', toolCallId, toolName, result },
   ];
+  const closed = new Set<string>(); // two parks in one child share its frames
   for (const pending of await loadOpenHitls(deps, threadId)) {
-    await deps.storage.messages.append(threadId, {
-      role: 'tool',
-      agentId: pending.agentId,
-      content: toolResult(pending.toolCallId, pending.toolName),
-    });
-    if (pending.nested) {
-      await recordStoppedRun(deps, pending.nested.agentId, new Date());
+    let frames = pending.frames;
+    if (pending.landed) {
+      // Its own call has its result already; only the levels above wait.
+      frames = frames.slice(pending.resumeFrame ?? 0);
+    } else {
+      await deps.storage.messages.append(threadId, {
+        role: 'tool',
+        agentId: pending.agentId,
+        content: toolResult(pending.toolCallId, pending.toolName),
+      });
+      if (pending.nested) {
+        await recordStoppedRun(deps, pending.nested.agentId, new Date());
+      }
     }
-    for (const frame of pending.frames) {
+    for (const frame of frames) {
+      if (closed.has(frame.toolCallId)) continue;
+      closed.add(frame.toolCallId);
       await deps.storage.messages.append(threadId, {
         role: 'tool',
         agentId: frame.agentId,

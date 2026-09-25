@@ -243,7 +243,9 @@ func MessagesFromDTOs(rows []ports.MessageDTO) []provider.Message {
 }
 
 // RepairDanglingToolCalls closes every assistant tool call that has no tool
-// result before the next turn, with a synthetic result saying so.
+// result before the next turn, with a synthetic result saying so. It also
+// drops every tool result whose call is not in the history before it (an
+// orphan: its call was cut away, or the result was written first).
 //
 // History can carry such a call legitimately: a run that was stopped while
 // parked for approval persisted the call and never its result, or a worker
@@ -251,6 +253,7 @@ func MessagesFromDTOs(rows []ports.MessageDTO) []provider.Message {
 // with a dangling call outright, which would wedge the thread on every later
 // run. The repair is prompt-side only; nothing is written back.
 func RepairDanglingToolCalls(msgs []provider.Message) []provider.Message {
+	msgs = dropOrphanResults(msgs)
 	out := make([]provider.Message, 0, len(msgs)+2)
 	for i := 0; i < len(msgs); i++ {
 		m := msgs[i]
@@ -292,6 +295,39 @@ func RepairDanglingToolCalls(msgs []provider.Message) []provider.Message {
 		out = append(out, msgs[i+1:j]...)
 		out = append(out, provider.Message{Role: provider.RoleTool, Content: missing})
 		i = j - 1
+	}
+	return out
+}
+
+// dropOrphanResults drops tool results whose call has not appeared yet; a
+// tool message left with no parts goes with them.
+func dropOrphanResults(msgs []provider.Message) []provider.Message {
+	called := map[string]bool{}
+	out := make([]provider.Message, 0, len(msgs))
+	for _, m := range msgs {
+		if m.Role == provider.RoleAssistant {
+			for _, p := range m.Content {
+				if p.Type == provider.PartToolCall && p.ToolCallID != "" {
+					called[p.ToolCallID] = true
+				}
+			}
+		}
+		if m.Role != provider.RoleTool {
+			out = append(out, m)
+			continue
+		}
+		kept := make([]provider.Part, 0, len(m.Content))
+		for _, p := range m.Content {
+			if p.Type != provider.PartToolResult || p.ToolCallID == "" || called[p.ToolCallID] {
+				kept = append(kept, p)
+			}
+		}
+		if len(kept) == len(m.Content) {
+			out = append(out, m)
+		} else if len(kept) > 0 {
+			m.Content = kept
+			out = append(out, m)
+		}
 	}
 	return out
 }

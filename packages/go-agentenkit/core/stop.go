@@ -138,16 +138,27 @@ func closeOpenParks(ctx context.Context, deps ports.RuntimePorts, threadID strin
 		return err
 	}
 	result := map[string]any{"cancelled": true, "reason": "stopped"}
+	closed := map[string]bool{} // two parks in one child share its frames
 	for _, p := range open {
-		if _, err := deps.Storage.Messages.Append(ctx, threadID, ports.NewMessage{
-			Role: ports.RoleTool, AgentID: p.AgentID, Content: ToolResultContent(p.ToolCallID, p.ToolName, result),
-		}); err != nil {
-			return err
+		frames := p.Frames
+		if p.Landed {
+			// Its own call has its result already; only the levels above wait.
+			frames = frames[p.ResumeFrame:]
+		} else {
+			if _, err := deps.Storage.Messages.Append(ctx, threadID, ports.NewMessage{
+				Role: ports.RoleTool, AgentID: p.AgentID, Content: ToolResultContent(p.ToolCallID, p.ToolName, result),
+			}); err != nil {
+				return err
+			}
+			if p.Nested != nil {
+				recordStoppedRun(ctx, deps, p.Nested.AgentID, time.Now())
+			}
 		}
-		if p.Nested != nil {
-			recordStoppedRun(ctx, deps, p.Nested.AgentID, time.Now())
-		}
-		for _, f := range p.Frames {
+		for _, f := range frames {
+			if closed[f.ToolCallID] {
+				continue
+			}
+			closed[f.ToolCallID] = true
 			if _, err := deps.Storage.Messages.Append(ctx, threadID, ports.NewMessage{
 				Role: ports.RoleTool, AgentID: f.AgentID, Content: ToolResultContent(f.ToolCallID, "spawnSubagent", result),
 			}); err != nil {

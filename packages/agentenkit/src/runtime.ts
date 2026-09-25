@@ -123,9 +123,9 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
         // that produced it. Only the in-flight step's chunks are missing from
         // durable history, so only those are transient.
         //
-        // Chunks alone: a park (INPUT_REQUIRED) is published DURING the step,
-        // before its messages commit, so slicing the whole window by this
-        // boundary would drop the very approval a reconnecting client needs.
+        // Chunks alone: a park (INPUT_REQUIRED) is published right after its
+        // step commits, so slicing the whole window by this boundary would
+        // drop the very approval a reconnecting client needs.
         const lastCommitted = active.reduce(
           (seq, e) => (e.type === 'STEP_COMMITTED' ? e.seq : seq),
           -1,

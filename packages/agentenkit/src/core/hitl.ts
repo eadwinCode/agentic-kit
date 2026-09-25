@@ -17,6 +17,10 @@ export const HITL_PARKED = '__hitl_parked__';
 
 export const hitlKey = (toolCallId: string) => `agent:hitl:${toolCallId}`;
 
+/** Keeps an approved tool's output until its result is saved (§2.5), so a
+ *  retry lands the same output instead of running the tool again. */
+export const hitlDoneKey = (toolCallId: string) => `agent:hitl-done:${toolCallId}`;
+
 export interface HitlResponse {
   approved: boolean;
   payload?: unknown;
@@ -72,6 +76,15 @@ export class ToolParkedError extends Error {
   }
 }
 
+/** A tool call cut off by a user stop (§2.1). Unlike any other tool error it
+ *  is not handed to the model: a stop tears the whole run down. */
+export class RunStoppedError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = 'RunStoppedError';
+  }
+}
+
 export function parkForInput(request: ParkRequest = {}): ToolParkedError {
   return new ToolParkedError(request);
 }
@@ -95,6 +108,33 @@ export interface ParkInput {
   resume: ResumeInfo;
 }
 
+/** Holds the parks a segment raised until the step that raised them is saved
+ *  (§2.5). A tool call parks in the middle of a model step, before the step's
+ *  messages exist. Writing the park then would let the answer, a failed step
+ *  or a stop act on a tool call the history does not have yet. So the wrapper
+ *  only records the park here; the main loop commits the box once its step is
+ *  saved, and a failed step simply drops it. Nested runs share their parent's
+ *  box, so a park raised any depth down waits for the main agent's step too. */
+export class ParkBox {
+  private parks: ParkInput[] = [];
+  add(p: ParkInput) {
+    this.parks.push(p);
+  }
+  take(): ParkInput[] {
+    const out = this.parks;
+    this.parks = [];
+    return out;
+  }
+}
+
+/** Write every park the box holds: WAITING_FOR_INPUT, the INPUT_REQUIRED
+ *  request and its expiry job (see parkForApproval). Called once the step that
+ *  raised them is durable. */
+export async function commitParks(deps: RuntimePorts, box: ParkBox | undefined): Promise<void> {
+  if (!box) return;
+  for (const p of box.take()) await parkForApproval(deps, p);
+}
+
 /** Wrap every tool so a call can park (§2.5) instead of blocking. A marked
  *  tool parks BEFORE it runs: the request is persisted as INPUT_REQUIRED and
  *  the wrapper returns the park sentinel; the real tool runs when a human
@@ -114,12 +154,15 @@ export function withHitl(
     agentId?: string | null;
     frames?: HitlFrame[];
     nested?: NestedDescriptor;
+    /** Where parks wait for their step to be saved (see ParkBox). Absent
+     *  parks at once. */
+    parks?: ParkBox;
   },
 ): Record<string, any> {
   const out: Record<string, any> = {};
   for (const [name, t] of Object.entries(tools)) {
     const park = async (toolCallId: string, args: unknown, request: ParkRequest) => {
-      await parkForApproval(deps, {
+      const p: ParkInput = {
         threadId,
         toolCallId,
         toolName: name,
@@ -130,7 +173,10 @@ export function withHitl(
         resume: ctx.resume,
         ...(request.reason ? { reason: request.reason } : {}),
         ...(request.ttlMs !== undefined ? { ttlMs: request.ttlMs } : {}),
-      });
+      };
+      // Written once the step is saved; with no box, at once.
+      if (ctx.parks) ctx.parks.add(p);
+      else await parkForApproval(deps, p);
       return { [HITL_PARKED]: toolCallId };
     };
     if ((t as any)?.requiresConfirmation) {
@@ -154,7 +200,17 @@ export function withHitl(
         try {
           return await execute(args, opts);
         } catch (err) {
-          if (!(err instanceof ToolParkedError)) throw err;
+          // A tool that fails is news for the model, not the end of the run:
+          // the error goes back as the call's result, worded exactly as the
+          // Go runtime words it, and the model decides what to do next.
+          // Thrown instead, the SDK would fail the whole step and spend a
+          // retry on what may be a plain bad input.
+          if (!(err instanceof ToolParkedError)) {
+            // A stop is not the tool's failure: it ends the run, as it does
+            // in Go, where the cancelled step never reaches the model.
+            if (err instanceof RunStoppedError || (opts as any)?.abortSignal?.aborted) throw err;
+            return `error: ${err instanceof Error ? err.message : String(err)}`;
+          }
           // A resumed call that parks again has nowhere to go: the verdict
           // for this call is being consumed right now.
           if (opts?.approval) {
@@ -265,6 +321,14 @@ export interface PendingHitl {
   expiresAt?: number;
   /** REASON_APPROVAL, or the self-parking tool's word (§2.5). */
   reason?: string;
+  /** The dispatch ticket, when the park recorded one. */
+  resume?: ResumeInfo;
+  /** Marks a park whose own call already has its result in the history, but
+   *  whose unwind stopped part way (§2.7): a worker died, or a child failed,
+   *  between one level and the next. Nothing is left to answer; the unwind
+   *  carries on from `resumeFrame`, the first frame still waiting. */
+  landed?: boolean;
+  resumeFrame?: number;
 }
 
 /** When a park stops being answerable, epoch ms. */
@@ -296,6 +360,7 @@ function fromInputRequired(pending: AgentEvent): PendingHitl {
     nested?: NestedDescriptor;
     reason?: string;
     expiresAt?: string;
+    resume?: ResumeInfo;
   };
   const expiresAt = p.expiresAt ? new Date(p.expiresAt).getTime() : NaN;
   return {
@@ -309,6 +374,7 @@ function fromInputRequired(pending: AgentEvent): PendingHitl {
     requestedAt: new Date(pending.createdAt).getTime(),
     ...(Number.isFinite(expiresAt) ? { expiresAt } : {}),
     ...(p.reason ? { reason: p.reason } : {}),
+    ...(p.resume ? { resume: p.resume } : {}),
   };
 }
 
@@ -340,9 +406,23 @@ export async function loadOpenHitls(
     }
   }
 
-  return requested
-    .map((e) => fromInputRequired(e))
-    .filter((p) => !answered.has(p.toolCallId) && !expired.has(p.toolCallId));
+  // Only the current run's parks. One an earlier run left behind can never be
+  // answered: the run failed, or an edit cut its turns out of the history,
+  // and its tool call may not even exist any more.
+  const current = await currentRunId(deps, threadId);
+  const open: PendingHitl[] = [];
+  for (const e of requested) {
+    const p = fromInputRequired(e);
+    if (current && p.resume?.runId && p.resume.runId !== current) continue;
+    if (!answered.has(p.toolCallId) && !expired.has(p.toolCallId)) {
+      open.push(p);
+      continue;
+    }
+    // Settled at its own level; is anything above still waiting?
+    const waiting = p.frames.findIndex((f) => !answered.has(f.toolCallId));
+    if (waiting >= 0) open.push({ ...p, landed: true, resumeFrame: waiting });
+  }
+  return open;
 }
 
 /** The §5.4 behavior: heal orphans first (§2.5), then record the answer in
@@ -358,7 +438,7 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
   // step can park several nested runs at once, and each is answered on its
   // own. The run resumes when the last of them is settled.
   const open = await loadOpenHitls(deps, input.threadId);
-  const match = open.find((p) => p.toolCallId === input.toolCallId);
+  const match = open.find((p) => p.toolCallId === input.toolCallId && !p.landed);
 
   if (thread?.state !== 'WAITING_FOR_INPUT' || !match) {
     return { delivered: false, error: 'No matching pending input request' };
@@ -371,11 +451,15 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
     60,
     Math.floor((hitlDeadline(match, deps.config) - Date.now()) / 1000),
   );
-  await deps.kv.set(
+  // The first answer wins. A repeat, from a second tab or a retry, must not
+  // overwrite it: an approval that can be rewritten after it was taken is a
+  // suggestion, not an approval.
+  const written = await deps.kv.set(
     hitlKey(input.toolCallId),
     JSON.stringify({ approved: input.approved, payload: input.payload }),
-    { exSeconds: remainingSec },
+    { exSeconds: remainingSec, onlyIfNotExists: true },
   );
+  if (!written) return { delivered: false, error: 'This request was already answered' };
   // Bus-only fast-path notice (seq 0 = never persisted) for live UIs (§2.5)
   await deps.bus.publish(input.threadId, {
     threadId: input.threadId,
@@ -397,24 +481,30 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
   // park's expiry job are the same run, and the lock must be able to tell
   // that. Bumping here would let both run and reply twice (§2.5).
   const runId = await currentRunId(deps, input.threadId);
-  await enqueueJob(deps, {
-    threadId: input.threadId,
-    runId,
-    model: resume?.model ?? thread.model,
-    ...(resume
-      ? {
-          agent: resume.agent,
-          ...(resume.tokenBudget !== undefined ? { tokenBudget: resume.tokenBudget } : {}),
-          ...(resume.costBudgetMicros !== undefined
-            ? { costBudgetMicros: resume.costBudgetMicros }
-            : {}),
-          ...(resume.providerOptions ? { providerOptions: resume.providerOptions } : {}),
-          // The answer resumes the SAME run, so it must scope storage the same
-          // way the parked segment did (§2.10).
-          ...(resume.state ? { state: resume.state } : {}),
-        }
-      : {}),
-  });
+  try {
+    await enqueueJob(deps, {
+      threadId: input.threadId,
+      runId,
+      model: resume?.model ?? thread.model,
+      ...(resume
+        ? {
+            agent: resume.agent,
+            ...(resume.tokenBudget !== undefined ? { tokenBudget: resume.tokenBudget } : {}),
+            ...(resume.costBudgetMicros !== undefined
+              ? { costBudgetMicros: resume.costBudgetMicros }
+              : {}),
+            ...(resume.providerOptions ? { providerOptions: resume.providerOptions } : {}),
+            // The answer resumes the SAME run, so it must scope storage the same
+            // way the parked segment did (§2.10).
+            ...(resume.state ? { state: resume.state } : {}),
+          }
+        : {}),
+    });
+  } catch (err) {
+    // The answer is withdrawn so a retry of the request can land it.
+    await deps.kv.del(hitlKey(input.toolCallId)).catch(() => undefined);
+    throw new Error(`resume dispatch: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   return { delivered: true };
 }

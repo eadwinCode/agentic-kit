@@ -167,9 +167,8 @@ func (c *AgentCore) GetThreadSnapshot(ctx context.Context, threadID string, stat
 		// Everything up to the last committed step is ALREADY in messages
 		// (§2.2). Only the in-flight step's chunks are missing from durable
 		// history, so only those are transient. Chunks alone: a park is
-		// published DURING the step, before its messages commit, so slicing
-		// the whole window would drop the very approval a reconnecting client
-		// needs.
+		// published right after its step commits, so slicing the whole
+		// window would drop the very approval a reconnecting client needs.
 		var lastCommitted int64 = -1
 		for _, e := range active {
 			if e.Type == "STEP_COMMITTED" {

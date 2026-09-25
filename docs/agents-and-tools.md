@@ -103,6 +103,10 @@ const sendEmail = markRequiresConfirmation(
 The run parks instead of executing, and resumes where it stopped once a human
 answers. See [Human in the loop](./human-in-the-loop.md).
 
+A tool that throws (TS) or returns an error (Go) does not fail the run: the
+model gets `error: <message>` as the call's result and decides what to do next,
+in both runtimes. A user stop is the exception: it ends the run.
+
 ### Tools see the run's state
 
 Every tool receives the run's [state](./run-state.md) as part of its second

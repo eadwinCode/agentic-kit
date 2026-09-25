@@ -13,7 +13,7 @@ import { wireId } from './types.js';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { RegisteredAgent } from './agent.js';
 import { publish, withPublishEvent } from './publish.js';
-import { HITL_PARKED, withHitl, type HitlFrame } from './hitl.js';
+import { HITL_PARKED, RunStoppedError, withHitl, type HitlFrame, type ParkBox } from './hitl.js';
 import { withRunState, type AgentRunState } from './state.js';
 import { markPromptCaching } from './cache.js';
 import { promptMessages, repairDanglingToolCalls } from './messages.js';
@@ -55,6 +55,8 @@ export interface SubagentCtx {
   abortSignal?: AbortSignal;
   /** True once the run lock is gone (see LoopInput.fenced). */
   fenced?: () => boolean;
+  /** The segment's park box, shared by every depth (see ParkBox). */
+  parks?: ParkBox;
   /** The run's state, handed down unchanged (§2.10). */
   state?: AgentRunState;
 }
@@ -194,7 +196,7 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
 
           // A user stop tears the whole run down (§2.1), so that one keeps
           // propagating.
-          if (cancelled) throw err;
+          if (cancelled) throw new RunStoppedError(err);
 
           // Anything else is reported TO THE PARENT as the delegation's
           // result, the same way an approved tool's failure is reported to the
@@ -218,7 +220,7 @@ function maybeCache(ports: RuntimePorts, messages: any[]): any[] {
   return ports.config.promptCaching ? markPromptCaching(messages) : messages;
 }
 
-async function closeNested(
+export async function closeNested(
   ctx: SubagentCtx,
   run: RunRecord,
   outcome: LoopOutcome | null,
@@ -272,6 +274,7 @@ function nestedTools(
         agentId: d.agentId,
         frames,
         nested: d,
+        parks: ctx.parks,
       }),
     ),
     ctx.state ?? {},

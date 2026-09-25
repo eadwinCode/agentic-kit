@@ -8,14 +8,17 @@ import { promptMessages, repairDanglingToolCalls } from './messages.js';
 import { mergeProviderOptions } from './types.js';
 import type { RegisteredAgent } from './agent.js';
 import {
+  hitlDoneKey,
   hitlKey,
   loadOpenHitls,
   withHitl,
   hitlDeadline,
   type PendingHitl,
+  commitParks,
+  ParkBox,
 } from './hitl.js';
 import { ACTIVE_STATES, publish, publishEvent, runStatePayload, transition, withPublishEvent } from './publish.js';
-import { runNestedAgent, spawnSubagentTool, type SubagentCtx } from './subagent.js';
+import { closeNested, runNestedAgent, spawnSubagentTool, type SubagentCtx } from './subagent.js';
 import { attemptsKey, COUNTER_TTL_SECONDS, counterScope, redriveKey, runIdKey } from './keys.js';
 import { withRunState, type AgentRunState } from './state.js';
 import { runLoop, type RunLedger } from './loop.js';
@@ -50,13 +53,21 @@ async function verdictReady(
   deps: RuntimePorts,
   pending: PendingHitl,
 ): Promise<'answered' | 'expired' | 'open'> {
+  if (pending.landed) return 'answered'; // its result is in the history already
   if (await deps.kv.get(hitlKey(pending.toolCallId))) return 'answered';
   return Date.now() >= hitlDeadline(pending, deps.config) ? 'expired' : 'open';
 }
 
 /** Turn a settled approval into the tool result the conversation will carry
  *  (§2.5): run the approved tool, record the denial, or convert an expired
- *  request into the timeout denial ("user had no response").
+ *  request into the timeout denial ("user had no response"). Reports whether
+ *  the request expired.
+ *
+ *  Nothing here is consumed: the answer stays until its result is in the
+ *  history (see landVerdict). An approved tool's output is kept under
+ *  `hitlDoneKey` the moment it returns, so a worker that dies before the
+ *  result is saved does not run the tool a second time on the retry: the
+ *  retry reuses the output.
  *
  *  The tool failure is surfaced TO THE MODEL as the tool result — the verdict
  *  arrives from a different process than the one that ran the model, so the
@@ -68,35 +79,59 @@ async function settleVerdict(
   target: { execute?: (args: unknown, opts: unknown) => Promise<unknown> } | undefined,
   signal: AbortSignal,
   state: AgentRunState,
-): Promise<unknown> {
+): Promise<{ result: unknown; expired: boolean }> {
   const raw = await deps.kv.get(hitlKey(pending.toolCallId));
-  await deps.kv.del(hitlKey(pending.toolCallId));
-
   if (!raw) {
-    await publish(deps, threadId, 'INPUT_EXPIRED', { toolCallId: pending.toolCallId });
-    return { responded: false, cancelled: true, reason: 'timeout' };
+    return { result: { responded: false, cancelled: true, reason: 'timeout' }, expired: true };
   }
 
   const answer = JSON.parse(raw) as HitlAnswer;
-  if (!answer.approved) return { denied: true };
-
-  try {
-    return target?.execute
-      ? await target.execute(pending.arguments, {
-          toolCallId: pending.toolCallId,
-          abortSignal: signal,
-          // The resumed tool gets the same context a live one does (§2.10).
-          state,
-          publishEvent: (type: string, payload: unknown, options?: { durable?: boolean }) =>
-            publishEvent(deps, threadId, type, payload, options),
-          // What the human sent back with the approval (§2.5): answers to
-          // the questions the tool asked, a corrected value, a reason.
-          approval: { payload: answer.payload },
-        })
-      : { error: `Unknown tool: ${pending.toolName}` };
-  } catch (err) {
-    return { error: err instanceof Error ? err.message : String(err) };
+  if (!answer.approved) return { result: { denied: true }, expired: false };
+  if (!target?.execute) {
+    return { result: { error: `Unknown tool: ${pending.toolName}` }, expired: false };
   }
+
+  const done = await deps.kv.get(hitlDoneKey(pending.toolCallId));
+  if (done !== null) return { result: JSON.parse(done), expired: false }; // it already ran
+
+  let result: unknown;
+  try {
+    result = await target.execute(pending.arguments, {
+      toolCallId: pending.toolCallId,
+      abortSignal: signal,
+      // The resumed tool gets the same context a live one does (§2.10).
+      state,
+      publishEvent: (type: string, payload: unknown, options?: { durable?: boolean }) =>
+        publishEvent(deps, threadId, type, payload, options),
+      // What the human sent back with the approval (§2.5): answers to
+      // the questions the tool asked, a corrected value, a reason.
+      approval: { payload: answer.payload },
+    });
+  } catch (err) {
+    result = { error: err instanceof Error ? err.message : String(err) };
+  }
+  await deps.kv.set(hitlDoneKey(pending.toolCallId), JSON.stringify(result ?? null), {
+    exSeconds: HITL_DONE_TTL_SECONDS,
+  });
+  return { result, expired: false };
+}
+
+/** How long an approved tool's output is kept for a retry that has to land
+ *  it: far past any retry backoff. */
+const HITL_DONE_TTL_SECONDS = 24 * 60 * 60;
+
+/** Clear a verdict once its result is in the history (§2.5): the answer and
+ *  the kept output go, and an expiry is published. Before that, a retry must
+ *  still find both. */
+async function landVerdict(
+  deps: RuntimePorts,
+  threadId: string,
+  pending: PendingHitl,
+  expired: boolean,
+): Promise<void> {
+  if (expired) await publish(deps, threadId, 'INPUT_EXPIRED', { toolCallId: pending.toolCallId });
+  await deps.kv.del(hitlKey(pending.toolCallId));
+  await deps.kv.del(hitlDoneKey(pending.toolCallId));
 }
 
 /** Land a settled verdict and unwind whatever was waiting on it (§2.7).
@@ -104,58 +139,85 @@ async function settleVerdict(
  *  The verdict belongs to the stream that asked — the main agent's, or a
  *  nested run's. When a nested run asked, its own loop is re-entered from its
  *  persisted turns and its result is handed to the call waiting one level up,
- *  repeating until the main agent's `spawnSubagent` call is answered.
+ *  repeating until the main agent's `spawnSubagent` call is answered. A park
+ *  that already landed (see PendingHitl.landed) carries on from the first
+ *  level still waiting.
  *
- *  Returns false when the unwind parked again: the thread stays
- *  WAITING_FOR_INPUT and a later dispatch picks up from the new request. */
+ *  A child that fails on the way up is reported to the level above as the
+ *  delegation's result, exactly as a live spawnSubagent reports it, so one
+ *  failed child never leaves the whole thread stuck waiting.
+ *
+ *  Returns false when the unwind parked again, or a user stopped it: the
+ *  thread stays as it is and a later dispatch picks up from there. */
 async function unwindVerdict(
   deps: RuntimePorts,
   threadId: string,
   pending: PendingHitl,
-  result: unknown,
+  settled: { result: unknown; expired: boolean } | null,
   subCtx: SubagentCtx | null,
   signal: AbortSignal,
 ): Promise<boolean> {
-  await deps.storage.messages.append(threadId, {
-    role: 'tool',
-    agentId: pending.agentId,
-    content: [
-      { type: 'tool-result', toolCallId: pending.toolCallId, toolName: pending.toolName, result },
-    ],
-  });
-
+  let start = 0;
   // `producer` is whoever must now run to produce the next result. Undefined
   // means the main agent, whose loop the caller re-enters itself.
   let producer = pending.nested;
-  for (let i = 0; i < pending.frames.length; i += 1) {
+  if (pending.landed) {
+    start = pending.resumeFrame ?? 0;
+    if (start > 0) producer = pending.frames[start - 1]!.nested;
+  } else {
+    await deps.storage.messages.append(threadId, {
+      role: 'tool',
+      agentId: pending.agentId,
+      content: [
+        {
+          type: 'tool-result',
+          toolCallId: pending.toolCallId,
+          toolName: pending.toolName,
+          result: settled?.result,
+        },
+      ],
+    });
+    await landVerdict(deps, threadId, pending, settled?.expired ?? false);
+  }
+
+  for (let i = start; i < pending.frames.length; i += 1) {
     const frame = pending.frames[i]!;
     if (!producer || !subCtx) break;
 
-    const outcome = await runNestedAgent(subCtx, producer, null, signal, pending.frames.slice(i));
-    if (outcome.parked) return false; // parked again, one level down
-    if (outcome.aborted) return false; // user stop mid-unwind (§2.1)
+    let handed: unknown;
+    try {
+      const outcome = await runNestedAgent(subCtx, producer, null, signal, pending.frames.slice(i));
+      if (outcome.parked) return false; // parked again, one level down
+      if (outcome.aborted) return false; // user stop mid-unwind (§2.1)
 
-    await deps.admin.runs.patch(producer.agentId, {
-      state: 'COMPLETED',
-      result: { text: outcome.text },
-      endedAt: new Date(),
-    });
-    await publish(deps, threadId, 'SUBAGENT_COMPLETED', { agentId: producer.agentId });
+      const run = await deps.admin.runs.get(producer.agentId).catch(() => null);
+      if (run) await closeNested(subCtx, run, outcome, { state: 'COMPLETED', result: { text: outcome.text } });
+      await publish(deps, threadId, 'SUBAGENT_COMPLETED', { agentId: producer.agentId });
+      // Hand the capped result to the call one level up (§2.6)
+      handed = {
+        agentId: producer.agentId,
+        result: outcome.text.slice(0, deps.config.subagentResultCapChars),
+      };
+    } catch (err) {
+      if (signal.aborted || (await deps.kv.get(`agent:state:${threadId}`)) === 'CANCELLED') {
+        return false; // user stop mid-unwind (§2.1)
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      const run = await deps.admin.runs.get(producer.agentId).catch(() => null);
+      if (run) await closeNested(subCtx, run, null, { state: 'FAILED', error: message });
+      await publish(deps, threadId, 'SUBAGENT_FAILED', {
+        agentId: producer.agentId,
+        state: 'FAILED',
+        error: message,
+      });
+      handed = { agentId: producer.agentId, error: message };
+    }
 
-    // Hand the capped result to the call one level up (§2.6)
     await deps.storage.messages.append(threadId, {
       role: 'tool',
       agentId: frame.agentId,
       content: [
-        {
-          type: 'tool-result',
-          toolCallId: frame.toolCallId,
-          toolName: 'spawnSubagent',
-          result: {
-            agentId: producer.agentId,
-            result: outcome.text.slice(0, deps.config.subagentResultCapChars),
-          },
-        },
+        { type: 'tool-result', toolCallId: frame.toolCallId, toolName: 'spawnSubagent', result: handed },
       ],
     });
     producer = frame.nested;
@@ -271,9 +333,11 @@ async function resumePendingHitl(
         ? rawTools[pending.toolName]
         : (subCtx?.sub.tools as Record<string, any> | undefined)?.[pending.toolName];
 
-    const result = await settleVerdict(deps, threadId, pending, target, signal, state);
-    if ((result as { reason?: string })?.reason === 'timeout') expiredAny = true;
-    if (!(await unwindVerdict(deps, threadId, pending, result, subCtx, signal))) return false;
+    const settled = pending.landed
+      ? null
+      : await settleVerdict(deps, threadId, pending, target, signal, state);
+    if (settled?.expired) expiredAny = true;
+    if (!(await unwindVerdict(deps, threadId, pending, settled, subCtx, signal))) return false;
   }
 
   // A stop that landed while the verdicts were applied wins: the thread stays
@@ -476,6 +540,9 @@ export async function execute(
           ? {}
           : agent.spec.subagents
         : null;
+      // Parks raised during this segment wait here until the step that raised
+      // them is saved (see ParkBox).
+      const parks = new ParkBox();
       const subCtx: SubagentCtx | null = sub
         ? {
             threadId,
@@ -494,6 +561,7 @@ export async function execute(
             providerOptions,
             abortSignal: abort.signal,
             fenced: () => lease.lost,
+            parks,
             state: input.state,
           }
         : null;
@@ -509,7 +577,7 @@ export async function execute(
         withPublishEvent(
           deps,
           threadId,
-          withHitl(deps, threadId, rawTools, { resume, agentId: null, frames: [] }),
+          withHitl(deps, threadId, rawTools, { resume, agentId: null, frames: [], parks }),
         ),
         input.state ?? {},
       );
@@ -528,7 +596,12 @@ export async function execute(
         const resumed = await resumePendingHitl(
           deps, threadId, open, rawTools, subCtx, abort.signal, input.state ?? {}, runId,
         );
-        if (!resumed) return 'executed'; // still parked — nothing to do yet
+        if (!resumed) {
+          // Still parked, or parked again one level down while unwinding: the
+          // new park's step is saved by now, so it is written here.
+          await commitParks(deps, parks);
+          return 'executed';
+        }
       }
 
       // Durable compaction pass — history always fits the model budget (§2.6);
@@ -567,6 +640,7 @@ export async function execute(
           agentName: agent.name,
           cacheSystemPrompt: deps.config.promptCaching,
           fenced: () => lease.lost,
+          commitParks: () => commitParks(deps, parks),
           onChunk: async (chunk) => {
             // One canonical path for every client: durable log + live Pub/Sub (§2.1, §2.2)
             await publish(deps, threadId, 'CHUNK', chunk);

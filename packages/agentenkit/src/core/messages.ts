@@ -54,8 +54,11 @@ export const DANGLING_CALL_RESULT = {
 };
 
 /** Close every assistant tool call that has no tool result before the next
- *  turn. Idempotent. */
-export function repairDanglingToolCalls<T extends MessageLike>(messages: T[]): T[] {
+ *  turn, and drop every tool result whose call is not in the history before
+ *  it (an orphan: its call was cut away, or the result was written first).
+ *  Strict providers reject both. Idempotent. */
+export function repairDanglingToolCalls<T extends MessageLike>(input: T[]): T[] {
+  const messages = dropOrphanResults(input);
   const out: T[] = [];
   for (let i = 0; i < messages.length; i += 1) {
     const m = messages[i]!;
@@ -85,6 +88,29 @@ export function repairDanglingToolCalls<T extends MessageLike>(messages: T[]): T
     out.push(...messages.slice(i + 1, j));
     out.push({ role: 'tool', content: missing } as T);
     i = j - 1;
+  }
+  return out;
+}
+
+/** Tool results whose call has not appeared yet are dropped; a tool message
+ *  left with no parts goes with them. */
+function dropOrphanResults<T extends MessageLike>(messages: T[]): T[] {
+  const called = new Set<string>();
+  const out: T[] = [];
+  for (const m of messages) {
+    if (m.role === 'assistant') {
+      for (const p of parts(m.content)) {
+        if (p.type === 'tool-call' && p.toolCallId) called.add(p.toolCallId);
+      }
+    }
+    if (m.role !== 'tool' || !Array.isArray(m.content)) {
+      out.push(m);
+      continue;
+    }
+    const all = parts(m.content);
+    const kept = all.filter((p) => p.type !== 'tool-result' || !p.toolCallId || called.has(p.toolCallId));
+    if (kept.length === all.length) out.push(m);
+    else if (kept.length > 0) out.push({ ...m, content: kept } as T);
   }
   return out;
 }

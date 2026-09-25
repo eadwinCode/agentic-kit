@@ -50,6 +50,8 @@ type SubagentCtx struct {
 	Aborted func() bool
 	// Fenced reports that the run lock is gone (see LoopInput.Fenced).
 	Fenced func() bool
+	// Parks is the segment's park box, shared by every depth (see ParkBox).
+	Parks *ParkBox
 	// State is the run's state, handed down unchanged (§2.10).
 	State ports.AgentRunState
 }
@@ -316,7 +318,7 @@ func nestedTools(sctx *SubagentCtx, d ports.NestedDescriptor, frames []HitlFrame
 	// A nested run's tools see the same state as its parent's (§2.10), and
 	// publish on the same thread.
 	return WithRunState(WithPublishEvent(sctx.Ports, sctx.ThreadID, WithHitl(sctx.Ports, sctx.ThreadID, raw, HitlCtx{
-		Resume: sctx.Resume, AgentID: d.AgentID, Frames: frames, Nested: &desc,
+		Resume: sctx.Resume, AgentID: d.AgentID, Frames: frames, Nested: &desc, Parks: sctx.Parks,
 	})), sctx.State)
 }
 

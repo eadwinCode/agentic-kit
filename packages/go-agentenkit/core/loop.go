@@ -340,6 +340,10 @@ type LoopInput struct {
 	GenCtx context.Context
 	// Aborted reports whether the platform cancelled GenCtx on purpose.
 	Aborted func() bool
+	// CommitParks writes the parks raised during a step, once that step is
+	// saved (see ParkBox). Only the main loop sets it: a nested run's parks
+	// wait for the main agent's step. Nil commits nothing.
+	CommitParks func(ctx context.Context) error
 	// Fenced reports that the run lock is gone (§3.4): another worker may
 	// own the thread, so this loop must not write another step to it. Nil
 	// means never.
@@ -576,6 +580,13 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			"index": out.Steps, "agentId": nullable(input.AgentID),
 		}); err != nil {
 			return out, err
+		}
+		// The step is durable now, tool calls included, so the parks it
+		// raised can be written: WAITING_FOR_INPUT and the approval requests.
+		if input.CommitParks != nil {
+			if err := input.CommitParks(ctx); err != nil {
+				return out, err
+			}
 		}
 
 		// One priced usage row per model call (§4), then the same counters

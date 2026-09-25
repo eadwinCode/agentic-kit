@@ -204,6 +204,10 @@ export interface LoopInput {
   /** True once the run lock is gone (§3.4): another worker may own the
    *  thread, so this loop must not write another step to it. */
   fenced?: () => boolean;
+  /** Writes the parks raised during a step, once that step is saved (see
+   *  ParkBox). Only the main loop sets it: a nested run's parks wait for the
+   *  main agent's step. */
+  commitParks?: () => Promise<void>;
   providerOptions?: ProviderOptions;
   /** Cumulative cap for the whole run, checked against the shared ledger. */
   tokenBudget?: number;
@@ -351,11 +355,15 @@ export async function runLoop(
 
     // Per-step durability (§5.6): append this step's turns BEFORE the next
     // step. A parked HITL tool result (the sentinel) is NOT a real result —
-    // it is skipped here; the resumed segment appends the user's verdict.
-    const persisted = step.responseMessages.filter((m) => {
-      if (m.role !== 'tool') return true;
+    // it is skipped here; the resumed segment appends the user's verdict. Only
+    // the parked parts go: another tool in the same step that already ran
+    // keeps its result, or the model would be told it never did.
+    const persisted = step.responseMessages.flatMap((m) => {
+      if (m.role !== 'tool') return [m];
       const parts = Array.isArray(m.content) ? m.content : [];
-      return !parts.some((p: any) => isParked(p?.result));
+      const kept = parts.filter((p: any) => !isParked(p?.result));
+      if (kept.length === 0) return [];
+      return [kept.length === parts.length ? m : { ...m, content: kept }];
     });
     for (const m of persisted) {
       await deps.storage.messages.append(threadId, {
@@ -375,6 +383,9 @@ export async function runLoop(
       index: stepsRun,
       agentId: input.agentId,
     });
+    // The step is durable now, tool calls included, so the parks it raised
+    // can be written: WAITING_FOR_INPUT and the approval requests.
+    await input.commitParks?.();
 
     // One priced usage row per model call (§4), then the same counters
     // accumulated across the segment's steps and into the run-wide ledger the
