@@ -13,6 +13,14 @@ export {
   type QueuedJob,
 } from './ports/queue.js';
 export type { Kv } from './ports/kv.js';
+export {
+  StreamClosedError,
+  StreamGoneError,
+  type RunStreams,
+  type StreamMeta,
+  type StreamSnapshot,
+} from './ports/streams.js';
+export * from './core/stream-events.js';
 export type {
   AgentCore,
   AgentHandle,
@@ -150,4 +158,4 @@ export { PrismaStorage, type PrismaLike } from './adapters/prisma.js';
 export { UpstashBus, UpstashKv, THREAD_CHANNEL, type UpstashRedisLike, type UpstashSubscriberLike } from './adapters/upstash.js';
 export { RedisBus, RedisKv, type RedisClientLike, type RedisSubscriberLike } from './adapters/redis.js';
 export { QStashQueue, type QStashLike, type QStashQueueOptions } from './adapters/qstash.js';
-export { MemoryStorage, MemoryBus, MemoryQueue, MemoryKv } from './adapters/memory.js';
+export { MemoryStorage, MemoryBus, MemoryQueue, MemoryKv, MemoryRunStreams } from './adapters/memory.js';

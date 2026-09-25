@@ -4,6 +4,8 @@ import type { Storage } from '../ports/storage.js';
 import type { EventBus } from '../ports/bus.js';
 import { DuplicateJobError, QueueFullError, type EnqueueOptions, type Queue, type QueueStats, type QueuedJob } from '../ports/queue.js';
 import type { Kv } from '../ports/kv.js';
+import { StreamClosedError, StreamGoneError, type RunStreams, type StreamMeta } from '../ports/streams.js';
+import { isStreamEnd, type StreamEnd, type StreamEvent, type StreamItem } from '../core/stream-events.js';
 
 const id = () => Math.random().toString(36).slice(2, 12);
 interface MemEntry { value: string; expiresAt?: number }
@@ -299,4 +301,119 @@ export class MemoryStorage implements Storage {
 
 
 
+}
+
+interface MemStream {
+  meta: StreamMeta;
+  items: StreamItem[];
+  end: StreamEnd | null;
+  expiresAt: number;
+  waiters: Set<() => void>;
+}
+
+/** In-memory RunStreams — tests and local prototyping. The offset is the
+ *  item's 1-based position. Expiry is checked on every call, and an open
+ *  drops every expired stream, so a dev server that runs for days holds only
+ *  live and recent streams. */
+export class MemoryRunStreams implements RunStreams {
+  private streams = new Map<string, MemStream>();
+
+  private live(streamId: string): MemStream | null {
+    const s = this.streams.get(streamId);
+    if (!s) return null;
+    if (Date.now() >= s.expiresAt) {
+      this.drop(streamId, s);
+      return null;
+    }
+    return s;
+  }
+
+  private drop(streamId: string, s: MemStream) {
+    this.streams.delete(streamId);
+    // A reader waiting on it wakes, finds it gone and ends.
+    for (const wake of s.waiters) wake();
+  }
+
+  private sweep() {
+    const now = Date.now();
+    for (const [streamId, s] of this.streams) if (now >= s.expiresAt) this.drop(streamId, s);
+  }
+
+  async open(streamId: string, meta: StreamMeta, ttlMs: number) {
+    this.sweep();
+    if (this.streams.has(streamId)) return;
+    this.streams.set(streamId, {
+      meta: { ...meta }, items: [], end: null, expiresAt: Date.now() + ttlMs, waiters: new Set(),
+    });
+  }
+
+  async append(streamId: string, events: StreamEvent[]) {
+    const s = this.live(streamId);
+    if (!s) throw new StreamGoneError(streamId);
+    if (s.end) throw new StreamClosedError(streamId);
+    const offsets: string[] = [];
+    for (const e of events) {
+      const offset = String(s.items.length + 1);
+      s.items.push({ ...e, offset } as StreamItem);
+      offsets.push(offset);
+    }
+    this.wake(s);
+    return offsets;
+  }
+
+  async *read(streamId: string, after: string | null, signal?: AbortSignal): AsyncIterable<StreamItem> {
+    let next = after ? Number(after) : 0;
+    for (;;) {
+      if (signal?.aborted) return;
+      const s = this.live(streamId);
+      if (!s) throw new StreamGoneError(streamId);
+      while (next < s.items.length) {
+        const item = s.items[next++]!;
+        yield item;
+        if (isStreamEnd(item)) return;
+      }
+      // Read from past the end item: nothing more will ever come.
+      if (s.end) return;
+      await new Promise<void>((resolve) => {
+        const done = () => {
+          s.waiters.delete(done);
+          signal?.removeEventListener('abort', done);
+          resolve();
+        };
+        s.waiters.add(done);
+        signal?.addEventListener('abort', done, { once: true });
+      });
+    }
+  }
+
+  async snapshot(streamId: string, after?: string | null) {
+    const s = this.live(streamId);
+    if (!s) return null;
+    return { meta: { ...s.meta }, items: s.items.slice(after ? Number(after) : 0), end: s.end };
+  }
+
+  async close(streamId: string, end: StreamEnd, graceMs: number) {
+    const s = this.live(streamId);
+    if (!s) throw new StreamGoneError(streamId);
+    if (s.end) return;
+    s.end = { ...end };
+    s.items.push({ ...end, offset: String(s.items.length + 1) } as StreamItem);
+    s.expiresAt = Date.now() + graceMs;
+    this.wake(s);
+  }
+
+  async delete(streamId: string) {
+    const s = this.streams.get(streamId);
+    if (s) this.drop(streamId, s);
+  }
+
+  private wake(s: MemStream) {
+    for (const wake of [...s.waiters]) wake();
+  }
+
+  /** Streams held now, expired ones included until the next sweep — lets a
+   *  test prove a stream was deleted. */
+  get size(): number {
+    return this.streams.size;
+  }
 }
