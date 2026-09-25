@@ -1,5 +1,5 @@
 import type { AgentEvent, ExecutionState, NewMessage, NewUsage, ThreadDTO, ThreadTransition, UsageFilter, UsageTotals } from '../core/types.js';
-import { emptyTotals } from '../core/usage.js';
+import { UsageMerger } from '../core/usage.js';
 import type { Storage } from '../ports/storage.js';
 
 /** Minimal structural type of the Prisma client surface we use. The real
@@ -52,11 +52,6 @@ export interface PrismaLike {
      *  precise one here would make the real PrismaClient fail to satisfy this
      *  interface. The RESULT is typed, which is the half the adapter reads. */
     groupBy(a: any): Promise<UsageGroupRow[]>;
-    /** The two figures a groupBy cannot give: how many calls were estimated
-     *  or unpriced (a conditional count), and which currency the priced
-     *  rows are in. Loosely typed for the same reason as groupBy. */
-    count(a: any): Promise<number>;
-    findFirst(a: any): Promise<{ costCurrency: string | null } | null>;
   };
 }
 
@@ -98,6 +93,9 @@ export interface UsageGroupRow {
   agentName: string | null;
   model: string | null;
   modelId: string | null;
+  /** Grouped on too, so a group never sums two units. Null for the unpriced
+   *  calls. */
+  costCurrency: string | null;
   _count: number;
   /** BigInt columns come back as `bigint`, so every figure is coerced before
    *  it is summed — mixing `bigint` and `number` arithmetic throws. */
@@ -199,59 +197,50 @@ export class PrismaStorage implements Storage {
 
   usage = {
     total: async (threadId: string, filter: UsageFilter = {}): Promise<UsageTotals> => {
-      const groups = await this.prisma.tokenUsage.groupBy({
-        by: ['agentId', 'agentName', 'model', 'modelId'],
-        where: { threadId, ...(filter.runId ? { runId: filter.runId } : {}) },
-        _sum: {
-          inputTokens: true, cachedInputTokens: true, cacheWriteInputTokens: true,
-          outputTokens: true, reasoningTokens: true, totalTokens: true, costMicros: true,
-        },
-        _count: true,
-      });
       const where = { threadId, ...(filter.runId ? { runId: filter.runId } : {}) };
-      // The figures a grouped sum cannot carry: which calls were guesses,
-      // which were never priced, and what unit the money is in. Read
-      // alongside the groups rather than hardcoded, so a bill can tell
-      // "spent nothing" from "nobody priced this".
-      const [estimatedByGroup, unpriced, first] = await Promise.all([
+      // Grouped by currency as well, so a group never sums two units. A
+      // group with no currency is the unpriced calls.
+      const by = ['agentId', 'agentName', 'model', 'modelId', 'costCurrency'];
+      const keyOf = (g: UsageGroupRow) => [g.agentId, g.agentName, g.model, g.modelId, g.costCurrency].join('\u0000');
+      const [groups, estimatedByGroup] = await Promise.all([
         this.prisma.tokenUsage.groupBy({
-          by: ['agentId', 'agentName', 'model', 'modelId'],
-          where: { ...where, estimated: true },
+          by,
+          where,
+          _sum: {
+            inputTokens: true, cachedInputTokens: true, cacheWriteInputTokens: true,
+            outputTokens: true, reasoningTokens: true, totalTokens: true, costMicros: true,
+          },
           _count: true,
+          _min: { createdAt: true },
         }),
-        this.prisma.tokenUsage.count({ where: { ...where, costMicros: null } }),
-        this.prisma.tokenUsage.findFirst({
-          where: { ...where, costCurrency: { not: null } },
-          orderBy: { createdAt: 'asc' },
-          select: { costCurrency: true },
-        }),
+        // Which calls were guesses: a conditional count a grouped sum cannot
+        // carry, read alongside rather than hardcoded.
+        this.prisma.tokenUsage.groupBy({ by, where: { ...where, estimated: true }, _count: true }),
       ]);
-      const estimatedOf = new Map(
-        estimatedByGroup.map((g) => [`${g.agentId}|${g.agentName}|${g.model}|${g.modelId}`, g._count]),
-      );
-      const out = emptyTotals();
-      out.unpriced = unpriced;
-      out.currency = first?.costCurrency ?? undefined;
-      for (const g of groups) {
+      const estimatedOf = new Map(estimatedByGroup.map((g) => [keyOf(g), g._count]));
+      // First-seen order, as every other adapter gives it.
+      const at = (g: UsageGroupRow) => new Date((g as any)._min?.createdAt ?? 0).getTime();
+      const merge = new UsageMerger();
+      for (const g of [...groups].sort((a, b) => at(a) - at(b))) {
         const n = (k: string) => Number(g._sum[k] ?? 0);
-        out.inputTokens += n('inputTokens');
-        out.cachedInputTokens += n('cachedInputTokens');
-        out.outputTokens += n('outputTokens');
-        out.totalTokens += n('totalTokens');
-        out.costMicros += n('costMicros');
-        out.lines.push({
-          agentId: g.agentId, agentName: g.agentName, model: g.model, modelId: g.modelId,
-          inputTokens: n('inputTokens'),
-          cacheReadInputTokens: n('cachedInputTokens'),
-          cacheWriteInputTokens: n('cacheWriteInputTokens'),
-          outputTokens: n('outputTokens'),
-          reasoningTokens: n('reasoningTokens'),
-          calls: g._count,
-          estimated: estimatedOf.get(`${g.agentId}|${g.agentName}|${g.model}|${g.modelId}`) ?? 0,
-          costMicros: n('costMicros'),
+        merge.add({
+          line: {
+            agentId: g.agentId, agentName: g.agentName, model: g.model, modelId: g.modelId,
+            inputTokens: n('inputTokens'),
+            cacheReadInputTokens: n('cachedInputTokens'),
+            cacheWriteInputTokens: n('cacheWriteInputTokens'),
+            outputTokens: n('outputTokens'),
+            reasoningTokens: n('reasoningTokens'),
+            calls: g._count,
+            estimated: estimatedOf.get(keyOf(g)) ?? 0,
+            costMicros: n('costMicros'),
+          },
+          currency: g.costCurrency,
+          totalTokens: n('totalTokens'),
+          unpriced: g.costCurrency ? 0 : g._count,
         });
       }
-      return out;
+      return merge.totals();
     },
     record: async (threadId: string, usage: NewUsage) => {
       await this.prisma.tokenUsage.create({

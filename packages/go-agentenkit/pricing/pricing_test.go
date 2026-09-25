@@ -124,3 +124,33 @@ func TestMicrosRoundTrip(t *testing.T) {
 		t.Fatalf("Format = %q", got)
 	}
 }
+
+// Workstream H: a price list never bills a token at a made-up zero, and a
+// receipt is only believed when it makes sense. The same cases run in the TS
+// package (test/pricing.test.ts).
+
+func TestTable_AMissingCacheRateIsPricedAsInput(t *testing.T) {
+	// gpt-4o has no cache rates in this table: its cache reads and writes are
+	// priced as input, never at 0.
+	got := price(t, table, ports.NewUsage{
+		Model: "gpt-4o-2024-11-20", CacheReadInputTokens: 1_000_000, CacheWriteInputTokens: 1_000_000,
+	})
+	if got.Micros != 5_000_000 {
+		t.Fatalf("got %d micros, want 5000000 (2 × $2.50)", got.Micros)
+	}
+}
+
+func TestReceipt_ANegativeReceiptIsLeftUnpriced(t *testing.T) {
+	p := pricing.Receipt(func(map[string]any) (int64, bool) { return -5, true })
+	if c := price(t, p, ports.NewUsage{ProviderMetadata: map[string]any{"x": 1}}); c != nil {
+		t.Fatalf("a negative receipt was believed: %+v", c)
+	}
+}
+
+func TestTable_AModelNamedLikeAnObjectKeyIsNotFound(t *testing.T) {
+	for _, name := range []string{"constructor", "toString", "__proto__"} {
+		if c := price(t, table, ports.NewUsage{Model: name, InputTokens: 1_000}); c != nil {
+			t.Fatalf("%s priced: %+v", name, c)
+		}
+	}
+}

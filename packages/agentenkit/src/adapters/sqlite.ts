@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type {
   AgentEvent, ExecutionState, MessageDTO, NewMessage, NewUsage, ThreadDTO, UsageFilter, UsageTotals, ThreadTransition,
 } from '../core/types.js';
-import { emptyTotals } from '../core/usage.js';
+import { UsageMerger } from '../core/usage.js';
 import type { Storage } from '../ports/storage.js';
 
 /** Minimal structural type over a synchronous SQLite handle — `bun:sqlite`'s
@@ -321,6 +321,8 @@ export class SqliteStorage implements Storage {
     // per model call (§4), and the bill only ever wants them by agent and
     // model. Summing the groups gives the totals, so the two always agree.
     total: async (threadId: string, filter: UsageFilter = {}): Promise<UsageTotals> => {
+      // Grouped by currency as well, so a group never sums two units; the
+      // merge puts one agent's spend on one model back on a single line.
       const rows = this.all(
         `SELECT COALESCE(agentId,'') AS agentId, COALESCE(agentName,'') AS agentName,
                 COALESCE(model,'') AS model, COALESCE(modelId,'') AS modelId,
@@ -328,31 +330,29 @@ export class SqliteStorage implements Storage {
                 COALESCE(SUM(cacheWriteInputTokens),0) AS cw, COALESCE(SUM(outputTokens),0) AS o,
                 COALESCE(SUM(reasoningTokens),0) AS rt, COALESCE(SUM(totalTokens),0) AS t,
                 COUNT(*) AS calls, COALESCE(SUM(estimated),0) AS est,
-                COALESCE(SUM(costMicros),0) AS cost, MAX(costCurrency) AS currency,
+                COALESCE(SUM(costMicros),0) AS cost, COALESCE(costCurrency,'') AS currency,
                 COALESCE(SUM(CASE WHEN costMicros IS NULL THEN 1 ELSE 0 END),0) AS unpriced
          FROM usage WHERE threadId = ?${filter.runId ? ' AND runId = ?' : ''}
-         GROUP BY agentId, agentName, model, modelId
+         GROUP BY agentId, agentName, model, modelId, costCurrency
          ORDER BY MIN(createdAt)`,
         ...(filter.runId ? [threadId, filter.runId] : [threadId]),
       );
-      const out = emptyTotals();
+      const merge = new UsageMerger();
       for (const r of rows) {
-        out.inputTokens += r.i;
-        out.cachedInputTokens += r.cr;
-        out.outputTokens += r.o;
-        out.totalTokens += r.t;
-        out.costMicros += r.cost;
-        out.unpriced += r.unpriced;
-        out.currency ??= r.currency ?? undefined;
-        out.lines.push({
-          agentId: r.agentId || null, agentName: r.agentName || null,
-          model: r.model || null, modelId: r.modelId || null,
-          inputTokens: r.i, cacheReadInputTokens: r.cr, cacheWriteInputTokens: r.cw,
-          outputTokens: r.o, reasoningTokens: r.rt,
-          calls: r.calls, estimated: r.est, costMicros: r.cost,
+        merge.add({
+          line: {
+            agentId: r.agentId || null, agentName: r.agentName || null,
+            model: r.model || null, modelId: r.modelId || null,
+            inputTokens: r.i, cacheReadInputTokens: r.cr, cacheWriteInputTokens: r.cw,
+            outputTokens: r.o, reasoningTokens: r.rt,
+            calls: r.calls, estimated: r.est, costMicros: r.cost,
+          },
+          currency: r.currency,
+          totalTokens: r.t,
+          unpriced: r.unpriced,
         });
       }
-      return out;
+      return merge.totals();
     },
   };
 

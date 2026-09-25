@@ -298,12 +298,37 @@ func capValue(raw json.RawMessage, limit int) json.RawMessage {
 	return TextContent(capText(string(raw), limit))
 }
 
-// RunLedger is the tokens a run has spent, main agent and nested runs
-// together (§2.7). Shared so a child's spend counts against the run's safety
-// cap the moment it happens.
+// RunLedger is what a run has spent, main agent and nested runs together
+// (§2.7): its tokens, its money and the one currency that money is in.
+// Shared so a child's spend counts against the run's caps the moment it
+// happens.
+//
+// A run's ledger starts from what the run already spent (SeedRunLedger): its
+// earlier segments, before a park or a retry, count against the same caps.
+// After that it is kept in memory, so the caps are checked without reading
+// every usage row back after every step.
 type RunLedger struct {
 	mu         sync.Mutex
 	tokensUsed int
+	costMicros int64
+	currency   string
+}
+
+// SeedRunLedger starts a ledger from the run's usage rows (§4). A failed
+// read is logged and the ledger starts from zero: a run is not failed over
+// its caps' bookkeeping.
+func SeedRunLedger(ctx context.Context, deps ports.RuntimePorts, threadID, runID string) *RunLedger {
+	l := &RunLedger{}
+	if runID == "" {
+		return l
+	}
+	spent, err := deps.Storage.Usage.Total(context.WithoutCancel(ctx), threadID, ports.UsageFilter{RunID: runID})
+	if err != nil {
+		Logger(deps).Error("run spend not read; the caps count from zero this segment", "run", runID, "err", err)
+		return l
+	}
+	l.tokensUsed, l.costMicros, l.currency = spent.TotalTokens, spent.CostMicros, spent.Currency
+	return l
 }
 
 // Add books tokens onto the ledger.
@@ -318,6 +343,42 @@ func (l *RunLedger) TokensUsed() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.tokensUsed
+}
+
+// Spent is the money the run has spent, and the currency it is in.
+func (l *RunLedger) Spent() (int64, string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.costMicros, l.currency
+}
+
+// Record prices one call, stores its row and books it (§4). A run is priced
+// in one currency: a call priced in another is stored unpriced, with an
+// error logged, rather than mixed into a bill that cannot add it up.
+func (l *RunLedger) Record(ctx context.Context, deps ports.RuntimePorts, threadID string, u ports.NewUsage) ports.NewUsage {
+	u = price(ctx, deps, u)
+	if l != nil && u.Cost != nil {
+		l.mu.Lock()
+		if l.currency == "" {
+			l.currency = u.Cost.Currency
+		}
+		if u.Cost.Currency != l.currency {
+			Logger(deps).Error("usage priced in a second currency; stored unpriced",
+				"run", u.RunID, "model", u.Model, "currency", u.Cost.Currency, "runCurrency", l.currency)
+			u.Cost = nil
+		}
+		l.mu.Unlock()
+	}
+	store(ctx, deps, threadID, u)
+	if l != nil {
+		l.mu.Lock()
+		l.tokensUsed += u.TotalTokens()
+		if u.Cost != nil {
+			l.costMicros += u.Cost.Micros
+		}
+		l.mu.Unlock()
+	}
+	return u
 }
 
 // LoopInput seeds a loop.
@@ -538,10 +599,9 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 				lastInput = EstimateMessages(messages)
 			}
 			if u := unfinishedUsage(input, out.Steps+1, step, outcome, lastInput); u.TotalTokens() > 0 {
-				u = RecordCall(ctx, deps, threadID, u)
+				u = ledger.Record(ctx, deps, threadID, u)
 				out.Attribution.Add(u.Totals())
 				out.TokensUsed += u.TotalTokens()
-				ledger.Add(u.TotalTokens())
 			}
 			if aborted() {
 				break // user stop mid-step
@@ -558,7 +618,7 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		// next holder may already be writing its own. The call itself did
 		// happen and the provider billed it, so its usage is still recorded.
 		if input.Fenced != nil && input.Fenced() {
-			RecordCall(ctx, deps, threadID, usageOf(input, out.Steps+1, ports.KindStep, step, ports.UsageFinished))
+			ledger.Record(ctx, deps, threadID, usageOf(input, out.Steps+1, ports.KindStep, step, ports.UsageFinished))
 			return out, ErrRunLockLost
 		}
 
@@ -577,6 +637,13 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			}
 		}
 		messages = append(messages, step.ResponseMessages...)
+
+		// One priced usage row per model call (§4), booked on the run-wide
+		// ledger the caps are checked against (§2.7). Written as soon as the
+		// step's messages are, before anything else: a crash after this
+		// point resumes from the saved step and never runs the call again,
+		// so its row must already be there.
+		u := ledger.Record(ctx, deps, threadID, usageOf(input, out.Steps+1, ports.KindStep, step, ports.UsageFinished))
 
 		// goai runs a step's tools after the step finishes and streams no
 		// tool-result chunk for them, so a client would keep showing the call
@@ -611,15 +678,10 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			}
 		}
 
-		// One priced usage row per model call (§4), then the same counters
-		// accumulated across the segment's steps and into the run-wide ledger
-		// the safety caps are checked against (§2.7).
-		u := RecordCall(ctx, deps, threadID, usageOf(input, out.Steps+1, ports.KindStep, step, ports.UsageFinished))
 		a := u.Totals()
 		lastInput = u.InputTokens
 		out.Attribution.Add(a)
 		out.TokensUsed += a.TotalTokens
-		ledger.Add(a.TotalTokens)
 		out.Text = step.Text
 		out.FinishReason = step.FinishReason
 		out.Steps++
@@ -680,25 +742,21 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			break
 		}
 
-		// The money cap (§4), checked in the same place and the same way. It
-		// reads the run's spend back from the store rather than from a
-		// counter in this process: a run that parked and resumed in another
-		// worker must not get its cap reset, and a nested run's calls have to
-		// count against the same cap.
+		// The money cap (§4), checked in the same place and the same way,
+		// against the same shared ledger: a nested run's calls count against
+		// it, and a run that parked or retried starts from what it already
+		// spent (see SeedRunLedger).
 		//
 		// It only ever sees priced calls: with no Pricer configured nothing is
 		// ever spent and the cap never fires.
 		if input.CostBudgetMicros > 0 {
-			spent, err := deps.Storage.Usage.Total(ctx, threadID, ports.UsageFilter{RunID: input.BillingRunID})
-			if err != nil {
-				Logger(deps).Error("cost budget not checked", "run", input.BillingRunID, "err", err)
-			} else if spent.CostMicros >= input.CostBudgetMicros {
+			if spent, currency := ledger.Spent(); spent >= input.CostBudgetMicros {
 				exhausted := map[string]any{
-					"agentId": nullable(input.AgentID), "costMicros": spent.CostMicros,
+					"agentId": nullable(input.AgentID), "costMicros": spent,
 					"costBudgetMicros": input.CostBudgetMicros,
 				}
-				if spent.Currency != "" { // left out when unset, as TS does
-					exhausted["currency"] = spent.Currency
+				if currency != "" { // left out when unset, as TS does
+					exhausted["currency"] = currency
 				}
 				_, _ = Publish(ctx, deps, threadID, "COST_BUDGET_EXHAUSTED", exhausted)
 				out.CostExhausted = true

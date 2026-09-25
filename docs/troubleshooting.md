@@ -37,6 +37,17 @@ The worker died holding the run lock. It clears when the lease expires
 shorter lease only makes a dead worker's lock clear sooner; it does not cut a
 long run short.
 
+Call `runtime.reclaimStuckRuns(olderThanMs)` (Go: `ReclaimStuckRuns`) from a
+periodic job. It re-dispatches a queued or running run that has no lock and no
+job, and settles an ended run whose settle never ran, paging through every
+such run.
+
+### A worker died after the answer was saved
+
+The retry does not ask the model again. A run whose last saved turn is an
+assistant answer with no tool calls (or which already settled) is finalized
+from that answer, so the user sees one reply and the call is billed once.
+
 ### A stopped run wedges the thread
 
 Fixed, but worth knowing the shape: stop and a fast resend both wrote the same

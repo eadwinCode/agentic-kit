@@ -3,11 +3,22 @@ import { ACTIVE_STATES, publish, transition } from './publish.js';
 import { loadOpenHitls } from './hitl.js';
 import type { StopResult } from '../ports/runtime.js';
 import { currentRunId } from './keys.js';
+import type { RegisteredAgent } from './agent.js';
+import { Lease } from './lease.js';
+import { settleEndedRun } from './settle.js';
+
+export interface StopOptions {
+  /** Resolves the registered agent a run belongs to, by the name on its
+   *  record. A stop that ends a run no worker holds (queued, or parked on an
+   *  approval) runs that agent's `onSettle` itself (§5.6); with no resolver
+   *  the run is left unsettled for the sweep. */
+  agent?: (name: string) => RegisteredAgent | null;
+}
 
 /** The whole stop mechanism (§2.1): one button, one behavior — everything
  *  stops immediately. The engine's poller sees CANCELLED on the hot cache and
  *  fires the abort; the durable state is the recovery truth (§3.4). */
-export async function stop(deps: RuntimePorts, threadId: string): Promise<StopResult> {
+export async function stop(deps: RuntimePorts, threadId: string, opts: StopOptions = {}): Promise<StopResult> {
   const thread = await deps.storage.threads.get(threadId);
   if (!thread || !ACTIVE_STATES.includes(thread.state)) {
     return { accepted: false, error: `Cannot stop thread in state ${thread?.state ?? 'unknown'}` };
@@ -31,7 +42,10 @@ export async function stop(deps: RuntimePorts, threadId: string): Promise<StopRe
   }
   // A queued or parked run may never execute again. Close its record here,
   // without touching usage that a running worker can still be accruing.
-  if (runId) await recordStoppedRun(deps, runId, endedAt);
+  if (runId) {
+    await recordStoppedRun(deps, runId, endedAt);
+    if (opts.agent) await settleAfterStop(deps, opts.agent, threadId, runId);
+  }
   await publish(deps, threadId, 'STATE_CHANGE', {
     state: 'CANCELLED', stopReason: 'cancelled', runId, endedAt,
   });
@@ -51,6 +65,38 @@ export async function recordStoppedRun(deps: RuntimePorts, runId: string, endedA
     });
   } catch {
     // Operational history must not prevent cancellation.
+  }
+}
+
+/** Settle a stopped run when no worker is there to (§5.6). A queued run never
+ *  reached a worker; a parked run's worker is long gone. Their steps were
+ *  priced as they happened, so the bill is real, and the spec's `onSettle` is
+ *  where it gets charged.
+ *
+ *  It takes the run lock and settles under it, exactly as a worker would. A
+ *  held lock means a worker owns the run right now (the lock is renewed while
+ *  a worker runs, §3.4), and that worker settles it: from its own cancel
+ *  path, or when it finds the thread cancelled at its segment start. Either
+ *  way the settle claim makes the second arrival a no-op. */
+async function settleAfterStop(
+  deps: RuntimePorts,
+  lookup: (name: string) => RegisteredAgent | null,
+  threadId: string,
+  runId: string,
+): Promise<void> {
+  const rec = await deps.admin.runs.get(runId).catch(() => null);
+  if (!rec || rec.settledAt) return;
+  const agent = lookup(rec.agent);
+  if (!agent) return;
+  const lease = await Lease.acquire(deps, threadId, runId, undefined);
+  if (!lease) return; // a worker holds the run; it settles the run itself
+  // Renewed while the hook runs: a slow settle must not let a queued job take
+  // the lock and settle the same run beside it.
+  lease.keep();
+  try {
+    await settleEndedRun(deps, agent, threadId, runId);
+  } finally {
+    await lease.release();
   }
 }
 

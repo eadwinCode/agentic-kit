@@ -195,6 +195,10 @@ type RunRecord struct {
 	// settles exactly once: a worker that ends it, or a stop that ends it
 	// while no worker holds it. Unset until then.
 	SettledAt *time.Time `json:"settledAt,omitempty"`
+	// SettlingAt is when a settle claimed the run and started its hook. It
+	// is cleared when the settle ends; one left behind for long is a settler
+	// that died, and the next settle takes the run over.
+	SettlingAt *time.Time `json:"settlingAt,omitempty"`
 	// Steps is loop iterations completed, summed across every segment.
 	Steps             int `json:"steps"`
 	InputTokens       int `json:"inputTokens"`
@@ -280,17 +284,32 @@ type UsageTotals struct {
 	// CostMicros is the summed cost, in millionths of one Currency unit.
 	// 1_000_000 is one dollar when Currency is "USD".
 	CostMicros int64 `json:"costMicros"`
-	// Currency is the unit CostMicros is in, empty when nothing was priced.
-	// One deployment should price in ONE currency: these are summed, not
-	// converted.
+	// Currency is the unit CostMicros is in: the first currency priced,
+	// empty when nothing was. Money is never converted, so a call priced in
+	// another currency is left out of CostMicros and counted in Unpriced;
+	// Costs has every currency's own total.
 	Currency string `json:"currency,omitempty"`
-	// Unpriced is how many calls had no cost, because no pricer answered for
-	// them. Above zero, CostMicros is a floor and not the whole bill.
+	// Unpriced is how many calls CostMicros leaves out: calls no pricer
+	// answered for, and calls priced in another currency. Above zero,
+	// CostMicros is a floor and not the whole bill.
 	Unpriced int `json:"unpriced"`
-	// Lines is the same spend grouped by agent and model: one line per pair,
-	// which is the shape a bill wants. Summing the lines gives the totals
-	// above.
+	// Costs is the money per currency, in the order each was first seen.
+	// One run is only ever priced in one currency (a second one is refused
+	// when the call is recorded), so a run's bill has at most one entry; a
+	// thread whose pricer changed currency between runs can have more.
+	Costs []CurrencyCost `json:"costs,omitempty"`
+	// Lines is the same spend grouped by agent, model and currency: one
+	// line per agent and model, which is the shape a bill wants. Summing
+	// the lines of one currency gives that currency's entry in Costs.
 	Lines []UsageLine `json:"lines,omitempty"`
+}
+
+// CurrencyCost is the money spent in one currency (§4).
+type CurrencyCost struct {
+	Currency   string `json:"currency"`
+	CostMicros int64  `json:"costMicros"`
+	// Calls is how many calls were priced in this currency.
+	Calls int `json:"calls"`
 }
 
 // UsageLine is one agent's spend on one model, summed over its calls (§4).
@@ -300,8 +319,11 @@ type UsageLine struct {
 	AgentID   string `json:"agentId,omitempty"`
 	AgentName string `json:"agentName,omitempty"`
 	// Model is the registry key; ModelID the wire id the provider reported.
-	Model                 string `json:"model,omitempty"`
-	ModelID               string `json:"modelId,omitempty"`
+	Model   string `json:"model,omitempty"`
+	ModelID string `json:"modelId,omitempty"`
+	// Currency is the unit CostMicros is in, empty when none of the
+	// line's calls was priced.
+	Currency              string `json:"currency,omitempty"`
 	InputTokens           int    `json:"inputTokens"`
 	CacheReadInputTokens  int    `json:"cacheReadInputTokens"`
 	CacheWriteInputTokens int    `json:"cacheWriteInputTokens"`
@@ -318,78 +340,57 @@ type UsageLine struct {
 // UsageAggregator sums usage rows into the shape Total must return: the four
 // counters, the money, and one Line per agent and model.
 //
-// A storage adapter that can group in the database should do that instead.
-// This is for the ones that cannot, and for anyone writing their own adapter:
-// feed every matching row through Add and Totals gives back exactly what the
-// port promises, lines in first-seen order.
-type UsageAggregator struct {
-	total UsageTotals
-	index map[usageLineKey]int
-}
-
-type usageLineKey struct{ agentID, agentName, model, modelID string }
+// A storage adapter that can group in the database should do that instead
+// (see UsageLineMerger). This is for the ones that cannot, and for anyone
+// writing their own adapter: feed every matching row through Add and Totals
+// gives back exactly what the port promises, lines in first-seen order.
+type UsageAggregator struct{ merge UsageLineMerger }
 
 // Add books one call.
 func (a *UsageAggregator) Add(u NewUsage) {
-	if a.index == nil {
-		a.index = map[usageLineKey]int{}
+	l := UsageLine{
+		AgentID: u.AgentID, AgentName: u.AgentName, Model: u.Model, ModelID: u.ModelID,
+		InputTokens: u.InputTokens, CacheReadInputTokens: u.CacheReadInputTokens,
+		CacheWriteInputTokens: u.CacheWriteInputTokens, OutputTokens: u.OutputTokens,
+		ReasoningTokens: u.ReasoningTokens, Calls: 1,
 	}
-	a.total.Add(u.Totals())
-
-	key := usageLineKey{u.AgentID, u.AgentName, u.Model, u.ModelID}
-	i, ok := a.index[key]
-	if !ok {
-		i = len(a.total.Lines)
-		a.index[key] = i
-		a.total.Lines = append(a.total.Lines, UsageLine{
-			AgentID: u.AgentID, AgentName: u.AgentName, Model: u.Model, ModelID: u.ModelID,
-		})
-	}
-	line := &a.total.Lines[i]
-	line.InputTokens += u.InputTokens
-	line.CacheReadInputTokens += u.CacheReadInputTokens
-	line.CacheWriteInputTokens += u.CacheWriteInputTokens
-	line.OutputTokens += u.OutputTokens
-	line.ReasoningTokens += u.ReasoningTokens
-	line.Calls++
 	if u.Estimated {
-		line.Estimated++
+		l.Estimated = 1
 	}
-	// Money is summed in ONE currency: the first one seen. A row priced in
-	// another currency cannot be added to it, so it counts as unpriced and
-	// the total stays a floor rather than a mix of units. Totals() above
-	// already added the row's cost; take it back out here.
+	unpriced := 1
 	if u.Cost != nil {
-		if a.total.Currency == "" {
-			a.total.Currency = u.Cost.Currency
-		}
-		if u.Cost.Currency == a.total.Currency {
-			line.CostMicros += u.Cost.Micros
-		} else {
-			a.total.CostMicros -= u.Cost.Micros
-			a.total.Unpriced++
-		}
+		l.Currency, l.CostMicros, unpriced = u.Cost.Currency, u.Cost.Micros, 0
 	}
+	a.merge.Add(l, l.Currency, u.TotalTokens(), unpriced)
 }
 
 // Totals is everything added so far.
-func (a *UsageAggregator) Totals() UsageTotals { return a.total }
+func (a *UsageAggregator) Totals() UsageTotals { return a.merge.Totals() }
+
+type usageLineKey struct{ agentID, agentName, model, modelID string }
 
 // UsageLineMerger rebuilds UsageTotals from grouped rows that a SQL adapter
 // read GROUP BY agent, model AND currency. Grouping by currency is what keeps
 // a sum honest; merging here is what keeps one agent's spend on one model a
-// single line. Money is summed in the first currency seen; a group priced in
-// another currency counts as unpriced instead of being added to it.
+// single line.
+//
+// The rules, the same in every adapter and in the TS runtime: CostMicros is
+// summed in the first currency seen, and a group priced in another currency
+// counts as unpriced there instead of being added. Costs keeps every
+// currency's own total. A line takes the currency of the first priced group
+// on it; a group priced in a different currency gets a line of its own, and
+// unpriced groups join the first line of their agent and model.
 type UsageLineMerger struct {
 	total UsageTotals
-	index map[usageLineKey]int
+	lines map[usageLineKey][]int
+	costs map[string]int
 }
 
 // Add books one grouped row: its line, the currency its cost is in, its
 // summed total tokens and how many of its calls were unpriced.
 func (m *UsageLineMerger) Add(l UsageLine, currency string, totalTokens, unpriced int) {
-	if m.index == nil {
-		m.index = map[usageLineKey]int{}
+	if m.lines == nil {
+		m.lines, m.costs = map[usageLineKey][]int{}, map[string]int{}
 	}
 	m.total.InputTokens += l.InputTokens
 	m.total.CachedInputTokens += l.CacheReadInputTokens
@@ -397,26 +398,49 @@ func (m *UsageLineMerger) Add(l UsageLine, currency string, totalTokens, unprice
 	m.total.TotalTokens += totalTokens
 	m.total.Unpriced += unpriced
 
-	priced := l.Calls - unpriced
-	if currency != "" && m.total.Currency == "" {
-		m.total.Currency = currency
-	}
-	if currency != "" && currency != m.total.Currency {
-		// Another unit: cannot be added to the total, so its calls are
-		// reported as unpriced and the total stays a floor.
-		m.total.Unpriced += priced
+	if currency == "" {
 		l.CostMicros = 0
+	} else {
+		priced := l.Calls - unpriced
+		i, ok := m.costs[currency]
+		if !ok {
+			i = len(m.total.Costs)
+			m.costs[currency] = i
+			m.total.Costs = append(m.total.Costs, CurrencyCost{Currency: currency})
+		}
+		m.total.Costs[i].CostMicros += l.CostMicros
+		m.total.Costs[i].Calls += priced
+		if m.total.Currency == "" {
+			m.total.Currency = currency
+		}
+		if currency == m.total.Currency {
+			m.total.CostMicros += l.CostMicros
+		} else {
+			// Another unit: it cannot be added to CostMicros, so its calls
+			// count as unpriced there and CostMicros stays a floor.
+			m.total.Unpriced += priced
+		}
 	}
-	m.total.CostMicros += l.CostMicros
+	l.Currency = currency
 
 	key := usageLineKey{l.AgentID, l.AgentName, l.Model, l.ModelID}
-	i, ok := m.index[key]
-	if !ok {
-		m.index[key] = len(m.total.Lines)
+	at := -1
+	for _, i := range m.lines[key] {
+		c := m.total.Lines[i].Currency
+		if currency == "" || c == currency || c == "" {
+			at = i
+			break
+		}
+	}
+	if at < 0 {
+		m.lines[key] = append(m.lines[key], len(m.total.Lines))
 		m.total.Lines = append(m.total.Lines, l)
 		return
 	}
-	line := &m.total.Lines[i]
+	line := &m.total.Lines[at]
+	if line.Currency == "" {
+		line.Currency = currency
+	}
 	line.InputTokens += l.InputTokens
 	line.CacheReadInputTokens += l.CacheReadInputTokens
 	line.CacheWriteInputTokens += l.CacheWriteInputTokens

@@ -196,7 +196,7 @@ describe('thread usage (§4)', () => {
     // And grouped into the lines a bill is made of: one agent, one model.
     expect(t1.lines).toEqual([
       {
-        agentId: null, agentName: 'chat', model: 'gpt-4o', modelId: 'gpt-4o',
+        agentId: null, agentName: 'chat', model: 'gpt-4o', modelId: 'gpt-4o', currency: 'USD',
         inputTokens: 20, cacheReadInputTokens: 8, cacheWriteInputTokens: 0,
         outputTokens: 12, reasoningTokens: 0, calls: 2, estimated: 0, costMicros: 50,
       },

@@ -478,62 +478,74 @@ type ReclaimReport struct {
 // (§2.5, §2.8): a QUEUED or RUNNING record older than olderThan whose lock
 // nobody holds and whose job the queue no longer has is re-dispatched, and
 // an ended record older than olderThan whose settle never ran is settled.
-// Call it from a periodic job. It needs the run's recorded state to scope
-// storage (RecordPayloads), and skips records without one.
+// Call it from a periodic job. It pages through every such run, not only
+// the first page. A record with no recorded state (RecordPayloads off) is
+// read with an empty state, so a tenant-scoped storage sees no tenant.
 func (c *AgentCore) ReclaimStuckRuns(ctx context.Context, olderThan time.Duration) (ReclaimReport, error) {
 	var report ReclaimReport
 	until := time.Now().Add(-olderThan)
-	open, err := c.admin.Runs().List(ctx, ports.RunFilter{
-		State: []ports.ExecutionState{StateQueued, StateRunning}, Until: &until, Limit: 500,
-	})
-	if err != nil {
-		return report, err
-	}
-	for _, rec := range open {
-		if rec.Depth > 0 || rec.RunState == nil {
-			continue
+	top := 0
+	err := c.eachRun(ctx, ports.RunFilter{
+		State: []ports.ExecutionState{StateQueued, StateRunning}, Until: &until, Depth: &top,
+	}, func(rec ports.RunRecord) {
+		if rec.EndedAt != nil {
+			return
 		}
 		report.Checked++
-		deps := c.scope(rec.RunState, rec.ID)
-		if rec.EndedAt != nil {
-			continue
-		}
-		did, err := core.ReclaimIfOrphaned(ctx, deps, rec.ThreadID)
+		did, err := core.ReclaimIfOrphaned(ctx, c.scope(rec.RunState, rec.ID), rec.ThreadID)
 		if err != nil {
 			report.Errors++
 			c.log().Error("stuck run not reclaimed", "thread", rec.ThreadID, "run", rec.ID, "err", err)
-			continue
+			return
 		}
 		if did {
 			report.Redispatched++
 		}
-	}
-	ended, err := c.admin.Runs().List(ctx, ports.RunFilter{
-		State: []ports.ExecutionState{StateCancelled, StateCompleted, StateFailed}, Until: &until, Limit: 500,
 	})
 	if err != nil {
 		return report, err
 	}
-	for _, rec := range ended {
-		if rec.Depth > 0 || rec.RunState == nil || rec.SettledAt != nil || rec.EndedAt == nil || rec.EndedAt.After(until) {
-			continue
+	err = c.eachRun(ctx, ports.RunFilter{Unsettled: true, Until: &until, Depth: &top}, func(rec ports.RunRecord) {
+		if rec.EndedAt == nil || rec.EndedAt.After(until) {
+			return
 		}
 		report.Checked++
 		agent := w(c).resolve(rec.Agent)
 		if agent == nil {
-			continue
+			return
 		}
 		settled, err := core.SettleLate(ctx, c.scope(rec.RunState, rec.ID), agent.Agent(), rec.ThreadID, rec.ID)
 		if err != nil {
 			report.Errors++
 			c.log().Error("unsettled run not settled", "thread", rec.ThreadID, "run", rec.ID, "err", err)
-			continue
+			return
 		}
 		if settled {
 			report.Settled++
 		}
+	})
+	return report, err
+}
+
+// sweepPage is how many run records one sweep read brings back.
+const sweepPage = 500
+
+// eachRun calls fn for every run the filter matches, a page at a time.
+func (c *AgentCore) eachRun(ctx context.Context, f ports.RunFilter, fn func(ports.RunRecord)) error {
+	f.Limit = sweepPage
+	for {
+		page, err := c.admin.Runs().List(ctx, f)
+		if err != nil {
+			return err
+		}
+		for _, rec := range page {
+			fn(rec)
+		}
+		if len(page) < sweepPage {
+			return nil
+		}
+		f.Before = ports.CursorOf(page[len(page)-1])
 	}
-	return report, nil
 }
 
 func w(c *AgentCore) *WorkerAPI { return c.Worker }

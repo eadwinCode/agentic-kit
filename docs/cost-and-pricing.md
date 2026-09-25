@@ -65,10 +65,17 @@ pricing.amount(250_000) // 0.25
 pricing.format(250_000) // '0.2500 USD'
 ```
 
-Price in **one currency per deployment**. Totals are summed, never converted.
-If rows in two currencies do meet on one thread, a total is reported in the
-first currency seen and the rows in any other currency count as `unpriced`,
-so the figure stays a floor in one unit rather than a sum of two.
+Price in **one currency per deployment**. Money is summed, never converted:
+
+- **One run is one currency.** A call priced in a different currency from the
+  run's earlier calls is stored unpriced, with an error in the log, so a run's
+  bill always adds up.
+- **A total keeps each currency apart.** `costMicros` and `currency` are the
+  first currency seen; calls in any other currency are left out of
+  `costMicros` and counted in `unpriced`, so that figure stays a floor in one
+  unit. `costs` has one entry per currency, and each line says its
+  `currency`. A thread only sees two currencies when the pricer changed
+  between runs.
 
 ## The three pricers that ship
 
@@ -96,6 +103,12 @@ key with any `@variant` suffix removed — so `claude-sonnet-4@high` finds
 missing price shows up as a gap in the bill (`unpriced` above zero) rather than
 as free work.
 
+**A missing cache rate is priced as input.** Leave out `cacheReadPerMillion`
+or `cacheWritePerMillion` (or set it to 0) and those tokens are priced at
+`inputPerMillion`, with a warning logged once per model. Cache tokens are
+never free, and a list that forgot them must not bill them at 0. Set the real
+rate to bill them right.
+
 `reasoningPerMillion` defaults to zero deliberately. Most providers already
 count reasoning tokens inside the output count, so charging them again bills the
 same tokens twice. Set it only when your provider reports them separately.
@@ -114,6 +127,10 @@ const fromGateway = pricing.receipt((meta) => {
   return cents ? Math.round(Number(cents) * 10_000) : null; // null: no receipt here
 });
 ```
+
+A receipt is only believed when it makes sense: a finite number, 0 or more.
+Anything else (a negative number, `NaN`) is treated as no receipt, and the next
+pricer in a chain gets its turn. A fraction of a micro is rounded.
 
 ```go
 fromGateway := pricing.Receipt(func(meta map[string]any) (int64, bool) {
@@ -171,8 +188,9 @@ agent and model, which is the shape a bill wants:
   inputTokens: 1_240, cachedInputTokens: 8_000, outputTokens: 310, totalTokens: 9_550,
   costMicros: 12_500, currency: 'USD',
   unpriced: 0,          // calls with no cost: above zero, costMicros is a floor
+  costs: [{ currency: 'USD', costMicros: 12_500, calls: 5 }], // one per currency
   lines: [
-    { agentId: null, agentName: 'chat', model: 'gpt-4o', modelId: 'gpt-4o-2024-11-20',
+    { agentId: null, agentName: 'chat', model: 'gpt-4o', modelId: 'gpt-4o-2024-11-20', currency: 'USD',
       inputTokens: 1_000, cacheReadInputTokens: 8_000, cacheWriteInputTokens: 0,
       outputTokens: 250, reasoningTokens: 0,
       calls: 4, estimated: 0, costMicros: 10_000 },
@@ -184,29 +202,34 @@ agent and model, which is the shape a bill wants:
 `unpriced` is what tells "this thread spent nothing" apart from "nobody priced
 this thread". Do not read a zero cost as free work without checking it.
 
-A hook that bills from `RunFinishInfo.usage` has one more thing to check: in
-Go, `UsageErr` is set when the platform could not read the run's rows back,
-and `Usage` is then zero-valued. Refuse to settle in that case (return the
-error from `OnSettle`) rather than charging nothing; the run fails and can be
-retried instead of going free.
+A hook that bills from `RunFinishInfo.usage` has one more thing to check:
+`usageError` (Go: `UsageErr`) is set when the platform could not read the run's
+rows back, and `usage` is then zeroed. Refuse to settle in that case (throw
+from `onSettle`, or return the error from `OnSettle`) rather than charging
+nothing; the run stays unsettled and is settled again later instead of going
+free.
 
-The same totals reach you three other ways:
+The same totals reach you four other ways:
 
 - `getThreadUsage(threadId)` → `usage.tokens`, for a thread header.
 - `admin.getRun(runId)` → `detail.usage`, for spend per run.
-- a spec's `onFinish` → `info.usage`, for billing at settle time.
+- `admin.getThread(threadId)` → `detail.thread.tokens`, for spend per thread.
+  (A thread **list** carries tokens only, summed from the run records; its
+  money would need a read per thread.)
+- a spec's `onSettle` and `onFinish` → `info.usage`, for billing.
 
 ## Billing at settle time
 
-`onFinish` fires once, after the platform has finalized the run, with the whole
-run's bill already read back and grouped. A credit system charges straight off
-the lines:
+`onSettle` runs once per run, whatever way the run ends, with the whole run's
+bill already read back and grouped. See
+[Settling a run](./agents-and-tools.md#settling-a-run) for when it runs. A
+credit system charges straight off the lines:
 
 ```ts
 const chat = runtime.createStreamTextAgent({
   name: 'chat',
   model: 'gpt-4o',
-  onFinish: async (info) => {
+  onSettle: async (info) => {
     await credits.recordAndBill({
       idempotencyKey: info.runId!,          // at-least-once dispatch: be idempotent
       entries: info.usage.lines.map((line) => ({
@@ -224,7 +247,10 @@ const chat = runtime.createStreamTextAgent({
 ```
 
 ```go
-OnFinish: func(info agentenkit.RunFinishInfo) {
+OnSettle: func(ctx context.Context, info agentenkit.RunFinishInfo) error {
+    if info.UsageErr != nil {
+        return info.UsageErr // settle later rather than charge nothing
+    }
     entries := make([]port.AIUsageEntry, 0, len(info.Usage.Lines))
     for _, line := range info.Usage.Lines {
         cost := line.CostMicros
@@ -236,7 +262,7 @@ OnFinish: func(info agentenkit.RunFinishInfo) {
             CostMicros:            &cost,
         })
     }
-    _ = credits.RecordAndBill(ctx, port.AIUsageRecord{IdempotencyKey: info.RunID, Entries: entries})
+    return credits.RecordAndBill(ctx, port.AIUsageRecord{IdempotencyKey: info.RunID, Entries: entries})
 },
 ```
 
@@ -263,9 +289,11 @@ next one never starts. The platform then publishes `COST_BUDGET_EXHAUSTED`
 `stopReason: 'cost_budget'` — the same shape as the token cap. A money break is
 not a stop: the run **completes**, and says why.
 
-The check reads the run's spend back from the store rather than from a counter
-in the worker, so a run that parked and resumed in another process keeps the cap
-it started with, and a nested run's calls count against the same cap.
+Both caps count the **whole run**. Each segment starts its count from the
+run's usage rows — the steps before a park, before a retry, and the platform's
+own compaction calls — and then keeps it in memory, shared with nested runs. So
+a run that parks and resumes, in this process or another, never gets a fresh
+budget, and a nested run's calls count against the same cap.
 
 **It needs a pricer.** With none configured nothing is ever priced, so nothing
 is ever spent and the cap can never fire.

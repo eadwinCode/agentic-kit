@@ -108,6 +108,13 @@ export interface RunRecord {
   /** Milliseconds between enqueue and a worker starting work — the number that
    *  says whether workers are keeping up (§2.8). */
   queuedMs?: number | null;
+  /** When the spec's `onSettle` ran for this run (§5.6). A run settles exactly
+   *  once: whoever ends it, or the late-settle sweep. Unset until then. */
+  settledAt?: Date | null;
+  /** When a settle claimed the run and started its hook. Cleared when the
+   *  settle ends; one left behind for long is a settler that died, and the
+   *  next settle takes the run over. */
+  settlingAt?: Date | null;
   /** Loop iterations completed, summed across every segment of the run. */
   steps: number;
   inputTokens: number;
@@ -164,16 +171,32 @@ export interface UsageTotals {
   /** Summed cost in millionths of one `currency` unit: 1_000_000 is one
    *  dollar when the currency is USD. */
   costMicros: number;
-  /** The unit `costMicros` is in, absent when nothing was priced. One
-   *  deployment should price in ONE currency: these are summed, not
-   *  converted. */
+  /** The unit `costMicros` is in: the first currency priced, absent when
+   *  nothing was. Money is never converted, so a call priced in another
+   *  currency is left out of `costMicros` and counted in `unpriced`; `costs`
+   *  has every currency's own total. */
   currency?: string;
-  /** How many calls had no cost, because no pricer answered for them. Above
-   *  zero, `costMicros` is a floor and not the whole bill. */
+  /** How many calls `costMicros` leaves out: calls no pricer answered for,
+   *  and calls priced in another currency. Above zero, `costMicros` is a
+   *  floor and not the whole bill. */
   unpriced: number;
-  /** The same spend grouped by agent and model: one line per pair, which is
-   *  the shape a bill wants. Summing the lines gives the totals above. */
+  /** The money per currency, in the order each was first seen. One run is
+   *  only ever priced in one currency (a second one is refused when the call
+   *  is recorded), so a run's bill has at most one entry; a thread whose
+   *  pricer changed currency between runs can have more. */
+  costs?: CurrencyCost[];
+  /** The same spend grouped by agent, model and currency: one line per agent
+   *  and model, which is the shape a bill wants. Summing the lines of one
+   *  currency gives that currency's entry in `costs`. */
   lines: UsageLine[];
+}
+
+/** The money spent in one currency (§4). */
+export interface CurrencyCost {
+  currency: string;
+  costMicros: number;
+  /** How many calls were priced in this currency. */
+  calls: number;
 }
 
 /** One agent's spend on one model, summed over its calls (§4). This is the
@@ -185,6 +208,9 @@ export interface UsageLine {
   /** The registry key; `modelId` is the wire id it resolved to. */
   model?: string | null;
   modelId?: string | null;
+  /** The unit `costMicros` is in, absent when none of the line's calls was
+   *  priced. */
+  currency?: string;
   inputTokens: number;
   cacheReadInputTokens: number;
   cacheWriteInputTokens: number;

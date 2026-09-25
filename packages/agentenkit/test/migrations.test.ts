@@ -108,7 +108,7 @@ CREATE INDEX i ON a(id);
 
     const store = SqliteAdminStore.open(handle);
     expect(await store.steps.listByThread('t1')).toEqual([]);
-    expect(await versions(driver)).toEqual(['0001_init', '0002_run_settled_at', '0003_run_enqueued_at']);
+    expect(await versions(driver)).toEqual(['0001_init', '0002_run_settled_at', '0003_run_enqueued_at', '0004_run_settle_claim']);
   });
 
   it('surfaces a failed migration on the first call, not as an empty dashboard', async () => {

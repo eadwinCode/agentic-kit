@@ -7,7 +7,7 @@ import { systemCacheMessage } from './cache.js';
 import {
   fillTokens,
   providerMeta,
-  recordCall,
+  type RunLedger,
   type TokenAttribution,
 } from './usage.js';
 import { estimateTokens } from './context.js';
@@ -183,12 +183,7 @@ function capValue(value: unknown, limit: number): unknown {
   return json.length <= limit ? value : `${json.slice(0, limit)}…`;
 }
 
-/** Tokens a run has spent, main agent and nested runs together (§2.7). Shared
- *  by reference so a child's spend counts against the run's safety cap the
- *  moment it happens — a budget that ignores delegated work is not a budget. */
-export interface RunLedger {
-  tokensUsed: number;
-}
+export { RunLedger, seedRunLedger } from './usage.js';
 
 export interface LoopInput {
   /** Whose stream this loop persists to (§2.7). `null` is the main agent. */
@@ -343,10 +338,9 @@ export async function runLoop(
         lastInput || estimateTokens(input.messages),
       );
       if (cut.totalTokens > 0) {
-        const priced = await recordCall(deps, threadId, cut);
+        const priced = await ledger.record(deps, threadId, cut);
         addAttribution(attribution, priced);
         tokensUsed += priced.totalTokens;
-        ledger.tokensUsed += priced.totalTokens;
       }
       if (input.abortSignal.aborted) break; // user stop mid-step
       throw err; // real failure → §2.8 redrive policy
@@ -363,10 +357,9 @@ export async function runLoop(
         lastInput || estimateTokens(input.messages),
       );
       if (cut.totalTokens > 0) {
-        const priced = await recordCall(deps, threadId, cut);
+        const priced = await ledger.record(deps, threadId, cut);
         addAttribution(attribution, priced);
         tokensUsed += priced.totalTokens;
-        ledger.tokensUsed += priced.totalTokens;
       }
       if (!input.abortSignal.aborted) interrupted = true;
       break;
@@ -392,7 +385,7 @@ export async function runLoop(
     // holder may already be writing its own. The call itself did happen and
     // the provider billed it, so its usage is still recorded.
     if (input.fenced?.()) {
-      await recordCall(deps, threadId, stepUsage);
+      await ledger.record(deps, threadId, stepUsage);
       throw new RunLockLostError();
     }
 
@@ -417,6 +410,13 @@ export async function runLoop(
     }
     input.messages.push(...step.responseMessages);
 
+    // One priced usage row per model call (§4), booked on the run-wide ledger
+    // the caps are checked against (§2.7). Written as soon as the step's
+    // messages are, before anything else: a crash after this point resumes
+    // from the saved step and never runs the call again, so its row must
+    // already be there.
+    const priced = await ledger.record(deps, threadId, stepUsage);
+
     // A replay boundary (§2.2). Everything this step produced is now durable
     // history, so a reconnecting client must NOT also replay its chunks — it
     // would render the same text twice, once from the message and once from
@@ -430,14 +430,9 @@ export async function runLoop(
     // can be written: WAITING_FOR_INPUT and the approval requests.
     await input.commitParks?.();
 
-    // One priced usage row per model call (§4), then the same counters
-    // accumulated across the segment's steps and into the run-wide ledger the
-    // safety caps are checked against (§2.7).
-    const priced = await recordCall(deps, threadId, stepUsage);
     lastInput = priced.inputTokens;
     addAttribution(attribution, priced);
     tokensUsed += priced.totalTokens;
-    ledger.tokensUsed += priced.totalTokens;
     lastText = step.text ?? '';
     lastFinishReason = step.finishReason;
     stepsRun += 1;
@@ -496,33 +491,22 @@ export async function runLoop(
       break;
     }
 
-    // The money cap (§4), checked in the same place and the same way. It reads
-    // the run's spend back from the store rather than from a counter in this
-    // process: a run that parked and resumed in another worker must not get
-    // its cap reset, and a nested run's calls have to count against the same
-    // cap.
+    // The money cap (§4), checked in the same place and the same way, against
+    // the same shared ledger: a nested run's calls count against it, and a
+    // run that parked or retried starts from what it already spent (see
+    // seedRunLedger).
     //
     // It only ever sees priced calls: with no pricer configured nothing is
     // ever spent and the cap never fires.
-    if (input.costBudgetMicros) {
-      try {
-        const spent = await deps.storage.usage.total(threadId, { runId: input.billingRunId });
-        if (spent.costMicros >= input.costBudgetMicros) {
-          await publish(deps, threadId, 'COST_BUDGET_EXHAUSTED', {
-            agentId: input.agentId,
-            costMicros: spent.costMicros,
-            costBudgetMicros: input.costBudgetMicros,
-            currency: spent.currency,
-          });
-          costExhausted = true;
-          break;
-        }
-      } catch (err) {
-        (deps.log ?? console).error('cost budget not checked', {
-          run: input.billingRunId,
-          err,
-        });
-      }
+    if (input.costBudgetMicros && ledger.costMicros >= input.costBudgetMicros) {
+      await publish(deps, threadId, 'COST_BUDGET_EXHAUSTED', {
+        agentId: input.agentId,
+        costMicros: ledger.costMicros,
+        costBudgetMicros: input.costBudgetMicros,
+        ...(ledger.currency ? { currency: ledger.currency } : {}),
+      });
+      costExhausted = true;
+      break;
     }
 
     // 'tool-calls' → the SDK executed the step's tools; the loop feeds the

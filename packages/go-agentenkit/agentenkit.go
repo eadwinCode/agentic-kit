@@ -242,6 +242,9 @@ const (
 	OutcomeStale        = core.OutcomeStale
 	OutcomeLockLost     = core.OutcomeLockLost
 
+	// SettleClaimTTL is how long a settle claim holds (§5.6).
+	SettleClaimTTL = core.SettleClaimTTL
+
 	HITLParked          = core.HITLParked
 	ReasonApproval      = core.ReasonApproval
 	HITLTTL             = core.HITLTTL

@@ -11,7 +11,11 @@ import type {
   RuntimePorts,
   ThreadSnapshot,
 } from './ports/runtime.js';
-import type { ThreadUsage } from './ports/runtime.js';
+import type { ReclaimReport, ThreadUsage } from './ports/runtime.js';
+import type { RunFilter } from './ports/admin.js';
+import type { RunRecord } from './core/types.js';
+import type { RegisteredAgent } from './core/agent.js';
+import { settleLate } from './core/settle.js';
 import { contextUsage } from './core/context.js';
 import { createGenerateTextAgent, createStreamTextAgent } from './core/agent.js';
 import * as adminReads from './core/admin.js';
@@ -61,6 +65,9 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
 
   // Handle registry — keyed by spec.name, resolved by the queue dispatch.
   const registry = new Map<string, AgentHandle>();
+  // The same agents as the engine sees them: what a stop or the sweep needs
+  // to settle a run by the agent name on its record (§5.6).
+  const agents = new Map<string, RegisteredAgent>();
   // The first registered stream-text handle is the default for jobs that
   // omit `agent` (§5).
   let defaultAgent: string | null = null;
@@ -72,10 +79,23 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
   ): AgentHandle => {
     const handle: AgentHandle =
       kind === 'stream-text'
-        ? createStreamTextAgent(scope, spec)
-        : createGenerateTextAgent(scope, spec);
+        ? createStreamTextAgent(scope, spec, agents)
+        : createGenerateTextAgent(scope, spec, agents);
     registry.set(name, handle);
     return handle;
+  };
+
+  /** Call `fn` for every run the filter matches, a page at a time. */
+  const SWEEP_PAGE = 500;
+  const eachRun = async (filter: RunFilter, fn: (rec: RunRecord) => Promise<void>) => {
+    let before: RunFilter['before'];
+    for (;;) {
+      const page = await deps.admin.runs.list({ ...filter, ...(before ? { before } : {}), limit: SWEEP_PAGE });
+      for (const rec of page) await fn(rec);
+      if (page.length < SWEEP_PAGE) return;
+      const last = page[page.length - 1]!;
+      before = { startedAt: last.startedAt, id: last.id };
+    }
   };
 
   const core: AgentCore = {
@@ -205,6 +225,35 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
     createGenerateTextAgent: (spec) => register(spec.name, 'generate-text', spec),
 
     getAgent: (name: string) => registry.get(name) ?? null,
+
+    reclaimStuckRuns: async (olderThanMs: number): Promise<ReclaimReport> => {
+      const report: ReclaimReport = { checked: 0, redispatched: 0, settled: 0, errors: 0 };
+      const until = new Date(Date.now() - olderThanMs);
+      const log = deps.log ?? console;
+      await eachRun({ state: ['QUEUED', 'RUNNING'], until, depth: 0 }, async (rec) => {
+        if (rec.endedAt) return;
+        report.checked++;
+        try {
+          if (await reclaimIfOrphaned(scope(rec.runState ?? {}, rec.id), rec.threadId)) report.redispatched++;
+        } catch (err) {
+          report.errors++;
+          log.error('stuck run not reclaimed', { threadId: rec.threadId, runId: rec.id, err });
+        }
+      });
+      await eachRun({ unsettled: true, until, depth: 0 }, async (rec) => {
+        if (!rec.endedAt || rec.endedAt > until) return;
+        report.checked++;
+        const agent = agents.get(rec.agent) ?? (defaultAgent ? agents.get(defaultAgent) : undefined);
+        if (!agent) return;
+        try {
+          if (await settleLate(scope(rec.runState ?? {}, rec.id), agent, rec.threadId, rec.id)) report.settled++;
+        } catch (err) {
+          report.errors++;
+          log.error('unsettled run not settled', { threadId: rec.threadId, runId: rec.id, err });
+        }
+      });
+      return report;
+    },
 
     worker: {
       handleJob: async (job: RunJob) => {

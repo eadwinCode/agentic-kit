@@ -42,6 +42,16 @@ type RunStore interface {
 	ListByThread(ctx context.Context, threadID string) ([]RunRecord, error)
 	List(ctx context.Context, f RunFilter) ([]RunRecord, error)
 	CountByState(ctx context.Context) (map[ExecutionState]int, error)
+	// ClaimSettle claims the right to run a run's settle hook (§5.6), in one
+	// conditional write: it wins only while the run is not settled and no
+	// other claim on it is newer than staleBefore. A claim older than that
+	// belongs to a settler that died, and is taken over. Returns false when
+	// the run is unknown, settled, or claimed by someone else.
+	ClaimSettle(ctx context.Context, runID, token string, staleBefore time.Time) (bool, error)
+	// EndSettle ends a claim made with token. settled marks the run settled
+	// for good; otherwise the claim is dropped so a later settle can run
+	// the hook again. A claim that was taken over is left alone.
+	EndSettle(ctx context.Context, runID, token string, settled bool) error
 }
 
 // StepStore holds one row per completed loop iteration.
@@ -140,6 +150,25 @@ type RunFilter struct {
 	ThreadID string
 	Since    *time.Time
 	Until    *time.Time
+	// Unsettled keeps only runs that have ended and whose settle has not
+	// run (§5.6): what the late-settle sweep looks for.
+	Unsettled bool
+	// Depth keeps only runs at this depth: 0 is a dispatched run. Nil is
+	// every depth.
+	Depth *int
+	// Before pages through a listing: only runs that sort after this one,
+	// newest first by start time and then by id. Pass the last run of the
+	// previous page.
+	Before *RunCursor
 	// Limit: newest first. Implementations cap this; core passes a bounded value.
 	Limit int
 }
+
+// RunCursor is a place in a run listing (see RunFilter.Before).
+type RunCursor struct {
+	StartedAt time.Time
+	ID        string
+}
+
+// CursorOf is the cursor just after a run in a listing.
+func CursorOf(r RunRecord) *RunCursor { return &RunCursor{StartedAt: r.StartedAt, ID: r.ID} }

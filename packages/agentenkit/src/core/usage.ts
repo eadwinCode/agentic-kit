@@ -1,4 +1,4 @@
-import type { NewUsage, UsageTotals } from './types.js';
+import type { NewUsage, UsageLine, UsageTotals } from './types.js';
 import type { RuntimePorts } from '../ports/runtime.js';
 
 /** Token attribution (§4): the four canonical counters. Same shape as
@@ -66,13 +66,14 @@ export function attributeTokens(
   const inputTokens =
     openaiCached > 0 ? Math.max(0, reportedInput - openaiCached) : reportedInput;
 
-  const totalFromProvider = pick(u.totalTokens);
-  const summed = inputTokens + cachedInputTokens + outputTokens;
+  // Always the sum, never the provider's own total: Anthropic's leaves the
+  // cache reads out, so trusting it would make the same count mean different
+  // things per provider. The Go runtime computes it the same way.
   return {
     inputTokens,
     cachedInputTokens,
     outputTokens,
-    totalTokens: totalFromProvider > 0 ? totalFromProvider : summed,
+    totalTokens: inputTokens + cachedInputTokens + outputTokens,
   };
 }
 
@@ -156,26 +157,93 @@ export function providerMeta(
  *  the run: a bill that is short a line is recoverable, a run that died over a
  *  price list is not. Storage failures are logged for the same reason — the
  *  tokens of a stopped run were still spent. */
+//
+// A run's own calls go through its RunLedger.record instead, which also holds
+// the run to one currency and books the spend against its caps.
 export async function recordCall(
   deps: RuntimePorts,
   threadId: string,
   usage: NewUsage,
 ): Promise<NewUsage> {
-  const log = deps.log ?? console;
+  const priced = await price(deps, usage);
+  await store(deps, threadId, priced);
+  return priced;
+}
+
+/** Put the pricer's cost on a usage row, leaving it unpriced when the pricer
+ *  fails or has nothing to say. */
+async function price(deps: RuntimePorts, usage: NewUsage): Promise<NewUsage> {
   const priced = { ...usage };
   if (deps.pricer && !priced.cost) {
     try {
       priced.cost = (await deps.pricer.price(priced)) ?? null;
     } catch (err) {
-      log.error('usage not priced', { run: priced.runId, model: priced.model, err });
+      (deps.log ?? console).error('usage not priced', { run: priced.runId, model: priced.model, err });
     }
   }
-  try {
-    await deps.storage.usage.record(threadId, priced);
-  } catch (err) {
-    log.error('usage not recorded', { run: priced.runId, thread: threadId, err });
-  }
   return priced;
+}
+
+/** Write a usage row. A failure is logged, not thrown: the tokens of a
+ *  stopped run were still spent. */
+async function store(deps: RuntimePorts, threadId: string, usage: NewUsage): Promise<void> {
+  try {
+    await deps.storage.usage.record(threadId, usage);
+  } catch (err) {
+    (deps.log ?? console).error('usage not recorded', { run: usage.runId, thread: threadId, err });
+  }
+}
+
+/** What a run has spent, main agent and nested runs together (§2.7): its
+ *  tokens, its money and the one currency that money is in. Shared by
+ *  reference so a child's spend counts against the run's caps the moment it
+ *  happens — a budget that ignores delegated work is not a budget.
+ *
+ *  A run's ledger starts from what the run already spent (`seedRunLedger`):
+ *  its earlier segments, before a park or a retry, count against the same
+ *  caps. After that it is kept in memory, so the caps are checked without
+ *  reading every usage row back after every step. */
+export class RunLedger {
+  tokensUsed = 0;
+  costMicros = 0;
+  currency: string | undefined;
+
+  /** Price one call, store its row and book it (§4). A run is priced in one
+   *  currency: a call priced in another is stored unpriced, with an error
+   *  logged, rather than mixed into a bill that cannot add it up. */
+  async record(deps: RuntimePorts, threadId: string, usage: NewUsage): Promise<NewUsage> {
+    const priced = await price(deps, usage);
+    if (priced.cost) {
+      this.currency ??= priced.cost.currency;
+      if (priced.cost.currency !== this.currency) {
+        (deps.log ?? console).error('usage priced in a second currency; stored unpriced', {
+          run: priced.runId, model: priced.model, currency: priced.cost.currency, runCurrency: this.currency,
+        });
+        priced.cost = null;
+      }
+    }
+    await store(deps, threadId, priced);
+    this.tokensUsed += priced.totalTokens;
+    if (priced.cost) this.costMicros += priced.cost.micros;
+    return priced;
+  }
+}
+
+/** Start a ledger from the run's usage rows (§4). A failed read is logged and
+ *  the ledger starts from zero: a run is not failed over its caps'
+ *  bookkeeping. */
+export async function seedRunLedger(deps: RuntimePorts, threadId: string, runId?: string): Promise<RunLedger> {
+  const ledger = new RunLedger();
+  if (!runId) return ledger;
+  try {
+    const spent = await deps.storage.usage.total(threadId, { runId });
+    ledger.tokensUsed = spent.totalTokens;
+    ledger.costMicros = spent.costMicros;
+    ledger.currency = spent.currency;
+  } catch (err) {
+    (deps.log ?? console).error('run spend not read; the caps count from zero this segment', { run: runId, err });
+  }
+  return ledger;
 }
 
 
@@ -190,51 +258,122 @@ export const emptyTotals = (): UsageTotals => ({
   lines: [],
 });
 
+/** One grouped row, as a SQL adapter reads it: a line, the currency its
+ *  cost is in, its summed total tokens and how many of its calls were
+ *  unpriced. */
+export interface UsageGroup {
+  line: UsageLine;
+  currency?: string | null;
+  totalTokens: number;
+  unpriced: number;
+}
+
+/** Rebuilds UsageTotals from grouped rows that a SQL adapter read GROUP BY
+ *  agent, model AND currency. Grouping by currency is what keeps a sum honest;
+ *  merging here is what keeps one agent's spend on one model a single line.
+ *
+ *  The rules, the same in every adapter and in the Go runtime: `costMicros`
+ *  is summed in the first currency seen, and a group priced in another
+ *  currency counts as unpriced there instead of being added. `costs` keeps
+ *  every currency's own total. A line takes the currency of the first priced
+ *  group on it; a group priced in a different currency gets a line of its
+ *  own, and unpriced groups join the first line of their agent and model. */
+export class UsageMerger {
+  private readonly out = emptyTotals();
+  private readonly lines = new Map<string, number[]>();
+  private readonly costs = new Map<string, number>();
+
+  add(g: UsageGroup): void {
+    const out = this.out;
+    const l: UsageLine = { ...g.line };
+    const currency = g.currency || '';
+    out.inputTokens += l.inputTokens;
+    out.cachedInputTokens += l.cacheReadInputTokens;
+    out.outputTokens += l.outputTokens;
+    out.totalTokens += g.totalTokens;
+    out.unpriced += g.unpriced;
+
+    if (!currency) {
+      l.costMicros = 0;
+      delete l.currency;
+    } else {
+      const priced = l.calls - g.unpriced;
+      out.costs ??= [];
+      let i = this.costs.get(currency);
+      if (i === undefined) {
+        i = out.costs.length;
+        this.costs.set(currency, i);
+        out.costs.push({ currency, costMicros: 0, calls: 0 });
+      }
+      out.costs[i]!.costMicros += l.costMicros;
+      out.costs[i]!.calls += priced;
+      out.currency ??= currency;
+      if (currency === out.currency) {
+        out.costMicros += l.costMicros;
+      } else {
+        // Another unit: it cannot be added to costMicros, so its calls count
+        // as unpriced there and costMicros stays a floor.
+        out.unpriced += priced;
+      }
+      l.currency = currency;
+    }
+
+    const key = [l.agentId ?? '', l.agentName ?? '', l.model ?? '', l.modelId ?? ''].join('\u0000');
+    const at = (this.lines.get(key) ?? []).find((i) => {
+      const c = out.lines[i]!.currency ?? '';
+      return !currency || c === currency || c === '';
+    });
+    if (at === undefined) {
+      this.lines.set(key, [...(this.lines.get(key) ?? []), out.lines.length]);
+      out.lines.push(l);
+      return;
+    }
+    const line = out.lines[at]!;
+    if (!line.currency && currency) line.currency = currency;
+    line.inputTokens += l.inputTokens;
+    line.cacheReadInputTokens += l.cacheReadInputTokens;
+    line.cacheWriteInputTokens += l.cacheWriteInputTokens;
+    line.outputTokens += l.outputTokens;
+    line.reasoningTokens += l.reasoningTokens;
+    line.calls += l.calls;
+    line.estimated += l.estimated;
+    line.costMicros += l.costMicros;
+  }
+
+  totals(): UsageTotals {
+    return this.out;
+  }
+}
+
 /** Sum usage rows into the shape `total` must return: the four counters, the
  *  money, and one line per agent and model.
  *
- *  A storage adapter that can group in the database should do that instead.
- *  This is for the ones that cannot, and for anyone writing their own adapter:
- *  feed every matching row through it and you get exactly what the port
- *  promises, lines in first-seen order. */
+ *  A storage adapter that can group in the database should do that instead
+ *  (see UsageMerger). This is for the ones that cannot, and for anyone writing
+ *  their own adapter: feed every matching row through it and you get exactly
+ *  what the port promises, lines in first-seen order. */
 export function sumUsage(rows: Iterable<NewUsage>): UsageTotals {
-  const out = emptyTotals();
-  const index = new Map<string, number>();
+  const merge = new UsageMerger();
   for (const u of rows) {
-    out.inputTokens += u.inputTokens;
-    out.cachedInputTokens += u.cacheReadInputTokens;
-    out.outputTokens += u.outputTokens;
-    out.totalTokens += u.totalTokens;
-    if (u.cost) {
-      out.costMicros += u.cost.micros;
-      out.currency ??= u.cost.currency;
-    } else {
-      out.unpriced += 1;
-    }
-
-    const key = [u.agentId ?? '', u.agentName ?? '', u.model ?? '', u.modelId ?? ''].join('\u0000');
-    let i = index.get(key);
-    if (i === undefined) {
-      i = out.lines.length;
-      index.set(key, i);
-      out.lines.push({
+    merge.add({
+      line: {
         agentId: u.agentId ?? null,
         agentName: u.agentName ?? null,
         model: u.model ?? null,
         modelId: u.modelId ?? null,
-        inputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0,
-        outputTokens: 0, reasoningTokens: 0, calls: 0, estimated: 0, costMicros: 0,
-      });
-    }
-    const line = out.lines[i]!;
-    line.inputTokens += u.inputTokens;
-    line.cacheReadInputTokens += u.cacheReadInputTokens;
-    line.cacheWriteInputTokens += u.cacheWriteInputTokens;
-    line.outputTokens += u.outputTokens;
-    line.reasoningTokens += u.reasoningTokens;
-    line.calls += 1;
-    if (u.estimated) line.estimated += 1;
-    if (u.cost) line.costMicros += u.cost.micros;
+        inputTokens: u.inputTokens,
+        cacheReadInputTokens: u.cacheReadInputTokens,
+        cacheWriteInputTokens: u.cacheWriteInputTokens,
+        outputTokens: u.outputTokens,
+        reasoningTokens: u.reasoningTokens,
+        calls: 1,
+        estimated: u.estimated ? 1 : 0,
+        costMicros: u.cost?.micros ?? 0,
+      },
+      currency: u.cost?.currency ?? null,
+      totalTokens: u.totalTokens,
+      unpriced: u.cost ? 0 : 1,
+    });
   }
-  return out;
+  return merge.totals();
 }

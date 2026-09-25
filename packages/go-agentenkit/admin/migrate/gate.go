@@ -129,6 +129,18 @@ func (r gatedRuns) Patch(ctx context.Context, runID string, p ports.RunPatch) er
 	}
 	return r.inner.Patch(ctx, runID, p)
 }
+func (r gatedRuns) ClaimSettle(ctx context.Context, runID, token string, staleBefore time.Time) (bool, error) {
+	if err := r.gate.Wait(ctx); err != nil {
+		return false, err
+	}
+	return r.inner.ClaimSettle(ctx, runID, token, staleBefore)
+}
+func (r gatedRuns) EndSettle(ctx context.Context, runID, token string, settled bool) error {
+	if err := r.gate.Wait(ctx); err != nil {
+		return err
+	}
+	return r.inner.EndSettle(ctx, runID, token, settled)
+}
 func (r gatedRuns) Get(ctx context.Context, runID string) (*ports.RunRecord, error) {
 	if err := r.gate.Wait(ctx); err != nil {
 		return nil, err

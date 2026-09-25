@@ -21,8 +21,9 @@ import { ACTIVE_STATES, publish, publishEvent, runStatePayload, transition, with
 import { closeNested, RunSlots, runNestedAgent, spawnSubagentTool, type SubagentCtx } from './subagent.js';
 import { attemptsKey, COUNTER_TTL_SECONDS, counterScope, redriveKey, runIdKey } from './keys.js';
 import { withRunState, type AgentRunState } from './state.js';
-import { runLoop, type RunLedger } from './loop.js';
+import { runLoop, seedRunLedger, type LoopOutcome } from './loop.js';
 import { enqueueJob, Lease, parseLockValue, runLockKey, RunLockLostError } from './lease.js';
+import { callOnFinish, isTerminal, runBill, settleEndedRun, settleRun } from './settle.js';
 
 export { countTokens } from './usage.js';
 // executeStep and the loop live in ./loop.js so a nested run can share them
@@ -284,13 +285,30 @@ export async function closeIfOpen(
  *  never what. */
 async function failRun(
   deps: RuntimePorts,
+  agent: RegisteredAgent | null,
   threadId: string,
   runId: string | undefined,
   error: string,
 ): Promise<void> {
+  // A failed run still spent money on the steps it did make (§4), so it
+  // settles like any other end. Settled even with no hook, so the late sweep
+  // does not keep coming back to it.
+  const bill = await runBill(deps, threadId, runId);
+  const info: RunFinishInfo = {
+    threadId, ...(runId ? { runId } : {}), state: 'FAILED', stopReason: 'failed', cancelled: false, error,
+    tokensUsed: bill.usage.totalTokens,
+    attribution: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    steps: 0,
+    usage: bill.usage,
+    ...(bill.error !== undefined ? { usageError: bill.error } : {}),
+  };
+  const { reached } = await settleRun(deps, agent, info);
   // Only while the thread is still this run's and still going: a stop or a
   // newer run that got there first keeps its own ending (§3.4).
-  if (!(await transition(deps, threadId, { from: ACTIVE_STATES, to: 'FAILED', runId }))) return;
+  if (!(await transition(deps, threadId, { from: ACTIVE_STATES, to: 'FAILED', runId }))) {
+    (deps.log ?? console).error('run not failed: the thread has moved on', { threadId, runId, reason: error });
+    return;
+  }
   let endedAt = new Date();
   if (runId) {
     endedAt = await closeRunRecord(deps, runId, {
@@ -305,6 +323,33 @@ async function failRun(
   await publish(deps, threadId, 'STATE_CHANGE', {
     state: 'FAILED', stopReason: 'failed', error, endedAt, ...(runId ? { runId } : {}),
   });
+  // onFinish fires on every end, a failure included, once.
+  if (reached) await callOnFinish(deps, agent, info);
+}
+
+/** Whether this run already made its last step in an earlier delivery
+ *  (§2.8): a worker saved the step that answered, then died before the run
+ *  ended. Every run appends its own user turn when it is dispatched, so a
+ *  main-agent history that ends in an assistant message with no tool calls can
+ *  only be this run's answer. A run already settled is finished too. The text
+ *  is that answer, for a generate-text run's result. */
+async function finishedEarlier(
+  deps: RuntimePorts,
+  threadId: string,
+  runId?: string,
+): Promise<{ done: boolean; text: string }> {
+  const no = { done: false, text: '' };
+  if (!runId) return no;
+  const rec = await deps.admin.runs.get(runId).catch(() => null);
+  const settled = !!rec?.settledAt;
+  const messages = await deps.storage.messages.list(threadId, { agentId: null }).catch(() => null);
+  const last = messages?.at(-1);
+  if (!last || last.role !== 'assistant') return { done: settled, text: '' };
+  const parts: any[] = typeof last.content === 'string'
+    ? [{ type: 'text', text: last.content }]
+    : Array.isArray(last.content) ? last.content : [];
+  if (parts.some((p) => p?.type === 'tool-call')) return { done: settled, text: '' }; // the loop was not done
+  return { done: true, text: parts.filter((p) => p?.type === 'text').map((p) => p.text ?? '').join('') };
 }
 
 /** Resolve every parked request at segment start (§2.5, §2.7) and flip the
@@ -475,11 +520,11 @@ export async function execute(
         await closeIfOpen(deps, runId, 'orphaned');
         return 'executed';
       }
-      if (
-        durable.state === 'CANCELLED' ||
-        durable.state === 'COMPLETED' ||
-        durable.state === 'FAILED'
-      ) {
+      if (isTerminal(durable.state)) {
+        // A stop ended this run before any worker got to it, or while a worker
+        // was between segments; or the run ended and its settle never landed.
+        // Whoever holds the lock settles it, once.
+        await settleEndedRun(deps, agent, threadId, runId);
         return 'executed';
       }
 
@@ -498,8 +543,10 @@ export async function execute(
       };
 
       // One ledger for the whole run: a nested run's spend counts against the
-      // same safety cap the main agent is checked against (§2.7).
-      const ledger: RunLedger = { tokensUsed: 0 };
+      // same caps the main agent is checked against (§2.7), and it starts from
+      // what the run spent before a park or a retry, so no segment gets a
+      // fresh budget.
+      const ledger = await seedRunLedger(deps, threadId, runId);
 
       // Pickup (§2.8): the run has a worker now. A QUEUED thread becomes
       // RUNNING on every home, its record takes the moment work started, and
@@ -610,65 +657,84 @@ export async function execute(
         }
       }
 
-      // Durable compaction pass — history always fits the model budget (§2.6);
-      // the budget uses the resolved model's contextWindow (§3.3)
-      const history = await compactContext(deps, threadId, input.model, {
-        runId,
-        abortSignal: abort.signal,
-      });
-      const model = deps.resolveModel(input.model);
-
-      // Prompt caching (§2.6): stamp the stable prefix once — appended step
-      // messages extend the prompt without invalidating the breakpoints.
-      let messages = repairDanglingToolCalls(promptMessages(history) as any[]);
-      if (deps.config.promptCaching) {
-        messages = markPromptCaching(messages);
-      }
-
       const userArgs = agent.args as Record<string, any>;
 
-      const loop = await runLoop(
-        deps,
-        agent,
-        threadId,
-        {
-          agentId: null, // the main agent's stream (§2.7)
+      // A retry after the run's last step was already saved (§2.8): the worker
+      // died between that step and the end of the run. The answer is in the
+      // history, so the run is finalized from it rather than asking the model
+      // again, which would answer twice. The same when the run already settled.
+      let loop: LoopOutcome;
+      const earlier = await finishedEarlier(deps, threadId, runId);
+      if (earlier.done) {
+        // The Logger port only promises `error`; this is not one.
+        ((deps.log ?? console) as { info?: (m: string, ...r: unknown[]) => void }).info?.(
+          'run already made its last step; finalized without calling the model again', { threadId, runId },
+        );
+        loop = {
+          text: earlier.text, finishReason: 'stop',
+          attribution: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          tokensUsed: 0, parked: false, aborted: false, interrupted: false, steps: 0, costExhausted: false,
+        };
+      } else {
+        // Durable compaction pass — history always fits the model budget (§2.6);
+        // the budget uses the resolved model's contextWindow (§3.3)
+        const history = await compactContext(deps, threadId, input.model, {
           runId,
-          kind: agent.kind,
-          model: model.instance(),
-          messages,
-          tools,
-          maxSteps: deps.config.maxSteps,
           abortSignal: abort.signal,
-          providerOptions,
-          tokenBudget,
-          costBudgetMicros: costBudget,
-          billingRunId: runId,
-          modelKey: input.model,
-          modelId: wireId(model, input.model),
-          agentName: agent.name,
-          cacheSystemPrompt: deps.config.promptCaching,
-          fenced: () => lease.lost,
-          commitParks: () => commitParks(deps, parks),
-          // One canonical path for every client: durable log + live Pub/Sub
-          // (§2.1, §2.2), with token deltas merged (see ChunkBatcher).
-          publishChunk: async (chunk) => {
-            await publish(deps, threadId, 'CHUNK', chunk);
-          },
-          toolErrors,
-          onChunk: async (chunk) => {
-            userArgs.onChunk?.({ chunk }); // the user callback sees every raw chunk
-          },
-        },
-        ledger,
-      );
+          ledger,
+        });
+        const model = deps.resolveModel(input.model);
 
-      // A lost lock aborts the run the way a stop does, but it is not a stop:
-      // another worker may own the thread now, so nothing below may write.
-      if (lease.lost) return 'lock-lost';
-      // The stream ended with no finish and no error: the step was not
-      // completed, so it goes to the retry policy rather than finalizing.
-      if (loop.interrupted) throw new Error(`step ${loop.steps + 1} ended without a finish`);
+        // Prompt caching (§2.6): stamp the stable prefix once — appended step
+        // messages extend the prompt without invalidating the breakpoints.
+        let messages = repairDanglingToolCalls(promptMessages(history) as any[]);
+        if (deps.config.promptCaching) {
+          messages = markPromptCaching(messages);
+        }
+
+        loop = await runLoop(
+          deps,
+          agent,
+          threadId,
+          {
+            agentId: null, // the main agent's stream (§2.7)
+            runId,
+            kind: agent.kind,
+            model: model.instance(),
+            messages,
+            tools,
+            maxSteps: deps.config.maxSteps,
+            abortSignal: abort.signal,
+            providerOptions,
+            tokenBudget,
+            costBudgetMicros: costBudget,
+            billingRunId: runId,
+            modelKey: input.model,
+            modelId: wireId(model, input.model),
+            agentName: agent.name,
+            cacheSystemPrompt: deps.config.promptCaching,
+            fenced: () => lease.lost,
+            commitParks: () => commitParks(deps, parks),
+            // One canonical path for every client: durable log + live Pub/Sub
+            // (§2.1, §2.2), with token deltas merged (see ChunkBatcher).
+            publishChunk: async (chunk) => {
+              await publish(deps, threadId, 'CHUNK', chunk);
+            },
+            toolErrors,
+            onChunk: async (chunk) => {
+              userArgs.onChunk?.({ chunk }); // the user callback sees every raw chunk
+            },
+          },
+          ledger,
+        );
+
+        // A lost lock aborts the run the way a stop does, but it is not a stop:
+        // another worker may own the thread now, so nothing below may write.
+        if (lease.lost) return 'lock-lost';
+        // The stream ended with no finish and no error: the step was not
+        // completed, so it goes to the retry policy rather than finalizing.
+        if (loop.interrupted) throw new Error(`step ${loop.steps + 1} ended without a finish`);
+      }
 
       const { attribution, parked } = loop;
       const tokensUsed = ledger.tokensUsed;
@@ -705,7 +771,28 @@ export async function execute(
               ? 'max_steps' // step ceiling hit (§2.1)
               : 'completed';
 
-      const state = abort.signal.aborted ? 'CANCELLED' : 'COMPLETED';
+      let state: ExecutionState = abort.signal.aborted ? 'CANCELLED' : 'COMPLETED';
+      let error: string | undefined;
+      // The caller settles BEFORE the terminal state lands (§5.6): what the run
+      // produced is committed by the time any client sees it end. A settle
+      // failure is a run failure. A stop reaches the hook with `cancelled`
+      // set. The whole run's bill, read back from the rows the loop wrote
+      // (§4): every segment and every nested run, priced and grouped into
+      // lines, so a settle hook charges in one pass without keeping its own
+      // tally. Read once, handed to both hooks; a failed read is reported,
+      // not hidden.
+      const bill = await runBill(deps, threadId, runId);
+      const info = (): RunFinishInfo => ({
+        threadId, ...(runId ? { runId } : {}), state, stopReason,
+        cancelled: state === 'CANCELLED', ...(error ? { error } : {}),
+        tokensUsed, attribution, steps: loop.steps,
+        usage: bill.usage, ...(bill.error !== undefined ? { usageError: bill.error } : {}),
+      });
+      const settled = await settleRun(deps, agent, info());
+      if (settled.error !== undefined && state !== 'CANCELLED') {
+        state = 'FAILED';
+        error = settled.error instanceof Error ? settled.error.message : String(settled.error);
+      }
       await finalize(deps, agent, threadId, {
         state,
         stopReason,
@@ -714,29 +801,9 @@ export async function execute(
         oneShotText: agent.kind === 'generate-text' ? lastText : undefined,
         runId,
         steps: loop.steps,
+        ...(error ? { error } : {}),
       });
-
-      if (typeof userArgs.onFinish === 'function') {
-        // The whole run's bill, read back from the rows the loop wrote (§4):
-        // every segment and every nested run, priced and grouped into lines, so
-        // a settle hook charges in one pass without keeping its own tally.
-        // The run is already finalized: a callback that throws is the
-        // caller's bug to see in the log, not a reason to fail a finished run.
-        try {
-          await userArgs.onFinish({
-            threadId,
-            runId,
-            state,
-            stopReason,
-            tokensUsed,
-            attribution,
-            steps: loop.steps,
-            usage: await runBill(deps, threadId, runId),
-          } satisfies RunFinishInfo);
-        } catch (err) {
-          (deps.log ?? console).error('onFinish threw', { runId, err: String(err) });
-        }
-      }
+      await callOnFinish(deps, agent, info());
 
       return 'executed';
     } catch (err) {
@@ -845,15 +912,34 @@ async function redriveOnLockConflict(
   maxAttempts: number,
 ): Promise<void> {
   if (!input.runId) return; // legacy dispatch, no identity — old drop behavior
-  // A thread that has ended has nothing left for this job, whoever holds the
-  // lock: redriving it would only fail the ended run again.
+  const log = deps.log ?? console;
+  const holderValue = await deps.kv.get(runLockKey(input.threadId));
+  const held = holderValue !== null && holderValue !== undefined;
+  const holder = parseLockValue(holderValue);
   const durable = await deps.storage.threads.get(input.threadId);
-  const state = durable?.state;
-  if (!durable || state === 'CANCELLED' || state === 'COMPLETED' || state === 'FAILED') return;
-  const holder = parseLockValue(await deps.kv.get(runLockKey(input.threadId)));
-  if (holder.runId === input.runId) {
+  if (held && holder.runId !== input.runId && durable && isTerminal(durable.state)) {
+    // The thread has ended: this job has nothing left to do, whoever holds
+    // the lock. Redriving it would only fail the ended run again.
+    return;
+  }
+  if (held && holder.runId === input.runId) {
     if (holder.dispatchId !== null && holder.dispatchId === input.dispatchId) return; // the same job, twice
-    if (state !== 'WAITING_FOR_INPUT' && (holder.dispatchId === null || !input.dispatchId)) {
+    if (!durable || durable.state === 'WAITING_FOR_INPUT') {
+      // fall through to the redrive below
+    } else if (isTerminal(durable.state)) {
+      // The run ended under a held lock. When its settle has not run, this
+      // job is the last chance to settle it, so it comes back once the lock
+      // has surely cleared.
+      const rec = await deps.admin.runs.get(input.runId).catch(() => null);
+      if (rec && !rec.settledAt) {
+        ((log as { info?: (m: string, ...r: unknown[]) => void }).info)?.(
+          'run ended under a held lock and is not settled; settle retried once the lock clears',
+          { threadId: input.threadId, runId: input.runId },
+        );
+        await enqueueJob(deps, jobOf(agent, input), { delaySeconds: deps.config.runLockLeaseSeconds });
+      }
+      return;
+    } else if (holder.dispatchId === null || !input.dispatchId) {
       // A lock or a job from before dispatch ids: the two deliveries cannot be
       // told apart, so the old rule stands — a duplicate of a running segment.
       return;
@@ -866,27 +952,11 @@ async function redriveOnLockConflict(
   const tries = await deps.kv.incrWithExpiry(redriveKey(scope), COUNTER_TTL_SECONDS);
   const { delaySeconds, waitedSeconds } = redriveDelay(deps, tries);
   if (tries <= maxAttempts || waitedSeconds < deps.config.runLockLeaseSeconds) {
-    return enqueueJob(
-      deps,
-      {
-        threadId: input.threadId,
-        runId: input.runId,
-        enqueuedAt: Date.now(),
-        model: input.model,
-        agent: agent.name,
-        tokenBudget: input.tokenBudget,
-        // A redrive is the SAME run trying again, so it keeps the caps it was
-        // dispatched with — a retry that lost its money cap would be unbounded.
-        costBudgetMicros: input.costBudgetMicros,
-        providerOptions: input.providerOptions,
-        state: input.state,
-      },
-      { delaySeconds },
-    );
+    return enqueueJob(deps, jobOf(agent, input), { delaySeconds });
   }
 
   await deps.kv.del(redriveKey(scope));
-  await failRun(deps, input.threadId, input.runId, 'the run lock never cleared');
+  await failRun(deps, agent, input.threadId, input.runId, 'the run lock never cleared');
 }
 
 /** How long the given try waits (`runRedriveDelaySeconds`, doubled on each
@@ -957,6 +1027,7 @@ export async function executeWithPolicy(
     log.error('run failed; attempts spent', { threadId: input.threadId, runId: input.runId, err: String(err), attempts });
     await failRun(
       deps,
+      agent,
       input.threadId,
       input.runId,
       err instanceof Error ? err.message : String(err),
@@ -977,21 +1048,26 @@ async function requeue(
   if (input.runId) await markQueued(deps, input.threadId, input.runId, input.model);
   await enqueueJob(
     deps,
-    {
-      threadId: input.threadId,
-      runId: input.runId,
-      enqueuedAt: Date.now(),
-      model: input.model,
-      agent: agent.name,
-      tokenBudget: input.tokenBudget,
-      // A retry is the SAME run trying again, so it keeps the caps it was
-      // dispatched with — a retry that lost its money cap would be unbounded.
-      costBudgetMicros: input.costBudgetMicros,
-      providerOptions: input.providerOptions,
-      state: input.state,
-    },
+    jobOf(agent, input),
     delayMs > 0 ? { delaySeconds: Math.ceil(delayMs / 1000) } : undefined,
   );
+}
+
+/** The job that runs the same run again: a retry or a redrive. It keeps the
+ *  caps the run was dispatched with — a retry that lost its money cap would be
+ *  unbounded. */
+function jobOf(agent: RegisteredAgent, input: ExecuteInput) {
+  return {
+    threadId: input.threadId,
+    runId: input.runId,
+    enqueuedAt: Date.now(),
+    model: input.model,
+    agent: agent.name,
+    tokenBudget: input.tokenBudget,
+    costBudgetMicros: input.costBudgetMicros,
+    providerOptions: input.providerOptions,
+    state: input.state,
+  };
 }
 
 /** Move a RUNNING thread back to QUEUED for a retry, on every home, and say so
@@ -1022,27 +1098,4 @@ function retryBackoffMs(deps: RuntimePorts, attempt: number): number {
   }
   if (max > 0 && d > max) d = max;
   return d + Math.floor(Math.random() * (d / 4 + 1));
-}
-
-
-/** Sum every model call a run made, nested runs included (§4). Best effort
- *  like every other read on the finish path: a storage hiccup must not turn a
- *  finished run into a failed one, so a failure comes back as zero totals and
- *  the error is logged. */
-async function runBill(
-  deps: RuntimePorts,
-  threadId: string,
-  runId?: string,
-): Promise<UsageTotals> {
-  const empty: UsageTotals = {
-    inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0,
-    costMicros: 0, unpriced: 0, lines: [],
-  };
-  if (!runId) return empty;
-  try {
-    return await deps.storage.usage.total(threadId, { runId });
-  } catch (err) {
-    (deps.log ?? console).error('run bill not read', { run: runId, err });
-    return empty;
-  }
 }

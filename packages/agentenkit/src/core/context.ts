@@ -1,8 +1,8 @@
 import { generateText } from 'ai';
 import type { RuntimePorts } from '../ports/runtime.js';
-import type { ContextUsage, MessageDTO } from './types.js';
+import type { ContextUsage, MessageDTO, NewUsage } from './types.js';
 import { publish } from './publish.js';
-import { fillTokens, providerMeta, recordCall } from './usage.js';
+import { fillTokens, providerMeta, recordCall, type RunLedger } from './usage.js';
 import { wireId } from './types.js';
 import { promptHistory, summaryOf } from './messages.js';
 
@@ -66,6 +66,9 @@ export interface CompactOptions {
   runId?: string;
   /** Cancels the summary call on a user stop. */
   abortSignal?: AbortSignal;
+  /** The run's ledger, so the summary call counts against the run's caps like
+   *  any other call. Absent records the row on its own. */
+  ledger?: RunLedger;
 }
 
 // Returns a history array guaranteed to fit the model's budget. Compaction is
@@ -152,7 +155,7 @@ export async function compactContext(
   // attributing without it books every cached prompt at the full input price.
   const meta =
     (rest as any).providerMetadata ?? (rest as any).experimental_providerMetadata;
-  await recordCall(deps, threadId, {
+  const usageRow: NewUsage = {
     ...(opts.runId ? { runId: opts.runId } : {}),
     agentId: null,
     kind: 'compaction',
@@ -162,7 +165,9 @@ export async function compactContext(
     outcome: 'finished',
     providerMetadata: providerMeta(meta, (rest as any).response),
     ...fillTokens(usage, meta),
-  });
+  };
+  if (opts.ledger) await opts.ledger.record(deps, threadId, usageRow);
+  else await recordCall(deps, threadId, usageRow);
   await publish(deps, threadId, 'CONTEXT_COMPACTED', { summarizedMessages: older.length });
 
   const out = [summary, ...tail];

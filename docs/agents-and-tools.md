@@ -250,12 +250,21 @@ chat.Run(ctx, agentenkit.RunInput{
 
 ## Settling a run
 
-> Go runtime.
-
-`OnFinish` fires after the terminal state is written, which is too late for
+`onFinish` fires after the terminal state is written, which is too late for
 work every client must see as done the moment the run ends: committing the
-files a run edited, charging for it. `OnSettle` runs after the last step and
-**before** the terminal `STATE_CHANGE`:
+files a run edited, charging for it. `onSettle` (Go: `OnSettle`) runs after
+the last step and **before** the terminal `STATE_CHANGE`:
+
+```ts
+runtime.createStreamTextAgent({
+  name: 'designer',
+  onSettle: async (info) => {
+    if (info.cancelled) return repo.discard(info.runId!);
+    await repo.commit(info.runId!); // a throw finalizes the run FAILED, with this reason
+    await billing.charge(info.runId!, info.usage);
+  },
+});
+```
 
 ```go
 rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
@@ -267,25 +276,40 @@ rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
 		if err := repo.Commit(ctx, info.RunID); err != nil {
 			return err // the run finalizes FAILED, with this reason
 		}
-		return billing.Charge(ctx, info.RunID, info.TokensUsed)
+		return billing.Charge(ctx, info.RunID, info.Usage)
 	},
 })
 ```
 
-Rules: an error fails the run (the reason lands on the terminal event and the
-run record); a user stop reaches the hook with `Cancelled` set and its error is
-ignored. The hook's `ctx` is never cancelled, not by a stop and not by a
-shutdown, so its writes land; tell a stop apart by `Cancelled`, not by
-`ctx.Err()`; a run whose attempts are exhausted still
-settles, as `FAILED` with `Error` set. A stop that ends a run no worker holds
-(one still queued, or parked on an approval) settles it right there, from the
-stop, with `Cancelled` set and the usage of the steps it did make on `Usage`;
-the hook then runs on the stop request's context, without its
-cancellation. Whichever side ends
-the run records the settle on it (`settledAt`), so a worker that wakes up
-later for the same run settles nothing. It can run more than once for one run
-— a worker that dies inside it is redelivered — so keep it idempotent on
-`RunID`.
+It runs once per run, **whatever way the run ends**:
+
+| End | Who settles |
+| :--- | :--- |
+| Completed, or stopped mid-step | The worker, before the terminal state |
+| Stopped while queued or parked | The stop itself, with `cancelled` set and the usage of the steps it did make |
+| Failed (attempts spent, lock never cleared) | Whoever fails it, with `error` set |
+| The settler died, or the hook failed | The late-settle sweep, `reclaimStuckRuns` (Go: `ReclaimStuckRuns`) |
+
+Rules:
+
+- An error fails a run that was going to complete: the reason lands on the
+  terminal event and the run record. A stop reaches the hook with `cancelled`
+  set, and its error is ignored.
+- An error also leaves the run **unsettled**, so the sweep runs the hook
+  again. Call `reclaimStuckRuns` from a periodic job to get that retry.
+- In Go the hook's `ctx` is never cancelled, not by a stop and not by a
+  shutdown, so its writes land. Tell a stop apart by `Cancelled`, not by
+  `ctx.Err()`.
+- `onFinish` fires once too, on every end, after the terminal state.
+
+**Once** is kept by a claim on the run record: before the hook runs, one
+conditional write claims the run, and only the settler that wins calls the
+hook. A stop and a worker that arrive together cannot both bill. Success marks
+the run settled (`settledAt`); a claim left by a settler that died is taken
+over after 10 minutes. So the hook can still, rarely, see one run twice — a
+hook slower than 10 minutes, or a settle mark that could not be written — and
+**must be idempotent on `runId`**. Pass it as the idempotency key to whatever
+you charge.
 
 ## Stopping
 

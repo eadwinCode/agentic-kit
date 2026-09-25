@@ -190,12 +190,16 @@ export interface ThreadUsage {
   model: string;
 }
 
-/** What the platform hands a spec's `onFinish` once the run is finalized. */
+/** What the platform hands a spec's `onSettle` and `onFinish`. */
 export interface RunFinishInfo {
   threadId: string;
   runId?: string;
   state: ExecutionState;
   stopReason: string;
+  /** A user stop (§2.1). */
+  cancelled: boolean;
+  /** Why the run failed, when it did. */
+  error?: string;
   tokensUsed: number;
   /** The tokens THIS segment spent. A run that parked and resumed finishes
    *  once, so this is the last segment, not the whole run — and it is tokens
@@ -209,7 +213,24 @@ export interface RunFinishInfo {
    *  `unpriced` above zero means some calls went unpriced and `costMicros` is
    *  a floor. */
   usage: UsageTotals;
+  /** Set when the platform could not read the run's rows back. `usage` is
+   *  then zeroed, and a hook that bills from it should refuse to settle
+   *  rather than charge nothing: throw from `onSettle` and the run fails
+   *  instead of going free. */
+  usageError?: unknown;
 }
+
+/** A spec's settle hook (§5.6): where a run is charged. It runs once per run,
+ *  whatever way the run ends — completed, stopped (while running, queued or
+ *  parked), failed, or found later by the late-settle sweep — before the
+ *  terminal state is written when a worker ends the run. A throw fails a run
+ *  that was going to complete, and leaves the run unsettled so a later
+ *  settle runs it again.
+ *
+ *  Make it idempotent by `runId`. Once is kept by a claim on the run record,
+ *  but a hook slower than the claim (10 minutes), or a mark that could not be
+ *  written, can see the same run twice. */
+export type SettleFn = (info: RunFinishInfo) => void | Promise<void>;
 
 /** Durable state used to hydrate a client before it starts live event replay. */
 export interface ThreadSnapshot {
@@ -252,6 +273,8 @@ export type StreamTextAgentSpec = {
   system?: string;
   tools?: ToolSet;
   onChunk?: (para: any) => void | Promise<void>;   // chained after platform persistence
+  /** Charges the run (§5.6). See SettleFn. */
+  onSettle?: SettleFn;
   /** Fires once, after the platform finalized the run, with what the run did
    *  and what it spent (§4). */
   onFinish?: (info: RunFinishInfo) => void | Promise<void>;
@@ -268,9 +291,23 @@ export type GenerateTextAgentSpec = {
 } & Omit<Parameters<typeof import('ai').generateText>[0],
     'model' | 'messages' | 'prompt' | 'abortSignal' | 'onFinish' | 'onStepFinish'> & {
   tools?: ToolSet;
+  /** Charges the run (§5.6). See SettleFn. */
+  onSettle?: SettleFn;
   /** Fires once, after the platform finalized the run (§4). */
   onFinish?: (info: RunFinishInfo) => void | Promise<void>;
 };
+
+/** What a stuck-run sweep did. */
+export interface ReclaimReport {
+  /** How many run records the sweep looked at. */
+  checked: number;
+  /** How many runs went back on the queue or were moved to their end state. */
+  redispatched: number;
+  /** How many ended runs had their settle run late. */
+  settled: number;
+  /** How many runs the sweep could not act on. */
+  errors: number;
+}
 
 /** An executor bound to a generation flavor and to the user's generation
  *  arguments (§3). Returned by the `create*Agent` factories. */
@@ -320,6 +357,14 @@ export interface AgentCore {
    *  usage rows, subagent runs, and the thread's hot kv keys (§3.2).
    *  Refused while a run is active; stop() first. */
   deleteThread(threadId: string, state?: AgentRunState): Promise<DeleteThreadResult>;
+
+  /** The backstop for a run that nothing is working on (§2.5, §2.8): a QUEUED
+   *  or RUNNING record older than `olderThanMs` whose lock nobody holds and
+   *  whose job is gone is re-dispatched, and an ended record older than that
+   *  whose settle never ran is settled. Call it from a periodic job. It pages
+   *  through every such run. A record with no recorded state is read with an
+   *  empty state. */
+  reclaimStuckRuns(olderThanMs: number): Promise<ReclaimReport>;
 
   hitl: {
     respond(input: RespondInput): Promise<RespondResult>;

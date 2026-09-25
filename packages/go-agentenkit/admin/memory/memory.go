@@ -19,11 +19,13 @@ type Store struct {
 	runs    map[string]*ports.RunRecord
 	steps   []ports.StepRecord
 	threads map[string]*ports.AdminThread
+	// settleTokens is who holds each run's settle claim.
+	settleTokens map[string]string
 }
 
 // New makes an empty store.
 func New() *Store {
-	return &Store{runs: map[string]*ports.RunRecord{}, threads: map[string]*ports.AdminThread{}}
+	return &Store{runs: map[string]*ports.RunRecord{}, threads: map[string]*ports.AdminThread{}, settleTokens: map[string]string{}}
 }
 
 func (s *Store) Threads() ports.AdminThreadStore { return threadStore{s} }
@@ -222,10 +224,53 @@ func (r runStore) List(_ context.Context, f ports.RunFilter) ([]ports.RunRecord,
 		if f.Until != nil && rec.StartedAt.After(*f.Until) {
 			continue
 		}
+		if f.Unsettled && (rec.EndedAt == nil || rec.SettledAt != nil) {
+			continue
+		}
+		if f.Depth != nil && rec.Depth != *f.Depth {
+			continue
+		}
+		if c := f.Before; c != nil && !(rec.StartedAt.Before(c.StartedAt) || rec.StartedAt.Equal(c.StartedAt) && rec.ID < c.ID) {
+			continue
+		}
 		rows = append(rows, *rec)
 	}
-	sort.SliceStable(rows, func(i, j int) bool { return rows[i].StartedAt.After(rows[j].StartedAt) })
+	sort.SliceStable(rows, func(i, j int) bool {
+		if !rows[i].StartedAt.Equal(rows[j].StartedAt) {
+			return rows[i].StartedAt.After(rows[j].StartedAt)
+		}
+		return rows[i].ID > rows[j].ID
+	})
 	return limit(rows, f.Limit), nil
+}
+
+func (r runStore) ClaimSettle(_ context.Context, runID, token string, staleBefore time.Time) (bool, error) {
+	r.s.mu.Lock()
+	defer r.s.mu.Unlock()
+	cur, ok := r.s.runs[runID]
+	if !ok || cur.SettledAt != nil || cur.SettlingAt != nil && !cur.SettlingAt.Before(staleBefore) {
+		return false, nil
+	}
+	now := time.Now()
+	cur.SettlingAt = &now
+	r.s.settleTokens[runID] = token
+	return true, nil
+}
+
+func (r runStore) EndSettle(_ context.Context, runID, token string, settled bool) error {
+	r.s.mu.Lock()
+	defer r.s.mu.Unlock()
+	cur, ok := r.s.runs[runID]
+	if !ok || r.s.settleTokens[runID] != token {
+		return nil
+	}
+	delete(r.s.settleTokens, runID)
+	cur.SettlingAt = nil
+	if settled {
+		now := time.Now()
+		cur.SettledAt = &now
+	}
+	return nil
 }
 
 func (r runStore) CountByState(context.Context) (map[ports.ExecutionState]int, error) {

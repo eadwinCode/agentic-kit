@@ -167,18 +167,22 @@ type runStore struct{ db *sql.DB }
 
 const runCols = `id, "threadId", "parentRunId", depth, agent, model, state, "stopReason", error, "startedAt", "endedAt",
 	"durationMs", "queuedMs", attempts, steps, "inputTokens", "cachedInputTokens", "outputTokens", "totalTokens",
-	result, prompt, "tokenBudget", "runState", "providerOptions", "settledAt", "enqueuedAt", "costBudgetMicros", "maxSteps"`
+	result, prompt, "tokenBudget", "runState", "providerOptions", "settledAt", "enqueuedAt", "costBudgetMicros", "maxSteps", "settlingAt"`
 
 func scanRun(row interface{ Scan(...any) error }) (*ports.RunRecord, error) {
 	var r ports.RunRecord
 	var parent, stop, errMsg, prompt sql.NullString
-	var ended, settled, enqueued sql.NullTime
+	var ended, settled, enqueued, settling sql.NullTime
 	var duration, queued, budget, costCap, stepCap sql.NullInt64
 	var result, runState, providerOptions []byte
 	if err := row.Scan(&r.ID, &r.ThreadID, &parent, &r.Depth, &r.Agent, &r.Model, &r.State, &stop, &errMsg,
 		&r.StartedAt, &ended, &duration, &queued, &r.Attempts, &r.Steps, &r.InputTokens, &r.CachedInputTokens,
-		&r.OutputTokens, &r.TotalTokens, &result, &prompt, &budget, &runState, &providerOptions, &settled, &enqueued, &costCap, &stepCap); err != nil {
+		&r.OutputTokens, &r.TotalTokens, &result, &prompt, &budget, &runState, &providerOptions, &settled, &enqueued, &costCap, &stepCap, &settling); err != nil {
 		return nil, err
+	}
+	if settling.Valid {
+		t := settling.Time
+		r.SettlingAt = &t
 	}
 	r.CostBudgetMicros, r.MaxSteps = costCap.Int64, int(stepCap.Int64)
 	r.ParentRunID, r.StopReason, r.Error, r.Prompt = parent.String, stop.String, errMsg.String, prompt.String
@@ -352,6 +356,15 @@ func (r runStore) List(ctx context.Context, f ports.RunFilter) ([]ports.RunRecor
 	if f.Until != nil {
 		where = append(where, `"startedAt" <= `+a.add(*f.Until))
 	}
+	if f.Unsettled {
+		where = append(where, `"endedAt" IS NOT NULL AND "settledAt" IS NULL`)
+	}
+	if f.Depth != nil {
+		where = append(where, `depth = `+a.add(*f.Depth))
+	}
+	if c := f.Before; c != nil {
+		where = append(where, `("startedAt", id) < (`+a.add(c.StartedAt)+`, `+a.add(c.ID)+`)`)
+	}
 	q := `SELECT ` + runCols + ` FROM agentic_runs`
 	if len(where) > 0 {
 		q += ` WHERE ` + strings.Join(where, " AND ")
@@ -360,8 +373,31 @@ func (r runStore) List(ctx context.Context, f ports.RunFilter) ([]ports.RunRecor
 	if limit <= 0 {
 		limit = 100
 	}
-	q += ` ORDER BY "startedAt" DESC LIMIT ` + a.add(limit)
+	// Ordered on the id after the start time, so a page's last run is a
+	// cursor that splits the listing exactly (RunFilter.Before).
+	q += ` ORDER BY "startedAt" DESC, id DESC LIMIT ` + a.add(limit)
 	return r.query(ctx, q, a.vals...)
+}
+
+func (r runStore) ClaimSettle(ctx context.Context, runID, token string, staleBefore time.Time) (bool, error) {
+	res, err := r.db.ExecContext(ctx,
+		`UPDATE agentic_runs SET "settlingAt" = now(), "settleToken" = $1
+		 WHERE id = $2 AND "settledAt" IS NULL AND ("settlingAt" IS NULL OR "settlingAt" < $3)`,
+		token, runID, staleBefore)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+func (r runStore) EndSettle(ctx context.Context, runID, token string, settled bool) error {
+	q := `UPDATE agentic_runs SET "settlingAt" = NULL, "settleToken" = NULL WHERE id = $1 AND "settleToken" = $2`
+	if settled {
+		q = `UPDATE agentic_runs SET "settledAt" = now(), "settlingAt" = NULL, "settleToken" = NULL WHERE id = $1 AND "settleToken" = $2`
+	}
+	_, err := r.db.ExecContext(ctx, q, runID, token)
+	return err
 }
 
 func (r runStore) CountByState(ctx context.Context) (map[ports.ExecutionState]int, error) {

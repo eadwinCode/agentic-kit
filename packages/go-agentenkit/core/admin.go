@@ -62,8 +62,11 @@ type ThreadSummary struct {
 	FirstSeenAt time.Time            `json:"firstSeenAt"`
 	UpdatedAt   time.Time            `json:"updatedAt"`
 	// Runs on this thread, nested ones included.
-	Runs   int               `json:"runs"`
-	Steps  int               `json:"steps"`
+	Runs  int `json:"runs"`
+	Steps int `json:"steps"`
+	// Tokens are summed from the run records. In a list that is tokens only,
+	// with no money; GetThread reads the thread's usage rows instead, so its
+	// Tokens carry the cost too (§4).
 	Tokens ports.UsageTotals `json:"tokens"`
 	// DurationMs is summed run durations. Not wall time: nested runs overlap
 	// their parent.
@@ -308,7 +311,16 @@ func GetThread(ctx context.Context, deps ports.RuntimePorts, threadID string) (*
 		base.State, base.Model = runs[0].State, runs[0].Model
 		base.FirstSeenAt, base.UpdatedAt = runs[len(runs)-1].StartedAt, runs[0].StartedAt
 	}
-	return &ThreadDetail{Thread: rollUp(base, runs), Runs: runs, Steps: steps}, nil
+	summary := rollUp(base, runs)
+	// The money lives on the usage rows, not the run records: read it from
+	// there, the same number a bill is built from. The view still renders
+	// with the records' tokens when the read fails.
+	if usage, err := deps.Storage.Usage.Total(ctx, threadID, ports.UsageFilter{}); err != nil {
+		Logger(deps).Error("thread usage not read", "thread", threadID, "err", err)
+	} else {
+		summary.Tokens = usage
+	}
+	return &ThreadDetail{Thread: summary, Runs: runs, Steps: steps}, nil
 }
 
 // GetRun assembles one run for a timeline view. Nil when unknown.

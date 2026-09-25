@@ -76,6 +76,7 @@ export class SqliteAdminStore implements AdminStore {
     stopReason: r.stopReason ?? null, error: r.error ?? null,
     startedAt: new Date(r.startedAt), endedAt: date(r.endedAt), enqueuedAt: date(r.enqueuedAt),
     durationMs: r.durationMs ?? null, queuedMs: r.queuedMs ?? null,
+    settledAt: date(r.settledAt), settlingAt: date(r.settlingAt),
     attempts: r.attempts, steps: r.steps,
     inputTokens: r.inputTokens, cachedInputTokens: r.cachedInputTokens,
     outputTokens: r.outputTokens, totalTokens: r.totalTokens,
@@ -168,11 +169,42 @@ export class SqliteAdminStore implements AdminStore {
       if (f.threadId) { where.push('threadId = ?'); vals.push(f.threadId); }
       if (f.since) { where.push('startedAt >= ?'); vals.push(f.since.getTime()); }
       if (f.until) { where.push('startedAt <= ?'); vals.push(f.until.getTime()); }
+      if (f.unsettled) where.push('endedAt IS NOT NULL AND settledAt IS NULL');
+      if (f.depth !== undefined) { where.push('depth = ?'); vals.push(f.depth); }
+      if (f.before) {
+        where.push('(startedAt < ? OR startedAt = ? AND id < ?)');
+        vals.push(f.before.startedAt.getTime(), f.before.startedAt.getTime(), f.before.id);
+      }
+      // Ordered on the id after the start time, so a page's last run is a
+      // cursor that splits the listing exactly (RunFilter.before).
       return this.all(
         `SELECT * FROM agentic_runs${where.length ? ` WHERE ${where.join(' AND ')}` : ''}` +
-          ' ORDER BY startedAt DESC LIMIT ?',
+          ' ORDER BY startedAt DESC, id DESC LIMIT ?',
         ...vals, f.limit ?? 100,
       ).map(this.toRun);
+    },
+    claimSettle: async (runId: string, token: string, staleBefore: Date) => {
+      // The token is new for every claim, so reading it back says whether
+      // this write is the one that won.
+      this.write(
+        `UPDATE agentic_runs SET settlingAt = ?, settleToken = ?
+         WHERE id = ? AND settledAt IS NULL AND (settlingAt IS NULL OR settlingAt < ?)`,
+        Date.now(), token, runId, staleBefore.getTime(),
+      );
+      return this.one('SELECT settleToken FROM agentic_runs WHERE id = ?', runId)?.settleToken === token;
+    },
+    endSettle: async (runId: string, token: string, settled: boolean) => {
+      if (settled) {
+        this.write(
+          'UPDATE agentic_runs SET settledAt = ?, settlingAt = NULL, settleToken = NULL WHERE id = ? AND settleToken = ?',
+          Date.now(), runId, token,
+        );
+      } else {
+        this.write(
+          'UPDATE agentic_runs SET settlingAt = NULL, settleToken = NULL WHERE id = ? AND settleToken = ?',
+          runId, token,
+        );
+      }
     },
     countByState: async () =>
       Object.fromEntries(

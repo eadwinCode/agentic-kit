@@ -67,6 +67,8 @@ const toRun = (r: any): RunRecord => ({
   startedAt: new Date(r.startedAt), endedAt: r.endedAt ? new Date(r.endedAt) : null,
   enqueuedAt: r.enqueuedAt ? new Date(r.enqueuedAt) : null,
   durationMs: r.durationMs ?? null, queuedMs: r.queuedMs ?? null,
+  settledAt: r.settledAt ? new Date(r.settledAt) : null,
+  settlingAt: r.settlingAt ? new Date(r.settlingAt) : null,
   attempts: r.attempts, steps: r.steps,
   inputTokens: r.inputTokens, cachedInputTokens: r.cachedInputTokens,
   outputTokens: r.outputTokens, totalTokens: r.totalTokens,
@@ -208,12 +210,38 @@ export class PostgresAdminStore implements AdminStore {
       if (f.threadId) where.push(`"threadId" = $${vals.push(f.threadId)}`);
       if (f.since) where.push(`"startedAt" >= $${vals.push(f.since)}`);
       if (f.until) where.push(`"startedAt" <= $${vals.push(f.until)}`);
+      if (f.unsettled) where.push('"endedAt" IS NOT NULL AND "settledAt" IS NULL');
+      if (f.depth !== undefined) where.push(`depth = $${vals.push(f.depth)}`);
+      if (f.before) {
+        where.push(`("startedAt", id) < ($${vals.push(f.before.startedAt)}, $${vals.push(f.before.id)})`);
+      }
+      // Ordered on the id after the start time, so a page's last run is a
+      // cursor that splits the listing exactly (RunFilter.before).
       const { rows } = await this.db.query(
         `SELECT * FROM agentic_runs${where.length ? ` WHERE ${where.join(' AND ')}` : ''}
-         ORDER BY "startedAt" DESC LIMIT $${vals.push(f.limit ?? 100)}`,
+         ORDER BY "startedAt" DESC, id DESC LIMIT $${vals.push(f.limit ?? 100)}`,
         vals,
       );
       return rows.map(toRun);
+    },
+    claimSettle: async (runId: string, token: string, staleBefore: Date) => {
+      const { rows } = await this.db.query(
+        `UPDATE agentic_runs SET "settlingAt" = now(), "settleToken" = $1
+         WHERE id = $2 AND "settledAt" IS NULL AND ("settlingAt" IS NULL OR "settlingAt" < $3)
+         RETURNING id`,
+        [token, runId, staleBefore],
+      );
+      return rows.length === 1;
+    },
+    endSettle: async (runId: string, token: string, settled: boolean) => {
+      await this.db.query(
+        settled
+          ? `UPDATE agentic_runs SET "settledAt" = now(), "settlingAt" = NULL, "settleToken" = NULL
+             WHERE id = $1 AND "settleToken" = $2`
+          : `UPDATE agentic_runs SET "settlingAt" = NULL, "settleToken" = NULL
+             WHERE id = $1 AND "settleToken" = $2`,
+        [runId, token],
+      );
     },
     countByState: async () => {
       const { rows } = await this.db.query(

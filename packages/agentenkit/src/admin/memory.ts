@@ -12,6 +12,8 @@ export class MemoryAdminStore implements AdminStore {
   readonly stepRows: StepRecord[] = [];
 
   readonly threadRows = new Map<string, AdminThread>();
+  /** Who holds each run's settle claim. */
+  private readonly settleTokens = new Map<string, string>();
 
   threads = {
     upsert: async (t: NewAdminThread) => {
@@ -67,9 +69,30 @@ export class MemoryAdminStore implements AdminStore {
       if (f.threadId) rows = rows.filter((r) => r.threadId === f.threadId);
       if (f.since) rows = rows.filter((r) => r.startedAt >= f.since!);
       if (f.until) rows = rows.filter((r) => r.startedAt <= f.until!);
+      if (f.unsettled) rows = rows.filter((r) => r.endedAt && !r.settledAt);
+      if (f.depth !== undefined) rows = rows.filter((r) => r.depth === f.depth);
+      const c = f.before;
+      if (c) {
+        rows = rows.filter((r) =>
+          r.startedAt.getTime() < c.startedAt.getTime() ||
+          (r.startedAt.getTime() === c.startedAt.getTime() && r.id < c.id));
+      }
       return rows
-        .sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime())
+        .sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime() || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0))
         .slice(0, f.limit ?? 100);
+    },
+    claimSettle: async (runId: string, token: string, staleBefore: Date) => {
+      const cur = this.runRows.get(runId);
+      if (!cur || cur.settledAt || (cur.settlingAt && cur.settlingAt >= staleBefore)) return false;
+      this.runRows.set(runId, { ...cur, settlingAt: new Date() });
+      this.settleTokens.set(runId, token);
+      return true;
+    },
+    endSettle: async (runId: string, token: string, settled: boolean) => {
+      const cur = this.runRows.get(runId);
+      if (!cur || this.settleTokens.get(runId) !== token) return;
+      this.settleTokens.delete(runId);
+      this.runRows.set(runId, { ...cur, settlingAt: null, ...(settled ? { settledAt: new Date() } : {}) });
     },
     countByState: async () => {
       const out: Partial<Record<ExecutionState, number>> = {};

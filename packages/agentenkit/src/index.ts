@@ -24,6 +24,8 @@ export type {
   Pricer,
   Logger,
   RunFinishInfo,
+  SettleFn,
+  ReclaimReport,
 } from './ports/runtime.js';
 
 // runtime — the factory that binds ports to behaviors
@@ -57,7 +59,7 @@ export type { AgentRunState, BoundStorage, StorageContext } from './core/state.j
 export type { AdminThread, ThreadStart, StepRecord, RunFilter, AdminThreadFilter } from './ports/admin.js';
 export type { BillingCheck } from './core/types.js';
 export { claimRun, redriveKey, runIdKey } from './core/keys.js';
-export { countTokens, sumUsage, emptyTotals } from './core/usage.js';
+export { countTokens, sumUsage, emptyTotals, UsageMerger, type UsageGroup } from './core/usage.js';
 
 /** Pricing (§4): the pricers that ship with the platform. `pricing.table(...)`
  *  is the common case; see the module for `receipt` and `chain`. */
@@ -110,6 +112,7 @@ export {
   type NewRunRecord,
   type NewUsage,
   type UsageLine,
+  type CurrencyCost,
   type UsageFilter,
   type UsageKind,
   type UsageOutcome,

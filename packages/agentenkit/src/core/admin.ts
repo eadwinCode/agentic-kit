@@ -49,6 +49,9 @@ export interface ThreadSummary {
   /** Runs on this thread, nested ones included. */
   runs: number;
   steps: number;
+  /** Summed from the run records. In a list that is tokens only, with no
+   *  money; `getThread` reads the thread's usage rows instead, so its tokens
+   *  carry the cost too (§4). */
   tokens: UsageTotals;
   /** Summed run durations. Not wall time: nested runs overlap their parent. */
   durationMs: number;
@@ -241,7 +244,16 @@ export async function getThread(
     firstSeenAt: runs.at(-1)?.startedAt ?? new Date(),
     updatedAt: runs[0]?.startedAt ?? new Date(),
   };
-  return { thread: rollUp(base, runs), runs, steps };
+  const thread_ = rollUp(base, runs);
+  // The money lives on the usage rows, not the run records: read it from
+  // there, the same number a bill is built from. The view still renders with
+  // the records' tokens when the read fails.
+  try {
+    thread_.tokens = await deps.storage.usage.total(threadId, {});
+  } catch (err) {
+    (deps.log ?? console).error('thread usage not read', { thread: threadId, err });
+  }
+  return { thread: thread_, runs, steps };
 }
 
 export async function getRun(deps: RuntimePorts, runId: string): Promise<RunDetail | null> {

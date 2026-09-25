@@ -103,8 +103,10 @@ doubles the bill:
 | OpenAI | `promptTokens` **includes** the cached ones | `promptTokens − cached` |
 | Anthropic | `cacheReadInputTokens` sits **alongside** input | as reported |
 
-The library handles both. `totalTokens` matches what the provider billed either
-way.
+The library handles both. `totalTokens` is always `input + cached + output`,
+worked out by the library rather than taken from the provider, whose own total
+does not mean the same thing everywhere (Anthropic's leaves the cache reads
+out).
 
 Cache hits are reported **only** in provider metadata — the SDK's `usage` object
 has no field for them. Any code that attributes spend from `usage` alone reports
@@ -118,7 +120,10 @@ await chat.run({ prompt: 'hi', tokenBudget: 50_000 });
 
 Order: run input → agent spec → `config.tokenBudget`. Undefined means unbounded
 apart from `maxSteps`. Spend is checked between steps against a ledger shared
-with nested runs.
+with nested runs. The ledger counts the **whole run**: each segment starts from
+what the run already spent (before a park, before a retry, and the
+platform's compaction calls), so a run that parks three times does not get
+three budgets.
 
 There is a money cap in the same shape, once a pricer is configured:
 

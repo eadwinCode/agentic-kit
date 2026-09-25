@@ -98,6 +98,9 @@ type CompactOptions struct {
 	// GenCtx is the context the summary call runs under: a stop cancels it.
 	// Nil means ctx.
 	GenCtx context.Context
+	// Ledger is the run's ledger, so the summary call counts against the
+	// run's caps like any other call. Nil records the row on its own.
+	Ledger *RunLedger
 }
 
 // CompactContext returns a history guaranteed to fit the model's budget.
@@ -188,7 +191,11 @@ func CompactContext(ctx context.Context, deps ports.RuntimePorts, threadID, mode
 	// keeps it separable: nobody asked for this call, and it is worth being
 	// able to see what the platform's own housekeeping costs. It is billed to
 	// the run it served, so it is on that run's bill and under its cap.
-	RecordCall(ctx, deps, threadID, ports.NewUsage{
+	record := RecordCall
+	if opts.Ledger != nil {
+		record = opts.Ledger.Record
+	}
+	record(ctx, deps, threadID, ports.NewUsage{
 		RunID: opts.RunID,
 		Kind:  ports.KindCompaction, Model: deps.Config.CompactionModel,
 		ModelID:               resolved.WireID(deps.Config.CompactionModel),
