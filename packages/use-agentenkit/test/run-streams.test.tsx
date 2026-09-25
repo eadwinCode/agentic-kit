@@ -72,7 +72,9 @@ describe('run streams in the hook', () => {
       emit({ kind: 'stream', streamId: 'r1:1', item: { type: 'RUN_FINISHED', status: 'parked', offset: '4' } });
       emit(text('r1:2', '1', 'lo')); // offset 1 again, but a new stream
     });
-    await waitFor(() => expect(view.result.current.entries.at(-1)!.text).toBe('Hello'));
+    // Applied, not dropped as seen; and a new segment's text is a new
+    // message, as a reload would show it.
+    await waitFor(() => expect(view.result.current.entries.at(-1)!.text).toBe('lo'));
     expect(streams[0]!.handlers.getCursor()).toBe('4 r1:2 1');
   });
 
@@ -114,6 +116,47 @@ describe('run streams in the hook', () => {
     const ids = view.result.current.entries.map((e) => e.id);
     expect(ids.filter((id) => id.startsWith('live:assistant:'))).toHaveLength(3);
     expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('a failed step drops its unsaved text, and the retry does not add to it', async () => {
+    const { view, emit } = await mount({ snapshot: running });
+    await act(async () => {
+      // Segment 1: a step that commits a tool call, then a step that fails.
+      emit({ kind: 'stream', streamId: 'r1:1', item: { type: 'TOOL_CALL_END', toolCallId: 'c1', toolName: 'look', args: {}, offset: '4' } });
+      emit({ kind: 'stream', streamId: 'r1:1', item: { type: 'TOOL_CALL_RESULT', toolCallId: 'c1', toolName: 'look', result: 'seen', offset: '5' } });
+      emit({ kind: 'stream', streamId: 'r1:1', item: { type: 'STEP_FINISHED', step: 1, offset: '6' } });
+      emit(text('r1:1', '7', 'Hello!'));
+      emit({ kind: 'stream', streamId: 'r1:1', item: { type: 'RUN_ERROR', status: 'error', error: 'cut short', offset: '8' } });
+      // The retry, as segment 2, answers again.
+      emit(text('r1:2', '1', 'Hello!'));
+    });
+    await waitFor(() => expect(view.result.current.entries.at(-1)!.text).toBe('Hello!'));
+    const entries = view.result.current.entries;
+    // Step 1 ("Hel" and the tool call) was saved and stays. The failed
+    // step's "Hello!" was not, so it goes, and the retry's answer is not
+    // added to it.
+    expect(entries.flatMap((e) => e.parts ?? []).some((p: any) => p.toolCallId === 'c1')).toBe(true);
+    expect(entries.filter((e) => e.id.startsWith('live:assistant:')).map((e) => e.text)).toEqual(['Hel', 'Hello!']);
+  });
+
+  it('a reload after a failed run shows the failure, not the replayed text', async () => {
+    const failed: ThreadSnapshot = {
+      ...running,
+      thread: { id: 't1', state: 'FAILED' },
+      runs: [{ id: 'r1', agent: 'chat', depth: 0, state: 'FAILED', startedAt: '2026-09-05T10:00:00Z', endedAt: '2026-09-05T10:00:05Z' }],
+      stream: {
+        ...running.stream!,
+        items: [
+          ...running.stream!.items,
+          { type: 'RUN_ERROR', status: 'error', error: 'cut short', offset: '4' },
+        ],
+        end: { type: 'RUN_ERROR', status: 'error', error: 'cut short', offset: '4' },
+        offset: '4',
+      },
+    };
+    const { view } = await mount({ snapshot: failed });
+    await waitFor(() => expect(view.result.current.activity.phase).toBe('failed'));
+    expect(view.result.current.entries.some((e) => e.id.startsWith('live:'))).toBe(false);
   });
 
   it('a SNAPSHOT merges in place and shows the text once', async () => {

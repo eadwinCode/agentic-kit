@@ -158,14 +158,20 @@ function latestRun(runs: readonly ThreadSnapshot['runs'][number][] | undefined):
 
 /** Streamed text not yet shown: deltas are gathered here and shown once per
  *  frame, rather than re-rendering the conversation on every token. */
-type Pending = { kind: 'text' | 'reasoning'; text: string; serial: number };
+type Pending = { kind: 'text' | 'reasoning'; text: string; serial: number; floor: number };
+
+/** The number a live entry was given (see nextLive), or 0 for any other. */
+function liveSerialOf(id: string): number {
+  return id.startsWith('live:') ? Number(id.slice(id.lastIndexOf(':') + 1)) || 0 : 0;
+}
 
 /** Add streamed text to the conversation: onto the live entry of its kind
- *  when that is the last one, as a new live entry otherwise. */
+ *  when that is the last one and belongs to the same step, as a new live
+ *  entry otherwise. */
 function appendDelta(prev: ChatEntry[], d: Pending): ChatEntry[] {
   const prefix = d.kind === 'text' ? 'live:assistant:' : 'live:reasoning:';
   const last = prev.at(-1);
-  if (last?.kind === d.kind && last.id.startsWith(prefix) && !last.agentId) {
+  if (last?.kind === d.kind && last.id.startsWith(prefix) && !last.agentId && liveSerialOf(last.id) > d.floor) {
     const text = last.text + d.text;
     return [...prev.slice(0, -1), { ...last, text, parts: [{ type: d.kind, text }] }];
   }
@@ -271,6 +277,10 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
    *  key. */
   const liveSerial = useRef(0);
   const nextLive = () => ++liveSerial.current;
+  /** The last live number from a step the server saved: its step ended, or
+   *  a new segment began. What a failed step streamed after it was never
+   *  saved, and is dropped. */
+  const committedSerial = useRef(0);
   /** The run stream being read: its id, the offset of the last item
    *  applied, and every offset applied from it. An item already applied —
    *  one a snapshot covered, or a transport resent — is dropped. A new stream
@@ -477,7 +487,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
         // Providers that do not expose reasoning send none; an empty one is
         // only a phase change.
         if (typeof p.textDelta === 'string' && p.textDelta) {
-          queueDelta({ kind, text: p.textDelta, serial: nextLive() });
+          queueDelta({ kind, text: p.textDelta, serial: nextLive(), floor: committedSerial.current });
         }
         return;
       }
@@ -577,10 +587,11 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
         // A generate-text agent streams nothing: its whole answer arrives here.
         case 'TEXT_RESULT': {
           if (typeof p.text !== 'string' || !p.text) break;
+          const id = `live:text-result:${nextLive()}`;
           setEntries((prev) => [
             ...prev,
             {
-              id: `live:text-result:${nextLive()}`,
+              id,
               kind: 'text',
               role: 'assistant',
               text: p.text,
@@ -624,10 +635,11 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
             if (p.toolCallId && seenToolCalls.current.has(p.toolCallId)) break; // already durable
             if (p.toolCallId) seenToolCalls.current.add(p.toolCallId);
             setActivity({ phase: 'tool-call', label: labels.callingTool, detail: p.toolName });
+            const id = `live:tool-call:${nextLive()}`;
             setEntries((prev) => [
               ...prev,
               {
-                id: `live:tool-call:${nextLive()}`,
+                id,
                 kind: 'tool',
                 role: 'tool',
                 text: format.toolCall(p.toolName, p.args ?? {}),
@@ -649,10 +661,11 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
             if (p.toolCallId && seenToolResults.current.has(p.toolCallId)) break; // already durable
             if (p.toolCallId) seenToolResults.current.add(p.toolCallId);
             setActivity({ phase: 'tool-result', label: labels.toolCompleted, detail: p.toolName });
+            const id = `live:tool-result:${nextLive()}`;
             setEntries((prev) => [
               ...settleToolCall(prev, p.toolCallId, p.result),
               {
-                id: `live:tool-result:${nextLive()}`,
+                id,
                 kind: 'tool',
                 role: 'tool',
                 text: format.toolResult(p.toolName, p.result),
@@ -707,12 +720,13 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
           setActivity({ phase: 'failed', label: labels.approvalExpired });
           break;
 
-        case 'SUBAGENT_STARTED':
+        case 'SUBAGENT_STARTED': {
           setActivity({ phase: 'tool-call', label: labels.subagentWorking, detail: p.name });
+          const id = `live:subagent:${p.agentId}:${nextLive()}`;
           setEntries((prev) => [
             ...prev,
             {
-              id: `live:subagent:${p.agentId}:${nextLive()}`,
+              id,
               kind: 'tool',
               role: 'tool',
               text: format.subagentStarted(p.name),
@@ -737,6 +751,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
                 ],
           );
           break;
+        }
 
         case 'SUBAGENT_CHUNK':
           // The child's answer only: its thinking and its tool traffic are
@@ -776,15 +791,31 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
   const applyStreamItem = useCallback(
     (streamId: string, item: WireStreamItem) => {
       const at = streamRef.current;
-      if (at.streamId !== streamId) streamRef.current = { streamId, seen: new Set() };
+      if (at.streamId !== streamId) {
+        streamRef.current = { streamId, seen: new Set() };
+        committedSerial.current = liveSerial.current;
+      }
       const cur = streamRef.current;
       if (cur.seen.has(item.offset)) return;
       cur.seen.add(item.offset);
       cur.offset = item.offset;
       if (item.type === 'CUSTOM') cfgRef.current.onCustom?.(String(item.name), item.value);
       for (const event of streamItemEvents(item)) applyEvent(event);
+      if (item.type === 'STEP_FINISHED') {
+        flushDeltas();
+        committedSerial.current = liveSerial.current;
+      } else if (item.type === 'RUN_ERROR') {
+        // The step that failed was never saved, and a retry streams it
+        // again: what it showed goes, so the retry does not add to it. A
+        // subagent's card stays; its run is its own.
+        flushDeltas();
+        const floor = committedSerial.current;
+        setEntries((prev) =>
+          prev.filter((e) => e.id.startsWith('live:subagent:') || liveSerialOf(e.id) <= floor),
+        );
+      }
     },
-    [applyEvent],
+    [applyEvent, flushDeltas],
   );
 
   /** Show a snapshot: the durable messages, the subagent cards, the run's
@@ -890,6 +921,9 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
         if (snapshot.stream.offset) streamRef.current.offset = snapshot.stream.offset;
       }
       flushDeltas();
+      // A stream that already ended says nothing about now: its replayed
+      // text must not leave the thread "Responding".
+      if (snapshot.stream?.end) setActivity(stateActivity(snapshot.thread.state, cfg.labels));
       lastSeqRef.current = Math.max(lastSeqRef.current, snapshot.lastEventSeq);
     },
     [applyEvent, applyStreamItem, flushDeltas, loadUsage, setActivity],
