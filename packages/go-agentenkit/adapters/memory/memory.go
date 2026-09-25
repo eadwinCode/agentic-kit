@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -33,8 +34,25 @@ type memEntry struct {
 // lazily on read; Incr holds the lock, so concurrent callers can never
 // collide on the same counter (§3.4).
 type Kv struct {
-	mu sync.Mutex
-	m  map[string]memEntry
+	mu        sync.Mutex
+	m         map[string]memEntry
+	lastSweep time.Time
+}
+
+// sweep drops expired keys nobody reads again, as writes come in, at most
+// once a minute: no goroutine to leak, and the map does not grow for ever.
+// Called with k.mu held.
+func (k *Kv) sweep() {
+	now := time.Now()
+	if now.Sub(k.lastSweep) < time.Minute {
+		return
+	}
+	k.lastSweep = now
+	for key, e := range k.m {
+		if !e.expiresAt.IsZero() && now.After(e.expiresAt) {
+			delete(k.m, key)
+		}
+	}
 }
 
 // NewKv makes an empty Kv.
@@ -65,6 +83,7 @@ func (k *Kv) Get(_ context.Context, key string) (string, bool, error) {
 func (k *Kv) Set(_ context.Context, key, value string, opts ports.SetOptions) (bool, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	k.sweep()
 	if opts.OnlyIfNotExists {
 		if _, ok := k.live(key); ok {
 			return false, nil
@@ -92,6 +111,7 @@ func (k *Kv) Incr(_ context.Context, key string) (int64, error) {
 func (k *Kv) IncrWithExpiry(_ context.Context, key string, ttl time.Duration) (int64, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	k.sweep()
 	e, ok := k.live(key)
 	n, _ := strconv.ParseInt(e.value, 10, 64)
 	n++
@@ -129,6 +149,11 @@ func (k *Kv) DelIfValue(_ context.Context, key, expected string) (bool, error) {
 	return true, nil
 }
 
+// PublishedKept is how many of the latest published events a memory Bus
+// keeps for Published: enough for any test, bounded for a dev server that
+// runs for days.
+const PublishedKept = 10_000
+
 // Bus is a synchronous in-memory bus. Publishes are delivered to subscribers
 // in order, on the publisher's goroutine.
 type Bus struct {
@@ -144,6 +169,9 @@ func NewBus() *Bus { return &Bus{subs: map[string]map[int]func(ports.AgentEvent)
 func (b *Bus) Publish(_ context.Context, threadID string, event ports.AgentEvent) error {
 	b.mu.Lock()
 	b.published = append(b.published, event)
+	if len(b.published) > PublishedKept {
+		b.published = append([]ports.AgentEvent(nil), b.published[len(b.published)-PublishedKept:]...)
+	}
 	handlers := make([]func(ports.AgentEvent), 0, len(b.subs[threadID]))
 	for _, h := range b.subs[threadID] {
 		handlers = append(handlers, h)
@@ -167,12 +195,15 @@ func (b *Bus) Subscribe(_ context.Context, threadID string, handler func(ports.A
 	return func() error {
 		b.mu.Lock()
 		delete(b.subs[threadID], id)
+		if len(b.subs[threadID]) == 0 {
+			delete(b.subs, threadID) // a thread nobody watches holds nothing
+		}
 		b.mu.Unlock()
 		return nil
 	}, nil
 }
 
-// Published is every event ever published, in order.
+// Published is the latest PublishedKept events published, in order.
 func (b *Bus) Published() []ports.AgentEvent {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -363,11 +394,13 @@ func (q *Queue) Drain(ctx context.Context, handler func(ctx context.Context, job
 // Storage is a full in-memory Storage: tests, demos, and a template for
 // custom adapters.
 type Storage struct {
-	mu       sync.Mutex
-	threads  map[string]*ports.ThreadDTO
-	messages map[string][]ports.MessageDTO
-	events   map[string][]ports.AgentEvent
-	usage    []usageRow
+	mu      sync.Mutex
+	threads map[string]*ports.ThreadDTO
+	// threadRuns is each thread's current run (ThreadTransition).
+	threadRuns map[string]string
+	messages   map[string][]ports.MessageDTO
+	events     map[string][]ports.AgentEvent
+	usage      []usageRow
 	// LastContext is the StorageContext of the most recent call, so a test
 	// can prove the run state reached the adapter (§2.10).
 	LastContext ports.StorageContext
@@ -385,9 +418,10 @@ type usageRow struct {
 // NewStorage makes an empty Storage.
 func NewStorage() *Storage {
 	return &Storage{
-		threads:  map[string]*ports.ThreadDTO{},
-		messages: map[string][]ports.MessageDTO{},
-		events:   map[string][]ports.AgentEvent{},
+		threads:    map[string]*ports.ThreadDTO{},
+		threadRuns: map[string]string{},
+		messages:   map[string][]ports.MessageDTO{},
+		events:     map[string][]ports.AgentEvent{},
 	}
 }
 
@@ -494,6 +528,7 @@ func (t threads) Delete(_ context.Context, threadID string, sc ports.StorageCont
 	delete(t.s.threads, threadID)
 	delete(t.s.messages, threadID)
 	delete(t.s.events, threadID)
+	delete(t.s.threadRuns, threadID)
 	kept := t.s.usage[:0]
 	for _, u := range t.s.usage {
 		if u.threadID != threadID {
@@ -514,6 +549,25 @@ func (t threads) ClaimState(_ context.Context, threadID string, from, to ports.E
 	}
 	th.State = to
 	th.UpdatedAt = time.Now()
+	return true, nil
+}
+
+func (t threads) Transition(_ context.Context, threadID string, tr ports.ThreadTransition, sc ports.StorageContext) (bool, error) {
+	t.s.mu.Lock()
+	defer t.s.mu.Unlock()
+	t.s.saw(sc)
+	th, ok := t.s.threads[threadID]
+	if !ok || !slices.Contains(tr.From, th.State) {
+		return false, nil
+	}
+	if current := t.s.threadRuns[threadID]; tr.RunID != "" && current != "" && current != tr.RunID {
+		return false, nil
+	}
+	th.State = tr.To
+	th.UpdatedAt = time.Now()
+	if tr.NewRunID != "" {
+		t.s.threadRuns[threadID] = tr.NewRunID
+	}
 	return true, nil
 }
 
@@ -562,12 +616,45 @@ func (m messages) DeleteFrom(_ context.Context, threadID, messageID string, sc p
 
 type events struct{ s *Storage }
 
-func (e events) Append(_ context.Context, threadID string, ev ports.AgentEvent, sc ports.StorageContext) error {
+func (e events) Append(_ context.Context, threadID string, in ports.NewThreadEvent, sc ports.StorageContext) (ports.AgentEvent, error) {
 	e.s.mu.Lock()
 	defer e.s.mu.Unlock()
 	e.s.saw(sc)
+	// The thread's next seq, minted here: one higher than any it holds.
+	var top int64
+	for _, ev := range e.s.events[threadID] {
+		top = max(top, ev.Seq)
+	}
+	at := in.CreatedAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+	payload := in.Payload
+	if len(payload) == 0 {
+		payload = json.RawMessage("null")
+	}
+	ev := ports.AgentEvent{ThreadID: threadID, Seq: top + 1, Type: in.Type, Payload: payload, CreatedAt: at, RunID: in.RunID}
 	e.s.events[threadID] = append(e.s.events[threadID], ev)
-	return nil
+	return ev, nil
+}
+
+func (e events) List(_ context.Context, threadID string, f ports.ThreadEventFilter, sc ports.StorageContext) ([]ports.AgentEvent, error) {
+	e.s.mu.Lock()
+	defer e.s.mu.Unlock()
+	e.s.saw(sc)
+	var out []ports.AgentEvent
+	for _, ev := range e.s.events[threadID] {
+		if (f.Types == nil || slices.Contains(f.Types, ev.Type)) &&
+			(f.RunID == "" || ev.RunID == f.RunID) &&
+			(f.After == nil || ev.Seq > *f.After) {
+			out = append(out, ev)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	if f.Limit > 0 && len(out) > f.Limit {
+		out = out[:f.Limit]
+	}
+	return out, nil
 }
 
 func (e events) ListSince(_ context.Context, threadID string, sinceSeq int64, sc ports.StorageContext) ([]ports.AgentEvent, error) {
@@ -610,6 +697,29 @@ func (e events) ListByType(_ context.Context, threadID, typ string, sc ports.Sto
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
 	return out, nil
+}
+
+func (e events) Prune(_ context.Context, types []string, limit int, dryRun bool) (map[string]int64, error) {
+	e.s.mu.Lock()
+	defer e.s.mu.Unlock()
+	counts := map[string]int64{}
+	left := limit
+	for threadID, list := range e.s.events {
+		kept := list[:0:0]
+		for _, ev := range list {
+			if (!dryRun && left <= 0) || !slices.Contains(types, ev.Type) {
+				kept = append(kept, ev)
+				continue
+			}
+			counts[ev.Type]++
+			left--
+			if dryRun {
+				kept = append(kept, ev)
+			}
+		}
+		e.s.events[threadID] = kept
+	}
+	return counts, nil
 }
 
 type usage struct{ s *Storage }

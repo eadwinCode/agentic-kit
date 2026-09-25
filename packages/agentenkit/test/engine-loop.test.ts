@@ -6,7 +6,7 @@ import { MockLanguageModelV1 } from 'ai/test';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
 import { bindStorage } from '../src/core/state.js';
-import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
+import { MemoryBus, MemoryKv, MemoryQueue, MemoryRunStreams, MemoryStorage } from '../src/adapters/memory.js';
 import { markRequiresConfirmation } from '../src/core/engine.js';
 import { parkForInput } from '../src/core/hitl.js';
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
@@ -77,6 +77,7 @@ async function makeRuntime(model: any, config: Partial<AgentConfig> = {}) {
   const bus = new MemoryBus();
   const queue = new MemoryQueue();
   const kv = new MemoryKv();
+  const streams = new MemoryRunStreams();
   const deps: RuntimeOptions = {
     storage,
     // Isolated per test: the default store is a file on disk.
@@ -84,10 +85,11 @@ async function makeRuntime(model: any, config: Partial<AgentConfig> = {}) {
     bus,
     queue,
     kv,
+    streams,
     resolveModel: () => ({ instance: () => model, contextWindow: 128_000 }),
-    config: resolveConfig(config),
+    config: resolveConfig({ streamFlushMs: 0, ...config }),
   };
-  return { deps, store: bindStorage(storage, { state: {} }), runtime: await setupAgentCore(deps), storage, bus, queue, kv };
+  return { deps, store: bindStorage(storage, { state: {} }), runtime: await setupAgentCore(deps), storage, bus, queue, kv, streams };
 }
 
 const states = (bus: MemoryBus) =>
@@ -105,16 +107,22 @@ describe('reconnecting mid-run (§2.2)', () => {
         (Array.isArray(m.content) ? m.content : []).map((p: any) => p?.text ?? '').join(''),
       )
       .join('');
-  const replayedText = (snap: any) =>
-    snap.activeEvents
-      .filter((e: any) => e.type === 'CHUNK' && e.payload?.type === 'text-delta')
-      .map((e: any) => e.payload.textDelta)
-      .join('');
+  /** The main agent's text in stream items. */
+  const text = (items: any[]) =>
+    items.filter((i: any) => i.type === 'TEXT_MESSAGE_CONTENT').map((i: any) => i.delta).join('');
+  /** What a client that reconnected at the snapshot holds once the in-flight
+   *  step finishes: the snapshot's stream items, then the step's events that
+   *  came after the snapshot's offset, up to that step's end. */
+  const replayedText = async (snap: any, streams: MemoryRunStreams) => {
+    const after = (await streams.snapshot(snap.stream.streamId, snap.stream.offset))!.items;
+    const stepEnd = after.findIndex((i: any) => i.type === 'STEP_FINISHED' && i.agentId === null);
+    return text(snap.stream.items) + text(stepEnd === -1 ? after : after.slice(0, stepEnd));
+  };
 
-  // A client rebuilds from durable messages and THEN replays activeEvents. So
-  // a step whose messages are already committed must not have its chunks
-  // replayed as well, or its text lands twice — once from the message, once
-  // from the stream that produced it.
+  // A client rebuilds from durable messages and THEN the snapshot's stream
+  // items. So a step whose messages are already saved must not have its
+  // deltas in those items as well, or its text lands twice — once from the
+  // message, once from the stream that produced it.
   it('replays only the step that has not been committed yet', async () => {
     let snap: any = null;
     let r: any;
@@ -149,8 +157,8 @@ describe('reconnecting mid-run (§2.2)', () => {
     expect(snap).not.toBeNull();
     // Step 1 is durable, step 2 is still in flight — each appears exactly once
     expect(assistantText(snap)).toBe('PART ONE. ');
-    expect(replayedText(snap)).toBe('PART TWO. ');
-    expect(assistantText(snap) + replayedText(snap)).toBe('PART ONE. PART TWO. ');
+    expect(await replayedText(snap, r.streams)).toBe('PART TWO. ');
+    expect(assistantText(snap) + (await replayedText(snap, r.streams))).toBe('PART ONE. PART TWO. ');
   });
 
   // Nothing is committed during the very first step, so its chunks are the
@@ -185,11 +193,11 @@ describe('reconnecting mid-run (§2.2)', () => {
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
     expect(assistantText(snap)).toBe('');
-    expect(replayedText(snap)).toBe('ONLY. ');
+    expect(await replayedText(snap, r.streams)).toBe('ONLY. ');
   });
 
-  // A park is published DURING the step, before its messages commit. Slicing
-  // the whole window at the commit boundary would drop the very approval the
+  // A park is published right after its step commits. Slicing the whole
+  // window at the commit boundary would drop the very approval the
   // reconnecting client needs to render.
   it('keeps a pending approval that was raised before the step committed', async () => {
     const { runtime, queue } = await makeRuntime(
@@ -325,7 +333,7 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
     await runtime.worker.handleJob(queue.items[0]!);
 
     expect(executed).toEqual(['x']);
-    expect(states(bus)).toEqual(['RUNNING', 'COMPLETED']);
+    expect(states(bus)).toEqual(['QUEUED', 'RUNNING', 'COMPLETED']);
     const terminal = lastTerminal(bus).payload as any;
     expect(terminal.stopReason).toBe('completed');
     expect(terminal.tokensUsed).toBe(30); // 15 per step × 2 steps
@@ -391,14 +399,14 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
     // Step 1 (120 tokens) stayed under budget → step 2 RAN and completed; only
     // step 3 was prevented. Nothing aborted mid-generation.
     expect(executed).toEqual(['x']);
-    expect(states(bus)).toEqual(['RUNNING', 'COMPLETED']);
+    expect(states(bus)).toEqual(['QUEUED', 'RUNNING', 'COMPLETED']);
     const terminal = lastTerminal(bus).payload as any;
     expect(terminal.stopReason).toBe('token_budget');
     expect(terminal.tokensUsed).toBe(240);
     // The break was announced before the run ended
     const exhausted = bus.published.find((e) => e.type === 'TOKEN_BUDGET_EXHAUSTED')!;
     expect(exhausted.payload).toEqual({ agentId: null, tokensUsed: 240, tokenBudget: 150 });
-    expect(exhausted.seq).toBeLessThan(lastTerminal(bus).seq);
+    expect(bus.published.indexOf(exhausted)).toBeLessThan(bus.published.indexOf(lastTerminal(bus)));
     expect(roles(storage, ran.threadId)).toEqual(['user', 'assistant', 'tool', 'assistant']);
     const last = storage.messages.store.get(ran.threadId)!.at(-1)!;
     expect((last.content as any)[0].text).toBe('done');
@@ -431,17 +439,18 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
   });
 
   it('one-shot flavor publishes TEXT_RESULT and needs no CHUNK stream', async () => {
-    const { runtime, bus, queue } = await makeRuntime(scriptedModel([{ text: 'answer' }]));
+    const { runtime, bus, queue, streams } = await makeRuntime(scriptedModel([{ text: 'answer' }]));
     const agent = runtime.createGenerateTextAgent({ name: 'oneshot', model: 'gpt-4o' });
 
     const ran = await agent.run({ prompt: 'hi' });
     await runtime.worker.handleJob(queue.items[0]!);
 
-    expect(states(bus)).toEqual(['RUNNING', 'COMPLETED']);
+    expect(states(bus)).toEqual(['QUEUED', 'RUNNING', 'COMPLETED']);
     expect(lastTerminal(bus).payload).toMatchObject({ state: 'COMPLETED', stopReason: 'completed' });
-    const textResult = bus.published.find((e) => e.type === 'TEXT_RESULT');
-    expect((textResult!.payload as any).text).toBe('answer');
-    expect(bus.published.some((e) => e.type === 'CHUNK')).toBe(false);
+    // The text rides on the stream's end; there are no deltas to stream.
+    const items = (await streams.snapshot(`${ran.runId}:1`))!.items;
+    expect(items.at(-1)).toMatchObject({ type: 'RUN_FINISHED', text: 'answer' });
+    expect(items.some((i) => i.type === 'TEXT_MESSAGE_CONTENT')).toBe(false);
     expect(ran.accepted).toBe(true);
   });
 });
@@ -487,7 +496,7 @@ describe('HITL run-segment park (§2.5)', () => {
     const threadId = await park(r);
 
     expect(r.sent).toEqual([]);
-    expect(states(r.bus)).toEqual(['RUNNING', 'WAITING_FOR_INPUT']);
+    expect(states(r.bus)).toEqual(['QUEUED', 'RUNNING', 'WAITING_FOR_INPUT']);
     expect(await r.kv.get(`agent:state:${threadId}`)).toBe('WAITING_FOR_INPUT');
     // The segment ended: the run lock is released while parked
     expect(await r.kv.get(`agent:lock:${threadId}`)).toBeNull();
@@ -726,7 +735,7 @@ describe('a tool that parks itself (§2.5)', () => {
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
     expect(started).toEqual(['intro']);
-    expect(states(r.bus)).toEqual(['RUNNING', 'WAITING_FOR_INPUT']);
+    expect(states(r.bus)).toEqual(['QUEUED', 'RUNNING', 'WAITING_FOR_INPUT']);
     expect(await r.kv.get(`agent:lock:${ran.threadId}`)).toBeNull();
     const req = r.storage.events.store.get(ran.threadId)!.find((e) => e.type === 'INPUT_REQUIRED')!;
     expect(req.payload).toMatchObject({ toolCallId: 'c1', toolName: 'render', reason: 'job', arguments: { jobId: 'job-1' } });

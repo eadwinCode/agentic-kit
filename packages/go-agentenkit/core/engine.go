@@ -42,6 +42,9 @@ func RequireConfirmation(t goai.Tool) ports.Tool {
 // one is ready, or a redelivery would run half of them and then leave the
 // thread parked with those verdicts already consumed.
 func verdictReady(ctx context.Context, deps ports.RuntimePorts, pending PendingHitl) (string, error) {
+	if pending.Landed {
+		return "answered", nil // its result is in the history already
+	}
 	if _, found, err := deps.Kv.Get(ctx, HitlKey(pending.ToolCallID)); err != nil {
 		return "", err
 	} else if found {
@@ -55,22 +58,23 @@ func verdictReady(ctx context.Context, deps ports.RuntimePorts, pending PendingH
 
 // settleVerdict turns a settled approval into the tool result the
 // conversation will carry (§2.5): run the approved tool, record the denial,
-// or convert an expired request into the timeout denial.
+// or convert an expired request into the timeout denial. It reports whether
+// the request expired.
 //
-// A tool failure is surfaced TO THE MODEL as the tool result, so the
-// conversation always stays executable.
+// Nothing here is consumed: the answer stays until its result is in the
+// history (see landVerdict). An approved tool's output is kept under
+// HitlDoneKey the moment it returns, so a worker that dies before the result
+// is saved does not run the tool a second time on the retry: the retry
+// reuses the output.
+//
+// A tool failure, or a panic, is surfaced TO THE MODEL as the tool result,
+// so the conversation always stays executable.
 func settleVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadID string, pending PendingHitl, target *ports.Tool, state ports.AgentRunState) (json.RawMessage, bool, error) {
 	raw, found, err := deps.Kv.Get(ctx, HitlKey(pending.ToolCallID))
 	if err != nil {
 		return nil, false, err
 	}
-	if err := deps.Kv.Del(ctx, HitlKey(pending.ToolCallID)); err != nil {
-		return nil, false, err
-	}
 	if !found {
-		if _, err := Publish(ctx, deps, threadID, "INPUT_EXPIRED", map[string]any{"toolCallId": pending.ToolCallID}); err != nil {
-			return nil, false, err
-		}
 		return MarshalPayload(map[string]any{"responded": false, "cancelled": true, "reason": "timeout"}), true, nil
 	}
 	var answer struct {
@@ -86,6 +90,11 @@ func settleVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadI
 	if target == nil || target.Execute == nil {
 		return MarshalPayload(map[string]any{"error": "Unknown tool: " + pending.ToolName}), false, nil
 	}
+	if done, found, err := deps.Kv.Get(ctx, HitlDoneKey(pending.ToolCallID)); err != nil {
+		return nil, false, err
+	} else if found {
+		return json.RawMessage(done), false, nil // it already ran; its result was never saved
+	}
 	args := pending.Arguments
 	if len(args) == 0 {
 		args = json.RawMessage("{}")
@@ -94,11 +103,40 @@ func settleVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadI
 	// what the human sent back with the approval.
 	toolCtx := ContextWithPublisher(ContextWithRunState(genCtx, state), ThreadPublisher(deps, threadID))
 	toolCtx = ContextWithApproval(ContextWithToolCallID(toolCtx, pending.ToolCallID), Approval{Payload: answer.Payload})
-	output, err := target.Execute(toolCtx, args)
-	if err != nil {
-		return MarshalPayload(map[string]any{"error": err.Error()}), false, nil
+	var output string
+	result := json.RawMessage(nil)
+	if err := CallSafely(func() error {
+		var err error
+		output, err = target.Execute(toolCtx, args)
+		return err
+	}); err != nil {
+		result = MarshalPayload(map[string]any{"error": err.Error()})
+	} else {
+		result = jsonOrString(output)
 	}
-	return jsonOrString(output), false, nil
+	if _, err := deps.Kv.Set(ctx, HitlDoneKey(pending.ToolCallID), string(result), ports.SetOptions{Expiry: hitlDoneTTL}); err != nil {
+		return nil, false, err
+	}
+	return result, false, nil
+}
+
+// hitlDoneTTL is how long an approved tool's output is kept for a retry
+// that has to land it: far past any retry backoff.
+const hitlDoneTTL = 24 * time.Hour
+
+// landVerdict clears a verdict once its result is in the history (§2.5):
+// the answer and the kept output go, and an expiry is published. Before
+// that, a retry must still find both.
+func landVerdict(ctx context.Context, deps ports.RuntimePorts, threadID string, pending PendingHitl, expired bool) error {
+	if expired {
+		if _, err := Publish(ctx, deps, threadID, "INPUT_EXPIRED", map[string]any{"toolCallId": pending.ToolCallID}); err != nil {
+			return err
+		}
+	}
+	if err := deps.Kv.Del(ctx, HitlKey(pending.ToolCallID)); err != nil {
+		return err
+	}
+	return deps.Kv.Del(ctx, HitlDoneKey(pending.ToolCallID))
 }
 
 // unwindVerdict lands a settled verdict and unwinds whatever was waiting on
@@ -106,52 +144,113 @@ func settleVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadI
 // or a nested run's. When a nested run asked, its own loop is re-entered
 // from its persisted turns and its result is handed to the call waiting one
 // level up, repeating until the main agent's spawnSubagent call is answered.
+// A park that already landed (see PendingHitl.Landed) carries on from the
+// first level still waiting.
 //
-// Returns false when the unwind parked again: the thread stays
-// WAITING_FOR_INPUT and a later dispatch picks up from the new request.
-func unwindVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadID string, pending PendingHitl, result json.RawMessage, subCtx *SubagentCtx) (bool, error) {
-	if _, err := deps.Storage.Messages.Append(ctx, threadID, ports.NewMessage{
-		Role: ports.RoleTool, AgentID: pending.AgentID,
-		Content: ToolResultContent(pending.ToolCallID, pending.ToolName, result),
-	}); err != nil {
-		return false, err
-	}
-	// producer is whoever must now run to produce the next result. Nil means
-	// the main agent, whose loop the caller re-enters itself.
+// A child that fails on the way up is reported to the level above as the
+// delegation's result, exactly as a live spawnSubagent reports it, so one
+// failed child never leaves the whole thread stuck waiting.
+//
+// Returns false when the unwind parked again, or a user stopped it: the
+// thread stays as it is and a later dispatch picks up from there.
+func unwindVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadID string, pending PendingHitl, result json.RawMessage, expired bool, subCtx *SubagentCtx) (bool, error) {
+	start := 0
 	producer := pending.Nested
-	for i, frame := range pending.Frames {
-		if producer == nil || subCtx == nil {
-			break
+	if pending.Landed {
+		start = pending.ResumeFrame
+		if start > 0 {
+			producer = pending.Frames[start-1].Nested
 		}
-		outcome, err := RunNestedAgent(genCtx, subCtx, *producer, nil, pending.Frames[i:])
-		if err != nil {
-			return false, err
-		}
-		if outcome.Parked || outcome.Aborted {
-			return false, nil // parked again one level down, or a user stop mid-unwind (§2.1)
-		}
-		if run, err := deps.Admin.Runs().Get(ctx, producer.AgentID); err == nil && run != nil {
-			completed := ports.StateCompleted
-			closeNested(ctx, subCtx, run, outcome, ports.RunPatch{
-				State: &completed, Result: MarshalPayload(map[string]any{"text": outcome.Text}),
-			})
-		}
-		if _, err := Publish(ctx, deps, threadID, "SUBAGENT_COMPLETED", map[string]any{"agentId": producer.AgentID}); err != nil {
-			return false, err
-		}
-		// Hand the capped result to the call one level up (§2.6)
+	} else {
 		if _, err := deps.Storage.Messages.Append(ctx, threadID, ports.NewMessage{
-			Role: ports.RoleTool, AgentID: frame.AgentID,
-			Content: ToolResultContent(frame.ToolCallID, "spawnSubagent", map[string]any{
-				"agentId": producer.AgentID,
-				"result":  capRunes(outcome.Text, deps.Config.SubagentResultCapChars),
-			}),
+			Role: ports.RoleTool, AgentID: pending.AgentID,
+			Content: ToolResultContent(pending.ToolCallID, pending.ToolName, result),
 		}); err != nil {
 			return false, err
 		}
+		streamToolResult(ctx, deps, threadID, pending.AgentID, pending.ToolCallID, pending.ToolName, result)
+		if err := landVerdict(ctx, deps, threadID, pending, expired); err != nil {
+			return false, err
+		}
+	}
+	// producer is whoever must now run to produce the next result. Nil means
+	// the main agent, whose loop the caller re-enters itself.
+	for i := start; i < len(pending.Frames); i++ {
+		frame := pending.Frames[i]
+		if producer == nil || subCtx == nil {
+			break
+		}
+		var handed any
+		outcome, err := RunNestedAgent(genCtx, subCtx, *producer, nil, pending.Frames[i:])
+		if err == nil && outcome.Interrupted && !outcome.Aborted {
+			// A child whose stream ended with no finish did not finish.
+			err = fmt.Errorf("step %d ended without a finish", outcome.Steps+1)
+		}
+		switch {
+		case err == nil && outcome.Parked:
+			return false, nil // parked again one level down
+		case (err == nil && outcome.Aborted) || genCtx.Err() != nil || stopped(ctx, deps, threadID):
+			return false, nil // a user stop mid-unwind (§2.1)
+		case err != nil:
+			msg := err.Error()
+			if run, gerr := deps.Admin.Runs().Get(ctx, producer.AgentID); gerr == nil && run != nil {
+				failed := ports.StateFailed
+				closeNested(ctx, subCtx, run, nil, ports.RunPatch{State: &failed, Error: &msg})
+			}
+			if _, err := Publish(ctx, deps, threadID, "SUBAGENT_FAILED", map[string]any{
+				"agentId": producer.AgentID, "state": ports.StateFailed, "error": msg,
+			}); err != nil {
+				return false, err
+			}
+			handed = map[string]any{"agentId": producer.AgentID, "error": msg}
+		default:
+			if run, err := deps.Admin.Runs().Get(ctx, producer.AgentID); err == nil && run != nil {
+				completed := ports.StateCompleted
+				closeNested(ctx, subCtx, run, outcome, ports.RunPatch{
+					State: &completed, Result: MarshalPayload(map[string]any{"text": outcome.Text}),
+				})
+			}
+			if _, err := Publish(ctx, deps, threadID, "SUBAGENT_COMPLETED", map[string]any{"agentId": producer.AgentID}); err != nil {
+				return false, err
+			}
+			// Hand the capped result to the call one level up (§2.6)
+			handed = map[string]any{
+				"agentId": producer.AgentID,
+				"result":  capRunes(outcome.Text, deps.Config.SubagentResultCapChars),
+			}
+		}
+		if _, err := deps.Storage.Messages.Append(ctx, threadID, ports.NewMessage{
+			Role: ports.RoleTool, AgentID: frame.AgentID,
+			Content: ToolResultContent(frame.ToolCallID, "spawnSubagent", handed),
+		}); err != nil {
+			return false, err
+		}
+		streamToolResult(ctx, deps, threadID, frame.AgentID, frame.ToolCallID, "spawnSubagent", handed)
 		producer = frame.Nested
 	}
 	return true, nil
+}
+
+// streamToolResult puts a result the resume saved on the resume's run
+// stream: a live tool's result goes out as its chunk, but a verdict's is
+// only ever saved.
+func streamToolResult(ctx context.Context, deps ports.RuntimePorts, threadID, agentID, toolCallID, toolName string, result any) {
+	seg := ActiveSegment(deps, threadID)
+	if seg == nil {
+		return
+	}
+	chunk := MarshalPayload(map[string]any{"type": "tool-result", "toolCallId": toolCallID, "toolName": toolName, "result": result})
+	if agentID != "" {
+		seg.Forward(ctx, "SUBAGENT_CHUNK", MarshalPayload(map[string]any{"agentId": agentID, "chunk": chunk}), true)
+		return
+	}
+	seg.Forward(ctx, "CHUNK", chunk, true)
+}
+
+// stopped reports a user stop on the hot cache (§2.1).
+func stopped(ctx context.Context, deps ports.RuntimePorts, threadID string) bool {
+	st, _, _ := deps.Kv.Get(ctx, StateKey(threadID))
+	return st == string(ports.StateCancelled)
 }
 
 // closeRunRecord sums this segment onto the run's record and stamps how it
@@ -173,71 +272,110 @@ func closeRunRecord(ctx context.Context, deps ports.RuntimePorts, runID string, 
 	}
 	patch := ports.RunPatch{
 		State: &f.State, StopReason: ports.Ptr(f.StopReason), EndedAt: &endedAt,
-		DurationMs:        ports.Ptr(endedAt.Sub(prior.StartedAt).Milliseconds()),
-		Steps:             ports.Ptr(prior.Steps + f.Steps),
-		InputTokens:       ports.Ptr(prior.InputTokens + f.Attribution.InputTokens),
-		CachedInputTokens: ports.Ptr(prior.CachedInputTokens + f.Attribution.CachedInputTokens),
-		OutputTokens:      ports.Ptr(prior.OutputTokens + f.Attribution.OutputTokens),
-		TotalTokens:       ports.Ptr(prior.TotalTokens + f.Attribution.TotalTokens),
+		DurationMs: ports.Ptr(endedAt.Sub(prior.StartedAt).Milliseconds()),
 	}
 	if f.Error != "" {
 		patch.Error = ports.Ptr(f.Error)
 	}
 	_ = deps.Admin.Runs().Patch(ctx, runID, patch)
+	// The counters are added in the store, not read and written back here:
+	// a nested run and its parent can close at the same moment.
+	_ = deps.Admin.Runs().Increment(ctx, runID, deltasOf(f.Steps, f.Attribution))
 	return endedAt
+}
+
+// deltasOf is a segment's steps and tokens as counters to add to its run.
+func deltasOf(steps int, a TokenAttribution) ports.RunDeltas {
+	return ports.RunDeltas{
+		Steps: steps, InputTokens: a.InputTokens, CachedInputTokens: a.CachedInputTokens,
+		OutputTokens: a.OutputTokens, TotalTokens: a.TotalTokens,
+	}
 }
 
 // accrueRunRecord adds a parked segment's steps and tokens onto the run's
 // record (§2.9) without closing it. Best effort, like every admin write.
 func accrueRunRecord(ctx context.Context, deps ports.RuntimePorts, runID string, loop *LoopOutcome) {
-	prior, err := deps.Admin.Runs().Get(ctx, runID)
-	if err != nil || prior == nil {
-		return
-	}
-	patch := ports.RunPatch{
-		Steps:             ports.Ptr(prior.Steps + loop.Steps),
-		InputTokens:       ports.Ptr(prior.InputTokens + loop.Attribution.InputTokens),
-		CachedInputTokens: ports.Ptr(prior.CachedInputTokens + loop.Attribution.CachedInputTokens),
-		OutputTokens:      ports.Ptr(prior.OutputTokens + loop.Attribution.OutputTokens),
-		TotalTokens:       ports.Ptr(prior.TotalTokens + loop.Attribution.TotalTokens),
-	}
-	_ = deps.Admin.Runs().Patch(ctx, runID, patch)
+	_ = deps.Admin.Runs().Increment(ctx, runID, deltasOf(loop.Steps, loop.Attribution))
 }
+
+// SettleClaimTTL is how long a settle claim holds (§5.6). A claim older
+// than this belongs to a settler that died, and the next settle takes the
+// run over.
+const SettleClaimTTL = 10 * time.Minute
 
 // settleRun runs the spec's OnSettle for a run, once (§5.6). Every path that
 // ends a run goes through here: the worker that finished or aborted it, the
-// worker that failed it, and a stop that ended it while no worker held it.
-// The run record remembers that the settle ran, so whichever of those comes
-// second sees the mark and does nothing; the caller holds the run lock, so
-// the read and the mark are not racing another settler.
+// worker that failed it, a stop that ended it while no worker held it, and
+// the late-settle sweep.
 //
-// Returns the hook's error, and whether the hook was reached at all. A run
-// with no record (a foreign dispatch) settles unmarked, as it always did.
+// Once is kept by a claim on the run record, made in one conditional write
+// before the hook runs: only the settler that wins it calls the hook, so two
+// that arrive together cannot both bill. The hook's success marks the run
+// settled; its failure drops the claim, so a later stop, delivery or sweep
+// runs it again. A claim that is never ended (the settler died mid-hook)
+// is taken over after SettleClaimTTL. That is also why the hook must be
+// idempotent by RunID: a hook slower than the claim, or a mark that could
+// not be written, can see the same run twice.
+//
+// Returns the hook's error, and whether this call ran the settle at all. A
+// run with no record (a foreign dispatch) settles unclaimed, as it always
+// did. A store that cannot take the claim leaves the run unsettled for the
+// sweep rather than risk a second bill.
+//
+// Everything here runs on a context no stop or shutdown can cancel. A
+// stopped run reaches this with its generation context already cancelled,
+// and the hook's own writes must still land. The hook learns about a stop
+// from info.Cancelled.
 func settleRun(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, info ports.RunFinishInfo) (bool, error) {
-	var prior *ports.RunRecord
-	if info.RunID != "" {
+	ctx = context.WithoutCancel(ctx)
+	log := Logger(deps).With("run", info.RunID)
+	hook := func() error {
+		if agent == nil || agent.Args.OnSettle == nil {
+			return nil
+		}
+		return CallSafely(func() error { return agent.Args.OnSettle(ctx, info) })
+	}
+	if info.RunID == "" {
+		return true, hook()
+	}
+	token := NewID()
+	var claimed bool
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+		}
+		if claimed, err = deps.Admin.Runs().ClaimSettle(ctx, info.RunID, token, time.Now().Add(-SettleClaimTTL)); err == nil {
+			break
+		}
+	}
+	if err != nil {
+		log.Error("settle not claimed; the run stays unsettled for the late-settle sweep", "err", err)
+		return false, nil
+	}
+	if !claimed {
 		rec, err := deps.Admin.Runs().Get(ctx, info.RunID)
-		if err != nil {
-			Logger(deps).Error("run record not read before settle", "run", info.RunID, "err", err)
+		if err == nil && rec == nil {
+			return true, hook() // no record to claim: settled unclaimed
 		}
-		prior = rec
+		return false, nil // settled already, or being settled by someone else
 	}
-	if prior != nil && prior.SettledAt != nil {
-		return false, nil // already settled, by a stop or an earlier worker
-	}
-	var hookErr error
-	if agent != nil && agent.Args.OnSettle != nil {
-		hookErr = agent.Args.OnSettle(ctx, info)
-	}
-	if prior != nil {
-		if hookErr == nil {
-			_ = deps.Admin.Runs().Patch(context.WithoutCancel(ctx), info.RunID, ports.RunPatch{SettledAt: ports.Ptr(time.Now())})
-		} else {
-			// The mark is only set once the hook has done its work. A hook
-			// that failed leaves the run unsettled, so a later stop, a later
-			// delivery or the stuck-run sweep can run it again.
-			Logger(deps).Error("settle hook failed; the run stays unsettled for a retry", "run", info.RunID, "err", hookErr)
+	hookErr := hook()
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
 		}
+		if err = deps.Admin.Runs().EndSettle(ctx, info.RunID, token, hookErr == nil); err == nil {
+			break
+		}
+	}
+	switch {
+	case hookErr != nil:
+		// The claim is dropped, so a later stop, delivery or sweep can run
+		// the hook again.
+		log.Error("settle hook failed; the run stays unsettled for a retry", "err", hookErr)
+	case err != nil:
+		log.Error("settle mark not written; the claim lapses and the late-settle sweep may settle this run again", "err", err)
 	}
 	return true, hookErr
 }
@@ -279,6 +417,40 @@ func settleEndedRun(ctx context.Context, deps ports.RuntimePorts, agent *Registe
 	return settled
 }
 
+// finishedEarlier reports whether this run already made its last step in an
+// earlier delivery (§2.8): a worker saved the step that answered, then died
+// before the run ended. Every run appends its own user turn when it is
+// dispatched, so a main-agent history that ends in an assistant message with
+// no tool calls can only be this run's answer. A run already settled is
+// finished too. The text is that answer, for a generate-text run's result.
+func finishedEarlier(ctx context.Context, deps ports.RuntimePorts, threadID, runID string) (string, bool) {
+	if runID == "" {
+		return "", false
+	}
+	settled := false
+	if rec, err := deps.Admin.Runs().Get(ctx, runID); err == nil && rec != nil {
+		settled = rec.SettledAt != nil
+	}
+	msgs, err := deps.Storage.Messages.List(ctx, threadID, ports.MainAgent)
+	if err != nil || len(msgs) == 0 {
+		return "", settled
+	}
+	last := msgs[len(msgs)-1]
+	if last.Role != ports.RoleAssistant {
+		return "", settled
+	}
+	text := ""
+	for _, p := range ParseContent(last.Content) {
+		switch p.Type {
+		case "tool-call":
+			return "", settled // the loop was not done
+		case "text":
+			text += p.Text
+		}
+	}
+	return text, true
+}
+
 // isTerminal reports whether a state is one a run cannot leave.
 func isTerminal(state ports.ExecutionState) bool {
 	return state == ports.StateCancelled || state == ports.StateCompleted || state == ports.StateFailed
@@ -304,32 +476,43 @@ func closeIfOpen(ctx context.Context, deps ports.RuntimePorts, runID, stopReason
 // this run must get to close them as failed. Its own error cannot change
 // the outcome, which is already a failure.
 func failRun(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, threadID, runID, reason string) error {
-	if agent != nil && agent.Args.OnSettle != nil {
-		// A failed run still spent money on the steps it did make (§4).
-		bill, billErr := runBill(ctx, deps, threadID, runID)
-		_, _ = settleRun(ctx, deps, agent, ports.RunFinishInfo{
-			ThreadID: threadID, RunID: runID, State: ports.StateFailed, StopReason: "failed", Error: reason,
-			Usage: bill, UsageErr: billErr,
-		})
+	// A failed run still spent money on the steps it did make (§4), so it
+	// settles like any other end. Settled even with no hook, so the late
+	// sweep does not keep coming back to it.
+	bill, billErr := runBill(ctx, deps, threadID, runID)
+	info := ports.RunFinishInfo{
+		ThreadID: threadID, RunID: runID, State: ports.StateFailed, StopReason: "failed", Error: reason,
+		TokensUsed: bill.TotalTokens, Usage: bill, UsageErr: billErr,
 	}
-	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateFailed), ports.SetOptions{}); err != nil {
+	settled, _ := settleRun(ctx, deps, agent, info)
+	// Only while the thread is still this run's and still going: a stop or a
+	// newer run that got there first keeps its own ending (§3.4).
+	won, err := Transition(ctx, deps, threadID, StateChange{From: ActiveStates, To: ports.StateFailed, RunID: runID})
+	if err != nil {
 		return err
 	}
-	if err := SetThreadState(ctx, deps, threadID, ports.StateFailed, ""); err != nil {
-		return err
+	if !won {
+		Logger(deps).Info("run not failed: the thread has moved on", "thread", threadID, "run", runID, "reason", reason)
+		return nil
 	}
 	endedAt := time.Now()
 	if runID != "" {
 		endedAt = closeRunRecord(ctx, deps, runID, FinalizeInput{
-			State: ports.StateFailed, StopReason: "completed", Error: reason, RunID: runID,
+			State: ports.StateFailed, StopReason: "failed", Error: reason, RunID: runID,
 		})
 	}
-	terminal := map[string]any{"state": ports.StateFailed, "error": reason, "endedAt": endedAt}
+	terminal := map[string]any{"state": ports.StateFailed, "stopReason": "failed", "error": reason, "endedAt": endedAt}
 	if runID != "" {
 		terminal["runId"] = runID
 	}
-	_, err := Publish(ctx, deps, threadID, "STATE_CHANGE", terminal)
-	return err
+	if _, err = Publish(ctx, deps, threadID, "STATE_CHANGE", terminal); err != nil {
+		return err
+	}
+	// OnFinish fires on every end, a failure included, once.
+	if settled && agent != nil && agent.Args.OnFinish != nil {
+		agent.Args.OnFinish(info)
+	}
+	return nil
 }
 
 func findTool(tools []ports.Tool, name string) *ports.Tool {
@@ -367,22 +550,28 @@ func resumePendingHitl(ctx, genCtx context.Context, deps ports.RuntimePorts, thr
 		} else if subCtx != nil {
 			target = findTool(nestedRawTools(subCtx, pending.Nested), pending.ToolName)
 		}
-		result, _, err := settleVerdict(ctx, genCtx, deps, threadID, pending, target, state)
-		if err != nil {
-			return false, err
+		var result json.RawMessage
+		expired := false
+		if !pending.Landed {
+			var err error
+			if result, expired, err = settleVerdict(ctx, genCtx, deps, threadID, pending, target, state); err != nil {
+				return false, err
+			}
 		}
-		ok, err := unwindVerdict(ctx, genCtx, deps, threadID, pending, result, subCtx)
+		ok, err := unwindVerdict(ctx, genCtx, deps, threadID, pending, result, expired, subCtx)
 		if err != nil || !ok {
 			return false, err
 		}
 	}
-	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateRunning), ports.SetOptions{}); err != nil {
+	// A stop that landed while the verdicts were applied wins: the thread
+	// stays CANCELLED and this segment goes no further (§3.4).
+	runID := RunIDFromContext(ctx)
+	if won, err := Transition(ctx, deps, threadID, StateChange{
+		From: []ports.ExecutionState{ports.StateWaitingForInput}, To: ports.StateRunning, RunID: runID,
+	}); err != nil || !won {
 		return false, err
 	}
-	if err := SetThreadState(ctx, deps, threadID, ports.StateRunning, ""); err != nil {
-		return false, err
-	}
-	if _, err := Publish(ctx, deps, threadID, "STATE_CHANGE", runStatePayload(ctx, deps, ports.StateRunning, RunIDFromContext(ctx))); err != nil {
+	if _, err := Publish(ctx, deps, threadID, "STATE_CHANGE", runStatePayload(ctx, deps, ports.StateRunning, runID)); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -395,6 +584,9 @@ type ExecuteInput struct {
 	// RunID is this dispatch's run id (§2.1). A job without one keeps the
 	// old behavior: no staleness check, and no redrive on a lock conflict.
 	RunID string
+	// DispatchID is the job's delivery id (see ports.RunJob). Empty means a
+	// call that did not come off the queue; the lock then makes one up.
+	DispatchID string
 	// EnqueuedAt is epoch ms at enqueue, for the queue-wait measurement (§2.9).
 	EnqueuedAt int64
 	// DispatchedAt is epoch ms of the run's first dispatch (§2.8), carried
@@ -415,8 +607,19 @@ type ExecuteInput struct {
 	MaxSteps int
 }
 
+// EnqueueJob is the one way the platform puts a job on the queue: it stamps
+// the job with a fresh DispatchID, so every enqueue is a delivery of its own
+// and only the queue's own redelivery repeats one (§3.4).
+func EnqueueJob(ctx context.Context, deps ports.RuntimePorts, job ports.RunJob, opts *ports.EnqueueOptions) error {
+	if job.DispatchID == "" {
+		job.DispatchID = NewID()
+	}
+	return deps.Queue.Enqueue(ctx, job, opts)
+}
+
 // job rebuilds the dispatch ticket for a job that goes back on the queue: a
-// retry, a redrive. Same run, same caps, same place in line.
+// retry, a redrive. Same run, same caps, same place in line; a new
+// delivery, so no DispatchID (EnqueueJob stamps a fresh one).
 func (input ExecuteInput) job(agent string, kind ports.JobKind) ports.RunJob {
 	return ports.RunJob{
 		ThreadID: input.ThreadID, RunID: input.RunID, Model: input.Model, Agent: agent,
@@ -459,7 +662,7 @@ const (
 // work and renews it while the segment runs, so a held lock always means a
 // live worker. Two workers can never run one thread, and a crashed worker's
 // lock expires within a lease instead of blocking forever (§3.4).
-func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, input ExecuteInput) (ExecuteOutcome, error) {
+func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, input ExecuteInput) (outcome ExecuteOutcome, retErr error) {
 	threadID, runID := input.ThreadID, input.RunID
 	if err := ValidateTokenBudget(input.TokenBudget, "tokenBudget"); err != nil {
 		return "", err
@@ -481,25 +684,21 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		return current != runID, err
 	}
 
-	// The lock carries the run id, so a later conflict can tell a duplicate
-	// delivery of THIS run apart from an older run that is still finishing.
-	lockValue := runID
-	if lockValue == "" {
-		lockValue = NewID()
-	}
-	locked, err := deps.Kv.Set(ctx, RunLockKey(threadID), lockValue, ports.SetOptions{
-		OnlyIfNotExists: true, Expiry: deps.Config.RunLockLease,
-	})
+	// The lock names this run and this delivery of it (§3.4), so a later
+	// conflict can tell a duplicate of THIS job apart from another delivery
+	// of the same run and from an older run that is still finishing.
+	lease, err := AcquireRunLock(ctx, deps, threadID, runID, input.DispatchID)
 	if err != nil {
 		return "", err
 	}
-	if !locked {
+	if lease == nil {
 		return OutcomeLockConflict, nil // another worker owns this thread (§2.8)
 	}
 	// Release on success, failure, or stop: only while the lock is still
 	// this worker's. A lock another worker took after this one lapsed is
-	// theirs to free (§3.4).
-	defer func() { _, _ = deps.Kv.DelIfValue(context.WithoutCancel(ctx), RunLockKey(threadID), lockValue) }()
+	// theirs to free (§3.4). Registered first, so it runs last: the lease
+	// is held through the settle and the finalize below.
+	defer lease.Release()
 
 	// Token budget (§2.1 safety cap): execute input → spec → config. Checked
 	// BETWEEN steps: the finished step is always kept in full.
@@ -567,43 +766,42 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			}
 		}
 	}()
-	// The lock is renewed every third of its lease while the segment runs,
-	// the way a queue renews a job lease, so an expired lock means a dead
-	// worker and nothing else. A renewal that finds the key gone or holding
-	// another value, or that fails three times running, ends the segment.
-	renewDone := make(chan struct{})
-	go func() {
-		defer close(renewDone)
-		ticker := time.NewTicker(deps.Config.RunLockLease / 3)
-		defer ticker.Stop()
-		failures := 0
-		for {
-			select {
-			case <-genCtx.Done():
-				return
-			case <-ticker.C:
-				ok, err := deps.Kv.SetIfValue(ctx, RunLockKey(threadID), lockValue, lockValue, deps.Config.RunLockLease)
-				if err != nil {
-					failures++
-					log.Warn("run lock renewal failed", "err", err, "consecutive", failures)
-					if failures < 3 {
-						continue
-					}
-				} else if ok {
-					failures = 0
-					continue
-				}
-				log.Error("run lock lost; ending the segment", "err", err)
-				lockLost.Store(true)
-				cancel()
-				return
-			}
-		}
-	}()
+	// The lease is renewed until it is released, not only while the model
+	// runs: the settle and the finalize after the loop are writes too. A
+	// lease that cannot be kept ends the segment (§3.4).
+	lease.Keep(func() {
+		lockLost.Store(true)
+		cancel()
+	})
 	defer func() {
 		cancel()
 		<-pollDone
-		<-renewDone
+	}()
+
+	// The segment's run stream, open from pickup (see SegmentStream), and how
+	// it ends: set where the segment's outcome is known, or worked out here
+	// from how it stopped. Closed before the lock goes, so the next
+	// segment's stream never starts while this one is still open.
+	var seg *SegmentStream
+	var segEnd ports.StreamEnd
+	defer func() {
+		if seg == nil || seg.Closed() {
+			return
+		}
+		end := segEnd
+		if end == nil {
+			switch {
+			case lockLost.Load() || outcome == OutcomeLockLost:
+				end = &ports.RunErrorEvent{Status: "lost", Error: "the worker lost the run lock"}
+			case ctx.Err() != nil:
+				end = &ports.RunErrorEvent{Status: "lost", Error: "the worker shut down mid-run"}
+			case retErr != nil:
+				end = &ports.RunErrorEvent{Status: "error", Error: retErr.Error()}
+			default:
+				end = &ports.RunErrorEvent{Status: "error", Error: "the segment ended"}
+			}
+		}
+		seg.Close(ctx, end)
 	}()
 
 	// A newer run already owns this thread: this job has nothing to do, and
@@ -654,8 +852,8 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		budget := &ports.RunBudget{CostBudgetMicros: costBudget, MaxSteps: input.MaxSteps}
 		check := ports.BillingCheck{
 			ThreadID: threadID, RunID: runID, State: input.State, Stage: ports.BillingAtPickup, Budget: budget,
-			PublishEvent: func(ctx context.Context, typ string, payload any, notice bool) (ports.AgentEvent, error) {
-				return PublishEvent(ctx, deps, threadID, typ, payload, PublishOptions{Notice: notice})
+			PublishEvent: func(ctx context.Context, typ string, payload any, durable bool) (ports.AgentEvent, error) {
+				return PublishEvent(ctx, deps, threadID, typ, payload, PublishOptions{Durable: durable})
 			},
 		}
 		if err := deps.Config.BillingPreCheck(ctx, check); err != nil {
@@ -688,8 +886,10 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		State: input.State, MaxSteps: input.MaxSteps,
 	}
 	// One ledger for the whole run: a nested run's spend counts against the
-	// same safety cap the main agent is checked against (§2.7).
-	ledger := &RunLedger{}
+	// same caps the main agent is checked against (§2.7), and it starts from
+	// what the run spent before a park or a retry, so no segment gets a
+	// fresh budget.
+	ledger := SeedRunLedger(ctx, deps, threadID, runID)
 
 	// Pickup (§2.8): the run has a worker now. A QUEUED thread becomes
 	// RUNNING on every home, its record takes the moment work started, and
@@ -703,6 +903,18 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			patch.QueuedMs = ports.Ptr(pickedUp.UnixMilli() - input.EnqueuedAt)
 		}
 		if durable.State == ports.StateQueued {
+			// A stop (or a newer run) that landed since the read above wins:
+			// this job has nothing to pick up (§3.4).
+			won, err := Transition(ctx, deps, threadID, StateChange{
+				From: []ports.ExecutionState{ports.StateQueued}, To: ports.StateRunning, RunID: runID, Model: input.Model,
+			})
+			if err != nil {
+				return "", err
+			}
+			if !won {
+				log.Info("run not picked up: the thread moved on before this worker got to it")
+				return OutcomeExecuted, nil
+			}
 			startedAt := pickedUp
 			if rec, err := deps.Admin.Runs().Get(ctx, runID); err == nil && rec != nil && rec.QueuedMs != nil {
 				startedAt = rec.StartedAt // a retry: the run started when it first ran
@@ -711,12 +923,6 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			}
 			patch.State = ports.Ptr(ports.StateRunning)
 			_ = deps.Admin.Runs().Patch(ctx, runID, patch)
-			if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateRunning), ports.SetOptions{}); err != nil {
-				return "", err
-			}
-			if err := SetThreadState(ctx, deps, threadID, ports.StateRunning, input.Model); err != nil {
-				return "", err
-			}
 			if _, err := Publish(ctx, deps, threadID, "STATE_CHANGE", map[string]any{
 				"state": ports.StateRunning, "runId": runID, "startedAt": startedAt,
 			}); err != nil {
@@ -728,16 +934,24 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		}
 	}
 
+	// From here on the segment does work, and says so on its own stream.
+	seg = OpenSegment(ctx, deps, threadID, runID)
+
 	// Platform-owned toolset: HITL (§2.5) over the user's set; spawnSubagent
 	// added ONLY when the spec opts in (§2.7). rawTools keeps the real
 	// implementations: the resolved park executes the approved tool.
+	// Parks raised during this segment wait here until the step that raised
+	// them is saved (see ParkBox).
+	parks := &ParkBox{}
 	var subCtx *SubagentCtx
 	if agent.Spec.Subagents != nil {
 		subCtx = &SubagentCtx{
-			IOCtx: ctx, ThreadID: threadID, Depth: 0, Sem: agent.Sem, Ports: deps,
-			Sub: *agent.Spec.Subagents, Agent: agent, Ledger: ledger, Resume: resume,
+			IOCtx: ctx, ThreadID: threadID, Depth: 0, Ports: deps,
+			// Made per run: the cap is this run's, never shared with others.
+			Slots: NewRunSlots(deps.Config.SubagentMaxConcurrent),
+			Sub:   *agent.Spec.Subagents, Agent: agent, Ledger: ledger, Resume: resume,
 			TokenBudget: tokenBudget, CostBudgetMicros: costBudget, BillingRunID: runID,
-			ProviderOptions: providerOptions, Aborted: aborted, State: input.State,
+			ProviderOptions: providerOptions, Aborted: aborted, Fenced: lease.Lost, Parks: parks, State: input.State,
 		}
 	}
 	rawTools := slices.Clone(agent.Args.Tools)
@@ -747,7 +961,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	// The main agent's own toolset: nothing is waiting on its parks (§2.7).
 	// Every tool also sees the run's state (§2.10) and can publish its own
 	// events on the thread.
-	tools := WithRunState(WithPublishEvent(deps, threadID, WithHitl(deps, threadID, rawTools, HitlCtx{Resume: resume})), input.State)
+	tools := WithRunState(WithPublishEvent(deps, threadID, WithHitl(deps, threadID, rawTools, HitlCtx{Resume: resume, Parks: parks})), input.State)
 
 	// §2.5 resume: a WAITING thread at segment start is either the /respond
 	// continuation or a redelivery of the original job while still parked.
@@ -766,58 +980,85 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			return "", err
 		}
 		if !resumed {
-			return OutcomeExecuted, nil // still parked, nothing to do yet
+			// Still parked, or parked again one level down while unwinding:
+			// the new park's step is saved by now, so it is written here.
+			if err := CommitParks(ctx, deps, parks); err != nil {
+				return "", err
+			}
+			segEnd = &ports.RunFinishedEvent{Status: "parked"}
+			return OutcomeExecuted, nil
 		}
 	}
 
-	// Durable compaction pass: history always fits the model budget (§2.6)
-	history, err := CompactContext(ctx, deps, threadID, input.Model)
-	if err != nil {
-		return "", err
-	}
-	model, err := deps.ResolveModel(input.Model)
-	if err != nil {
-		return "", err
-	}
-	// Prompt caching (§2.6): stamp the stable prefix once; appended step
-	// messages extend the prompt without invalidating the breakpoints.
-	messages := RepairDanglingToolCalls(MessagesFromDTOs(history))
-	if deps.Config.PromptCaching {
-		messages = MarkPromptCaching(messages)
-	}
-
-	loop, err := RunLoop(ctx, deps, agent, threadID, LoopInput{
-		AgentID: "", RunID: runID, Kind: agent.Kind, Model: model.Instance(),
-		Messages: messages, Tools: tools, MaxSteps: maxSteps,
-		GenCtx: genCtx, Aborted: aborted,
-		ProviderOptions: providerOptions, TokenBudget: tokenBudget,
-		SystemFn: agent.Args.SystemFn, PrepareStep: agent.Args.PrepareStep, State: input.State,
-		CostBudgetMicros: costBudget, BillingRunID: runID,
-		ModelKey: input.Model, ModelID: model.WireID(input.Model), AgentName: agent.Name,
-		CacheSystemPrompt: deps.Config.PromptCaching,
-		OnChunk: func(chunk provider.StreamChunk) {
-			// One canonical path for every client: durable log + live bus (§2.1, §2.2)
-			_, _ = Publish(ctx, deps, threadID, "CHUNK", ChunkPayload(chunk))
-			if agent.Args.OnChunk != nil {
-				agent.Args.OnChunk(chunk) // user callback still fires
-			}
-		},
-	}, ledger)
+	// A retry after the run's last step was already saved (§2.8): the worker
+	// died between that step and the end of the run. The answer is in the
+	// history, so the run is finalized from it rather than asking the model
+	// again, which would answer twice. The same when the run already settled.
+	var loop *LoopOutcome
 	timedOut := false
-	if err != nil {
+	if text, done := finishedEarlier(ctx, deps, threadID, runID); done {
+		log.Info("run already made its last step; finalized without calling the model again")
+		loop = &LoopOutcome{Text: text, FinishReason: provider.FinishStop}
+	} else {
+		// Durable compaction pass: history always fits the model budget (§2.6)
+		var history []ports.MessageDTO
+		history, err = CompactContext(ctx, deps, threadID, input.Model, CompactOptions{RunID: runID, GenCtx: genCtx, Ledger: ledger})
+		if err != nil {
+			return "", err
+		}
+		var model ports.ResolvedModel
+		model, err = deps.ResolveModel(input.Model)
+		if err != nil {
+			return "", err
+		}
+		// Prompt caching (§2.6): stamp the stable prefix once; appended step
+		// messages extend the prompt without invalidating the breakpoints.
+		messages := RepairDanglingToolCalls(MessagesFromDTOs(history))
+		if deps.Config.PromptCaching {
+			messages = MarkPromptCaching(messages)
+		}
+
+		loop, err = RunLoop(ctx, deps, agent, threadID, LoopInput{
+			AgentID: "", RunID: runID, Kind: agent.Kind, Model: model.Instance(),
+			Messages: messages, Tools: tools, MaxSteps: maxSteps,
+			GenCtx: genCtx, Aborted: aborted, Fenced: lease.Lost,
+			CommitParks:     func(c context.Context) error { return CommitParks(c, deps, parks) },
+			ProviderOptions: providerOptions, TokenBudget: tokenBudget,
+			SystemFn: agent.Args.SystemFn, PrepareStep: agent.Args.PrepareStep, State: input.State,
+			CostBudgetMicros: costBudget, BillingRunID: runID,
+			ModelKey: input.Model, ModelID: model.WireID(input.Model), AgentName: agent.Name,
+			CacheSystemPrompt: deps.Config.PromptCaching,
+			// One canonical path for every client: durable log + live bus (§2.1,
+			// §2.2), with token deltas merged (see chunkBatcher).
+			PublishChunk: func(p map[string]any) {
+				_, _ = Publish(ctx, deps, threadID, "CHUNK", p)
+			},
+			OnChunk: agent.Args.OnChunk, // the user callback sees every raw chunk
+		}, ledger)
+		// A lost lock ends the segment whatever the loop returned: another
+		// worker may own the thread now, so nothing below may write to it. A
+		// loop cut short by the lock loss can even come back without an error.
 		if lockLost.Load() {
 			// Every finished step is persisted; the job comes back once the
 			// lock is free and resumes from the last one.
 			log.Warn("segment ended early: run lock lost", "steps", loop.Steps)
 			return OutcomeLockLost, nil
 		}
-		if errors.Is(genBase.Err(), context.DeadlineExceeded) {
-			// The segment's own deadline ended it, whatever the provider
-			// turned that into.
-			timedOut = true
-			log.Warn("segment timed out", "after", deps.Config.SegmentTimeout, "steps", loop.Steps)
-		} else {
-			return "", err
+		if err != nil || loop.Interrupted {
+			switch {
+			case errors.Is(genBase.Err(), context.DeadlineExceeded):
+				// The segment's own deadline ended it, whatever the provider
+				// turned that into.
+				timedOut = true
+				log.Warn("segment timed out", "after", deps.Config.SegmentTimeout, "steps", loop.Steps)
+			case err != nil:
+				return "", err
+			default:
+				// The stream ended with no finish and no error. The step was
+				// not completed, so it goes to the retry policy rather than
+				// finalizing as COMPLETED.
+				return "", fmt.Errorf("step %d ended without a finish", loop.Steps+1)
+			}
 		}
 	}
 
@@ -830,6 +1071,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		if runID != "" {
 			accrueRunRecord(ctx, deps, runID, loop)
 		}
+		segEnd = &ports.RunFinishedEvent{Status: "parked"}
 		return OutcomeExecuted, nil
 	}
 
@@ -860,14 +1102,14 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	}
 	// The caller settles BEFORE the terminal state lands (§5.6): what the run
 	// produced is committed by the time any client sees it end. A settle
-	// failure is a run failure; a stop reaches the hook cancelled, on the
-	// generation context, so it can tell the two apart.
+	// failure is a run failure. A stop reaches the hook with Cancelled set,
+	// on a context that is not cancelled, so the hook's own writes land.
 	// The whole run's bill, read back from the rows the loop wrote (§4):
 	// every segment and every nested run, priced and grouped into lines, so a
 	// settle hook charges in one pass without keeping its own tally. Read
 	// once, handed to both hooks; a failed read is reported, not hidden.
 	bill, billErr := runBill(ctx, deps, threadID, runID)
-	if _, err := settleRun(genCtx, deps, agent, ports.RunFinishInfo{
+	if _, err := settleRun(ctx, deps, agent, ports.RunFinishInfo{
 		ThreadID: threadID, RunID: runID, State: state, StopReason: stopReason, Error: f.Error,
 		TokensUsed: f.TokensUsed, Attribution: f.Attribution, Steps: f.Steps,
 		Cancelled: state == ports.StateCancelled,
@@ -880,6 +1122,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	if err := Finalize(ctx, deps, agent, threadID, f); err != nil {
 		return "", err
 	}
+	segEnd = segmentEnd(state, f.Error, bill, string(loop.FinishReason), seg)
 	if agent.Args.OnFinish != nil {
 		agent.Args.OnFinish(ports.RunFinishInfo{
 			ThreadID: threadID, RunID: runID, State: state, StopReason: stopReason,
@@ -909,6 +1152,36 @@ type FinalizeInput struct {
 	Error string
 }
 
+// segmentEnd is how a finalized segment's stream ends.
+func segmentEnd(state ports.ExecutionState, failure string, bill ports.UsageTotals, finishReason string, seg *SegmentStream) ports.StreamEnd {
+	if state == ports.StateFailed {
+		if failure == "" {
+			failure = "the run failed"
+		}
+		return &ports.RunErrorEvent{Status: "error", Error: failure}
+	}
+	end := &ports.RunFinishedEvent{
+		Status: "finished",
+		Usage: &ports.StreamUsage{
+			InputTokens: int64(bill.InputTokens), CachedInputTokens: int64(bill.CachedInputTokens),
+			OutputTokens: int64(bill.OutputTokens), TotalTokens: int64(bill.TotalTokens),
+		},
+		FinishReason: finishReason,
+	}
+	if state == ports.StateCancelled {
+		end.Status = "stopped"
+	}
+	for _, c := range bill.Costs {
+		end.Costs = append(end.Costs, ports.StreamCost{Currency: c.Currency, Micros: c.CostMicros})
+	}
+	if seg != nil {
+		if text, ok := seg.OneShotText(); ok {
+			end.Text = text
+		}
+	}
+	return end
+}
+
 // Finalize finalizes a finished run (§5.6): attribute the segment's tokens
 // (§4), then flip state on both homes and publish. Message persistence
 // already happened per step inside the loop.
@@ -920,38 +1193,33 @@ func Finalize(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAge
 	// as it happened, inside the loop (§4). Even a run that was replaced
 	// part-way through has already had its calls written.
 	//
-	// Close the run's durable record (§2.9). Additive: a run that parked and
-	// resumed finalises once, but its steps and tokens accrued over several
-	// segments. The run lock (§3.4) makes this read-modify-write single-writer.
+	// The thread moves only while it is still this run's and still RUNNING
+	// (§3.4). A stop that got there first has already written CANCELLED and
+	// said so; a newer run owns the thread. Either way this finish loses and
+	// stays silent: publishing it would land on top of the stop, or wedge the
+	// newer run (§2.1).
+	won, err := Transition(ctx, deps, threadID, StateChange{
+		From: []ports.ExecutionState{ports.StateRunning}, To: f.State, RunID: f.RunID,
+	})
+	if err != nil {
+		return err
+	}
+	// Close the run's durable record (§2.9) either way: the segment's steps
+	// and tokens are real. Additive: a run that parked and resumed finalises
+	// once, but its steps and tokens accrued over several segments. A stop
+	// already recorded on it is kept (closeRunRecord never undoes one).
 	endedAt := time.Now()
 	if f.RunID != "" {
 		endedAt = closeRunRecord(ctx, deps, f.RunID, f)
-		// Past that, a replaced run stays silent. Its CANCELLED would otherwise
-		// land on top of the next run's RUNNING and wedge the thread (§2.1).
-		current, _, err := deps.Kv.Get(ctx, RunIDKey(threadID))
-		if err != nil {
-			return err
-		}
-		if current != f.RunID {
-			return nil
-		}
 	}
-	if state, _, err := deps.Kv.Get(ctx, StateKey(threadID)); err != nil {
-		return err
-	} else if state == string(ports.StateCancelled) {
-		f.State, f.StopReason, f.OneShotText = ports.StateCancelled, "cancelled", nil
+	if !won {
+		return nil
 	}
 	if f.OneShotText != nil {
 		// One-shot flavor: no CHUNK stream; publish the final text as one event
 		if _, err := Publish(ctx, deps, threadID, "TEXT_RESULT", map[string]any{"text": *f.OneShotText}); err != nil {
 			return err
 		}
-	}
-	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(f.State), ports.SetOptions{}); err != nil {
-		return err
-	}
-	if err := SetThreadState(ctx, deps, threadID, f.State, ""); err != nil {
-		return err
 	}
 	// The run's identity and end time ride the terminal event, so a client
 	// closes the right timer without reading the run record back.
@@ -965,43 +1233,54 @@ func Finalize(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAge
 	if f.Error != "" {
 		terminal["error"] = f.Error
 	}
-	_, err := Publish(ctx, deps, threadID, "STATE_CHANGE", terminal)
+	_, err = Publish(ctx, deps, threadID, "STATE_CHANGE", terminal)
 	return err
 }
 
-// redriveOnLockConflict: a lock conflict has two very different causes
-// (§2.8), and only one of them is a no-op:
+// redriveOnLockConflict: the lock names the run and the delivery that hold
+// it (§3.4), so a conflict can say which of these it is:
 //
-//   - the lock carries THIS run's id → an at-least-once duplicate of a job
-//     that is already executing. Drop it, and say so.
-//   - the lock belongs to an OLDER run that has not finished tearing down →
-//     this job never ran. Dropping it strands the message the user just sent,
-//     so come back once the lock clears. Bounded by maxAttempts, then FAILED.
+//   - the same job, delivered twice by the queue (same run, same dispatch):
+//     a duplicate of work already running. Drop it, and say so.
+//   - another delivery of the same run: a retry, an approval's answer or its
+//     expiry (§2.5), arriving while the current holder winds down. It has
+//     work to do once the lock clears, so it comes back.
+//   - an OLDER run that has not finished tearing down: this job never ran.
+//     Dropping it strands the message the user just sent, so it comes back.
 //
-// Because the lock is renewed while its worker runs (§3.4), a held lock
-// means a live worker. One case is neither: the thread already ended under
-// the held lock and its settle never ran. That job is the last chance to
-// settle, so it comes back once the lock has surely cleared.
+// Because the lock is renewed while its holder runs, a held lock means a
+// live worker, and waiting for it is always right. The job comes back with
+// a growing delay until it has waited at least one lease and used its
+// attempts; only then is the lock taken to be wedged and the run FAILED.
+//
+// One case is none of these: the thread already ended under the held lock
+// and its settle never ran. That job is the last chance to settle, so it
+// comes back once the lock has surely cleared.
 func redriveOnLockConflict(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, input ExecuteInput, maxAttempts int) error {
 	if input.RunID == "" {
 		return nil // legacy dispatch, no identity: old drop behavior
 	}
 	log := Logger(deps).With("thread", input.ThreadID, "run", input.RunID, "kind", string(input.Kind))
 	scope := CounterScope(input.ThreadID, input.RunID)
-	if holder, _, err := deps.Kv.Get(ctx, RunLockKey(input.ThreadID)); err != nil {
+	holder, held, err := deps.Kv.Get(ctx, RunLockKey(input.ThreadID))
+	if err != nil {
 		return err
-	} else if holder == input.RunID {
-		// The lock is held by THIS run. While its segment is running that is
-		// a duplicate delivery, and a no-op. But a park hands the same run id
-		// to two later deliveries, the approval's answer and its expiry
-		// (§2.5), and either can arrive while the parking segment is still
-		// winding down and holding the lock. Dropping that one would leave
-		// the thread waiting forever: nobody re-sends an expiry. The thread's
-		// durable state tells the two cases apart, because ParkForApproval
-		// writes WAITING_FOR_INPUT before the segment ends.
-		durable, err := deps.Storage.Threads.Get(ctx, input.ThreadID)
-		if err != nil {
-			return err
+	}
+	durable, err := deps.Storage.Threads.Get(ctx, input.ThreadID)
+	if err != nil {
+		return err
+	}
+	holderRun, holderDispatch := ParseLockValue(holder)
+	if held && holderRun != input.RunID && durable != nil && isTerminal(durable.State) {
+		// The thread has ended: this job has nothing left to do, whoever
+		// holds the lock. Redriving it would only fail the ended run again.
+		log.Info("delivery dropped: the thread has already ended")
+		return nil
+	}
+	if held && holderRun == input.RunID {
+		if holderDispatch != "" && holderDispatch == input.DispatchID {
+			log.Info("duplicate delivery dropped: this job is already running")
+			return nil
 		}
 		switch {
 		case durable == nil || durable.State == ports.StateWaitingForInput:
@@ -1010,7 +1289,7 @@ func redriveOnLockConflict(ctx context.Context, deps ports.RuntimePorts, agent *
 			rec, err := deps.Admin.Runs().Get(ctx, input.RunID)
 			if err == nil && rec != nil && rec.SettledAt == nil {
 				log.Info("run ended under a held lock and is not settled; settle retried once the lock clears")
-				err := deps.Queue.Enqueue(ctx, input.job(agent.Name, ports.JobRedrive),
+				err := EnqueueJob(ctx, deps, input.job(agent.Name, ports.JobRedrive),
 					&ports.EnqueueOptions{Delay: deps.Config.RunLockLease, Key: "settle:" + input.RunID, Priority: ports.PriorityLow})
 				if errors.Is(err, ports.ErrDuplicateJob) {
 					return nil
@@ -1018,9 +1297,14 @@ func redriveOnLockConflict(ctx context.Context, deps ports.RuntimePorts, agent *
 				return err
 			}
 			return nil
-		default:
+		case holderDispatch == "" || input.DispatchID == "":
+			// A lock or a job from before dispatch ids: the two deliveries
+			// cannot be told apart, so the old rule stands.
 			log.Info("duplicate delivery dropped: this run already holds the lock")
-			return nil // own duplicate
+			return nil
+		default:
+			// Another delivery of this run, while it runs: a retry its own
+			// holder queued before letting go. Come back once it has.
 		}
 	}
 	if current, _, err := deps.Kv.Get(ctx, RunIDKey(input.ThreadID)); err != nil {
@@ -1033,14 +1317,30 @@ func redriveOnLockConflict(ctx context.Context, deps ports.RuntimePorts, agent *
 	if err != nil {
 		return err
 	}
-	if tries <= int64(maxAttempts) {
-		log.Info("run lock held by an older run; redriven", "try", tries, "in", deps.Config.RunRedriveDelay)
-		return deps.Queue.Enqueue(ctx, input.job(agent.Name, ports.JobRedrive), &ports.EnqueueOptions{Delay: deps.Config.RunRedriveDelay})
+	delay, waited := redriveDelay(deps.Config, tries)
+	if tries <= int64(maxAttempts) || waited < deps.Config.RunLockLease {
+		log.Info("run lock held; redriven", "try", tries, "in", delay)
+		return EnqueueJob(ctx, deps, input.job(agent.Name, ports.JobRedrive), &ports.EnqueueOptions{Delay: delay})
 	}
 	if err := deps.Kv.Del(ctx, RedriveKey(scope)); err != nil {
 		return err
 	}
 	return failRun(ctx, deps, agent, input.ThreadID, input.RunID, "the run lock never cleared")
+}
+
+// redriveDelay is how long the given try waits (RunRedriveDelay, doubled on
+// each try, capped at the lease), and how long the tries before it waited in
+// all.
+func redriveDelay(cfg ports.AgentConfig, tries int64) (delay, waited time.Duration) {
+	delay = cfg.RunRedriveDelay
+	if delay <= 0 {
+		delay = time.Second // a zero base would never grow, and never give up
+	}
+	for i := int64(1); i < tries; i++ {
+		waited += delay
+		delay = min(delay*2, cfg.RunLockLease)
+	}
+	return delay, waited
 }
 
 // ExecuteFunc is the signature of Execute, an injection seam for tests.
@@ -1109,6 +1409,16 @@ func ExecuteWithPolicy(ctx context.Context, deps ports.RuntimePorts, agent *Regi
 	} else if state == string(ports.StateCancelled) {
 		return nil
 	}
+	// A run that a newer one replaced failed after it stopped mattering: its
+	// error is not the thread's, so it spends no attempt and fails nothing.
+	if input.RunID != "" {
+		if current, curErr := CurrentRunID(bg, deps, input.ThreadID); curErr != nil {
+			return errors.Join(err, curErr)
+		} else if current != input.RunID {
+			log.Info("replaced run failed; nothing to retry", "err", err)
+			return nil
+		}
+	}
 	attempts, kvErr := deps.Kv.IncrWithExpiry(bg, AttemptsKey(scope), counterTTL)
 	if kvErr != nil {
 		return errors.Join(err, kvErr)
@@ -1138,7 +1448,7 @@ func requeue(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			return err
 		}
 	}
-	return deps.Queue.Enqueue(ctx, input.job(agent.Name, ports.JobRetry), &ports.EnqueueOptions{Delay: delay})
+	return EnqueueJob(ctx, deps, input.job(agent.Name, ports.JobRetry), &ports.EnqueueOptions{Delay: delay})
 }
 
 // markQueued moves a RUNNING thread back to QUEUED for a retry, on every
@@ -1150,14 +1460,11 @@ func markQueued(ctx context.Context, deps ports.RuntimePorts, threadID, runID, m
 	if err != nil || current != runID {
 		return err
 	}
-	durable, err := deps.Storage.Threads.Get(ctx, threadID)
-	if err != nil || durable == nil || durable.State != ports.StateRunning {
-		return err
-	}
-	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateQueued), ports.SetOptions{}); err != nil {
-		return err
-	}
-	if err := SetThreadState(ctx, deps, threadID, ports.StateQueued, model); err != nil {
+	// Only a RUNNING thread that is still this run's (§3.4).
+	won, err := Transition(ctx, deps, threadID, StateChange{
+		From: []ports.ExecutionState{ports.StateRunning}, To: ports.StateQueued, RunID: runID, Model: model,
+	})
+	if err != nil || !won {
 		return err
 	}
 	_ = deps.Admin.Runs().Patch(ctx, runID, ports.RunPatch{State: ports.Ptr(ports.StateQueued)})
@@ -1221,15 +1528,20 @@ func FailLostRun(ctx context.Context, deps ports.RuntimePorts, agent *Registered
 	if err != nil || thread == nil || !IsActive(thread.State) {
 		return false, err
 	}
-	locked, err := deps.Kv.Set(ctx, RunLockKey(threadID), runID, ports.SetOptions{OnlyIfNotExists: true, Expiry: deps.Config.RunLockLease})
-	if err != nil || !locked {
+	lease, err := AcquireRunLock(ctx, deps, threadID, runID, "")
+	if err != nil || lease == nil {
 		return false, err // a worker still holds it; the run is not lost
 	}
-	defer func() { _, _ = deps.Kv.DelIfValue(context.WithoutCancel(ctx), RunLockKey(threadID), runID) }()
+	lease.Keep(nil) // the settle hook in failRun can be slow
+	defer lease.Release()
 	if thread.State == ports.StateWaitingForInput {
 		_ = closeOpenParks(ctx, deps, threadID)
 	}
-	return true, failRun(ctx, deps, agent, threadID, runID, reason)
+	err = failRun(ctx, deps, agent, threadID, runID, reason)
+	// The dead worker never closed its segment's stream: a reader waiting on
+	// it stops here.
+	CloseLostSegment(ctx, deps, threadID, runID, reason)
+	return true, err
 }
 
 // SettleLate settles an ended run whose settle never ran (§5.6), under the
@@ -1239,10 +1551,11 @@ func SettleLate(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredA
 	if runID == "" {
 		return false, nil
 	}
-	locked, err := deps.Kv.Set(ctx, RunLockKey(threadID), runID, ports.SetOptions{OnlyIfNotExists: true, Expiry: deps.Config.RunLockLease})
-	if err != nil || !locked {
+	lease, err := AcquireRunLock(ctx, deps, threadID, runID, "")
+	if err != nil || lease == nil {
 		return false, err
 	}
-	defer func() { _, _ = deps.Kv.DelIfValue(context.WithoutCancel(ctx), RunLockKey(threadID), runID) }()
+	lease.Keep(nil) // renewed while the settle hook runs
+	defer lease.Release()
 	return settleEndedRun(ctx, deps, agent, threadID, runID), nil
 }

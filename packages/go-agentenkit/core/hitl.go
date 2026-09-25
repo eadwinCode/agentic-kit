@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/zendev-sh/goai"
@@ -23,6 +24,10 @@ const HITLParked = "__hitl_parked__"
 
 // HitlKey is the handoff key an answer is written to.
 func HitlKey(toolCallID string) string { return "agent:hitl:" + toolCallID }
+
+// HitlDoneKey keeps an approved tool's output until its result is saved
+// (§2.5), so a retry lands the same output instead of running the tool again.
+func HitlDoneKey(toolCallID string) string { return "agent:hitl-done:" + toolCallID }
 
 // expiryJobKey names a park's expiry row on the queue, so the answer can
 // withdraw it (§2.5).
@@ -137,6 +142,53 @@ type HitlCtx struct {
 	AgentID string
 	Frames  []HitlFrame
 	Nested  *ports.NestedDescriptor
+	// Parks collects the parks raised in this segment, to be committed once
+	// the step that raised them is saved (see ParkBox). Nil parks at once.
+	Parks *ParkBox
+}
+
+// ParkBox holds the parks a segment raised until the step that raised them
+// is saved (§2.5). A tool call parks in the middle of a model step, before
+// the step's messages exist. Writing the park then would let the answer, a
+// failed step or a stop act on a tool call the history does not have yet.
+// So the wrapper only records the park here; the main loop commits the box
+// once its step is saved, and a failed step simply drops it. Nested runs
+// share their parent's box, so a park raised any depth down waits for the
+// main agent's step too.
+type ParkBox struct {
+	mu    sync.Mutex
+	parks []ParkInput
+}
+
+func (b *ParkBox) add(p ParkInput) {
+	b.mu.Lock()
+	b.parks = append(b.parks, p)
+	b.mu.Unlock()
+}
+
+func (b *ParkBox) take() []ParkInput {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := b.parks
+	b.parks = nil
+	return out
+}
+
+// CommitParks writes every park the box holds: WAITING_FOR_INPUT, the
+// INPUT_REQUIRED request and its expiry job (see ParkForApproval). Called
+// once the step that raised them is durable.
+func CommitParks(ctx context.Context, deps ports.RuntimePorts, box *ParkBox) error {
+	if box == nil {
+		return nil
+	}
+	for _, p := range box.take() {
+		// Durable state, not part of the model call: it must land even while
+		// the generation context is being torn down.
+		if err := ParkForApproval(context.WithoutCancel(ctx), deps, p); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ParkedResult is the sentinel a wrapped tool returns.
@@ -162,13 +214,18 @@ func WithHitl(deps ports.RuntimePorts, threadID string, tools []ports.Tool, hc H
 		wrapped := t
 		execute := t.Execute
 		park := func(ctx context.Context, toolCallID string, args json.RawMessage, req ParkRequest) (string, error) {
-			// The park must land even when the generation context is being
-			// torn down; it is durable state, not part of the model call.
-			if err := ParkForApproval(context.WithoutCancel(ctx), deps, ParkInput{
+			p := ParkInput{
 				ThreadID: threadID, ToolCallID: toolCallID, ToolName: name, Args: args,
 				AgentID: hc.AgentID, Frames: hc.Frames, Nested: hc.Nested, Resume: hc.Resume,
 				Reason: req.Reason, TTL: req.TTL,
-			}); err != nil {
+			}
+			if hc.Parks != nil {
+				hc.Parks.add(p) // written once the step is saved
+				return ParkedResult(toolCallID), nil
+			}
+			// No box: a caller outside a segment. The park must land even
+			// when the generation context is being torn down.
+			if err := ParkForApproval(context.WithoutCancel(ctx), deps, p); err != nil {
 				return "", err
 			}
 			return ParkedResult(toolCallID), nil
@@ -236,11 +293,21 @@ type inputRequiredPayload struct {
 // deliveries of one run: whichever resolves the park first wins, and the run
 // lock makes the other a no-op.
 func ParkForApproval(ctx context.Context, deps ports.RuntimePorts, i ParkInput) error {
-	if _, err := deps.Kv.Set(ctx, StateKey(i.ThreadID), string(ports.StateWaitingForInput), ports.SetOptions{}); err != nil {
+	// Only while the run still owns a going thread (§3.4). A step can park
+	// several calls, so the thread may already be WAITING. A run that was
+	// stopped meanwhile parks nothing: the stop has ended it, and a later
+	// prompt repairs the call it left without a result.
+	won, err := Transition(ctx, deps, i.ThreadID, StateChange{
+		From:  []ports.ExecutionState{ports.StateRunning, ports.StateWaitingForInput},
+		To:    ports.StateWaitingForInput,
+		RunID: i.Resume.RunID, Model: i.Resume.Model,
+	})
+	if err != nil {
 		return err
 	}
-	if err := SetThreadState(ctx, deps, i.ThreadID, ports.StateWaitingForInput, i.Resume.Model); err != nil {
-		return err
+	if !won {
+		Logger(deps).Info("park skipped: the run no longer owns the thread", "thread", i.ThreadID, "toolCall", i.ToolCallID)
+		return nil
 	}
 	args := i.Args
 	if len(args) == 0 || !json.Valid(args) {
@@ -281,7 +348,7 @@ func ParkForApproval(ctx context.Context, deps ports.RuntimePorts, i ParkInput) 
 	// resolves to nothing and the job is a no-op (see resumePendingHitl).
 	// The row is keyed so an answer can withdraw it, and it queues behind
 	// every user message: an expiry that came due is never urgent.
-	if err := deps.Queue.Enqueue(ctx, ports.RunJob{
+	if err := EnqueueJob(ctx, deps, ports.RunJob{
 		ThreadID: i.ThreadID, RunID: runID, Model: i.Resume.Model, Agent: i.Resume.Agent,
 		Kind: ports.JobExpiry, DispatchedAt: i.Resume.DispatchedAt,
 		TokenBudget: i.Resume.TokenBudget, CostBudgetMicros: i.Resume.CostBudgetMicros,
@@ -313,6 +380,13 @@ type PendingHitl struct {
 	Reason string
 	// Resume is the dispatch ticket, when the park recorded one.
 	Resume *ports.ResumeInfo
+	// Landed marks a park whose own call already has its result in the
+	// history, but whose unwind stopped part way (§2.7): a worker died, or
+	// a child failed, between one level and the next. Nothing is left to
+	// answer; the unwind carries on from ResumeFrame, the first frame still
+	// waiting for its result.
+	Landed      bool
+	ResumeFrame int
 }
 
 // Deadline is when this park stops being answerable.
@@ -399,14 +473,33 @@ func LoadOpenHitls(ctx context.Context, deps ports.RuntimePorts, threadID string
 			answered[id] = true
 		}
 	}
+	// Only the current run's parks. One an earlier run left behind can never
+	// be answered: the run failed, or an edit cut its turns out of the
+	// history, and its tool call may not even exist any more.
+	current, err := CurrentRunID(ctx, deps, threadID)
+	if err != nil {
+		return nil, err
+	}
 	var open []PendingHitl
 	for _, e := range requested {
 		p, err := fromInputRequired(e)
 		if err != nil {
 			continue
 		}
+		if current != "" && p.Resume != nil && p.Resume.RunID != "" && p.Resume.RunID != current {
+			continue
+		}
 		if !answered[p.ToolCallID] && !expired[p.ToolCallID] {
 			open = append(open, p)
+			continue
+		}
+		// Settled at its own level; is anything above still waiting?
+		for i, f := range p.Frames {
+			if !answered[f.ToolCallID] {
+				p.Landed, p.ResumeFrame = true, i
+				open = append(open, p)
+				break
+			}
 		}
 	}
 	return open, nil
@@ -432,7 +525,7 @@ func Respond(ctx context.Context, deps ports.RuntimePorts, input ports.RespondIn
 	}
 	var match *PendingHitl
 	for i := range open {
-		if open[i].ToolCallID == input.ToolCallID {
+		if open[i].ToolCallID == input.ToolCallID && !open[i].Landed {
 			match = &open[i]
 			break
 		}
@@ -487,7 +580,7 @@ func Respond(ctx context.Context, deps ports.RuntimePorts, input ports.RespondIn
 	}
 	// One resume row per answer, keyed on the call: a second enqueue for
 	// the same answer is refused by the queue itself.
-	if err := deps.Queue.Enqueue(ctx, job, &ports.EnqueueOptions{Key: resumeJobKey(input.ToolCallID)}); err != nil {
+	if err := EnqueueJob(ctx, deps, job, &ports.EnqueueOptions{Key: resumeJobKey(input.ToolCallID)}); err != nil {
 		if errors.Is(err, ports.ErrDuplicateJob) {
 			return ports.RespondResult{Delivered: false, Error: "This request was already answered"}, nil
 		}

@@ -10,7 +10,7 @@ import {
 import { initialCustomState, isCustomEvent, reduceCustom } from './events';
 
 const stateLabel: Record<string, string> = {
-  IDLE: 'idle', RUNNING: 'running…', WAITING_FOR_INPUT: 'waiting for you',
+  IDLE: 'idle', QUEUED: 'queued…', RUNNING: 'running…', WAITING_FOR_INPUT: 'waiting for you',
   CANCELLED: 'stopped', COMPLETED: 'completed', FAILED: 'failed',
 };
 
@@ -84,7 +84,8 @@ export function App() {
   // the default for its state: open while it streams, folded once done.
   const [openThoughts, setOpenThoughts] = useState<Record<string, boolean>>({});
 
-  const running = agentState === 'RUNNING' || agentState === 'WAITING_FOR_INPUT';
+  const running =
+    agentState === 'QUEUED' || agentState === 'RUNNING' || agentState === 'WAITING_FOR_INPUT';
   const waiting = agentState === 'WAITING_FOR_INPUT';
   // Exhausted by the button, or by spending: either way the next message
   // will be refused, and the panel says so before it happens.

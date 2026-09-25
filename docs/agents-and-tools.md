@@ -28,12 +28,21 @@ module everywhere.
 
 ### A system prompt built per step
 
-> Go runtime. The TypeScript package will follow.
-
 `system` is a string. When the persona depends on what the run is acting on
-— a project, a page, a user's settings — give the spec a `SystemFn` instead.
-It is called once per step with the thread id and the run's
-[state](./run-state.md), and wins over `system`:
+— a project, a page, a user's settings — give the spec a `systemFn` (Go:
+`SystemFn`) instead. It is called once per step with the thread id and the
+run's [state](./run-state.md), and wins over `system`. A throw (Go: an error)
+fails the step, like a model error:
+
+```ts
+runtime.createStreamTextAgent({
+  name: 'designer',
+  systemFn: async (threadId, state) => {
+    const project = await projects.load(state.projectId as string);
+    return `${stablePersona}\n\n${project.brief()}`;
+  },
+});
+```
 
 ```go
 rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
@@ -51,6 +60,21 @@ rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
 Keep the stable part first. Prompt caching stamps the system message as a
 cached prefix, and a prefix that moves every step is a prefix that never
 hits.
+
+### Context for one step only
+
+`prepareStep` (Go: `PrepareStep`) edits the prompt just before each step is
+sent. It gets the thread id, the run's state and the messages the platform
+assembled, and what it returns is what the model sees. It is the place for
+context that must not be saved — a screenshot to look at once, an editor
+snapshot — because nothing added here reaches the stored history:
+
+```ts
+prepareStep: (threadId, state, messages) => [
+  ...messages,
+  { role: 'user', content: [{ type: 'image', image: currentScreenshot() }] },
+],
+```
 
 ## Models
 
@@ -102,6 +126,10 @@ const sendEmail = markRequiresConfirmation(
 
 The run parks instead of executing, and resumes where it stopped once a human
 answers. See [Human in the loop](./human-in-the-loop.md).
+
+A tool that throws (TS) or returns an error (Go) does not fail the run: the
+model gets `error: <message>` as the call's result and decides what to do next,
+in both runtimes. A user stop is the exception: it ends the run.
 
 ### Tools see the run's state
 
@@ -164,19 +192,20 @@ The model cannot reach outside the tenant even if it asks to, because the tool
 ### Tools can publish events
 
 The same second argument carries `publishEvent`, bound to the thread the tool
-runs on. Anything the tool learns can reach the UI through the event log, live
-and on reconnect:
+runs on. Anything the tool learns can reach the UI through the same follow the
+text comes through:
 
 ```ts
 execute: async ({ brief }, { publishEvent }) => {
   const url = await render(brief);
-  await publishEvent('DESIGN_PREVIEW', { url });
+  await publishEvent('DESIGN_PREVIEW', { url }, { durable: true });
   return { url };
 },
 ```
 
-See [Custom events](./custom-events.md) for the durable/notice choice and the
-client side.
+An event is live only by default: it goes to the run's stream. Pass
+`{ durable: true }` to keep it in the thread record, so it survives a reload.
+See [Custom events](./custom-events.md) for the choice and the client side.
 
 ## Budgets and ceilings
 
@@ -229,13 +258,27 @@ Model resolution order: run input → agent spec → `'gpt-4o'`.
 `accepted: false` means the thread already has an active run, or your
 `billingPreCheck` rejected it. Nothing was written.
 
-Three more fields, Go runtime for now:
+Four more fields:
 
 | Field | What it does |
 | :--- | :--- |
-| `RunID` | Name the run yourself. Your own records (a workspace, a billing line) can be keyed by it *before* dispatch, and the worker sees the same id. A reused id is refused with `accepted: false`. |
-| `MaxSteps` | Cap this run's round trips below the config's `MaxSteps`. Zero keeps the config value; more is clamped to it. |
-| `Attachments` | Images sent with the prompt (`{URL, MediaType}`). Stored as image parts on the user turn and handed to the model natively. |
+| `runId` | Name the run yourself. Your own records (a workspace, a billing line) can be keyed by it *before* dispatch, and the worker sees the same id. A reused id is refused with `accepted: false`. |
+| `maxSteps` | Cap this run's round trips below the config's `maxSteps`. 0 keeps the config value; more is clamped to it; a negative one is refused. |
+| `attachments` | Images sent with the prompt (`{ url, mediaType }`). Stored as image parts on the user turn and handed to the model natively. |
+| `partitionKey` | Your tenant, written on the dispatch ticket so a queue that spreads its claims across partitions keeps one tenant's backlog from starving the others. |
+
+A refusal carries a `reason` a host can act on: `active_run`, `queue_full`
+(try again shortly) or `billing`.
+
+A budget (`tokenBudget`, `costBudgetMicros`) of `0` means "no cap from this
+level": the agent spec's applies, then the config's. A negative one is refused.
+
+```ts
+await chat.run({
+  prompt: 'what is in this picture?', runId, maxSteps: 8,
+  attachments: [{ url: 'https://cdn.example/cat.png', mediaType: 'image/png' }],
+});
+```
 
 ```go
 chat.Run(ctx, agentenkit.RunInput{
@@ -246,40 +289,66 @@ chat.Run(ctx, agentenkit.RunInput{
 
 ## Settling a run
 
-> Go runtime.
-
-`OnFinish` fires after the terminal state is written, which is too late for
+`onFinish` fires after the terminal state is written, which is too late for
 work every client must see as done the moment the run ends: committing the
-files a run edited, charging for it. `OnSettle` runs after the last step and
-**before** the terminal `STATE_CHANGE`:
+files a run edited, charging for it. `onSettle` (Go: `OnSettle`) runs after
+the last step and **before** the terminal `STATE_CHANGE`:
+
+```ts
+runtime.createStreamTextAgent({
+  name: 'designer',
+  onSettle: async (info) => {
+    if (info.cancelled) return repo.discard(info.runId!);
+    await repo.commit(info.runId!); // a throw finalizes the run FAILED, with this reason
+    await billing.charge(info.runId!, info.usage);
+  },
+});
+```
 
 ```go
 rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
 	Name: "designer",
 	OnSettle: func(ctx context.Context, info agentenkit.RunFinishInfo) error {
-		ctx = context.WithoutCancel(ctx) // a stop arrives cancelled; the commit still has to land
 		if info.Cancelled {
 			return repo.Discard(ctx, info.RunID)
 		}
 		if err := repo.Commit(ctx, info.RunID); err != nil {
 			return err // the run finalizes FAILED, with this reason
 		}
-		return billing.Charge(ctx, info.RunID, info.TokensUsed)
+		return billing.Charge(ctx, info.RunID, info.Usage)
 	},
 })
 ```
 
-Rules: an error fails the run (the reason lands on the terminal event and the
-run record); a user stop reaches the hook with `Cancelled` set on a cancelled
-context and its error is ignored; a run whose attempts are exhausted still
-settles, as `FAILED` with `Error` set. A stop that ends a run no worker holds
-(one still queued, or parked on an approval) settles it right there, from the
-stop, with `Cancelled` set and the usage of the steps it did make on `Usage`;
-the hook then runs on the stop request's own context. Whichever side ends
-the run records the settle on it (`settledAt`), so a worker that wakes up
-later for the same run settles nothing. It can run more than once for one run
-— a worker that dies inside it is redelivered — so keep it idempotent on
-`RunID`.
+It runs once per run, **whatever way the run ends**:
+
+| End | Who settles |
+| :--- | :--- |
+| Completed, or stopped mid-step | The worker, before the terminal state |
+| Stopped while queued or parked | The stop itself, with `cancelled` set and the usage of the steps it did make |
+| Failed (attempts spent, lock never cleared) | Whoever fails it, with `error` set |
+| The settler died, or the hook failed | The late-settle sweep, `reclaimStuckRuns` (Go: `ReclaimStuckRuns`) |
+
+Rules:
+
+- An error fails a run that was going to complete: the reason lands on the
+  terminal event and the run record. A stop reaches the hook with `cancelled`
+  set, and its error is ignored.
+- An error also leaves the run **unsettled**, so the sweep runs the hook
+  again. Call `reclaimStuckRuns` from a periodic job to get that retry.
+- In Go the hook's `ctx` is never cancelled, not by a stop and not by a
+  shutdown, so its writes land. Tell a stop apart by `Cancelled`, not by
+  `ctx.Err()`.
+- `onFinish` fires once too, on every end, after the terminal state.
+
+**Once** is kept by a claim on the run record: before the hook runs, one
+conditional write claims the run, and only the settler that wins calls the
+hook. A stop and a worker that arrive together cannot both bill. Success marks
+the run settled (`settledAt`); a claim left by a settler that died is taken
+over after 10 minutes. So the hook can still, rarely, see one run twice — a
+hook slower than 10 minutes, or a settle mark that could not be written — and
+**must be idempotent on `runId`**. Pass it as the idempotency key to whatever
+you charge.
 
 ## Stopping
 
@@ -294,7 +363,7 @@ not the handle. One durable write; the worker notices within `stopPollMs`.
 
 `onChunk`, `onFinish` and `onStepFinish` from the AI SDK still fire. The
 platform chains its own handlers around yours rather than replacing them, so
-your callback runs *and* the event still reaches the log and the bus.
+your callback runs *and* the event still reaches the run stream.
 
 Platform-owned keys — `model`, `messages`, `tools`, `maxSteps`, `abortSignal` —
 are set by the engine and cannot be overridden from the spec.

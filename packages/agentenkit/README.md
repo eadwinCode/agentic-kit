@@ -16,14 +16,14 @@ now describe that behaviour.
 
 ## Running locally, with nothing to stand up
 
-There is no `createDevRuntime`. Assembling the platform is four adapters and one wire,
+There is no `createDevRuntime`. Assembling the platform is five adapters and one wire,
 and seeing them is the point — swapping any of them for the durable equivalent later is
 then obvious rather than magic.
 
 ```ts
 import { Database } from 'bun:sqlite';           // or node:sqlite — see openSqlite
 import { setupAgentCore } from 'agentenkit';
-import { SqliteStorage } from 'agentenkit/adapters/sqlite';
+import { SqliteRunStreams, SqliteStorage } from 'agentenkit/adapters/sqlite';
 import { InlineQueue } from 'agentenkit/adapters/inline';
 import { MemoryBus, MemoryKv } from 'agentenkit/adapters/memory';
 import { SqliteAdminStore } from 'agentenkit/admin/sqlite';
@@ -36,6 +36,7 @@ const queue = new InlineQueue();
 
 export const runtime = await setupAgentCore({
   storage: new SqliteStorage(db),      // ← later: PrismaStorage, or your own
+  streams: new SqliteRunStreams(db),   // ← later: RedisRunStreams, PrismaRunStreams
   admin: SqliteAdminStore.open(db),     // ← later: PostgresAdminStore
   bus: new MemoryBus(),                // ← later: RedisBus
   kv: new MemoryKv(),                  // ← later: RedisKv
@@ -79,7 +80,7 @@ import { createClient } from 'redis';
 import { PrismaClient } from '@prisma/client';
 import { setupAgentCore } from 'agentenkit';
 import { PrismaStorage } from 'agentenkit/adapters/prisma';
-import { RedisBus, RedisKv } from 'agentenkit/adapters/redis';
+import { RedisBus, RedisKv, RedisRunStreams } from 'agentenkit/adapters/redis';
 import { QStashQueue } from 'agentenkit/adapters/qstash';
 
 const redis = createClient({ url: process.env.REDIS_URL });
@@ -93,6 +94,7 @@ export const runtime = await setupAgentCore({
     { url: 'https://app.example.com/api/queue/agent-run' },
   ),
   kv: new RedisKv(redis),
+  streams: new RedisRunStreams(redis),             // ← one stream per run segment
   // `admin` omitted on purpose: with AGENTIC_KIT_ADMIN_DATABASE_URL set, the
   // platform opens Postgres for its own history (§2.9). Pass one to override.
   resolveModel: (name) => ({ instance: () => models[name], contextWindow: 128_000 }),
@@ -110,16 +112,27 @@ await chat.run({ prompt: 'hi', state: { orgId } });      // persist + enqueue �
 await chat.stop(threadId);                               // one write: state → CANCELLED (§2.1)
 await runtime.hitl.respond({ threadId, toolCallId, approved, payload, state });  // §2.5
 await runtime.getThreadSnapshot(threadId, state);        // hydrate a client (§2.2)
-const { stream, headers } = runtime.events.sse(threadId, { since, signal }); // SSE, any framework
-for await (const e of runtime.events.follow(threadId, { signal })) { … }     // or iterate
-const missed = await runtime.events.since(threadId, lastSeq);              // raw replay
-const unsub  = await runtime.events.subscribe(threadId, handler);          // raw tail
+const { stream, headers } = runtime.events.sse(threadId, { cursor, lastMessageId, signal }); // SSE, any framework
+for await (const frame of runtime.events.follow(threadId, { cursor, signal })) { … }    // or iterate
+for await (const item of runtime.streams.read(streamId, null, signal)) { … }          // one run stream
+const missed = await runtime.events.since(threadId, lastSeq);              // the thread record, raw
+const unsub  = await runtime.events.subscribe(threadId, handler);          // raw tail of the bus
 await runtime.worker.handleJob(job);                     // queue consumer (§2.8)
-await runtime.events.publishEvent(threadId, 'MY_EVENT', payload); // your own event, same pipe
+await runtime.events.publishEvent(threadId, 'MY_EVENT', payload);                     // your own event, live only
+await runtime.events.publishEvent(threadId, 'MY_EVENT', payload, { durable: true }); // …or kept in the record
+await runtime.pruneEvents({ dryRun: true });             // after upgrading: clear old stream-only rows
 ```
 
+A follow yields frames: `{ kind: 'thread', event }` (a record entry or a
+notice), `{ kind: 'stream', streamId, item }` (a run stream item) and
+`{ kind: 'snapshot', snapshot }` (sent once when the stream the client was
+reading is gone). The cursor is one string, `<seq> <streamId> <offset>`; every
+SSE frame that moves it carries it as its `id:`, so EventSource sends it back
+as `Last-Event-ID`. See [Run streams](../../docs/run-streams.md).
+
 Tools get `publishEvent` on their second argument, bound to their thread; see
-[Custom events](../../docs/custom-events.md).
+[Custom events](../../docs/custom-events.md). It is live only unless you pass
+`{ durable: true }`.
 
 The Next.js routes in [`examples/nextjs-app`](../../examples/nextjs-app) show the HTTP
 wiring — each handler is a few lines over the runtime.
@@ -154,10 +167,16 @@ declare module 'agentenkit' {
 
 | Port | Role | Reference adapter |
 | :--- | :--- | :--- |
-| `Storage` | threads / messages / events / usage — incl. atomic `claimState` | `PrismaStorage`, `SqliteStorage` |
+| `Storage` | threads / messages / the thread record / usage — incl. atomic `claimState` | `PrismaStorage`, `SqliteStorage` |
 | `EventBus` | live fan-out + HITL death notices (at-most-once) | `RedisBus`, `UpstashBus` |
 | `Queue` | durable run dispatch (at-least-once) | `QStashQueue`, `InlineQueue` (dev) |
-| `Kv` | hot state cache, HITL handoff keys, seq/attempt counters | `RedisKv`, `UpstashKv` |
+| `Kv` | hot state cache, HITL handoff keys, segment/attempt counters | `RedisKv`, `UpstashKv` |
+| `RunStreams` | one short-lived stream per run segment | `RedisRunStreams`, `UpstashRunStreams`, `PrismaRunStreams`, `SqliteRunStreams` |
+
+Leave `streams` out and they are kept in memory, with a warning logged once.
+Only that process can read them, so when web servers and workers run apart,
+pass a real one. `PrismaRunStreams` needs the `RunStream` and `RunStreamEvent`
+models from [the example schema](../../examples/nextjs-app/prisma/schema.prisma).
 
 Implement any of them for your own stack — `core/` imports nothing else. The
 [`Memory*` adapters](./src/adapters/memory.ts) are a complete implementation used by the
@@ -207,7 +226,7 @@ platform's own tables. You do not implement `AdminStore`; you read it back:
 await runtime.admin.overview();          // threads and runs by state, plus what's in flight
 await runtime.admin.listRuns({ state: ['FAILED'], since });
 await runtime.admin.stats({ since });    // p50/p95 duration and queue wait, tokens, failures
-await runtime.admin.getRun(runId);       // one run: steps, nested runs, timeline, spend
+await runtime.admin.getRun(runId);       // one run: steps, nested runs, its record entries, spend
 ```
 
 Its schema migrates itself, from numbered migration files. `setupAgentCore`
@@ -236,7 +255,8 @@ reading your database at all.
 
 ## Adapter invariants (§3.4)
 
-1. `events.append` receives `seq` from `kv.incr('agent:seq:{threadId}')` — monotonic per thread.
+1. `events.append` takes an entry without a `seq` and the store mints it — monotonic per
+   thread, never repeated.
 2. `threads.claimState` must be atomic (one conditional UPDATE) — exactly one caller wins.
 3. `queue.enqueue` is at-least-once and the engine is idempotent. An adapter that cannot
    honour `delaySeconds` may deliver immediately, but must never throw for it — a HITL
@@ -251,7 +271,7 @@ reading your database at all.
 | Spec | Where in the package |
 | :--- | :--- |
 | §2.1 Detached execution, stop, run identity | `core/run.ts`, `core/stop.ts`, `core/engine.ts`, `core/keys.ts` |
-| §2.2 Multi-user stream | `ports/bus.ts` + `runtime.events` |
+| §2.2 Multi-user stream | `ports/bus.ts`, `ports/streams.ts`, `core/follow.ts` + `runtime.events` |
 | §2.5 HITL park, respond, expiry, reclaim | `core/hitl.ts`, `core/reclaim.ts` |
 | §2.6 Context ceiling & compaction | `core/context.ts` |
 | §2.7 Subagents as nested runs | `core/subagent.ts`, `core/loop.ts` |

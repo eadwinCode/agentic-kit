@@ -3,13 +3,14 @@ import { waitUntil } from '@vercel/functions';
 import { runtime, INLINE_WORKER, chat } from '@/lib/runtime';
 
 export async function POST(req: NextRequest) {
-  const { threadId, prompt, model, tokenBudget, providerOptions, editMessageId } =
+  const { threadId, prompt, model, tokenBudget, providerOptions, editMessageId, clientMessageId } =
     await req.json();
 
   // editMessageId (§5.1): replace that user turn, drop everything after it,
-  // and answer again from there.
+  // and answer again from there. clientMessageId comes back on the turn's
+  // MESSAGE_APPENDED, so the sending tab swaps its optimistic copy by id.
   const result = await chat.run({
-    threadId, prompt, model, tokenBudget, providerOptions, editMessageId,
+    threadId, prompt, model, tokenBudget, providerOptions, editMessageId, clientMessageId,
   });
   // chat.run: heal orphans (§2.5) → billing pre-check (§4) → persist user
   // message → state RUNNING → enqueue `agent-runs` (§2.8)

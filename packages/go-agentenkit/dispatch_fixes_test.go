@@ -98,7 +98,9 @@ func TestDispatch_ADuplicateOfTheRunningJobIsDropped(t *testing.T) {
 }
 
 func TestDispatch_ALockThatNeverClearsFailsTheRun(t *testing.T) {
-	h := makeRuntime(t, scripted(step{text: "ok"}), func(c *agentenkit.AgentConfig) { c.RunMaxAttempts = 1 })
+	// A held lock is waited out for at least one lease: a one-second lease
+	// and a two-second first redrive means the second arrival gives up.
+	h := makeRuntime(t, scripted(step{text: "ok"}), func(c *agentenkit.AgentConfig) { c.RunMaxAttempts = 1; c.RunLockLease = time.Second })
 	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
 	_, _ = h.kv.Set(h.ctx, agentenkit.RunLockKey(ran.ThreadID), "older-run", agentenkit.SetOptions{})
@@ -151,4 +153,86 @@ func TestDispatch_UnknownAgentIsRefusedAndTheDefaultIsTheFirstStreamHandle(t *te
 	bare.rt.CreateGenerateTextAgent(agentenkit.GenerateTextAgentSpec{Name: "one"})
 	res, _ = bare.rt.Worker.HandleJob(bare.ctx, agentenkit.RunJob{ThreadID: "x", Agent: "nope"})
 	mustEqual(t, res.Reason, "unknown-agent", "unknown")
+}
+
+// The lock names the delivery that holds it, so a conflict can tell the
+// queue's duplicate of a job apart from another delivery of the same run.
+func TestDispatch_TheQueuesDuplicateOfTheRunningJobIsDropped(t *testing.T) {
+	h := makeRuntime(t, scripted(step{text: "ok"}))
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
+	job, _ := h.queue.Shift()
+	if job.DispatchID == "" {
+		t.Fatal("every enqueue is stamped with a dispatch id")
+	}
+	_, _ = h.kv.Set(h.ctx, agentenkit.RunLockKey(ran.ThreadID), ran.RunID+"/"+job.DispatchID+"/other-worker", agentenkit.SetOptions{})
+	if _, err := h.rt.Worker.HandleJob(h.ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	mustEqual(t, h.model.Calls(), 0, "nothing ran")
+	mustEqual(t, h.queue.Len(), 0, "the same job, delivered twice: dropped")
+}
+
+func TestDispatch_AnotherDeliveryOfTheRunningRunWaitsForTheLock(t *testing.T) {
+	h := makeRuntime(t, scripted(step{text: "ok"}))
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
+	job, _ := h.queue.Shift()
+	// The holder is this run, but another delivery of it: say the failed
+	// segment that queued this retry and has not let go yet. Dropping the
+	// retry would leave the thread RUNNING with nobody working on it.
+	_, _ = h.kv.Set(h.ctx, agentenkit.RunLockKey(ran.ThreadID), ran.RunID+"/earlier-delivery/w1", agentenkit.SetOptions{})
+	if _, err := h.rt.Worker.HandleJob(h.ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	mustEqual(t, h.queue.Len(), 1, "redriven, not dropped")
+	mustEqual(t, h.queue.Items()[0].Kind, agentenkit.JobRedrive, "as a redrive")
+	if h.queue.Items()[0].DispatchID == job.DispatchID {
+		t.Fatal("the redrive is a delivery of its own")
+	}
+	_ = h.kv.Del(h.ctx, agentenkit.RunLockKey(ran.ThreadID))
+	h.handleNext(t)
+	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "it runs once the lock clears")
+}
+
+func TestDispatch_ARedriveWaitsLongerEachTimeUpToTheLease(t *testing.T) {
+	h := makeRuntime(t, scripted(step{text: "ok"}), func(c *agentenkit.AgentConfig) {
+		c.RunRedriveDelay = time.Second
+		c.RunLockLease = 5 * time.Second
+		c.RunMaxAttempts = 1
+	})
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
+	_, _ = h.kv.Set(h.ctx, agentenkit.RunLockKey(ran.ThreadID), "older-run/d/n", agentenkit.SetOptions{})
+	var delays []time.Duration
+	for range 5 {
+		h.handleNext(t)
+		if h.queue.Len() == 0 {
+			break
+		}
+		delays = append(delays, h.queue.Delays()[0])
+	}
+	// 1s, 2s, 4s, then capped at the 5s lease; having waited 7s (more than
+	// one lease) and spent its attempts, the fourth arrival gives up.
+	mustEqual(t, len(delays), 3, "three redrives")
+	mustEqual(t, delays[0], time.Second, "first")
+	mustEqual(t, delays[1], 2*time.Second, "doubled")
+	mustEqual(t, delays[2], 4*time.Second, "doubled again")
+	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateFailed, "then FAILED")
+}
+
+func TestDispatch_AJobForAnEndedThreadIsNotRedriven(t *testing.T) {
+	h := makeRuntime(t, scripted(step{text: "ok"}), func(c *agentenkit.AgentConfig) { c.RunMaxAttempts = 1; c.RunLockLease = time.Second })
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
+	_, _ = h.kv.Set(h.ctx, agentenkit.RunLockKey(ran.ThreadID), "older-run/d/n", agentenkit.SetOptions{})
+	h.handleNext(t) // redrive 1
+	h.handleNext(t) // gives up: FAILED
+	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateFailed, "FAILED")
+	// A stray copy of the job arrives afterwards.
+	job := agentenkit.RunJob{ThreadID: ran.ThreadID, RunID: ran.RunID, Model: "gpt-4o", Agent: "chat"}
+	if _, err := h.rt.Worker.HandleJob(h.ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	mustEqual(t, h.queue.Len(), 0, "an ended thread is not redriven")
 }

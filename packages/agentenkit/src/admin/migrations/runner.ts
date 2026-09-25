@@ -30,6 +30,10 @@ export interface Migration {
   /** Sorts and identifies it. Never reused, never renamed. */
   version: string;
   sql: string;
+  /** Other checksums this step is known to be the same as: the same SQL,
+   *  recorded under a different text by the Go runtime. A database migrated
+   *  by either runtime is then accepted by both. */
+  equivalent?: string[];
 }
 
 /** The two calls a migration runner needs. Both stores already have them. */
@@ -47,6 +51,11 @@ export interface MigrationDialect {
   insert: string;
   /** Reads one version back. One bind parameter. */
   selectOne: string;
+  /** Opens the migration's transaction; `BEGIN` when omitted. SQLite's is
+   *  `BEGIN IMMEDIATE`: a plain BEGIN takes the write lock only at the first
+   *  write, so two processes that both read the ledger first both fail with
+   *  SQLITE_BUSY instead of one waiting for the other. */
+  begin?: string;
   /** Taken first inside each migration's transaction, so two workers starting
    *  together queue rather than both applying the same file. Omitted for a
    *  database that serialises writers by itself. */
@@ -115,7 +124,7 @@ export async function runMigrations(
 ): Promise<void> {
   const where = (msg: string) => `${dialect.name} migrations: ${msg}`;
 
-  await db.exec('BEGIN');
+  await db.exec(dialect.begin ?? 'BEGIN');
   try {
     if (dialect.lock) await db.exec(dialect.lock);
     await db.exec(dialect.ledger);
@@ -130,7 +139,7 @@ export async function runMigrations(
       const sum = checksum(m.sql);
       const already = applied.get(m.version);
       if (already !== undefined) {
-        if (already !== sum) {
+        if (already !== sum && !m.equivalent?.includes(already)) {
           throw new Error(
             `${m.version} changed after it was applied: the database no longer matches the code`,
           );
@@ -160,16 +169,56 @@ export async function runMigrations(
  *  that failed surfaces on the first call rather than as a mystery empty
  *  dashboard.
  *
+ *  A failed migration is never an unhandled rejection: nothing awaits it until
+ *  the first admin call, and Node ends the process on a rejection nobody
+ *  handled. Nor is it final: a database that was down at boot comes back, so
+ *  a call made after `retryMs` runs the migration again (the wait doubles on
+ *  each failure, up to a minute). Calls in between fail fast with the last
+ *  error.
+ *
  *  Written once here so every admin store, including one added later, gets the
  *  same behaviour for free. */
-export function gatedAdminStore(inner: AdminStore, ready: Promise<void>): AdminStore {
+export function gatedAdminStore(
+  inner: AdminStore,
+  migrate: () => Promise<void>,
+  opts: { retryMs?: number; maxRetryMs?: number; now?: () => number } = {},
+): AdminStore {
+  const now = opts.now ?? Date.now;
+  const maxRetryMs = opts.maxRetryMs ?? 60_000;
+  let wait = opts.retryMs ?? 1_000;
+  let failedAt = 0;
+  let lastError: unknown;
+  let ready: Promise<void> | null = null;
+  const start = () => {
+    const attempt = migrate().then(
+      () => {
+        lastError = undefined;
+      },
+      (err) => {
+        lastError = err;
+        failedAt = now();
+        ready = null;
+      },
+    );
+    ready = attempt;
+    return attempt;
+  };
+  void start();
+  const whenReady = async () => {
+    if (ready) await ready;
+    if (lastError === undefined) return;
+    if (now() - failedAt < wait) throw lastError;
+    wait = Math.min(wait * 2, maxRetryMs);
+    await start();
+    if (lastError !== undefined) throw lastError;
+  };
   const gate = <T extends Record<string, any>>(group: T): T => {
     const out: Record<string, unknown> = {};
     for (const [name, fn] of Object.entries(group)) {
       out[name] =
         typeof fn === 'function'
           ? async (...args: unknown[]) => {
-              await ready;
+              await whenReady();
               return fn.apply(group, args);
             }
           : fn;

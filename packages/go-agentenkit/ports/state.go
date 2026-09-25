@@ -68,6 +68,9 @@ func (b BoundThreads) Delete(ctx context.Context, threadID string) error {
 func (b BoundThreads) ClaimState(ctx context.Context, threadID string, from, to ExecutionState) (bool, error) {
 	return b.s.ClaimState(ctx, threadID, from, to, b.sc)
 }
+func (b BoundThreads) Transition(ctx context.Context, threadID string, t ThreadTransition) (bool, error) {
+	return b.s.Transition(ctx, threadID, t, b.sc)
+}
 
 // BoundMessages is MessageStore with the StorageContext bound.
 type BoundMessages struct {
@@ -91,8 +94,11 @@ type BoundEvents struct {
 	sc StorageContext
 }
 
-func (b BoundEvents) Append(ctx context.Context, threadID string, e AgentEvent) error {
+func (b BoundEvents) Append(ctx context.Context, threadID string, e NewThreadEvent) (AgentEvent, error) {
 	return b.s.Append(ctx, threadID, e, b.sc)
+}
+func (b BoundEvents) List(ctx context.Context, threadID string, f ThreadEventFilter) ([]AgentEvent, error) {
+	return b.s.List(ctx, threadID, f, b.sc)
 }
 func (b BoundEvents) ListSince(ctx context.Context, threadID string, sinceSeq int64) ([]AgentEvent, error) {
 	return b.s.ListSince(ctx, threadID, sinceSeq, b.sc)
@@ -102,6 +108,12 @@ func (b BoundEvents) Latest(ctx context.Context, threadID, typ string) (*AgentEv
 }
 func (b BoundEvents) ListByType(ctx context.Context, threadID, typ string) ([]AgentEvent, error) {
 	return b.s.ListByType(ctx, threadID, typ, b.sc)
+}
+
+// Pruner is the store's EventPruner, or nil when it cannot prune.
+func (b BoundEvents) Pruner() EventPruner {
+	p, _ := b.s.(EventPruner)
+	return p
 }
 
 // BoundUsage is UsageStore with the StorageContext bound.

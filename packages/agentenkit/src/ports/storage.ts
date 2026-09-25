@@ -4,10 +4,13 @@ import type {
   ExecutionState,
   MessageDTO,
   NewMessage,
+  NewThreadEvent,
+  ThreadEventFilter,
   NewUsage,
   UsageFilter,
   UsageTotals,
   ThreadDTO,
+  ThreadTransition,
 } from '../core/types.js';
 
 /** Persistence port for a caller's OWN data (§3.2): threads, messages, events,
@@ -42,6 +45,11 @@ export interface Storage {
       to: ExecutionState,
       ctx: StorageContext,
     ): Promise<boolean>;
+    /** The compare-and-set every run state change goes through: true iff THIS
+     *  caller moved the thread (see ThreadTransition). The adapter keeps the
+     *  thread's current run beside its state. Atomic, like `claimState`: one
+     *  conditional UPDATE or equivalent. */
+    transition(threadId: string, t: ThreadTransition, ctx: StorageContext): Promise<boolean>;
   };
   messages: {
     append(threadId: string, message: NewMessage, ctx: StorageContext): Promise<MessageDTO>;
@@ -66,16 +74,29 @@ export interface Storage {
      *  provider accepts. `run()` enforces that; adapters just delete. */
     deleteFrom(threadId: string, messageId: string, ctx: StorageContext): Promise<number>;
   };
+  /** The thread record: the few events that must outlive a run — parks and
+   *  their answers, refusals, budget stops, compaction, each segment's start
+   *  and end, and an app's own events published durable. A run's live
+   *  events go to its run stream, never here, so this grows with runs, not
+   *  with tokens. */
   events: {
-    append(threadId: string, event: AgentEvent, ctx: StorageContext): Promise<void>;
-    /** All events after the cursor, ascending by seq — SSE replay (§2.2) */
+    /** Store an entry and mint its seq: the thread's next, one higher than
+     *  any it holds. Two appends on one thread never get the same seq. */
+    append(threadId: string, event: NewThreadEvent, ctx: StorageContext): Promise<AgentEvent>;
+    /** Entries by filter, ascending by seq. */
+    list(threadId: string, filter: ThreadEventFilter, ctx: StorageContext): Promise<AgentEvent[]>;
+    /** All events after the cursor, ascending by seq. */
     listSince(threadId: string, sinceSeq: number, ctx: StorageContext): Promise<AgentEvent[]>;
     /** Most recent event of a type — the HITL pending check (§2.5) */
     latest(threadId: string, type: string, ctx: StorageContext): Promise<AgentEvent | null>;
     /** Every event of a type, ascending by seq. The open-approval set (§2.7)
-     *  is derived from these; scanning `listSince` instead would drag every
-     *  CHUNK on the thread through memory. */
+     *  is derived from these. */
     listByType(threadId: string, type: string, ctx: StorageContext): Promise<AgentEvent[]>;
+    /** Optional: one batch of `runtime.pruneEvents`. Deletes up to `limit`
+     *  entries of these types, on every thread, and says how many of each
+     *  went. With `dryRun` it deletes nothing and counts every entry of
+     *  these types instead. */
+    prune?(types: string[], opts: { limit: number; dryRun?: boolean }): Promise<Record<string, number>>;
   };
   /** One row per model call (§4).
    *

@@ -722,3 +722,17 @@ table.runs .sub { display: block; color: var(--muted); font-size: 10px; }
 .started-params dt { color: var(--muted); }
 .started-params dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .started-params code { font-size: 11px; color: var(--accent); }
+
+.send-error {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--red, #d33);
+  border-radius: 6px;
+  color: var(--red, #d33);
+}
+
+.connection {
+  margin: 0 0 12px;
+  font-size: 0.85em;
+  opacity: 0.7;
+}

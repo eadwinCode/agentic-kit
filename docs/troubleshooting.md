@@ -18,6 +18,9 @@ runs, the problem is delivery, not the runtime.
 
 ### Every job resolves to an unknown agent
 
+`handleJob` throws `UnknownAgentError` (Go: `ErrUnknownAgent`) for these, so the
+queue keeps retrying them.
+
 The worker route imported the runtime from a module that does not also register
 the agents. The registry lives in the runtime's closure, and frameworks that
 give each route its own module instance will hand you a runtime with an empty
@@ -33,9 +36,31 @@ Either the thread has an active run — stop it first, or wait — or your
 ### A thread is stuck in `RUNNING` with no worker
 
 The worker died holding the run lock. It clears when the lease expires
-(`runLockLeaseSeconds`). If that is routinely too long, shorten it — but keep it
-above your longest run segment, or a second worker will start on a thread that is
-still being advanced.
+(`runLockLeaseSeconds`). A live worker renews its lock while it runs, so a
+shorter lease only makes a dead worker's lock clear sooner; it does not cut a
+long run short.
+
+Call `runtime.reclaimStuckRuns(olderThanMs)` (Go: `ReclaimStuckRuns`) from a
+periodic job. It re-dispatches a queued or running run that has no lock and no
+job, and settles an ended run whose settle never ran, paging through every
+such run.
+
+### A thread is stuck in `QUEUED` ("Waiting to start")
+
+Its job never reached a worker: the queue dropped it, or it was a local
+dev queue that lost its jobs on restart. The same sweep (and the stream
+route's `reclaimIfOrphaned`) sends it again. With a queue that can look up
+jobs, that happens once the lock lease has passed with no job. With one
+that cannot (QStash), it waits for the longest of the lock lease,
+`maxQueueWaitMs` and the longest retry delay (with defaults, 2 minutes),
+so a job that is only slow is not sent twice. Pressing Stop clears it at
+once.
+
+### A worker died after the answer was saved
+
+The retry does not ask the model again. A run whose last saved turn is an
+assistant answer with no tool calls (or which already settled) is finalized
+from that answer, so the user sees one reply and the call is billed once.
 
 ### A stopped run wedges the thread
 
@@ -163,7 +188,9 @@ you have added `externals` entries for it, try removing them.
 
 ## Still stuck
 
-Open an issue with the thread's event log (`runtime.events.since(threadId, -1)`)
-and the run record (`runtime.admin.getRun(runId)`). Between them they usually
-show exactly where a run stopped doing what you expected:
+Open an issue with the thread's record (`runtime.events.since(threadId, -1)`)
+and the run record (`runtime.admin.getRun(runId)`). Add the run's stream
+(`runtime.streams.snapshot('<runId>:<segment>')`) if it is still inside its
+grace window. Between them they usually show exactly where a run stopped doing
+what you expected:
 <https://github.com/eadwinCode/agentic-kit/issues>

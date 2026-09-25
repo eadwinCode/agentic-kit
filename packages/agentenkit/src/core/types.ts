@@ -5,8 +5,9 @@ import type { AgentRunState } from './state.js';
  *  (`agent:state:{threadId}`) is a hot cache the engine polls (§2.1, §3.4). */
 export type ExecutionState =
   | 'IDLE'
-  /** Accepted and waiting for a worker; written by the Go runtime. It becomes
-   *  RUNNING the moment a worker picks the job up. */
+  /** Accepted and waiting for a worker. It becomes RUNNING the moment a
+   *  worker picks the job up, and goes back to QUEUED while a failed run
+   *  waits for its retry. */
   | 'QUEUED'
   | 'RUNNING'
   | 'WAITING_FOR_INPUT'
@@ -25,6 +26,22 @@ export interface ThreadDTO {
   model: string;
   createdAt: Date;
   updatedAt: Date;
+}
+
+/** One compare-and-set on a thread's state (§3.4). It lands only while the
+ *  thread is in one of `from` AND still belongs to `runId`, so a run that has
+ *  been stopped or replaced can never move the thread again: its write simply
+ *  loses. */
+export interface ThreadTransition {
+  from: ExecutionState[];
+  to: ExecutionState;
+  /** The run the caller acts for. The transition lands only while the
+   *  thread's current run is this one, or the thread has no run recorded yet
+   *  (a thread from before run ids were stored). Omitted means any run. */
+  runId?: string;
+  /** Makes the thread belong to a new run: set by run admission. Omitted
+   *  keeps the current one. */
+  newRunId?: string;
 }
 
 export interface MessageDTO {
@@ -49,10 +66,32 @@ export interface NewMessage {
  *  engine via Kv.incr before append (§3.4). */
 export interface AgentEvent {
   threadId: string;
+  /** The thread record's order, minted by the store on insert. 0 for a
+   *  notice, which is never stored. */
   seq: number;
   type: string;
   payload: unknown;
   createdAt: Date;
+  /** The run the entry belongs to, when it belongs to one. */
+  runId?: string | null;
+}
+
+/** An entry for the thread record, before the store gives it its seq. */
+export interface NewThreadEvent {
+  type: string;
+  payload: unknown;
+  runId?: string | null;
+  /** When it happened; now when omitted. */
+  createdAt?: Date;
+}
+
+/** Which record entries to read back: all of them by default, oldest first. */
+export interface ThreadEventFilter {
+  types?: string[];
+  runId?: string;
+  /** Only entries after this seq. */
+  after?: number;
+  limit?: number;
 }
 
 /** The durable record of ONE agent run (§2.9): when it started, how it ended,
@@ -78,8 +117,12 @@ export interface RunRecord {
   stopReason?: string | null;
   /** Why it failed, when it did. Previously dropped on the floor (§2.8). */
   error?: string | null;
-  /** When the run was accepted and enqueued. */
+  /** When a worker first started work on it. Until then (a QUEUED run) the
+   *  time it was accepted. */
   startedAt: Date;
+  /** When the run was accepted and enqueued (§2.8): a queued run's wait
+   *  shows while it lasts. Null on records from before the QUEUED stage. */
+  enqueuedAt?: Date | null;
   endedAt?: Date | null;
   /** endedAt - startedAt, denormalised so a listing never recomputes it. A
    *  parked run legitimately spans however long the human took (§2.5). */
@@ -87,6 +130,13 @@ export interface RunRecord {
   /** Milliseconds between enqueue and a worker starting work — the number that
    *  says whether workers are keeping up (§2.8). */
   queuedMs?: number | null;
+  /** When the spec's `onSettle` ran for this run (§5.6). A run settles exactly
+   *  once: whoever ends it, or the late-settle sweep. Unset until then. */
+  settledAt?: Date | null;
+  /** When a settle claimed the run and started its hook. Cleared when the
+   *  settle ends; one left behind for long is a settler that died, and the
+   *  next settle takes the run over. */
+  settlingAt?: Date | null;
   /** Loop iterations completed, summed across every segment of the run. */
   steps: number;
   inputTokens: number;
@@ -106,6 +156,10 @@ export interface RunRecord {
   providerOptions?: Record<string, unknown> | null;
   /** A nested run's capped result, handed back to its parent (§2.7). */
   result?: unknown;
+  /** The caps the run was dispatched with (§4, §2.1), kept so a run
+   *  re-dispatched from its record keeps them. */
+  costBudgetMicros?: number | null;
+  maxSteps?: number | null;
 }
 
 export interface NewRunRecord {
@@ -120,6 +174,15 @@ export interface NewRunRecord {
   /** Defaults to 0 — a dispatched run. */
   depth?: number;
   parentRunId?: string | null;
+  /** A dispatched run opens QUEUED; a nested run starts RUNNING (the
+   *  default). */
+  state?: ExecutionState;
+  /** When a dispatched run was accepted. */
+  enqueuedAt?: Date | null;
+  /** The caps the run was dispatched with (§4, §2.1), kept so a run
+   *  re-dispatched from its record keeps them. */
+  costBudgetMicros?: number | null;
+  maxSteps?: number | null;
 }
 
 export type RunPatch = Partial<Omit<RunRecord, 'id' | 'threadId'>>;
@@ -138,16 +201,32 @@ export interface UsageTotals {
   /** Summed cost in millionths of one `currency` unit: 1_000_000 is one
    *  dollar when the currency is USD. */
   costMicros: number;
-  /** The unit `costMicros` is in, absent when nothing was priced. One
-   *  deployment should price in ONE currency: these are summed, not
-   *  converted. */
+  /** The unit `costMicros` is in: the first currency priced, absent when
+   *  nothing was. Money is never converted, so a call priced in another
+   *  currency is left out of `costMicros` and counted in `unpriced`; `costs`
+   *  has every currency's own total. */
   currency?: string;
-  /** How many calls had no cost, because no pricer answered for them. Above
-   *  zero, `costMicros` is a floor and not the whole bill. */
+  /** How many calls `costMicros` leaves out: calls no pricer answered for,
+   *  and calls priced in another currency. Above zero, `costMicros` is a
+   *  floor and not the whole bill. */
   unpriced: number;
-  /** The same spend grouped by agent and model: one line per pair, which is
-   *  the shape a bill wants. Summing the lines gives the totals above. */
+  /** The money per currency, in the order each was first seen. One run is
+   *  only ever priced in one currency (a second one is refused when the call
+   *  is recorded), so a run's bill has at most one entry; a thread whose
+   *  pricer changed currency between runs can have more. */
+  costs?: CurrencyCost[];
+  /** The same spend grouped by agent, model and currency: one line per agent
+   *  and model, which is the shape a bill wants. Summing the lines of one
+   *  currency gives that currency's entry in `costs`. */
   lines: UsageLine[];
+}
+
+/** The money spent in one currency (§4). */
+export interface CurrencyCost {
+  currency: string;
+  costMicros: number;
+  /** How many calls were priced in this currency. */
+  calls: number;
 }
 
 /** One agent's spend on one model, summed over its calls (§4). This is the
@@ -159,6 +238,9 @@ export interface UsageLine {
   /** The registry key; `modelId` is the wire id it resolved to. */
   model?: string | null;
   modelId?: string | null;
+  /** The unit `costMicros` is in, absent when none of the line's calls was
+   *  priced. */
+  currency?: string;
   inputTokens: number;
   cacheReadInputTokens: number;
   cacheWriteInputTokens: number;
@@ -303,6 +385,14 @@ export function mergeProviderOptions(
 /** Dispatch ticket for the queue (§2.8). At-least-once — consumers must be
  *  idempotent. `agent` resolves via `AgentCore.getAgent`; when missing, the
  *  default handle executes. */
+/** Why a job was enqueued (see `RunJob.kind`):
+ *  - `retry`: the same run trying again after a failure (§2.8);
+ *  - `redrive`: a job that found the run lock held by an older run;
+ *  - `resume`: a parked run continuing after an answer (§2.5);
+ *  - `expiry`: a park's own deadline (§2.5);
+ *  - `reclaim`: an orphaned thread re-dispatched (§2.5). */
+export type JobKind = 'retry' | 'redrive' | 'resume' | 'expiry' | 'reclaim';
+
 export interface RunJob {
   threadId: string;
   model: string;
@@ -312,9 +402,19 @@ export interface RunJob {
    *  been replaced by a newer run and must not execute. Omitted on legacy
    *  dispatches, which keep the old no-identity behavior. */
   runId?: string;
+  /** Names THIS enqueue of the run: a fresh dispatch, a retry, a resume each
+   *  get their own. A queue that delivers one job twice delivers the same
+   *  id, which is how the run lock tells a duplicate apart from another
+   *  delivery of the same run (§3.4). Stamped by `enqueueJob`; absent on
+   *  jobs written before it. */
+  dispatchId?: string;
   /** Epoch ms at enqueue. The worker subtracts it on pickup to record how long
    *  the job waited — the number that says whether workers keep up (§2.9). */
   enqueuedAt?: number;
+  /** Why the job exists, so a queue can log it, order it and cap only the
+   *  kind that brings new work in. Absent is a fresh dispatch from `run`, the
+   *  only kind a depth cap refuses. */
+  kind?: JobKind;
   /** The run's state (§2.10), so a worker rehydrates exactly what the caller
    *  attached — hours later, in another process, after an approval. */
   state?: AgentRunState;
@@ -323,6 +423,15 @@ export interface RunJob {
    *  cap the caller asked for. */
   costBudgetMicros?: number;
   providerOptions?: ProviderOptions;
+  /** The run's own step cap, when the caller set one (§2.1). */
+  maxSteps?: number;
+  /** The caller's tenant, opaque to the platform. A queue that spreads its
+   *  claims across partitions keeps one tenant's backlog from starving the
+   *  others. */
+  partitionKey?: string;
+  /** Epoch ms of the run's first dispatch, carried onto every retry and
+   *  resume so the run keeps its place in line. */
+  dispatchedAt?: number;
 }
 
 /** Identifies a nested run well enough to re-enter its loop (§2.7). Persisted
@@ -350,6 +459,11 @@ export interface ResumeInfo {
    *  closure that is long gone. Without it every storage call after an
    *  approval loses whatever the caller attached, tenant scope included. */
   state?: AgentRunState;
+  /** The run's own step cap (§2.1), so a resumed segment keeps it. */
+  maxSteps?: number;
+  /** Epoch ms of the run's first dispatch, so a resume keeps its place in
+   *  line. */
+  dispatchedAt?: number;
 }
 
 /** A model identity after resolution: the real provider instance (created
@@ -381,6 +495,30 @@ export interface SubagentsConfig {
   /** Extra tools merged into every spawned subagent's toolset
    *  (HITL-wrapped identically to the parent's tools). */
   tools?: ToolSet;
+  /** Named specialists (§2.7). When set, `spawnSubagent` must name one of
+   *  them: the child takes the profile's persona, model, tools and step cap
+   *  instead of the shared defaults above. The model still writes the brief;
+   *  the profile says who reads it. */
+  profiles?: Record<string, SubagentProfile>;
+}
+
+/** One named specialist a run may delegate to. */
+export interface SubagentProfile {
+  /** Shown to the model beside the name, so it can choose. */
+  description?: string;
+  /** The child's static persona; `systemFn` wins when set. */
+  system?: string;
+  systemFn?: import('../ports/runtime.js').SystemFn;
+  /** Edits the child's prompt per step; see PrepareStepFn. */
+  prepareStep?: import('../ports/runtime.js').PrepareStepFn;
+  /** Registry key; absent falls back to the config's `model`, then the
+   *  default. */
+  model?: string;
+  /** The child's own tools, HITL-wrapped like the parent's. They replace the
+   *  shared `tools` above. */
+  tools?: ToolSet;
+  /** Caps the child's round trips; 0 or absent keeps `subagentMaxSteps`. */
+  maxSteps?: number;
 }
 
 export interface AgentConfig {
@@ -402,6 +540,12 @@ export interface AgentConfig {
    *  it would strand the user's message — so it comes back once the previous
    *  run has let go. */
   runRedriveDelaySeconds: number;
+  /** A failed run waits this long before its first retry, twice as long each
+   *  time after, up to `runRetryBackoffMaxMs`, with up to a quarter of jitter
+   *  so a fleet that failed together does not retry together (§2.8). 0 retries
+   *  at once. */
+  runRetryBackoffMs: number;
+  runRetryBackoffMaxMs: number;
   /** Default per-run token budget (input + output) when neither the execute
    *  input nor the agent spec declares one. `undefined` = unbounded apart
    *  from `maxSteps` (§2.1 safety cap). */
@@ -454,14 +598,46 @@ export interface AgentConfig {
   /** Per-model native windows below the ceiling (§2.6) — merged over defaults.
    *  A `contextWindow` declared via `resolveModel` wins over this table. */
   nativeWindows?: Record<string, number>;
-  /** Lease (seconds) for the per-thread run lock — must exceed the longest
-   *  possible run segment; parked HITL waits hold NO lock (§2.8, §3.4). */
+  /** Lease (seconds) for the per-thread run lock. The holder renews it every
+   *  sixth of the lease while it holds it, so an expired lock means a dead
+   *  worker; parked HITL waits hold NO lock (§2.8, §3.4). */
   runLockLeaseSeconds: number;
+  /** Bounds one model round trip in wall time (ms). A model that accepts the
+   *  call and never answers ends that step like any failed step, and the run
+   *  takes the retry policy (§2.8). 0 means no bound. */
+  stepTimeoutMs: number;
+  /** Bounds one worker segment in wall time (ms). Past it the run ends FAILED
+   *  with stopReason `timeout`, rather than holding the worker. 0 means no
+   *  bound. */
+  segmentTimeoutMs: number;
+  /** The longest a job may wait in the queue (ms). A job picked up later
+   *  fails its run with the reason, instead of doing work nobody is waiting
+   *  for any more. 0 means no limit. */
+  maxQueueWaitMs: number;
+  /** How long a run stream is kept after its segment ends (ms). A tab that
+   *  reconnects within it resumes inside the stream; one that comes later
+   *  gets a snapshot, which has the final text in the messages. */
+  streamGraceMs: number;
+  /** How long a stream lives if nothing ever closes it (ms): the last guard
+   *  when the worker and the sweep both failed. */
+  streamTtlMs: number;
+  /** How long stream events wait to be appended together (ms). A step end,
+   *  a tool result, a park and a close go out at once. 0 sends every event
+   *  as it comes. */
+  streamFlushMs: number;
+  /** Append at once when this many stream events are waiting. */
+  streamFlushEvents: number;
+  /** Refuse a new run (RUN_REFUSED, reason `queue_full`) once this many jobs
+   *  are ready and waiting (§2.8). Needs a queue that can count; one that
+   *  cannot is never refused on. 0 means no cap. */
+  maxQueueDepth: number;
   /** Billing pre-execution check (§4). Return `{ ok: false, error }` to reject
    *  a run. The check can publish on the thread (a credit warning, a reset
    *  date) so every client sees why; the platform also publishes RUN_REFUSED
    *  with the error. */
   billingPreCheck?: (check: BillingCheck) => Promise<{ ok: boolean; error?: string }>;
+  // It runs twice for a run: at dispatch, before anything is written, and
+  // again at pickup, however long the job waited — see BillingCheck.stage.
   /** Provider-specific options applied to EVERY run (§3.1) — a reasoning
    *  budget, a service tier, a safety identifier. The lowest of three levels:
    *  an agent spec overrides this, and a run input overrides both, per
@@ -474,12 +650,28 @@ export interface AgentConfig {
  *  caller. `publishEvent(type, payload, { durable })` — durable by default. */
 export interface BillingCheck {
   threadId: string;
+  /** Set at pickup; absent at dispatch, where the run has no id yet. */
+  runId?: string;
   state: AgentRunState;
+  /** When the check runs. `dispatch` is inside `run`, before anything is
+   *  written: a refusal means the run never exists. `pickup` is when a worker
+   *  takes the job (a first dispatch, a retry, a resume): a refusal fails the
+   *  run. */
+  stage: 'dispatch' | 'pickup';
+  /** The caps the job carries, at pickup only. The check may LOWER either and
+   *  the segment runs with the lowered cap; raising is ignored. */
+  budget?: RunBudget;
   publishEvent: (
     type: string,
     payload: unknown,
     options?: { durable?: boolean },
   ) => Promise<AgentEvent>;
+}
+
+/** The money and step cap a segment runs with. 0 is no cap from this level. */
+export interface RunBudget {
+  costBudgetMicros: number;
+  maxSteps: number;
 }
 
 export const DEFAULT_CONFIG: AgentConfig = {
@@ -489,6 +681,8 @@ export const DEFAULT_CONFIG: AgentConfig = {
   runMaxAttempts: 3,
   stopPollMs: 500,
   runRedriveDelaySeconds: 2,
+  runRetryBackoffMs: 5_000,
+  runRetryBackoffMaxMs: 120_000,
   subagentMaxDepth: 2,
   subagentMaxConcurrent: 3,
   subagentMaxSteps: 10,
@@ -501,7 +695,15 @@ export const DEFAULT_CONFIG: AgentConfig = {
   contextTailShare: 0.25,
   compactionModel: 'gpt-4o-mini',
   promptCaching: true,
-  runLockLeaseSeconds: 30 * 60,
+  runLockLeaseSeconds: 2 * 60,
+  stepTimeoutMs: 0,
+  segmentTimeoutMs: 0,
+  maxQueueWaitMs: 0,
+  maxQueueDepth: 0,
+  streamGraceMs: 10 * 60_000,
+  streamTtlMs: 24 * 60 * 60_000,
+  streamFlushMs: 50,
+  streamFlushEvents: 32,
 };
 
 export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
@@ -523,10 +725,25 @@ export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
       `Invalid config: stopPollMs (${config.stopPollMs}) must be an integer of at least 1`,
     );
   }
+  for (const key of ['runRetryBackoffMs', 'runRetryBackoffMaxMs'] as const) {
+    if (!Number.isInteger(config[key]) || config[key] < 0) {
+      throw new Error(`Invalid config: ${key} (${config[key]}) must be a non-negative integer`);
+    }
+  }
   if (!Number.isInteger(config.runRedriveDelaySeconds) || config.runRedriveDelaySeconds < 0) {
     throw new Error(
       `Invalid config: runRedriveDelaySeconds (${config.runRedriveDelaySeconds}) must be a non-negative integer`,
     );
+  }
+  for (const key of ['streamGraceMs', 'streamTtlMs', 'streamFlushEvents'] as const) {
+    if (!Number.isInteger(config[key]) || config[key] < 1) {
+      throw new Error(`Invalid config: ${key} (${config[key]}) must be an integer of at least 1`);
+    }
+  }
+  for (const key of ['stepTimeoutMs', 'segmentTimeoutMs', 'maxQueueWaitMs', 'maxQueueDepth', 'streamFlushMs'] as const) {
+    if (!Number.isFinite(config[key]) || config[key] < 0) {
+      throw new Error(`Invalid config: ${key} (${config[key]}) must not be negative`);
+    }
   }
   if (!Number.isInteger(config.runLockLeaseSeconds) || config.runLockLeaseSeconds < 1) {
     // The lease is the only thing that heals a crashed worker's lock — a

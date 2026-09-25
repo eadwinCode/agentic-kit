@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"slices"
 	"sort"
 	"time"
 
@@ -32,6 +33,10 @@ type RunStats struct {
 	// Waiting is how many runs in the window are still QUEUED.
 	Waiting int `json:"waiting"`
 	Failed  int `json:"failed"`
+	// Sampled is true when the window held more runs than the percentiles
+	// were worked out over. The counts and token sums are exact either way;
+	// the percentiles are then over the newest runs only.
+	Sampled bool `json:"sampled,omitempty"`
 }
 
 // AdminOverview is the top of an operational view.
@@ -62,8 +67,11 @@ type ThreadSummary struct {
 	FirstSeenAt time.Time            `json:"firstSeenAt"`
 	UpdatedAt   time.Time            `json:"updatedAt"`
 	// Runs on this thread, nested ones included.
-	Runs   int               `json:"runs"`
-	Steps  int               `json:"steps"`
+	Runs  int `json:"runs"`
+	Steps int `json:"steps"`
+	// Tokens are summed from the run records. In a list that is tokens only,
+	// with no money; GetThread reads the thread's usage rows instead, so its
+	// Tokens carry the cost too (§4).
 	Tokens ports.UsageTotals `json:"tokens"`
 	// DurationMs is summed run durations. Not wall time: nested runs overlap
 	// their parent.
@@ -88,7 +96,9 @@ type RunDetail struct {
 	Steps []ports.StepRecord `json:"steps"`
 	// Subagents are the nested runs spawned beneath it (§2.7).
 	Subagents []ports.RunRecord `json:"subagents"`
-	// Events are the run's events with CHUNKs stripped: the readable spine.
+	// Events are the run's entries in the thread record: each segment's
+	// start and end, its parks and their answers, a refusal, a budget stop.
+	// The readable spine; its steps are in Steps.
 	Events []ports.AgentEvent `json:"events"`
 	// Usage is what this run spent, nested runs included (§4): tokens, money,
 	// and a line per agent and model. Read from the usage rows, so it is the
@@ -170,11 +180,30 @@ func RunStatsFor(ctx context.Context, deps ports.RuntimePorts, r StatsRange) (Ru
 	if limit <= 0 {
 		limit = 1_000
 	}
-	runs, err := ListRuns(ctx, deps, ports.RunFilter{Since: r.Since, Until: r.Until, Limit: limit})
+	return statsOver(ctx, deps, ports.RunFilter{Since: r.Since, Until: r.Until}, limit)
+}
+
+// statsOver is Summarise over the newest sample runs, with the counts and
+// token sums taken exact from the store, whatever the window holds.
+func statsOver(ctx context.Context, deps ports.RuntimePorts, f ports.RunFilter, sample int) (RunStats, error) {
+	f.Limit = sample
+	runs, err := ListRuns(ctx, deps, f)
 	if err != nil {
 		return RunStats{}, err
 	}
-	return Summarise(runs), nil
+	out := Summarise(runs)
+	totals, err := deps.Admin.Runs().Totals(ctx, f)
+	if err != nil {
+		return RunStats{}, err
+	}
+	out.Total, out.ByState, out.ByStopReason = totals.Runs, totals.ByState, totals.ByStopReason
+	out.Failed, out.Waiting = totals.ByState[ports.StateFailed], totals.ByState[ports.StateQueued]
+	out.Tokens = ports.UsageTotals{
+		InputTokens: totals.InputTokens, CachedInputTokens: totals.CachedInputTokens,
+		OutputTokens: totals.OutputTokens, TotalTokens: totals.TotalTokens,
+	}
+	out.Sampled = totals.Runs > len(runs)
+	return out, nil
 }
 
 // activeLimit caps the Active sample in an overview.
@@ -190,7 +219,7 @@ func Overview(ctx context.Context, deps ports.RuntimePorts, since *time.Time) (A
 	if err != nil {
 		return AdminOverview{}, err
 	}
-	recent, err := ListRuns(ctx, deps, ports.RunFilter{Since: since, Limit: 1_000})
+	recent, err := statsOver(ctx, deps, ports.RunFilter{Since: since}, 1_000)
 	if err != nil {
 		return AdminOverview{}, err
 	}
@@ -201,7 +230,7 @@ func Overview(ctx context.Context, deps ports.RuntimePorts, since *time.Time) (A
 		return AdminOverview{}, err
 	}
 	out := AdminOverview{
-		Runs: Summarise(recent), Threads: threads, RunsByState: runsByState, Active: active, ActiveLimit: activeLimit,
+		Runs: recent, Threads: threads, RunsByState: runsByState, Active: active, ActiveLimit: activeLimit,
 		ActiveTotal: runsByState[ports.StateQueued] + runsByState[ports.StateRunning] + runsByState[ports.StateWaitingForInput],
 	}
 	// The queue's own numbers ride the same response every dashboard
@@ -252,7 +281,7 @@ func rollUp(t ports.AdminThread, runs []ports.RunRecord) ThreadSummary {
 }
 
 // ListThreads lists threads with their runs rolled up, newest activity first
-// (§2.9). One pass over the window's runs rather than a query per thread.
+// (§2.9). One read of those threads' runs rather than a query per thread.
 func ListThreads(ctx context.Context, deps ports.RuntimePorts, filter ports.AdminThreadFilter) ([]ThreadSummary, error) {
 	if filter.Limit <= 0 {
 		filter.Limit = defaultLimit
@@ -261,9 +290,17 @@ func ListThreads(ctx context.Context, deps ports.RuntimePorts, filter ports.Admi
 	if err != nil {
 		return nil, err
 	}
-	runs, err := deps.Admin.Runs().List(ctx, ports.RunFilter{Since: filter.Since, Limit: 5_000})
-	if err != nil {
-		return nil, err
+	// The runs of exactly the threads listed, not the latest few thousand
+	// overall: a busy system would otherwise roll some threads up short.
+	ids := make([]string, 0, len(threads))
+	for _, t := range threads {
+		ids = append(ids, t.ID)
+	}
+	var runs []ports.RunRecord
+	if len(ids) > 0 {
+		if runs, err = deps.Admin.Runs().List(ctx, ports.RunFilter{ThreadIDs: ids, Limit: 100_000}); err != nil {
+			return nil, err
+		}
 	}
 	byThread := map[string][]ports.RunRecord{}
 	for _, r := range runs {
@@ -287,16 +324,9 @@ func GetThread(ctx context.Context, deps ports.RuntimePorts, threadID string) (*
 	if err != nil {
 		return nil, err
 	}
-	rows, err := deps.Admin.Threads().List(ctx, ports.AdminThreadFilter{Limit: 5_000})
+	thread, err := deps.Admin.Threads().Get(ctx, threadID)
 	if err != nil {
 		return nil, err
-	}
-	var thread *ports.AdminThread
-	for i := range rows {
-		if rows[i].ID == threadID {
-			thread = &rows[i]
-			break
-		}
 	}
 	if thread == nil && len(runs) == 0 {
 		return nil, nil
@@ -308,7 +338,16 @@ func GetThread(ctx context.Context, deps ports.RuntimePorts, threadID string) (*
 		base.State, base.Model = runs[0].State, runs[0].Model
 		base.FirstSeenAt, base.UpdatedAt = runs[len(runs)-1].StartedAt, runs[0].StartedAt
 	}
-	return &ThreadDetail{Thread: rollUp(base, runs), Runs: runs, Steps: steps}, nil
+	summary := rollUp(base, runs)
+	// The money lives on the usage rows, not the run records: read it from
+	// there, the same number a bill is built from. The view still renders
+	// with the records' tokens when the read fails.
+	if usage, err := deps.Storage.Usage.Total(ctx, threadID, ports.UsageFilter{}); err != nil {
+		Logger(deps).Error("thread usage not read", "thread", threadID, "err", err)
+	} else {
+		summary.Tokens = usage
+	}
+	return &ThreadDetail{Thread: summary, Runs: runs, Steps: steps}, nil
 }
 
 // GetRun assembles one run for a timeline view. Nil when unknown.
@@ -325,7 +364,7 @@ func GetRun(ctx context.Context, deps ports.RuntimePorts, runID string) (*RunDet
 	if err != nil {
 		return nil, err
 	}
-	events, err := deps.Storage.Events.ListSince(ctx, run.ThreadID, -1)
+	events, err := runEvents(ctx, deps, run)
 	if err != nil {
 		return nil, err
 	}
@@ -342,18 +381,31 @@ func GetRun(ctx context.Context, deps ports.RuntimePorts, runID string) (*RunDet
 			detail.Subagents = append(detail.Subagents, c) // its children: same table, by depth (§2.7)
 		}
 	}
-	from := run.StartedAt
-	for _, e := range events {
-		if e.Type == "CHUNK" || e.Type == "SUBAGENT_CHUNK" {
-			continue // the token firehose; a timeline wants the spine
-		}
-		if e.CreatedAt.Before(from) {
+	detail.Events = append(detail.Events, events...)
+	return detail, nil
+}
+
+// runEvents is a run's entries in the thread record. A thread written
+// before entries named their run has none by id; its log is read by the
+// run's time window instead, without the chunks.
+func runEvents(ctx context.Context, deps ports.RuntimePorts, run *ports.RunRecord) ([]ports.AgentEvent, error) {
+	own, err := deps.Storage.Events.List(ctx, run.ThreadID, ports.ThreadEventFilter{RunID: run.ID})
+	if err != nil || len(own) > 0 {
+		return own, err
+	}
+	all, err := deps.Storage.Events.ListSince(ctx, run.ThreadID, -1)
+	if err != nil {
+		return nil, err
+	}
+	var out []ports.AgentEvent
+	for _, e := range all {
+		if slices.Contains(StreamOnlyTypes, e.Type) || e.CreatedAt.Before(run.StartedAt) {
 			continue
 		}
 		if run.EndedAt != nil && e.CreatedAt.After(*run.EndedAt) {
 			continue
 		}
-		detail.Events = append(detail.Events, e)
+		out = append(out, e)
 	}
-	return detail, nil
+	return out, nil
 }

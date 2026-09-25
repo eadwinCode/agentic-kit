@@ -27,6 +27,9 @@ model Thread {
   updatedAt DateTime       @updatedAt
   state     ExecutionState @default(IDLE)
   model     String         @default("gpt-4o")
+  /// The run this thread belongs to now: every state change is a
+  /// compare-and-set on it, so a stopped or replaced run cannot move the thread.
+  runId     String?
 
   messages     Message[]
   usage        TokenUsage[]
@@ -40,18 +43,49 @@ model Message {
   role      String   // 'user' | 'assistant' | 'system' | 'tool'
   content   Json
   createdAt DateTime @default(now())
+  // Insertion order: a tool call and its result can share a millisecond, so
+  // messages are ordered by this, never by createdAt.
+  seq       BigInt   @default(autoincrement())
 
   thread Thread @relation(fields: [threadId], references: [id], onDelete: Cascade)
 
   @@index([threadId, createdAt])
+  @@index([threadId, seq])
 }
 
+/// A run segment's short-lived stream (agentenkit PrismaRunStreams). Closed
+/// when the segment ends and deleted after a grace window.
+model RunStream {
+  id        String   @id
+  threadId  String
+  runId     String
+  closed    Boolean  @default(false)
+  endEvent  String?
+  expiresAt DateTime
+
+  @@index([expiresAt])
+  @@index([threadId])
+}
+
+/// One event in a run stream. The autoincrement key is the stream offset.
+model RunStreamEvent {
+  pos      BigInt @id @default(autoincrement())
+  streamId String
+  event    String
+
+  @@index([streamId, pos])
+}
+
+/// The thread record: parks, refusals, budget stops, compaction, each run
+/// segment's start and end, and an app's durable events. A run's live
+/// events go to its RunStream, never here.
 model AgentEvent {
   id        String   @id @default(cuid())
   threadId  String
   seq       Int
   type      String
   payload   Json
+  runId     String?
   createdAt DateTime @default(now())
 
   thread Thread @relation(fields: [threadId], references: [id], onDelete: Cascade)

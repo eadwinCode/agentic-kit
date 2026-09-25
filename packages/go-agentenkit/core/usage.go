@@ -70,7 +70,18 @@ func Logger(deps ports.RuntimePorts) *slog.Logger {
 // The write uses a context that a user stop cannot cancel, because the
 // tokens of a stopped run were still spent. Storage failures are logged, not
 // returned: the same reasoning.
+//
+// A run's own calls go through its RunLedger.Record instead, which also holds
+// the run to one currency and books the spend against its caps.
 func RecordCall(ctx context.Context, deps ports.RuntimePorts, threadID string, u ports.NewUsage) ports.NewUsage {
+	u = price(ctx, deps, u)
+	store(ctx, deps, threadID, u)
+	return u
+}
+
+// price puts the pricer's cost on a usage row, leaving it unpriced when the
+// pricer fails or has nothing to say.
+func price(ctx context.Context, deps ports.RuntimePorts, u ports.NewUsage) ports.NewUsage {
 	if deps.Pricer != nil && u.Cost == nil {
 		cost, err := deps.Pricer.Price(ctx, u)
 		switch {
@@ -81,9 +92,14 @@ func RecordCall(ctx context.Context, deps ports.RuntimePorts, threadID string, u
 			u.Cost = cost
 		}
 	}
+	return u
+}
+
+// store writes a usage row on a context a stop cannot cancel: the tokens of
+// a stopped run were still spent. A failure is logged, not returned.
+func store(ctx context.Context, deps ports.RuntimePorts, threadID string, u ports.NewUsage) {
 	if err := deps.Storage.Usage.Record(context.WithoutCancel(ctx), threadID, u); err != nil {
 		Logger(deps).Error("usage not recorded",
 			"run", u.RunID, "thread", threadID, "err", err)
 	}
-	return u
 }

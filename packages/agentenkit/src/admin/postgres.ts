@@ -1,8 +1,9 @@
 import type { ExecutionState, NewRunRecord, RunPatch, RunRecord } from '../core/types.js';
 import type {
   AdminStore, AdminThread, AdminThreadFilter, NewAdminThread,
-  NewStepRecord, RunFilter, StepRecord,
+  NewStepRecord, RunDeltas, RunFilter, RunTotals, StepRecord,
 } from '../ports/admin.js';
+import { addRunTotals, emptyRunTotals, JSON_COLUMNS, RUN_COLUMNS } from './shared.js';
 import { gatedAdminStore, runMigrations, type MigrationDriver } from './migrations/runner.js';
 import { dialect, migrations } from './migrations/postgres/index.js';
 
@@ -60,18 +61,49 @@ async function migrate(db: PgLike): Promise<void> {
   }
 }
 
+/** The RunFilter as a WHERE clause, limit aside. */
+function runWhere(f: RunFilter): { where: string; vals: unknown[] } {
+  const where: string[] = [];
+  const vals: unknown[] = [];
+  if (f.state?.length) where.push(`state = ANY($${vals.push(f.state)})`);
+  if (f.agent) where.push(`agent = $${vals.push(f.agent)}`);
+  if (f.threadId) where.push(`"threadId" = $${vals.push(f.threadId)}`);
+  if (f.threadIds?.length) where.push(`"threadId" = ANY($${vals.push(f.threadIds)})`);
+  if (f.since) where.push(`"startedAt" >= $${vals.push(f.since)}`);
+  if (f.until) where.push(`"startedAt" <= $${vals.push(f.until)}`);
+  if (f.unsettled) where.push('"endedAt" IS NOT NULL AND "settledAt" IS NULL');
+  if (f.depth !== undefined) where.push(`depth = $${vals.push(f.depth)}`);
+  if (f.before) {
+    where.push(`("startedAt", id) < ($${vals.push(f.before.startedAt)}, $${vals.push(f.before.id)})`);
+  }
+  return { where: where.length ? ` WHERE ${where.join(' AND ')}` : '', vals };
+}
+
+/** BIGINT columns come back from `pg` as strings (§2.9). */
+const num = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v));
+
+const toThread = (r: any): AdminThread => ({
+  id: r.id, state: r.state as ExecutionState, model: r.model,
+  firstSeenAt: new Date(r.firstSeenAt), updatedAt: new Date(r.updatedAt),
+  startedWith: r.startedWith ? { ...r.startedWith, at: new Date(r.startedWith.at) } : null,
+});
+
 const toRun = (r: any): RunRecord => ({
   id: r.id, threadId: r.threadId, parentRunId: r.parentRunId ?? null, depth: r.depth,
   agent: r.agent, model: r.model, state: r.state as ExecutionState,
   stopReason: r.stopReason ?? null, error: r.error ?? null,
   startedAt: new Date(r.startedAt), endedAt: r.endedAt ? new Date(r.endedAt) : null,
-  durationMs: r.durationMs ?? null, queuedMs: r.queuedMs ?? null,
+  enqueuedAt: r.enqueuedAt ? new Date(r.enqueuedAt) : null,
+  durationMs: num(r.durationMs), queuedMs: num(r.queuedMs),
+  settledAt: r.settledAt ? new Date(r.settledAt) : null,
+  settlingAt: r.settlingAt ? new Date(r.settlingAt) : null,
   attempts: r.attempts, steps: r.steps,
-  inputTokens: r.inputTokens, cachedInputTokens: r.cachedInputTokens,
-  outputTokens: r.outputTokens, totalTokens: r.totalTokens,
+  inputTokens: Number(r.inputTokens), cachedInputTokens: Number(r.cachedInputTokens),
+  outputTokens: Number(r.outputTokens), totalTokens: Number(r.totalTokens),
   result: r.result ?? null,
   prompt: r.prompt ?? null, tokenBudget: r.tokenBudget ?? null,
   runState: r.runState ?? null, providerOptions: r.providerOptions ?? null,
+  costBudgetMicros: num(r.costBudgetMicros), maxSteps: num(r.maxSteps),
 });
 
 /** Operational history in Postgres — the production store (§2.9), reached
@@ -82,9 +114,10 @@ export class PostgresAdminStore implements AdminStore {
 
   /** The store with its schema migration already running behind it (§2.9).
    *
-   *  Connecting stays synchronous — a URL that cannot be reached is a
-   *  configuration problem worth failing on at startup. Only the schema moves
-   *  to the background, so a service starts at the same speed whether or not
+   *  Nothing here touches the network: a `pg` Pool connects lazily, so a
+   *  URL that cannot be reached shows up as a failed migration, logged, and
+   *  retried on a later admin call (see `gatedAdminStore`). The schema runs
+   *  in the background, so a service starts at the same speed whether or not
    *  it has migrating to do, and the returned store waits for it before its
    *  first call.
    *
@@ -96,14 +129,26 @@ export class PostgresAdminStore implements AdminStore {
     log?: { error(message: string, ...rest: unknown[]): void },
   ): AdminStore {
     const store = new PostgresAdminStore(db);
-    const ready = migrate(db).catch((err) => {
-      // Loud, because everything downstream of this is silent: admin writes
-      // are best effort, so a failed migration shows up as a dashboard with
-      // nothing in it rather than as an error.
-      (log ?? console).error('admin migrations failed', err);
-      throw err;
-    });
-    return gatedAdminStore(store, ready);
+    // A pg Pool emits 'error' when an idle connection drops (a failover, a
+    // server restart). An EventEmitter with no listener for it throws, which
+    // ends the process. The pool replaces the connection by itself, so a
+    // log line is all the error needs. A caller's own listener is left alone.
+    const emitter = db as unknown as {
+      on?(event: 'error', fn: (err: unknown) => void): unknown;
+      listenerCount?(event: 'error'): number;
+    };
+    if (typeof emitter.on === 'function' && (emitter.listenerCount?.('error') ?? 0) === 0) {
+      emitter.on('error', (err) => (log ?? console).error('admin postgres connection error', err));
+    }
+    return gatedAdminStore(store, () =>
+      migrate(db).catch((err) => {
+        // Loud, because everything downstream of this is silent: admin writes
+        // are best effort, so a failed migration shows up as a dashboard with
+        // nothing in it rather than as an error.
+        (log ?? console).error('admin migrations failed', err);
+        throw err;
+      }),
+    );
   }
 
   threads = {
@@ -136,26 +181,54 @@ export class PostgresAdminStore implements AdminStore {
          ORDER BY "updatedAt" DESC LIMIT $${vals.push(f.limit ?? 100)}`,
         vals,
       );
-      return rows.map((r) => ({
-        id: r.id, state: r.state as ExecutionState, model: r.model,
-        firstSeenAt: new Date(r.firstSeenAt), updatedAt: new Date(r.updatedAt),
-        startedWith: r.startedWith ? { ...r.startedWith, at: new Date(r.startedWith.at) } : null,
-      }));
+      return rows.map(toThread);
+    },
+    get: async (threadId: string): Promise<AdminThread | null> => {
+      const { rows } = await this.db.query('SELECT * FROM agentic_threads WHERE id = $1', [threadId]);
+      return rows[0] ? toThread(rows[0]) : null;
+    },
+    delete: async (threadId: string) => {
+      await this.transaction(async (q) => {
+        await q('DELETE FROM agentic_steps WHERE "threadId" = $1', [threadId]);
+        await q('DELETE FROM agentic_runs WHERE "threadId" = $1', [threadId]);
+        await q('DELETE FROM agentic_threads WHERE id = $1', [threadId]);
+      });
     },
   };
+
+  /** Run `fn` in one transaction, on one connection: a pool hands each query
+   *  whichever connection is free, which is not a transaction at all. */
+  private async transaction(fn: (q: (sql: string, params?: unknown[]) => Promise<unknown>) => Promise<void>) {
+    const conn = this.db.connect ? await this.db.connect() : null;
+    const q = (sql: string, params?: unknown[]) => (conn ?? this.db).query(sql, params);
+    try {
+      await q('BEGIN');
+      try {
+        await fn(q);
+        await q('COMMIT');
+      } catch (err) {
+        await q('ROLLBACK').catch(() => undefined);
+        throw err;
+      }
+    } finally {
+      conn?.release();
+    }
+  }
 
   runs = {
     start: async (run: NewRunRecord) => {
       const { rows } = await this.db.query(
         `INSERT INTO agentic_runs
            (id, "threadId", "parentRunId", depth, agent, model, state,
-            prompt, "tokenBudget", "runState", "providerOptions")
-         VALUES ($1, $2, $3, $4, $5, $6, 'RUNNING', $7, $8, $9, $10) RETURNING *`,
+            prompt, "tokenBudget", "runState", "providerOptions", "enqueuedAt", "costBudgetMicros", "maxSteps")
+         VALUES ($1, $2, $3, $4, $5, $6, $11, $7, $8, $9, $10, $12, $13, $14) RETURNING *`,
         [
           run.id, run.threadId, run.parentRunId ?? null, run.depth ?? 0,
           run.agent, run.model, run.prompt ?? null, run.tokenBudget ?? null,
           run.runState ? JSON.stringify(run.runState) : null,
           run.providerOptions ? JSON.stringify(run.providerOptions) : null,
+          run.state ?? 'RUNNING', run.enqueuedAt ?? null,
+          run.costBudgetMicros ?? null, run.maxSteps ?? null,
         ],
       );
       return toRun(rows[0]);
@@ -164,9 +237,10 @@ export class PostgresAdminStore implements AdminStore {
       const sets: string[] = [];
       const vals: unknown[] = [];
       for (const [k, v] of Object.entries(patch)) {
-        if (v === undefined) continue;
+        // Only the run's own columns, never a key SQL was built from blindly.
         // JSON columns need the value serialised; everything else pg handles.
-        sets.push(`"${k}" = $${vals.push(k === 'result' ? JSON.stringify(v) : v)}`);
+        if (v === undefined || !RUN_COLUMNS.has(k)) continue;
+        sets.push(`"${k}" = $${vals.push(JSON_COLUMNS.has(k) ? JSON.stringify(v) : v)}`);
       }
       if (sets.length === 0) return;
       await this.db.query(
@@ -186,19 +260,55 @@ export class PostgresAdminStore implements AdminStore {
       return rows.map(toRun);
     },
     list: async (f: RunFilter) => {
-      const where: string[] = [];
-      const vals: unknown[] = [];
-      if (f.state?.length) where.push(`state = ANY($${vals.push(f.state)})`);
-      if (f.agent) where.push(`agent = $${vals.push(f.agent)}`);
-      if (f.threadId) where.push(`"threadId" = $${vals.push(f.threadId)}`);
-      if (f.since) where.push(`"startedAt" >= $${vals.push(f.since)}`);
-      if (f.until) where.push(`"startedAt" <= $${vals.push(f.until)}`);
+      const { where, vals } = runWhere(f);
+      // Ordered on the id after the start time, so a page's last run is a
+      // cursor that splits the listing exactly (RunFilter.before).
       const { rows } = await this.db.query(
-        `SELECT * FROM agentic_runs${where.length ? ` WHERE ${where.join(' AND ')}` : ''}
-         ORDER BY "startedAt" DESC LIMIT $${vals.push(f.limit ?? 100)}`,
+        `SELECT * FROM agentic_runs${where}
+         ORDER BY "startedAt" DESC, id DESC LIMIT $${vals.push(f.limit ?? 100)}`,
         vals,
       );
       return rows.map(toRun);
+    },
+    increment: async (runId: string, d: RunDeltas) => {
+      await this.db.query(
+        `UPDATE agentic_runs SET steps = steps + $1, "inputTokens" = "inputTokens" + $2,
+           "cachedInputTokens" = "cachedInputTokens" + $3, "outputTokens" = "outputTokens" + $4,
+           "totalTokens" = "totalTokens" + $5 WHERE id = $6`,
+        [d.steps, d.inputTokens, d.cachedInputTokens, d.outputTokens, d.totalTokens, runId],
+      );
+    },
+    totals: async (f: RunFilter): Promise<RunTotals> => {
+      const { where, vals } = runWhere({ ...f, before: undefined });
+      const { rows } = await this.db.query(
+        `SELECT state, "stopReason", COUNT(*) AS n, COALESCE(SUM(steps),0) AS steps,
+           COALESCE(SUM("inputTokens"),0) AS "inputTokens", COALESCE(SUM("cachedInputTokens"),0) AS "cachedInputTokens",
+           COALESCE(SUM("outputTokens"),0) AS "outputTokens", COALESCE(SUM("totalTokens"),0) AS "totalTokens"
+         FROM agentic_runs${where} GROUP BY state, "stopReason"`,
+        vals,
+      );
+      const out = emptyRunTotals();
+      for (const r of rows) addRunTotals(out, r.state, r.stopReason, Number(r.n), r);
+      return out;
+    },
+    claimSettle: async (runId: string, token: string, staleBefore: Date) => {
+      const { rows } = await this.db.query(
+        `UPDATE agentic_runs SET "settlingAt" = now(), "settleToken" = $1
+         WHERE id = $2 AND "settledAt" IS NULL AND ("settlingAt" IS NULL OR "settlingAt" < $3)
+         RETURNING id`,
+        [token, runId, staleBefore],
+      );
+      return rows.length === 1;
+    },
+    endSettle: async (runId: string, token: string, settled: boolean) => {
+      await this.db.query(
+        settled
+          ? `UPDATE agentic_runs SET "settledAt" = now(), "settlingAt" = NULL, "settleToken" = NULL
+             WHERE id = $1 AND "settleToken" = $2`
+          : `UPDATE agentic_runs SET "settlingAt" = NULL, "settleToken" = NULL
+             WHERE id = $1 AND "settleToken" = $2`,
+        [runId, token],
+      );
     },
     countByState: async () => {
       const { rows } = await this.db.query(
@@ -246,9 +356,9 @@ export class PostgresAdminStore implements AdminStore {
 
 const toStep = (r: any): StepRecord => ({
         runId: r.runId, threadId: r.threadId ?? '', agentId: r.agentId ?? null, index: r.index,
-        durationMs: r.durationMs, finishReason: r.finishReason,
-        inputTokens: r.inputTokens, cachedInputTokens: r.cachedInputTokens,
-        outputTokens: r.outputTokens, totalTokens: r.totalTokens,
+        durationMs: Number(r.durationMs), finishReason: r.finishReason,
+        inputTokens: Number(r.inputTokens), cachedInputTokens: Number(r.cachedInputTokens),
+        outputTokens: Number(r.outputTokens), totalTokens: Number(r.totalTokens),
         tools: r.tools ?? [], text: r.text ?? null,
         toolCalls: r.toolCalls ?? [], at: new Date(r.at),
 });

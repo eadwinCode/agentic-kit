@@ -8,6 +8,7 @@ const runtime = await setupAgentCore({
   queue,            // required — durable dispatch
   bus,              // required — live fan-out
   kv,               // required — hot state
+  streams,          // run streams; left out, kept in memory (one process only)
   resolveModel,     // required — registry key → { instance, contextWindow, modelId }
   admin,            // optional — defaults to SQLite, or Postgres via env
   pricer,           // optional — prices every model call (§4)
@@ -28,16 +29,21 @@ be opened should be a startup error.
 | `hitlTtlMs` | `900000` (15 min) | How long a parked approval stays answerable. On expiry it resolves as a timeout denial and the run continues. |
 | `reclaimGraceMs` | `60000` | Grace beyond the TTL before orphan reclamation may claim a thread. |
 
-### Run limits (Go runtime additions)
+### Deadlines and overload
 
-| Key | Default | What it does |
-| :--- | :--- | :--- |
-| `RunLockLease` | `2m` | The per-thread run lock's lease. The worker renews it every third of the lease while its segment runs, so an expired lock means a dead worker. |
-| `RunRetryBackoff` / `RunRetryBackoffMax` | `5s` / `2m` | A failed run waits this long before its first retry, twice as long each time after, with jitter. |
-| `StepTimeout` | off | Bounds one model round trip; a step past it fails and the run takes the retry policy. |
-| `SegmentTimeout` | off | Bounds one worker segment; a segment past it settles the run `FAILED` with a reason. |
-| `MaxQueueWait` | off | A job picked up later than this fails with the reason instead of running. |
-| `MaxQueueDepth` | off | A new run is refused (`RefusedQueueFull`) before anything is written once this many jobs are ready and waiting. |
+The same four settings in both runtimes (Go names in brackets, as durations):
+
+| Setting | Default | Meaning |
+| :--- | ---: | :--- |
+| `stepTimeoutMs` (`StepTimeout`) | `0` (off) | Bounds one model round trip; a step past it fails and the run takes the retry policy. |
+| `segmentTimeoutMs` (`SegmentTimeout`) | `0` (off) | Bounds one worker segment; a segment past it settles the run `FAILED` with stopReason `timeout`. |
+| `maxQueueWaitMs` (`MaxQueueWait`) | `0` (off) | A job picked up later than this fails with the reason instead of running. |
+| `maxQueueDepth` (`MaxQueueDepth`) | `0` (off) | A new run is refused (reason `queue_full`) before anything is written once this many jobs are ready and waiting. Needs a queue that can count. |
+
+In Go, a config built by hand keeps the default of every field left at zero
+where zero could never work (a step cap, a poll, a lease). The two booleans,
+`RecordPayloads` and `PromptCaching`, cannot tell "false" from "left out":
+start from `DefaultConfig()` to keep them on.
 
 ### Run limits
 
@@ -48,15 +54,16 @@ be opened should be a startup error.
 | `costBudgetMicros` | `undefined` | Default per-run money cap, in millionths of the pricer's currency. Needs a `pricer`. See [Cost and pricing](./cost-and-pricing.md). |
 | `runMaxAttempts` | `3` | Queue redrive attempts before a run finalizes `FAILED`. |
 | `stopPollMs` | `500` | How often a running worker re-reads the stop signal. Also the window in which it notices a newer run replaced it. |
-| `runRedriveDelaySeconds` | `2` | Delay before re-dispatching a job that found the run lock held by an older run. |
-| `runLockLeaseSeconds` | `1800` (30 min) | Lease on the per-thread run lock. **Must exceed your longest run segment.** Parked approvals hold no lock. |
+| `runRetryBackoffMs` / `runRetryBackoffMaxMs` | `5000` / `120000` | A failed run waits this long before its first retry, twice as long each time after, with jitter. The thread shows `QUEUED` while it waits. |
+| `runRedriveDelaySeconds` | `2` | First delay before re-dispatching a job that found the run lock held. It doubles on each try, up to the lease. |
+| `runLockLeaseSeconds` | `120` (2 min) | Lease on the per-thread run lock. The worker renews it every sixth of the lease while it holds it, so an expired lock means a dead worker. A job blocked by a held lock gives up only after waiting at least one lease. Parked approvals hold no lock. |
 
 ### Subagents
 
 | Setting | Default | Meaning |
 | :--- | ---: | :--- |
 | `subagentMaxDepth` | `2` | Nesting cap. |
-| `subagentMaxConcurrent` | `3` | Children running at once per run. |
+| `subagentMaxConcurrent` | `3` | Children running at once per run, at each depth. |
 | `subagentMaxSteps` | `10` | Model round trips per child. |
 | `subagentResultCapChars` | `8000` | Characters of a child's result handed to the parent. |
 
@@ -71,6 +78,21 @@ be opened should be a startup error.
 | `compactionModel` | `'gpt-4o-mini'` | Registry key of the cheap model that writes the summary. Resolved through your own `resolveModel`, so a registry without that key must name its own. |
 | `promptCaching` | `true` | Stamp cache breakpoints on the stable prefix. |
 | `nativeWindows` | — | Per-model windows below the ceiling. A `contextWindow` from `resolveModel` wins. |
+
+### Run streams
+
+Each run segment writes a short-lived [run stream](./run-streams.md). Go names
+in brackets, as durations.
+
+| Setting | Default | Meaning |
+| :--- | ---: | :--- |
+| `streamGraceMs` (`StreamGrace`) | `600000` (10 min) | How long a stream is kept after its segment ends. A tab that reconnects within it picks up inside the stream; one that comes later gets a snapshot, which has the final text in the messages. |
+| `streamTtlMs` (`StreamTTL`) | `86400000` (24 h) | How long a stream lives if nothing ever closes it. The last guard when the worker and the sweep both failed. |
+| `streamFlushMs` (`StreamFlush`) | `50` | How long stream events wait to be appended together. A step end, a tool result, a park and a close go out at once. `0` sends every event as it comes. |
+| `streamFlushEvents` (`StreamFlushEvents`) | `32` | Append at once when this many stream events are waiting. |
+
+Keep the grace short on Redis, where streams live in memory. On Postgres or
+SQLite it can be higher, since rows on disk cost little.
 
 ### Operational history
 
@@ -89,7 +111,7 @@ be opened should be a startup error.
 
 | Setting | Default | Meaning |
 | :--- | ---: | :--- |
-| `billingPreCheck` | — | `({ threadId, state, publishEvent }) => { ok, error? }`. Reject a run before it costs anything; the check can publish on the thread, and the platform publishes `RUN_REFUSED`. |
+| `billingPreCheck` | — | `({ threadId, runId?, state, stage, budget?, publishEvent }) => { ok, error? }`. Runs at `stage: 'dispatch'`, before anything is written (a refusal means the run never exists), and again at `'pickup'`, when a worker takes the job (a refusal fails the run; lowering `budget.costBudgetMicros` or `budget.maxSteps` caps this segment). The check can publish on the thread, and the platform publishes `RUN_REFUSED`. |
 
 Pricing is not a `config` setting — `pricer` sits on `setupAgentCore` beside the
 ports, because it decides what goes into the store rather than how the loop
@@ -111,5 +133,5 @@ by *your* code, not the library's.
 
 See [React](./react.md#everything-else-you-can-change) for the full table. In
 brief: `routes`, `baseUrl`, `fetch`, `headers`, `openStream`, `defaultModel`,
-`persistence`, `labels`, `format`, `onEvent`, `threadsRefreshMs`,
+`persistence`, `labels`, `format`, `onEvent`, `onCustom`, `threadsRefreshMs`,
 `loadThreadsOnMount`, `initialThreadId`.

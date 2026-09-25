@@ -103,8 +103,8 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 	if deps.Config.BillingPreCheck != nil {
 		check := ports.BillingCheck{
 			ThreadID: threadID, State: input.State, Stage: ports.BillingAtDispatch,
-			PublishEvent: func(ctx context.Context, typ string, payload any, notice bool) (ports.AgentEvent, error) {
-				return PublishEvent(ctx, deps, threadID, typ, payload, PublishOptions{Notice: notice})
+			PublishEvent: func(ctx context.Context, typ string, payload any, durable bool) (ports.AgentEvent, error) {
+				return PublishEvent(ctx, deps, threadID, typ, payload, PublishOptions{Durable: durable})
 			},
 		}
 		if err := deps.Config.BillingPreCheck(ctx, check); err != nil {
@@ -185,7 +185,11 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 	if err != nil {
 		return ports.RunResult{}, err
 	}
-	admitted, err := deps.Storage.Threads.ClaimState(ctx, threadID, initialState, ports.StateQueued)
+	// The thread now belongs to this run: every later state change names it,
+	// so a run that is stopped or replaced can never move the thread (§3.4).
+	admitted, err := Transition(ctx, deps, threadID, StateChange{
+		From: []ports.ExecutionState{initialState}, To: ports.StateQueued, NewRunID: runID, Model: model,
+	})
 	if err != nil {
 		return ports.RunResult{}, err
 	}
@@ -214,9 +218,6 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 	}
 	installed = true
 
-	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateQueued), ports.SetOptions{}); err != nil {
-		return ports.RunResult{}, err
-	}
 	// The run's durable record opens here (§2.9), QUEUED: no worker has it
 	// yet. The record remembers when it was enqueued, so the wait is visible
 	// while it lasts and measurable once it ends.
@@ -264,10 +265,14 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 	// The user's turn goes on the bus like everything else (§2.2). Without it
 	// a second client watching the same thread sees the reply stream in with
 	// no question in front of it.
-	if _, err := Publish(ctx, deps, threadID, "MESSAGE_APPENDED", map[string]any{
+	appended := map[string]any{
 		"id": userMessage.ID, "role": userMessage.Role, "content": userMessage.Content,
 		"agentId": nullable(userMessage.AgentID), "createdAt": userMessage.CreatedAt,
-	}); err != nil {
+	}
+	if input.ClientMessageID != "" {
+		appended["clientMessageId"] = input.ClientMessageID // the sender's own name for it
+	}
+	if _, err := Publish(ctx, deps, threadID, "MESSAGE_APPENDED", appended); err != nil {
 		return ports.RunResult{}, err
 	}
 
@@ -297,7 +302,7 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 	} else if !active {
 		return refuse("Run was stopped before dispatch")
 	}
-	if err := deps.Queue.Enqueue(ctx, ports.RunJob{
+	if err := EnqueueJob(ctx, deps, ports.RunJob{
 		ThreadID: threadID, RunID: runID, Model: model, Agent: agent.Name,
 		Kind: ports.JobDispatch, PartitionKey: input.PartitionKey,
 		EnqueuedAt: enqueuedAt.UnixMilli(), DispatchedAt: enqueuedAt.UnixMilli(),
@@ -327,7 +332,7 @@ func dispatchActive(ctx context.Context, deps ports.RuntimePorts, threadID, runI
 	}
 	recordStoppedRun(ctx, deps, runID, time.Now())
 	if current == runID && thread != nil && thread.State == ports.StateCancelled {
-		_, err = deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateCancelled), ports.SetOptions{})
+		_, err = deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateCancelled), ports.SetOptions{Expiry: ThreadKeyTTL})
 	}
 	return false, err
 }
@@ -342,14 +347,10 @@ func failDispatch(ctx context.Context, deps ports.RuntimePorts, threadID, runID,
 	if current != runID && (previousRunID == nil || current != *previousRunID) {
 		return nil
 	}
-	changed, err := deps.Storage.Threads.ClaimState(ctx, threadID, ports.StateQueued, ports.StateFailed)
+	changed, err := Transition(ctx, deps, threadID, StateChange{
+		From: []ports.ExecutionState{ports.StateQueued}, To: ports.StateFailed, RunID: runID, Model: model,
+	})
 	if err != nil || !changed {
-		return err
-	}
-	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateFailed), ports.SetOptions{}); err != nil {
-		return err
-	}
-	if err := SetThreadState(ctx, deps, threadID, ports.StateFailed, model); err != nil {
 		return err
 	}
 	endedAt := closeRunRecord(ctx, deps, runID, FinalizeInput{State: ports.StateFailed, StopReason: "failed", Error: reason})

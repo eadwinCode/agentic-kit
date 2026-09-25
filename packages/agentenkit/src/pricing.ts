@@ -46,13 +46,28 @@ export function lookupPrice(
   model?: string | null,
   modelId?: string | null,
 ): ModelPrice | undefined {
-  if (model && prices[model]) return prices[model];
-  if (modelId && prices[modelId]) return prices[modelId];
+  // Own keys only: a model named 'constructor' or 'toString' must not find
+  // something off the object's prototype.
+  const own = (k?: string | null) => (k && Object.hasOwn(prices, k) ? prices[k] : undefined);
   const base = model?.split('@')[0];
-  return base && base !== model ? prices[base] : undefined;
+  return own(model) ?? own(modelId) ?? (base !== model ? own(base) : undefined);
+}
+
+/** Warned once per model and rate, so a price list missing a cache rate says
+ *  so without filling the log. */
+const warned = new Set<string>();
+function warnOnce(key: string, msg: string, model?: string | null) {
+  if (warned.has(key)) return;
+  warned.add(key);
+  console.warn(msg, { model });
 }
 
 /** A price-list pricer (§4).
+ *
+ *  A cache rate that is missing (or 0) is taken as not given: those tokens
+ *  are priced at `inputPerMillion`, and a warning is logged once per model.
+ *  Cache tokens are never free, and a price list that forgot them must not
+ *  bill them at 0.
  *
  *  A model the table does not know is not priced. Its row is stored with no
  *  cost and `UsageTotals.unpriced` counts it, so a missing price shows up as
@@ -65,10 +80,20 @@ export function table(prices: PriceTable, currency: string = USD): Pricer {
       // tokens / 1_000_000 × pricePerMillion is the cost in currency units,
       // and micros is that × 1_000_000. The two cancel: tokens ×
       // pricePerMillion IS the micro-unit cost, with no scaling in between.
+      let cacheRead = p.cacheReadPerMillion ?? 0;
+      let cacheWrite = p.cacheWritePerMillion ?? 0;
+      if (!cacheRead && u.cacheReadInputTokens > 0) {
+        cacheRead = p.inputPerMillion ?? 0;
+        warnOnce(`${u.model}\u0000read`, 'price table has no cache read rate; cache reads priced as input', u.model);
+      }
+      if (!cacheWrite && u.cacheWriteInputTokens > 0) {
+        cacheWrite = p.inputPerMillion ?? 0;
+        warnOnce(`${u.model}\u0000write`, 'price table has no cache write rate; cache writes priced as input', u.model);
+      }
       const micros =
         u.inputTokens * (p.inputPerMillion ?? 0) +
-        u.cacheReadInputTokens * (p.cacheReadPerMillion ?? 0) +
-        u.cacheWriteInputTokens * (p.cacheWritePerMillion ?? 0) +
+        u.cacheReadInputTokens * cacheRead +
+        u.cacheWriteInputTokens * cacheWrite +
         u.outputTokens * (p.outputPerMillion ?? 0) +
         u.reasoningTokens * (p.reasoningPerMillion ?? 0);
       return { micros: Math.round(micros), currency, source: 'table' };
@@ -92,9 +117,10 @@ export function receipt(read: ReceiptReader, currency: string = USD): Pricer {
     price(u: NewUsage): Cost | null {
       if (!u.providerMetadata) return null;
       const micros = read(u.providerMetadata);
-      return micros === null || micros === undefined
-        ? null
-        : { micros, currency, source: 'receipt' };
+      // No receipt, or one that makes no sense (not a number, negative, not
+      // finite): not believed, and the call is left for the next pricer.
+      if (typeof micros !== 'number' || !Number.isFinite(micros) || micros < 0) return null;
+      return { micros: Math.round(micros), currency, source: 'receipt' };
     },
   };
 }

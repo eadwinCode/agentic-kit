@@ -1,23 +1,90 @@
 import type { RuntimePorts } from '../ports/runtime.js';
-import type { ExecutionState } from './types.js';
+import { THREAD_KEY_TTL_SECONDS } from './keys.js';
+import { activeSegment } from './segment.js';
+import type { ExecutionState, ThreadTransition } from './types.js';
 import type { AgentEvent } from './types.js';
 
-/** Persist to the replayable event log, then fan out live to all subscribers
- *  (§2.2). Seq comes from Kv.incr — monotonic per thread (§3.4). */
+/** The platform's types that go in the thread record: what must outlive a
+ *  run (see Storage.events). Every other platform type is live only: a
+ *  notice on the bus, and an event on the run stream when one is open. */
+export const RECORD_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'INPUT_REQUIRED',
+  'INPUT_EXPIRED',
+  'HITL_RESPONSE',
+  'RUN_REFUSED',
+  'TOKEN_BUDGET_EXHAUSTED',
+  'COST_BUDGET_EXHAUSTED',
+  'CONTEXT_COMPACTED',
+  'MESSAGES_DROPPED',
+  'RUN_STARTED',
+  'RUN_ENDED',
+]);
+
+/** The run an entry belongs to: the one given, else the one its payload
+ *  names. */
+function runOf(payload: unknown, runId?: string): string | null {
+  if (runId) return runId;
+  const p = payload as { runId?: unknown; resume?: { runId?: unknown } } | null;
+  if (typeof p?.runId === 'string') return p.runId;
+  if (typeof p?.resume?.runId === 'string') return p.resume.runId;
+  return null;
+}
+
+/** Publish a platform event (§2.2). A record type is stored first (the
+ *  store mints its seq) and then sent; any other type is sent as a notice.
+ *  Either way it reaches the run stream this process has open on the
+ *  thread. */
 export async function publish(
   deps: RuntimePorts,
   threadId: string,
   type: string,
   payload: unknown,
+  runId?: string,
 ): Promise<AgentEvent> {
-  const seq = await deps.kv.incr(`agent:seq:${threadId}`);
-  const event: AgentEvent = { threadId, seq, type, payload, createdAt: new Date() };
-  await deps.storage.events.append(threadId, event);
+  if (!RECORD_EVENT_TYPES.has(type)) return publishNotice(deps, threadId, type, payload);
+  return record(deps, threadId, type, payload, runOf(payload, runId));
+}
+
+/** Store an entry in the thread record, then send it. */
+async function record(
+  deps: RuntimePorts,
+  threadId: string,
+  type: string,
+  payload: unknown,
+  runId: string | null,
+): Promise<AgentEvent> {
+  const event = await deps.storage.events.append(threadId, { type, payload, runId });
   await deps.bus.publish(threadId, event);
+  // A platform entry the stream shows too (a park). An app's durable event
+  // is delivered as this entry alone, so a tab never sees it twice.
+  if (RESERVED_EVENT_TYPES.has(type)) await toSegment(deps, threadId, type, payload);
   return event;
 }
 
-/** Publish a bus-only notice (never persisted) — e.g. HITL death notices (§2.5). */
+/** What a run stream carries in place of the bus while a segment is open:
+ *  a tab reads these from the stream, so the bus sending them too would
+ *  show them twice. */
+const STREAM_CONTENT: ReadonlySet<string> = new Set([
+  'CHUNK',
+  'SUBAGENT_CHUNK',
+  'TEXT_RESULT',
+  'STEP_COMMITTED',
+  'SUBAGENT_STARTED',
+  'SUBAGENT_COMPLETED',
+  'SUBAGENT_FAILED',
+]);
+
+/** Hands an event to the run stream this process has open on the thread,
+ *  if any; the segment keeps what belongs in a stream (see SegmentStream). */
+async function toSegment(deps: RuntimePorts, threadId: string, type: string, payload: unknown) {
+  const seg = activeSegment(deps, threadId);
+  if (seg) await seg.forward(type, payload, RESERVED_EVENT_TYPES.has(type));
+}
+
+/** Publish a live-only event (never stored). While this process has a
+ *  segment open on the thread, stream content and an app's own events go to
+ *  the run stream alone; everything else goes on the bus, and to the stream
+ *  when the stream has a shape for it (a step's end). */
 export async function publishNotice(
   deps: RuntimePorts,
   threadId: string,
@@ -25,7 +92,14 @@ export async function publishNotice(
   payload: unknown,
 ): Promise<AgentEvent> {
   const event: AgentEvent = { threadId, seq: 0, type, payload, createdAt: new Date() };
+  const seg = activeSegment(deps, threadId);
+  const custom = !RESERVED_EVENT_TYPES.has(type);
+  if (seg && (custom || STREAM_CONTENT.has(type))) {
+    await seg.forward(type, payload, !custom);
+    return event;
+  }
   await deps.bus.publish(threadId, event);
+  if (seg) await seg.forward(type, payload, true);
   return event;
 }
 
@@ -51,18 +125,25 @@ export const RESERVED_EVENT_TYPES: ReadonlySet<string> = new Set([
   'HEARTBEAT',
   'RUN_REFUSED',
   'TOKEN_BUDGET_EXHAUSTED',
+  'COST_BUDGET_EXHAUSTED',
+  'RUN_STARTED',
+  'RUN_ENDED',
+  'RECORD_CHANGED',
+  'SNAPSHOT',
 ]);
 
 export interface PublishEventOptions {
-  /** `true` (the default) writes the event to the thread's log, so it is
-   *  replayed to a client that reconnects. `false` sends it over the bus only:
-   *  a progress tick, a typing indicator — anything nobody needs to see twice. */
+  /** `true` also keeps the event in the thread record, so a tab that opens
+   *  the thread next week still sees it. Otherwise (the default) it is live
+   *  only: it goes out on the bus and, during a run, on the run's stream,
+   *  which a tab that reconnects within the grace window replays. */
   durable?: boolean;
 }
 
 /** Publish an event of your own on a thread, through the same pipeline the
- *  platform's events take: the durable log and the live bus (§2.2). A client
- *  sees it in `onEvent`, exactly like a built-in one. */
+ *  platform's events take (§2.2): the live bus, the run stream during a run
+ *  (as CUSTOM), and the thread record when it is durable. A client sees it
+ *  in `onEvent`, exactly like a built-in one. */
 export async function publishEvent(
   deps: RuntimePorts,
   threadId: string,
@@ -76,9 +157,9 @@ export async function publishEvent(
   if (RESERVED_EVENT_TYPES.has(type)) {
     throw new Error(`publishEvent: ${type} is a platform event type — pick your own`);
   }
-  return options.durable === false
-    ? publishNotice(deps, threadId, type, payload)
-    : publish(deps, threadId, type, payload);
+  return options.durable
+    ? record(deps, threadId, type, payload, runOf(payload))
+    : publishNotice(deps, threadId, type, payload);
 }
 
 /** What a tool calls to publish: `publishEvent(type, payload, options?)`,
@@ -113,6 +194,49 @@ export function withPublishEvent(
   return out;
 }
 
+/** A non-terminal STATE_CHANGE: the state, the run it belongs to, and when
+ *  that run started, read off its record. Every STATE_CHANGE names its run,
+ *  so a client keeps one timer per run and never refetches history to find
+ *  its start. */
+export async function runStatePayload(
+  deps: RuntimePorts,
+  state: ExecutionState,
+  runId?: string,
+): Promise<Record<string, unknown>> {
+  const p: Record<string, unknown> = { state };
+  if (!runId) return p;
+  p.runId = runId;
+  try {
+    const rec = await deps.admin.runs.get(runId);
+    if (rec) p.startedAt = rec.startedAt;
+  } catch {
+    // The timer is a nicety; a missing record never fails a transition.
+  }
+  return p;
+}
+
+/** The states a run is still going in: the ones a stop or a failure can end. */
+export const ACTIVE_STATES: ExecutionState[] = ['QUEUED', 'RUNNING', 'WAITING_FOR_INPUT'];
+
+/** The one way a run moves its thread's state (§3.4). A compare-and-set on
+ *  the durable row, on the state AND the run that owns the thread, and only
+ *  the caller that wins it writes the hot cache and the admin view. So a stop
+ *  is never overwritten by a finish, and a stopped or replaced run can never
+ *  move the thread again: its change simply loses. Returns whether this
+ *  caller made the change. Publishing the STATE_CHANGE is left to the caller,
+ *  whose payload differs per change. */
+export async function transition(
+  deps: RuntimePorts,
+  threadId: string,
+  change: ThreadTransition & { model?: string },
+): Promise<boolean> {
+  const { model, ...t } = change;
+  if (!(await deps.storage.threads.transition(threadId, t))) return false;
+  await deps.kv.set(`agent:state:${threadId}`, t.to, { exSeconds: THREAD_KEY_TTL_SECONDS });
+  await upsertAdminThread(deps, threadId, t.to, model);
+  return true;
+}
+
 /** Move a thread to a new state on BOTH the caller's storage and the
  *  platform's own operational view (§2.9).
  *
@@ -128,6 +252,15 @@ export async function setThreadState(
   model?: string,
 ): Promise<void> {
   await deps.storage.threads.setState(threadId, state);
+  await upsertAdminThread(deps, threadId, state, model);
+}
+
+async function upsertAdminThread(
+  deps: RuntimePorts,
+  threadId: string,
+  state: ExecutionState,
+  model?: string,
+): Promise<void> {
   try {
     const resolved = model ?? (await deps.storage.threads.get(threadId))?.model ?? 'unknown';
     await deps.admin.threads.upsert({ id: threadId, state, model: resolved });

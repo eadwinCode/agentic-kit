@@ -22,7 +22,7 @@ const config: AgentRunConfig = {
     threads: '/api/threads',
     deleteThread: '/api/threads',
   },
-  defaultModel: 'gpt-4o',
+  // No defaultModel: the hook sends none, and the server runs the agent's own.
 };
 
 export function Providers({ children }: { children: ReactNode }) {

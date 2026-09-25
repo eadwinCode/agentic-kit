@@ -11,6 +11,7 @@ import { markRequiresConfirmation } from '../src/core/engine.js';
 import { compactContext } from '../src/core/context.js';
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
 import type { RuntimeOptions } from '../src/ports/runtime.js';
+import { subagents } from './stream-helpers.js';
 
 const finish = (reason: string, usage = { promptTokens: 10, completionTokens: 5 }) =>
   ({ type: 'finish', finishReason: reason, usage }) as LanguageModelV1StreamPart;
@@ -557,32 +558,36 @@ describe('a nested run that fails (§2.7)', () => {
     expect((await r.storage.threads.get(ran.threadId))!.state).toBe('COMPLETED');
     expect(await r.kv.get(`agent:attempts:${ran.threadId}`)).toBeNull(); // never retried
     // The child is still recorded as failed, with its reason.
-    const failed = r.bus.published.find((e) => e.type === 'SUBAGENT_FAILED')!.payload as any;
-    expect(failed).toMatchObject({ state: 'FAILED', error: 'child provider exploded' });
+    const [failed] = (await subagents(r.runtime.ports(), ran.threadId)).failed;
+    expect(failed).toMatchObject({ status: 'failed', error: 'child provider exploded' });
   });
 
   it('a user stop still tears the whole run down', async () => {
+    let threadId = '';
     const model = new MockLanguageModelV1({
       provider: 'mock',
       modelId: 'mock-stopped-child',
-      doStream: async ({ prompt }: any) =>
-        isChild(prompt)
-          ? Promise.reject(new Error('aborted'))
-          : stream([
-              call('parent_call_1', 'spawnSubagent', { name: 'helper', instructions: 'do it' }),
-              finish('tool-calls'),
-            ]),
+      doStream: async ({ prompt }: any) => {
+        if (!isChild(prompt)) {
+          return stream([
+            call('parent_call_1', 'spawnSubagent', { name: 'helper', instructions: 'do it' }),
+            finish('tool-calls'),
+          ]);
+        }
+        // The user pressed stop while the child was in flight.
+        await r.kv.set(`agent:state:${threadId}`, 'CANCELLED');
+        throw new Error('aborted');
+      },
     });
     const r = await makeRuntime(model);
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', subagents: true });
     const ran = await chat.run({ prompt: 'delegate' });
-    // The user pressed stop while the child was in flight.
-    await r.kv.set(`agent:state:${ran.threadId}`, 'CANCELLED');
+    threadId = ran.threadId;
 
     await chat.executeWithPolicy({ threadId: ran.threadId, runId: ran.runId, model: 'gpt-4o' });
 
-    const failed = r.bus.published.find((e) => e.type === 'SUBAGENT_FAILED')!.payload as any;
-    expect(failed.state).toBe('CANCELLED');
+    const [failed] = (await subagents(r.runtime.ports(), ran.threadId)).failed;
+    expect(failed!.status).toBe('cancelled');
     // It propagated rather than being handed back as a result the model reads.
     expect(
       r.storage.messages.store.get(ran.threadId)!.some((m) => m.role === 'tool'),

@@ -65,6 +65,11 @@ export type ActivityPhase =
   | 'stopped'
   | 'failed';
 
+/** Where the live stream stands: being opened, open, retrying after a
+ *  dropped connection, or closed for good (the hook then re-reads the thread
+ *  and opens a new one). */
+export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed';
+
 export interface AgentActivity {
   phase: ActivityPhase;
   label: string;
@@ -177,6 +182,8 @@ export interface StreamEvent {
   seq: number;
   type: string;
   payload: any;
+  /** When the server wrote it, ISO time. */
+  createdAt?: string;
 }
 
 export interface SnapshotRun {
@@ -208,13 +215,42 @@ export interface ThreadRun {
   endedAt?: string;
 }
 
+/** An item from a run stream, as the server sends it: a typed event (see the
+ *  agentenkit StreamEvent union) with the offset its store gave it. */
+export interface WireStreamItem {
+  type: string;
+  offset: string;
+  [key: string]: any;
+}
+
+/** The run stream a snapshot carries: what the messages do not have yet, and
+ *  where a live read picks up. */
+export interface SnapshotStream {
+  streamId: string;
+  runId: string;
+  items: WireStreamItem[];
+  end: WireStreamItem | null;
+  offset: string | null;
+}
+
 export interface ThreadSnapshot {
   thread: { id: string; state: AgentState };
   messages: SnapshotMessage[];
   runs: SnapshotRun[];
+  /** The thread record's last seq. */
   lastEventSeq: number;
+  /** The unfinished run's record entries: its open park, a refusal. */
   activeEvents: StreamEvent[];
+  /** The run stream in flight, or one that just ended. Absent from a server
+   *  older than run streams. */
+  stream?: SnapshotStream | null;
 }
+
+/** One frame of a thread's follow. */
+export type FollowFrame =
+  | { kind: 'thread'; event: StreamEvent }
+  | { kind: 'stream'; streamId: string; item: WireStreamItem }
+  | { kind: 'snapshot'; snapshot: ThreadSnapshot };
 
 export interface RunResult {
   accepted: boolean;

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/admin/migrate"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/core"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
@@ -53,9 +54,13 @@ type QueueOptions struct {
 	// MaxPayloadBytes refuses a job whose encoded payload is larger
 	// (ports.ErrPayloadTooLarge). Zero means 1 MiB.
 	MaxPayloadBytes int
-	// MaxAge keeps a job from running once it has waited this long: the row
-	// is kept as dead instead, and the dead handler fails its run. Zero means
-	// a job waits for ever.
+	// MaxAge keeps a fresh dispatch from running once it has been ready for
+	// this long: the row is kept as dead instead, and the dead handler fails
+	// its run. The wait counts from when the job was due, not when it was
+	// written, so a delay never counts against it. Only JobDispatch is
+	// capped: a resume, an expiry or a reclaim is the platform finishing work
+	// it already took on, and failing it would lose that work. Zero means a
+	// job waits for ever.
 	MaxAge time.Duration
 	// RetryBackoff is the delay before a job whose handler failed is offered
 	// again, doubled on every further failure up to RetryBackoffMax. Zero
@@ -146,17 +151,25 @@ func NewQueue(ctx context.Context, db *sql.DB, opts QueueOptions, storageOpts ..
 		log = slog.Default()
 	}
 	q := &Queue{db: db, table: s.prefix + "jobs", control: s.prefix + "jobs_control", channel: s.prefix + "jobs", opts: opts, log: log.With("queue", s.prefix+"jobs", "namespace", opts.Namespace)}
-	for _, stmt := range q.schema() {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return nil, fmt.Errorf("postgres queue schema: %w", err)
-		}
+	t := q.table
+	if err := migrateSchema(ctx, db, s.prefix, "queue", []migrate.Migration{
+		migrate.NewMigration("queue_0001_init", q.schema()...),
+		// The head of the line, read through an index rather than by sorting
+		// every ready row on each poll: overall, and per partition for the
+		// fair pick (see candidates).
+		migrate.NewMigration("queue_0002_head_indexes",
+			`CREATE INDEX IF NOT EXISTS `+t+`_head ON `+t+`(namespace, priority DESC, "sortAt") WHERE "deadAt" IS NULL`,
+			`CREATE INDEX IF NOT EXISTS `+t+`_parts ON `+t+`(namespace, partition, priority DESC, "sortAt") WHERE "deadAt" IS NULL`),
+	}); err != nil {
+		return nil, err
 	}
 	return q, nil
 }
 
-// schema is the table as it stands, written so an older table grows the
-// columns it is missing: every ADD COLUMN is IF NOT EXISTS, and the new
-// indexes carry new names so the old ones stay harmless.
+// schema is the table as it stood before the migration ledger, written so
+// an older table grows the columns it is missing: every ADD COLUMN is IF NOT
+// EXISTS, and the new indexes carry new names so the old ones stay harmless.
+// It runs once per database now (see migrateSchema).
 func (q *Queue) schema() []string {
 	t := q.table
 	return []string{
@@ -211,48 +224,55 @@ func (q *Queue) Enqueue(ctx context.Context, job ports.RunJob, opts *ports.Enque
 	// The cap counts every row ready to run, but refuses only NEW work. A
 	// retry, a resume or an expiry belongs to a run that is already under
 	// way; refusing it would strand that run.
+	capped := 0
 	if q.opts.MaxDepth > 0 && job.Kind == ports.JobDispatch {
-		var waiting int
-		if err := q.db.QueryRowContext(ctx,
-			`SELECT count(*) FROM `+q.table+` WHERE namespace = $1 AND `+ready,
-			q.opts.Namespace).Scan(&waiting); err != nil {
-			return err
-		}
-		if waiting >= q.opts.MaxDepth {
-			q.log.Warn("queue full: dispatch refused", "thread", job.ThreadID, "run", job.RunID, "waiting", waiting, "maxDepth", q.opts.MaxDepth)
-			return fmt.Errorf("%w: %d waiting, cap %d", ports.ErrQueueFull, waiting, q.opts.MaxDepth)
-		}
+		capped = q.opts.MaxDepth
 	}
 	sortAt := time.Now()
 	if job.DispatchedAt > 0 {
 		sortAt = time.UnixMilli(job.DispatchedAt)
 	}
-	// The NOTIFY rides the same statement as the INSERT: a duplicate key
-	// inserts nothing and so wakes nobody.
+	// One statement counts, inserts and notifies, so the cap is checked
+	// against the table as the insert sees it rather than a count read a
+	// moment before. The NOTIFY fires only when a row went in: a duplicate
+	// key or a full queue inserts nothing and wakes nobody.
 	var id sql.NullString
+	var waiting int
 	err = q.db.QueryRowContext(ctx,
-		`WITH ins AS (
+		`WITH depth AS (
+		   SELECT count(*) AS n FROM `+q.table+` WHERE namespace = $4 AND `+ready+`),
+		 ins AS (
 		   INSERT INTO `+q.table+` (id, payload, "runAt", namespace, partition, priority, "sortAt", key, kind, "threadId", "runId")
-		   VALUES ($1, $2, now() + $3 * interval '1 millisecond', $4, $5, $6, $7, $8, $9, $10, $11)
+		   SELECT $1, $2, now() + $3 * interval '1 millisecond', $4, $5, $6, $7, $8, $9, $10, $11
+		   WHERE $13 = 0 OR (SELECT n FROM depth) < $13
 		   ON CONFLICT (namespace, key) WHERE key IS NOT NULL AND "deadAt" IS NULL DO NOTHING
 		   RETURNING id)
-		 SELECT ins.id, pg_notify($12, $4) FROM ins`,
+		 SELECT (SELECT id FROM ins), (SELECT n FROM depth),
+		        CASE WHEN EXISTS (SELECT 1 FROM ins) THEN pg_notify($12, $4) END`,
 		core.NewID(), string(payload), delay.Milliseconds(), q.opts.Namespace, job.PartitionKey, priority, sortAt, key,
-		string(job.Kind), job.ThreadID, job.RunID, q.channel).Scan(&id, new(any))
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("%w: %s", ports.ErrDuplicateJob, opts.Key)
+		string(job.Kind), job.ThreadID, job.RunID, q.channel, capped).Scan(&id, &waiting, new(any))
+	if err != nil {
+		return err
 	}
-	return err
+	if id.Valid {
+		return nil
+	}
+	if capped > 0 && waiting >= capped {
+		q.log.Warn("queue full: dispatch refused", "thread", job.ThreadID, "run", job.RunID, "waiting", waiting, "maxDepth", capped)
+		return fmt.Errorf("%w: %d waiting, cap %d", ports.ErrQueueFull, waiting, capped)
+	}
+	return fmt.Errorf("%w: %s", ports.ErrDuplicateJob, opts.Key)
 }
 
 // Cancel drops every waiting row under key. A row a worker already holds is
-// left to finish: it is a correct no-op by the engine's own rules.
+// left to finish: it is a correct no-op by the engine's own rules. A dead row
+// is kept for its operator.
 func (q *Queue) Cancel(ctx context.Context, key string) error {
 	if key == "" {
 		return nil
 	}
 	_, err := q.db.ExecContext(ctx,
-		`DELETE FROM `+q.table+` WHERE namespace = $1 AND key = $2 AND ("lockedUntil" IS NULL OR "lockedUntil" <= now())`,
+		`DELETE FROM `+q.table+` WHERE namespace = $1 AND key = $2 AND "deadAt" IS NULL AND ("lockedUntil" IS NULL OR "lockedUntil" <= now())`,
 		q.opts.Namespace, key)
 	return err
 }
@@ -365,11 +385,19 @@ type PurgeFilter struct {
 	Kind     *ports.JobKind
 	// OlderThan keeps rows enqueued more recently than this.
 	OlderThan time.Duration
+	// IncludeDead purges dead rows too. Without it they are kept for their
+	// operator (PurgeDead drops them by age).
+	IncludeDead bool
 }
 
-// Purge deletes waiting rows that match. Rows a worker holds are left alone.
+// Purge deletes waiting rows that match. Rows a worker holds are left alone,
+// and dead rows unless the filter asks for them.
 func (q *Queue) Purge(ctx context.Context, f PurgeFilter) (int64, error) {
 	where := []string{`namespace = $1`, `("lockedUntil" IS NULL OR "lockedUntil" <= now())`}
+	if !f.IncludeDead {
+		where = append(where, `"deadAt" IS NULL`)
+	}
+	base := len(where)
 	args := []any{q.opts.Namespace}
 	add := func(cond string, v any) {
 		args = append(args, v)
@@ -387,7 +415,7 @@ func (q *Queue) Purge(ctx context.Context, f PurgeFilter) (int64, error) {
 	if f.OlderThan > 0 {
 		add(`"createdAt" < now() - $%d * interval '1 millisecond'`, f.OlderThan.Milliseconds())
 	}
-	if len(where) == 2 {
+	if len(where) == base {
 		return 0, errors.New("postgres queue: purge needs a filter")
 	}
 	res, err := q.db.ExecContext(ctx, `DELETE FROM `+q.table+` WHERE `+strings.Join(where, " AND "), args...)
@@ -625,18 +653,36 @@ type claimed struct {
 	attempts int
 }
 
-// candidates is the head of the line: ready rows, the partition with the
-// fewest jobs in flight first, then priority, then dispatch time.
+// candidates is the head of the line: the partition with the fewest jobs in
+// flight first, then priority, then dispatch time. One tenant's burst cannot
+// hold the head of the line against everyone else.
+//
+// It never sorts the backlog. The partitions are walked through the index
+// one step each (a loose index scan), each partition's head rows are an
+// index lookup, and only those few rows are ordered. The cost follows the
+// number of partitions, not the number of waiting jobs.
 func (q *Queue) candidates(ctx context.Context) ([]string, error) {
+	t := q.table
 	rows, err := q.db.QueryContext(ctx,
-		`WITH leased AS (
-		   SELECT partition, count(*) AS n FROM `+q.table+`
+		`WITH RECURSIVE parts AS (
+		   (SELECT partition FROM `+t+` WHERE namespace = $1 AND "deadAt" IS NULL ORDER BY partition LIMIT 1)
+		   UNION ALL
+		   SELECT (SELECT partition FROM `+t+` WHERE namespace = $1 AND "deadAt" IS NULL AND partition > p.partition
+		           ORDER BY partition LIMIT 1)
+		   FROM parts p WHERE p.partition IS NOT NULL),
+		 leased AS (
+		   SELECT partition, count(*) AS n FROM `+t+`
 		   WHERE namespace = $1 AND "deadAt" IS NULL AND "lockedUntil" > now()
 		   GROUP BY partition)
-		 SELECT j.id FROM `+q.table+` j LEFT JOIN leased l ON l.partition = j.partition
-		 WHERE j.namespace = $1 AND j.`+ready+`
+		 SELECT h.id FROM parts p
+		 CROSS JOIN LATERAL (
+		   SELECT id, priority, "sortAt" FROM `+t+`
+		   WHERE namespace = $1 AND partition = p.partition AND `+ready+`
+		   ORDER BY priority DESC, "sortAt" LIMIT 8) h
+		 LEFT JOIN leased l ON l.partition = p.partition
+		 WHERE p.partition IS NOT NULL
 		   AND NOT EXISTS (SELECT 1 FROM `+q.control+` c WHERE c.namespace = $1 AND c.paused)
-		 ORDER BY COALESCE(l.n, 0) ASC, j.priority DESC, j."sortAt" ASC
+		 ORDER BY COALESCE(l.n, 0) ASC, h.priority DESC, h."sortAt" ASC
 		 LIMIT 8`, q.opts.Namespace)
 	if err != nil {
 		return nil, err
@@ -682,29 +728,41 @@ func (q *Queue) take(ctx context.Context, id string) (claimed, bool, error) {
 	defer func() { _ = tx.Rollback() }()
 	var c claimed
 	var payload []byte
+	var kind string
 	var ageMs float64
 	// The age is measured on the database's clock, the one that stamped the
-	// row: a worker's own clock can be seconds away from it.
+	// row: a worker's own clock can be seconds away from it. It counts from
+	// "runAt", when the job became due, so a delayed job starts at zero.
+	var threadID, runID string
 	err = tx.QueryRowContext(ctx,
-		`SELECT id, payload, attempts, EXTRACT(EPOCH FROM now() - "createdAt") * 1000 FROM `+q.table+`
-		 WHERE id = $1 AND `+ready+` FOR UPDATE SKIP LOCKED`, id).Scan(&c.id, &payload, &c.attempts, &ageMs)
+		`SELECT id, payload, attempts, kind, "threadId", "runId", EXTRACT(EPOCH FROM now() - "runAt") * 1000 FROM `+q.table+`
+		 WHERE id = $1 AND `+ready+` FOR UPDATE SKIP LOCKED`, id).Scan(&c.id, &payload, &c.attempts, &kind, &threadID, &runID, &ageMs)
 	if errors.Is(err, sql.ErrNoRows) {
 		return claimed{}, false, nil // another consumer got here first
 	}
 	if err != nil {
 		return claimed{}, false, err
 	}
-	if age := time.Duration(ageMs) * time.Millisecond; q.opts.MaxAge > 0 && age > q.opts.MaxAge {
-		cause := fmt.Errorf("job waited %s, longer than the %s cap", age.Round(time.Second), q.opts.MaxAge)
-		if _, err := tx.ExecContext(ctx, `UPDATE `+q.table+` SET "deadAt" = now(), "lastError" = $2 WHERE id = $1`, c.id, cause.Error()); err != nil {
+	// Every earlier claim spent an attempt. A job that already has them all
+	// was claimed and never came back: its worker died with it (a panic past
+	// recovery, the OOM killer, a kill -9). Running it again is how one bad
+	// job takes down every worker in turn, so it is kept as dead instead.
+	var cause error
+	if c.attempts >= q.opts.MaxAttempts {
+		cause = fmt.Errorf("job was claimed %d times and its worker never finished it", c.attempts)
+	} else if age := time.Duration(ageMs) * time.Millisecond; q.opts.MaxAge > 0 && ports.JobKind(kind) == ports.JobDispatch && age > q.opts.MaxAge {
+		cause = fmt.Errorf("job waited %s, longer than the %s cap", age.Round(time.Second), q.opts.MaxAge)
+	}
+	if cause != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE `+q.table+` SET "deadAt" = now(), "lastError" = $2, "lockedUntil" = NULL WHERE id = $1`, c.id, cause.Error()); err != nil {
 			return claimed{}, false, err
 		}
 		if err := tx.Commit(); err != nil {
 			return claimed{}, false, err
 		}
-		var job ports.RunJob
+		job := ports.RunJob{ThreadID: threadID, RunID: runID, Kind: ports.JobKind(kind)}
 		_ = json.Unmarshal(payload, &job)
-		q.log.Error("job too old to run; kept as dead", "id", c.id, "thread", job.ThreadID, "run", job.RunID, "err", cause)
+		q.log.Error("job kept as dead instead of run", "id", c.id, "thread", job.ThreadID, "run", job.RunID, "err", cause)
 		q.dead(job, c.attempts, cause)
 		return claimed{}, false, nil
 	}
@@ -720,13 +778,17 @@ func (q *Queue) take(ctx context.Context, id string) (claimed, bool, error) {
 	c.attempts++
 	if err := json.Unmarshal(payload, &c.job); err != nil {
 		// A row that cannot be read will never run. It is kept, dead, with
-		// the reason, so the loss has a trace and can be repaired.
+		// the reason, so the loss has a trace and can be repaired; and the
+		// dead handler hears of it like any other, with the thread and run
+		// the row names in its own columns, so the run is failed rather than
+		// left RUNNING.
 		cause := fmt.Errorf("payload cannot be decoded: %w", err)
 		if _, dbErr := q.db.ExecContext(ctx, `UPDATE `+q.table+` SET "deadAt" = now(), "lastError" = $2, "lockedUntil" = NULL WHERE id = $1`, c.id, cause.Error()); dbErr != nil {
 			q.log.Error("unreadable job could not be marked dead", "id", c.id, "err", dbErr)
 		}
 		q.log.Error("job payload unreadable; kept as dead", "id", c.id, "err", err)
-		return claimed{}, false, cause
+		q.dead(ports.RunJob{ThreadID: threadID, RunID: runID, Kind: ports.JobKind(kind)}, c.attempts, cause)
+		return claimed{}, false, nil
 	}
 	return c, true, nil
 }
@@ -769,9 +831,12 @@ func (q *Queue) execute(c claimed) {
 	q.mu.Unlock()
 	log := q.log.With("id", c.id, "thread", c.job.ThreadID, "run", c.job.RunID, "kind", string(c.job.Kind), "attempt", c.attempts)
 
-	hctx, cancelHandler := context.WithCancel(jobsCtx)
+	var hctx context.Context
+	var cancelHandler context.CancelFunc
 	if q.opts.MaxRunTime > 0 {
 		hctx, cancelHandler = context.WithTimeout(jobsCtx, q.opts.MaxRunTime)
+	} else {
+		hctx, cancelHandler = context.WithCancel(jobsCtx)
 	}
 	defer cancelHandler()
 	renewCtx, stopRenew := context.WithCancel(context.Background())
@@ -807,7 +872,13 @@ func (q *Queue) execute(c claimed) {
 			}
 		}
 	}()
-	err := handler(hctx, c.job)
+	// A panic in the handler is a failed attempt like any other error: it is
+	// retried with a backoff and kept as dead once the attempts are spent.
+	err := core.CallSafely(func() error { return handler(hctx, c.job) })
+	var panicked *core.PanicError
+	if errors.As(err, &panicked) {
+		log.Error("job handler panicked", "err", err, "stack", string(panicked.Stack))
+	}
 	stopRenew()
 	// Every write below must land even while the process is shutting down.
 	done, cancel := context.WithTimeout(context.WithoutCancel(hctx), 15*time.Second)

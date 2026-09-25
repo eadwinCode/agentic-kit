@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zendev-sh/goai"
-	"github.com/zendev-sh/goai/provider"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
@@ -23,8 +23,9 @@ type SubagentCtx struct {
 	IOCtx    context.Context
 	ThreadID string
 	Depth    int // 0 = called from the main agent
-	Sem      *Semaphore
-	Ports    ports.RuntimePorts
+	// Slots caps how many subagents this run has going at once (§2.7).
+	Slots *RunSlots
+	Ports ports.RuntimePorts
 	// Sub is the delegation config carried from the parent's spec.
 	Sub ports.SubagentsConfig
 	// Agent is the registered agent whose generation args every nested run
@@ -48,12 +49,16 @@ type SubagentCtx struct {
 	ProviderOptions ports.ProviderOptions
 	// Aborted reports a user stop (§2.1).
 	Aborted func() bool
+	// Fenced reports that the run lock is gone (see LoopInput.Fenced).
+	Fenced func() bool
+	// Parks is the segment's park box, shared by every depth (see ParkBox).
+	Parks *ParkBox
 	// State is the run's state, handed down unchanged (§2.10).
 	State ports.AgentRunState
 }
 
-// Semaphore is a run-scoped concurrency cap: sibling subagents queue instead
-// of running away (§2.7).
+// Semaphore is a concurrency cap: sibling subagents queue instead of running
+// away (§2.7). See RunSlots for how a run uses them.
 type Semaphore struct{ slots chan struct{} }
 
 // NewSemaphore makes a semaphore with limit slots.
@@ -79,6 +84,35 @@ func (s *Semaphore) Acquire(ctx context.Context) (release func(), err error) {
 		released = true
 		<-s.slots
 	}, nil
+}
+
+// RunSlots is one run's subagent cap (§2.7): SubagentMaxConcurrent children
+// at a time at each depth. It is made per run, so one run's children never
+// wait on another run's. And each depth has slots of its own: a parent holds
+// its slot while its child runs, so if parent and child shared one pool, a
+// full level of parents would each wait for a slot only a finished child can
+// free, and never finish.
+type RunSlots struct {
+	limit   int
+	mu      sync.Mutex
+	byDepth map[int]*Semaphore
+}
+
+// NewRunSlots makes a run's subagent cap: limit children at a time per depth.
+func NewRunSlots(limit int) *RunSlots {
+	return &RunSlots{limit: limit, byDepth: map[int]*Semaphore{}}
+}
+
+// Acquire takes a slot at a depth, waiting for one until ctx is done.
+func (r *RunSlots) Acquire(ctx context.Context, depth int) (release func(), err error) {
+	r.mu.Lock()
+	sem := r.byDepth[depth]
+	if sem == nil {
+		sem = NewSemaphore(r.limit)
+		r.byDepth[depth] = sem
+	}
+	r.mu.Unlock()
+	return sem.Acquire(ctx)
 }
 
 type spawnInput struct {
@@ -182,7 +216,7 @@ func SpawnSubagentTool(sctx *SubagentCtx) ports.Tool {
 				return jsonString(map[string]any{"error": fmt.Sprintf(
 					"Unknown subagent %q; use one of: %s", in.Name, strings.Join(profileNames(sctx), ", "))}), nil
 			}
-			release, err := sctx.Sem.Acquire(ctx)
+			release, err := sctx.Slots.Acquire(ctx, depth)
 			if err != nil {
 				return "", err
 			}
@@ -226,6 +260,10 @@ func SpawnSubagentTool(sctx *SubagentCtx) ports.Tool {
 			outcome, err := RunNestedAgent(ctx, sctx, descriptor, &instructions, frames)
 			if err == nil && outcome.Aborted {
 				err = context.Canceled
+			} else if err == nil && outcome.Interrupted {
+				// A child whose stream ended with no finish did not finish:
+				// it failed, and its partial text is not a result.
+				err = fmt.Errorf("step %d ended without a finish", outcome.Steps+1)
 			}
 			if err != nil {
 				cancelled := sctx.Aborted != nil && sctx.Aborted()
@@ -314,7 +352,7 @@ func nestedTools(sctx *SubagentCtx, d ports.NestedDescriptor, frames []HitlFrame
 	// A nested run's tools see the same state as its parent's (§2.10), and
 	// publish on the same thread.
 	return WithRunState(WithPublishEvent(sctx.Ports, sctx.ThreadID, WithHitl(sctx.Ports, sctx.ThreadID, raw, HitlCtx{
-		Resume: sctx.Resume, AgentID: d.AgentID, Frames: frames, Nested: &desc,
+		Resume: sctx.Resume, AgentID: d.AgentID, Frames: frames, Nested: &desc, Parks: sctx.Parks,
 	})), sctx.State)
 }
 
@@ -409,7 +447,7 @@ func RunNestedAgent(genCtx context.Context, sctx *SubagentCtx, d ports.NestedDes
 		Messages: messages,
 		Tools:    nestedTools(sctx, d, frames),
 		MaxSteps: maxSteps,
-		GenCtx:   genCtx, Aborted: sctx.Aborted,
+		GenCtx:   genCtx, Aborted: sctx.Aborted, Fenced: sctx.Fenced,
 		ProviderOptions: sctx.ProviderOptions,
 		TokenBudget:     sctx.TokenBudget,
 		// Money is capped and billed at the RUN, not per child (§2.7, §4):
@@ -425,10 +463,10 @@ func RunNestedAgent(genCtx context.Context, sctx *SubagentCtx, d ports.NestedDes
 		PrepareStep:       prepareStep,
 		State:             sctx.State,
 		CacheSystemPrompt: deps.Config.PromptCaching,
-		OnChunk: func(chunk provider.StreamChunk) {
+		PublishChunk: func(p map[string]any) {
 			// Namespaced into the shared thread event log → same multi-user pipeline (§2.2)
 			_, _ = Publish(io, deps, threadID, "SUBAGENT_CHUNK", map[string]any{
-				"agentId": d.AgentID, "chunk": ChunkPayload(chunk),
+				"agentId": d.AgentID, "chunk": p,
 			})
 		},
 	}, sctx.Ledger)

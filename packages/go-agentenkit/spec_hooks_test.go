@@ -13,6 +13,7 @@ import (
 	"github.com/zendev-sh/goai/provider"
 
 	agentenkit "github.com/eadwinCode/agentic-kit/packages/go-agentenkit"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
 
 // noCaching keeps the system prompt in GenerateParams.System, where a test
@@ -111,7 +112,7 @@ func TestOnSettle_AnErrorFailsTheRunAndKeepsWhy(t *testing.T) {
 	mustEqual(t, h.queue.Len(), 0, "a settle failure is not retried")
 }
 
-func TestOnSettle_SeesAStopAsCancelledOnACancelledContext(t *testing.T) {
+func TestOnSettle_SeesAStopAsCancelledOnALiveContext(t *testing.T) {
 	h := makeRuntime(t, scripted(step{text: "slow", delay: 500 * time.Millisecond}))
 	var seen agentenkit.RunFinishInfo
 	var ctxErr error
@@ -137,10 +138,103 @@ func TestOnSettle_SeesAStopAsCancelledOnACancelledContext(t *testing.T) {
 	wg.Wait()
 	mustEqual(t, seen.Cancelled, true, "cancelled")
 	mustEqual(t, seen.State, agentenkit.StateCancelled, "state")
-	if ctxErr == nil {
-		t.Fatal("a stop must reach the settle hook on a cancelled context")
+	if ctxErr != nil {
+		t.Fatalf("a stop reaches the settle hook on a live context, so its writes land: %v", ctxErr)
 	}
 	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCancelled, "a settle error cannot turn a stop into a failure")
+}
+
+// ctxRuns is a run store that fails a call made on a cancelled context, the
+// way the SQL admin stores do. The memory store ignores ctx, which is how a
+// settle on a cancelled context went unnoticed in the tests.
+type ctxRuns struct{ ports.RunStore }
+
+func (r ctxRuns) Get(ctx context.Context, id string) (*ports.RunRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return r.RunStore.Get(ctx, id)
+}
+
+func (r ctxRuns) Patch(ctx context.Context, id string, p ports.RunPatch) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return r.RunStore.Patch(ctx, id, p)
+}
+
+type ctxAdmin struct{ ports.AdminStore }
+
+func (a ctxAdmin) Runs() ports.RunStore { return ctxRuns{a.AdminStore.Runs()} }
+
+func TestOnSettle_AStoppedLiveRunIsMarkedSettledOnASQLLikeStore(t *testing.T) {
+	h := makeRuntimeOpts(t, scripted(step{text: "slow", delay: 500 * time.Millisecond}), func(o *agentenkit.RuntimeOptions) {
+		o.Admin = ctxAdmin{o.Admin}
+	})
+	settles := 0
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
+		Name:     "chat",
+		OnSettle: func(context.Context, agentenkit.RunFinishInfo) error { settles++; return nil },
+	})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
+	job, _ := h.queue.Shift()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = h.rt.Worker.HandleJob(h.ctx, job)
+	}()
+	time.Sleep(30 * time.Millisecond)
+	if _, err := chat.Stop(h.ctx, ran.ThreadID, nil); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	mustEqual(t, settles, 1, "settled once")
+	rec, err := h.admin.Runs().Get(h.ctx, ran.RunID)
+	if err != nil || rec == nil {
+		t.Fatalf("run record: %+v %v", rec, err)
+	}
+	if rec.SettledAt == nil {
+		t.Fatal("the settle is marked, so the late-settle sweep does not charge the run again")
+	}
+}
+
+func TestExecute_AStreamCutWithoutAFinishIsNotCompleted(t *testing.T) {
+	h := makeRuntime(t, scripted(step{text: "part", noFinish: true}, step{text: "whole"}))
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
+	h.handleNext(t)
+	if st := h.thread(t, ran.ThreadID).State; st == agentenkit.StateCompleted {
+		t.Fatal("a step that never finished must not complete the run")
+	}
+	h.handleNext(t) // the retry
+	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "the retry completes it")
+}
+
+// goai's OpenAI provider sends the finish reason on step_finish and then a
+// finish chunk with only the usage. That is a finished step: an answer that
+// came back whole must complete the run on the first try.
+func TestExecute_AFinishReasonOnStepFinishCompletesTheRun(t *testing.T) {
+	h := makeRuntime(t, scripted(step{text: "Hello!", reasonOnStepFinish: true}))
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
+	h.handleNext(t)
+	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "completed on the first try")
+	mustEqual(t, h.queue.Len(), 0, "no retry")
+}
+
+// A finish chunk with no reason, and nothing before it that gave one, is a
+// stream cut short.
+func TestExecute_AFinishWithNoReasonAnywhereIsNotCompleted(t *testing.T) {
+	h := makeRuntime(t, scripted(step{text: "part", finishNoReason: true}, step{text: "whole"}))
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
+	h.handleNext(t)
+	if st := h.thread(t, ran.ThreadID).State; st == agentenkit.StateCompleted {
+		t.Fatal("a step that never gave a finish reason must not complete the run")
+	}
+	h.handleNext(t) // the retry
+	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "the retry completes it")
 }
 
 func TestOnSettle_RunsWhenAttemptsAreExhausted(t *testing.T) {
@@ -294,7 +388,7 @@ func TestSubagents_AProfileGivesTheChildItsOwnPersonaToolsAndModel(t *testing.T)
 			t.Fatalf("spawn description %q lacks %q", spawnDesc, want)
 		}
 	}
-	childID := payload(h.events(ran.ThreadID, "SUBAGENT_STARTED")[0])["agentId"].(string)
+	childID := subagentsOf(t, h, ran.ThreadID).started[0].SubagentID
 	rec, _ := h.admin.Runs().Get(h.ctx, childID)
 	mustEqual(t, rec.Model, "gpt-4o-mini", "the profile's model")
 	mustEqual(t, rec.Agent, "researcher", "the profile's name")
@@ -314,7 +408,7 @@ func TestSubagents_AnUnknownProfileIsReportedToTheModel(t *testing.T) {
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
 	h.handleNext(t)
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "state")
-	mustEqual(t, len(h.events(ran.ThreadID, "SUBAGENT_STARTED")), 0, "nothing was spawned")
+	mustEqual(t, len(subagentsOf(t, h, ran.ThreadID).started), 0, "nothing was spawned")
 	parent, _ := h.storage.Messages().List(h.ctx, ran.ThreadID, agentenkit.MainAgent, agentenkit.StorageContext{})
 	result := string(agentenkit.ParseContent(parent[2].Content)[0].Result)
 	if !strings.Contains(result, `Unknown subagent \"nobody\"`) || !strings.Contains(result, "researcher") {
@@ -387,6 +481,7 @@ func TestModelCalls_CarryTheRunIDAndStateOnTheirContext(t *testing.T) {
 	model := &ctxModel{scriptedModel: inner}
 	rt, err := agentenkit.SetupAgentCore(h.ctx, agentenkit.RuntimeOptions{
 		Storage: h.storage, Admin: h.admin, Bus: h.bus, Kv: h.kv, Queue: h.queue,
+		Streams: h.rt.Ports(nil).Streams, // the harness reads them back
 		ResolveModel: func(string) (agentenkit.ResolvedModel, error) {
 			return agentenkit.ResolvedModel{Instance: func() provider.LanguageModel { return model }, ContextWindow: 128_000}, nil
 		},
@@ -403,7 +498,7 @@ func TestModelCalls_CarryTheRunIDAndStateOnTheirContext(t *testing.T) {
 	if _, err := rt.Worker.HandleJob(h.ctx, job); err != nil {
 		t.Fatal(err)
 	}
-	childID := payload(h.events(ran.ThreadID, "SUBAGENT_STARTED")[0])["agentId"].(string)
+	childID := subagentsOf(t, h, ran.ThreadID).started[0].SubagentID
 	mustStrings(t, model.seen, []string{"run-x|acme", childID + "|acme", "run-x|acme"}, "run id and state per model call")
 }
 

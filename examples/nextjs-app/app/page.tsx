@@ -30,6 +30,8 @@ export default function Page() {
     threads,
     threadsLoading,
     usage,
+    connection,
+    error,
     selectThread,
     deleteThread,
     newThread,
@@ -47,7 +49,8 @@ export default function Page() {
   // Same for thought blocks.
   const [openThoughts, setOpenThoughts] = useState<Record<string, boolean>>({});
   // One button, two jobs: while a run is live it stops; otherwise it sends.
-  const running = agentState === 'RUNNING' || agentState === 'WAITING_FOR_INPUT';
+  const running =
+    agentState === 'QUEUED' || agentState === 'RUNNING' || agentState === 'WAITING_FOR_INPUT';
   const waiting = agentState === 'WAITING_FOR_INPUT';
   const canSend = !historyLoading && !running && prompt.trim().length > 0;
 
@@ -152,6 +155,11 @@ export default function Page() {
             {activity.detail && <span>{activity.detail}</span>}
           </div>
         </section>
+      )}
+      {/* A send that did not go through leaves the thread as it was, and says why here. */}
+      {error && <p className="send-error" role="alert">{error}</p>}
+      {threadId && (connection === 'reconnecting' || connection === 'closed') && (
+        <p className="connection" aria-live="polite">Reconnecting to the live stream…</p>
       )}
 
       <section className="thread">

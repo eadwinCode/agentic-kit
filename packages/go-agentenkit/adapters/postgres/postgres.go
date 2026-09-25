@@ -13,7 +13,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
+	"time"
 
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/admin/migrate"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/core"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
@@ -36,10 +40,23 @@ func New(ctx context.Context, db *sql.DB, opts ...Option) (*Storage, error) {
 	for _, o := range opts {
 		o(s)
 	}
-	for _, stmt := range s.schema() {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return nil, fmt.Errorf("postgres storage schema: %w", err)
-		}
+	if err := migrateSchema(ctx, db, s.prefix, "storage", []migrate.Migration{
+		migrate.NewMigration("storage_0001_init", s.schema()...),
+		// One event per seq on a thread: a counter that restarted must fail
+		// its write, never land a second event under a seq clients already
+		// have. A log from before this check may hold duplicates; the index
+		// is then left off, said so, and tried again on the next start.
+		optional(migrate.NewMigration("storage_0002_events_seq_unique",
+			`CREATE UNIQUE INDEX IF NOT EXISTS `+s.t("events_thread_seq_unique")+` ON `+s.t("events")+`("threadId", seq)`)),
+		// The same for messages, so two appends that raced to one seq cannot
+		// both land (Append retries the loser).
+		optional(migrate.NewMigration("storage_0003_messages_seq_unique",
+			`CREATE UNIQUE INDEX IF NOT EXISTS `+s.t("messages_thread_seq_unique")+` ON `+s.t("messages")+`("threadId", seq)`)),
+		// The run a record entry belongs to.
+		migrate.NewMigration("storage_0004_events_run",
+			`ALTER TABLE `+s.t("events")+` ADD COLUMN IF NOT EXISTS "runId" TEXT`),
+	}); err != nil {
+		return nil, err
 	}
 	return s, nil
 }
@@ -90,6 +107,8 @@ func (s *Storage) schema() []string {
 		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS "costCurrency" TEXT`,
 		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS "costSource" TEXT`,
 		`CREATE INDEX IF NOT EXISTS ` + p + `usage_run ON ` + p + `usage("runId", "createdAt")`,
+		// The thread's current run, for ThreadTransition's compare-and-set.
+		`ALTER TABLE ` + p + `threads ADD COLUMN IF NOT EXISTS "runId" TEXT`,
 	}
 }
 
@@ -175,6 +194,29 @@ func (t threads) ClaimState(ctx context.Context, threadID string, from, to ports
 	return n > 0, err
 }
 
+func (t threads) Transition(ctx context.Context, threadID string, tr ports.ThreadTransition, _ ports.StorageContext) (bool, error) {
+	if len(tr.From) == 0 {
+		return false, nil
+	}
+	// Single conditional UPDATE: the atomicity contract (§3.4). A thread
+	// with no run recorded yet (from before the column) matches any run.
+	args := []any{string(tr.To), threadID, tr.RunID, tr.NewRunID}
+	in := make([]string, len(tr.From))
+	for i, s := range tr.From {
+		args = append(args, string(s))
+		in[i] = fmt.Sprintf("$%d", len(args))
+	}
+	res, err := t.s.db.ExecContext(ctx,
+		`UPDATE `+t.s.t("threads")+` SET state = $1, "updatedAt" = now(), "runId" = COALESCE(NULLIF($4, ''), "runId")
+		 WHERE id = $2 AND state IN (`+strings.Join(in, ", ")+`)
+		   AND ($3 = '' OR "runId" IS NULL OR "runId" = $3)`, args...)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
 type messages struct{ s *Storage }
 
 const messageCols = `id, "threadId", "agentId", role, content, "createdAt"`
@@ -197,11 +239,45 @@ func (m messages) Append(ctx context.Context, threadID string, msg ports.NewMess
 		content = json.RawMessage("null")
 	}
 	// An explicit seq keeps insertion order stable inside one millisecond.
-	return scanMessage(m.s.db.QueryRowContext(ctx,
+	// Under READ COMMITTED two appends could read the same MAX, so appends to
+	// one thread take its row lock first and go one at a time; the unique
+	// index is the backstop, and a clash that still gets through is retried.
+	for attempt := 0; ; attempt++ {
+		out, err := m.append(ctx, threadID, msg.AgentID, string(msg.Role), string(content))
+		if err == nil || attempt == 4 || !isUniqueViolation(err) {
+			return out, err
+		}
+	}
+}
+
+func (m messages) append(ctx context.Context, threadID, agentID, role, content string) (*ports.MessageDTO, error) {
+	tx, err := m.s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SELECT 1 FROM `+m.s.t("threads")+` WHERE id = $1 FOR UPDATE`, threadID); err != nil {
+		return nil, err
+	}
+	out, err := scanMessage(tx.QueryRowContext(ctx,
 		`INSERT INTO `+m.s.t("messages")+` (id, "threadId", "agentId", role, content, seq)
 		 VALUES ($1, $2, $3, $4, $5, (SELECT COALESCE(MAX(seq),0)+1 FROM `+m.s.t("messages")+` WHERE "threadId" = $2))
 		 RETURNING `+messageCols,
-		core.NewID(), threadID, nullStr(msg.AgentID), string(msg.Role), string(content)))
+		core.NewID(), threadID, nullStr(agentID), role, content))
+	if err != nil {
+		return nil, err
+	}
+	return out, tx.Commit()
+}
+
+// isUniqueViolation reports a unique-index clash (SQLSTATE 23505), from any
+// Postgres driver.
+func isUniqueViolation(err error) bool {
+	var coded interface{ SQLState() string }
+	if errors.As(err, &coded) {
+		return coded.SQLState() == "23505"
+	}
+	return strings.Contains(err.Error(), "23505") || strings.Contains(err.Error(), "duplicate key")
 }
 
 func (m messages) List(ctx context.Context, threadID string, scope *ports.MessageScope, _ ports.StorageContext) ([]ports.MessageDTO, error) {
@@ -244,7 +320,7 @@ func (m messages) DeleteFrom(ctx context.Context, threadID, messageID string, _ 
 
 type events struct{ s *Storage }
 
-const eventCols = `"threadId", seq, type, payload, "createdAt"`
+const eventCols = `"threadId", seq, type, payload, "createdAt", COALESCE("runId", '')`
 
 func (e events) query(ctx context.Context, q string, vals ...any) ([]ports.AgentEvent, error) {
 	rows, err := e.s.db.QueryContext(ctx, q, vals...)
@@ -256,7 +332,7 @@ func (e events) query(ctx context.Context, q string, vals ...any) ([]ports.Agent
 	for rows.Next() {
 		var ev ports.AgentEvent
 		var payload []byte
-		if err := rows.Scan(&ev.ThreadID, &ev.Seq, &ev.Type, &payload, &ev.CreatedAt); err != nil {
+		if err := rows.Scan(&ev.ThreadID, &ev.Seq, &ev.Type, &payload, &ev.CreatedAt, &ev.RunID); err != nil {
 			return nil, err
 		}
 		ev.Payload = json.RawMessage(payload)
@@ -268,11 +344,65 @@ func (e events) query(ctx context.Context, q string, vals ...any) ([]ports.Agent
 	return out, rows.Err()
 }
 
-func (e events) Append(ctx context.Context, threadID string, ev ports.AgentEvent, _ ports.StorageContext) error {
-	_, err := e.s.db.ExecContext(ctx,
-		`INSERT INTO `+e.s.t("events")+` (id, "threadId", seq, type, payload, "createdAt") VALUES ($1,$2,$3,$4,$5,$6)`,
-		core.NewID(), threadID, ev.Seq, ev.Type, string(core.MarshalPayload(ev.Payload)), ev.CreatedAt)
-	return err
+// Append mints the seq as messages do: it locks the thread's row, so two
+// appends on one thread take turns and never read the same MAX.
+func (e events) Append(ctx context.Context, threadID string, in ports.NewThreadEvent, _ ports.StorageContext) (ports.AgentEvent, error) {
+	at := in.CreatedAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+	payload := core.MarshalPayload(in.Payload)
+	ev := ports.AgentEvent{ThreadID: threadID, Type: in.Type, Payload: payload, CreatedAt: at, RunID: in.RunID}
+	tx, err := e.s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ev, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SELECT 1 FROM `+e.s.t("threads")+` WHERE id = $1 FOR UPDATE`, threadID); err != nil {
+		return ev, err
+	}
+	var runID any
+	if in.RunID != "" {
+		runID = in.RunID
+	}
+	if err := tx.QueryRowContext(ctx,
+		`INSERT INTO `+e.s.t("events")+` (id, "threadId", seq, type, payload, "createdAt", "runId")
+		 SELECT $1, $2, COALESCE(MAX(seq), 0) + 1, $3, $4, $5, $6 FROM `+e.s.t("events")+` WHERE "threadId" = $2
+		 RETURNING seq`,
+		core.NewID(), threadID, in.Type, string(payload), at, runID).Scan(&ev.Seq); err != nil {
+		return ev, err
+	}
+	return ev, tx.Commit()
+}
+
+func (e events) List(ctx context.Context, threadID string, f ports.ThreadEventFilter, _ ports.StorageContext) ([]ports.AgentEvent, error) {
+	where := []string{`"threadId" = $1`}
+	args := []any{threadID}
+	arg := func(v any) string {
+		args = append(args, v)
+		return "$" + strconv.Itoa(len(args))
+	}
+	if f.Types != nil {
+		marks := make([]string, len(f.Types))
+		for i, t := range f.Types {
+			marks[i] = arg(t)
+		}
+		if len(marks) == 0 {
+			marks = []string{"NULL"}
+		}
+		where = append(where, "type IN ("+strings.Join(marks, ", ")+")")
+	}
+	if f.RunID != "" {
+		where = append(where, `"runId" = `+arg(f.RunID))
+	}
+	if f.After != nil {
+		where = append(where, "seq > "+arg(*f.After))
+	}
+	q := `SELECT ` + eventCols + ` FROM ` + e.s.t("events") + ` WHERE ` + strings.Join(where, " AND ") + ` ORDER BY seq`
+	if f.Limit > 0 {
+		q += " LIMIT " + strconv.Itoa(f.Limit)
+	}
+	return e.query(ctx, q, args...)
 }
 
 func (e events) ListSince(ctx context.Context, threadID string, sinceSeq int64, _ ports.StorageContext) ([]ports.AgentEvent, error) {
@@ -289,6 +419,43 @@ func (e events) Latest(ctx context.Context, threadID, typ string, _ ports.Storag
 
 func (e events) ListByType(ctx context.Context, threadID, typ string, _ ports.StorageContext) ([]ports.AgentEvent, error) {
 	return e.query(ctx, `SELECT `+eventCols+` FROM `+e.s.t("events")+` WHERE "threadId" = $1 AND type = $2 ORDER BY seq`, threadID, typ)
+}
+
+func (e events) Prune(ctx context.Context, types []string, limit int, dryRun bool) (map[string]int64, error) {
+	counts := map[string]int64{}
+	if len(types) == 0 {
+		return counts, nil
+	}
+	args := make([]any, len(types))
+	marks := make([]string, len(types))
+	for i, t := range types {
+		args[i], marks[i] = t, "$"+strconv.Itoa(i+1)
+	}
+	in := strings.Join(marks, ", ")
+	q := `SELECT type, COUNT(*) FROM ` + e.s.t("events") + ` WHERE type IN (` + in + `) GROUP BY type`
+	if !dryRun {
+		// One statement: pick a batch, delete it, count what went.
+		q = `WITH gone AS (
+		       DELETE FROM ` + e.s.t("events") + ` WHERE id IN (
+		         SELECT id FROM ` + e.s.t("events") + ` WHERE type IN (` + in + `) LIMIT $` + strconv.Itoa(len(types)+1) + `)
+		       RETURNING type)
+		     SELECT type, COUNT(*) FROM gone GROUP BY type`
+		args = append(args, limit)
+	}
+	rows, err := e.s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var typ string
+		var n int64
+		if err := rows.Scan(&typ, &n); err != nil {
+			return nil, err
+		}
+		counts[typ] = n
+	}
+	return counts, rows.Err()
 }
 
 type usage struct{ s *Storage }

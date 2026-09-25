@@ -4,9 +4,9 @@
 bun add use-agentenkit
 ```
 
-A hook that owns the client state machine — hydrate from the durable snapshot,
-replay the active run, then tail the event stream — and leaves every endpoint,
-string and transport to you.
+A hook that owns the client state machine — hydrate from the snapshot, show
+the run stream in flight, then follow the thread record and the run streams —
+and leaves every endpoint, string and transport to you.
 
 ## The smallest thing that works
 
@@ -49,7 +49,7 @@ is assumed.
 | :--- | :--- |
 | `threadId` | the open thread, or `undefined` |
 | `entries` | the conversation — see below |
-| `agentState` | `IDLE` · `QUEUED` · `RUNNING` · `WAITING_FOR_INPUT` · `COMPLETED` · `CANCELLED` · `FAILED` — `QUEUED` is accepted and waiting for a worker (Go runtime) |
+| `agentState` | `IDLE` · `QUEUED` · `RUNNING` · `WAITING_FOR_INPUT` · `COMPLETED` · `CANCELLED` · `FAILED` — `QUEUED` is accepted and waiting for a worker |
 | `activity` | `{ phase, label, detail }` — a live status line |
 | `historyLoading` | hydration in progress |
 | `pendingInputs` | requests the run is parked on: `reason: 'approval'` waits on a human (show a card); any other reason is a tool waiting on work it started (show a status) |
@@ -57,16 +57,47 @@ is assumed.
 | `threads`, `threadsLoading` | the thread list, for a sidebar |
 | `usage` | tokens spent, money spent, and context load |
 | `currentRun` | the thread's latest run: `{ id, startedAt?, endedAt? }`, or `null` before the first |
+| `connection` | the live stream: `connecting` · `open` · `reconnecting` · `closed` |
+| `error` | why the last send did not go through, or why the server refused the run (`RUN_REFUSED`); `null` otherwise |
 
 `currentRun` is what a "running for 1:32" timer counts from. It is hydrated
 from the snapshot's `runs` and then kept from `STATE_CHANGE` alone: every one
 names its run and carries `startedAt` while the run is running or waiting, or
-`endedAt` once it ended. A client never refetches history for timing.
+`endedAt` once it ended. A server that leaves a clock off still gets a timer:
+the event's own time stands in. A client never refetches history for timing.
+
+`connection` says where the stream stands. A dropped connection is
+`reconnecting` while the transport retries on its own. One the transport gave
+up on (a 401, a 404) is `closed`: the hook then reads the thread again and
+opens a new stream from where it stands, waiting longer each time (1 s,
+doubling, up to 30 s). An event the hook already has — a replay, or a
+transport that resent after reconnecting — is dropped before anything sees it,
+so text is never shown twice.
+
+The hook opens the stream with two query params: `cursor` (where it is,
+`<seq> <streamId> <offset>`) and `lastMessageId` (the last message it has). It
+also sends `since`, the record seq alone, for an older server. If the stream
+it was reading is gone by the time it reconnects, the server sends one
+`SNAPSHOT` frame on the same connection, and the hook merges its newer
+messages in place — no second request, no reload. See
+[HTTP API](./http-api.md#live-stream).
 
 **Actions**
 
 `run`, `stop`, `respondToInput`, `newThread`, `selectThread`, `deleteThread`,
 `loadThreads`, `loadUsage`.
+
+`run()` is refused while a run is queued, running or waiting on an approval,
+and while an earlier send is still on its way: a second send would wipe the
+first run's approval cards, and two fast sends on a new thread would make two
+threads. A send that fails — refused by the server, or lost in transit — puts
+the conversation back exactly as it was and sets `error`; it does not mark the
+thread `FAILED`. The next accepted send clears `error`. An edit of a turn the
+server has not confirmed yet is refused too: it has no id the server knows.
+
+The turn a send adds right away is swapped for the real one by an id the hook
+sends with it (`clientMessageId`, echoed on `MESSAGE_APPENDED`), never by
+matching its text.
 
 `stop()` and `respondToInput()` return `true` when the server confirms the
 action, and `false` on refusal or a transport failure. Failures appear in
@@ -94,7 +125,7 @@ type EntryPart =
 
 A tool call's `state` flips to `done` (or `error`) in place when its result
 arrives, live or on reload, so a card can settle without a second lookup.
-Live, the runtime publishes a `tool-result` chunk for every tool it ran,
+Live, the run stream carries a `TOOL_CALL_RESULT` for every tool it ran,
 before the step commits. On reload the state is derived from the durable tool
 messages, which is how a denied approval, a stop, or an approval that ran the
 tool later gets its state: those never stream a result. `error` means the
@@ -141,8 +172,8 @@ await run('…', { runId: myRunId, maxSteps: 8 });
 
 `attachments` show on the optimistic turn as image parts and reach the model
 natively. `runId` names the run so your own records can be keyed by it before
-the server answers; `maxSteps` caps the run below the server's ceiling. Both
-need a server that accepts them (the Go runtime does).
+the server answers; `maxSteps` caps the run below the server's ceiling. Your
+run route must pass them through to `run()`; both runtimes accept them.
 
 The hook adds the user's turn locally before the request goes out, then replaces
 it with the durable one when the server confirms — so the id is real and the
@@ -155,7 +186,7 @@ message can be edited.
 | `run` | POST | `/api/agent/run` |
 | `stop` | POST | `/api/agent/control` |
 | `respond` | POST | `/api/agent/respond` |
-| `stream` | GET (SSE) | `/api/agent/stream` |
+| `stream` | GET (SSE) | `/api/agent/stream` — params `{ threadId, since, cursor, lastMessageId }` |
 | `history` | GET | `/api/agent/history` |
 | `usage` | GET | `/api/agent/usage` |
 | `threads` | GET | `/api/threads` |
@@ -200,11 +231,12 @@ route without restating the rest.
 | `fetch` | global `fetch` | auth wrappers, retries, a test double |
 | `headers` | none | sent with every request; a function is called per request, so a rotating token stays fresh |
 | `openStream` | `browserEventStream` | how the stream is opened — see below |
-| `defaultModel` | `'gpt-4o'` | when `run()` names no model |
+| `defaultModel` | none | the model `run()` sends when the call names none; unset sends no model, and the server uses the agent's own |
 | `persistence` | `browserPersistence()` | where the open thread id is remembered; `false` keeps it in memory |
 | `labels` | English | every user-facing string the hook produces |
 | `format` | plain text | how tool calls, results and subagent notices render |
 | `onEvent` | none | see every event first; return `true` to claim it |
+| `onCustom` | none | `(name, value)` for your own events, once each, live or durable |
 | `threadsRefreshMs` | `30000` | background thread-list refresh; `false` disables |
 | `loadThreadsOnMount` | `true` | off for a single-thread embed |
 
@@ -216,18 +248,43 @@ supply your own opener:
 
 ```ts
 useAgentThread({
-  openStream: (url, { onMessage, onError }) => {
+  openStream: (url, { onMessage, onError, onOpen, onClose, getCursor }) => {
     const source = new MyAuthedEventSource(url, { token });
+    source.onopen = () => onOpen?.();
     source.onmessage = (e) => onMessage(e.data);
-    source.onerror = onError;
+    source.onerror = onError; // retrying on its own
+    source.onclose = () => onClose?.(); // gave up: the hook re-reads and reopens
     return { close: () => source.close() };
   },
 });
 ```
 
-The same hook takes a WebSocket or fetch-streaming transport.
+The same hook takes a WebSocket or fetch-streaming transport. One that
+reconnects on its own should resume from `getCursor()`: the cursor string
+`<seq> <streamId> <offset>`, the id of the last frame the hook applied. Send it
+as `Last-Event-ID` or as the `cursor` query param. The hook drops anything it
+already has anyway.
+
+The default persistence keeps the thread id in the URL with
+`history.replaceState`, passing the page's own history state through, so it
+does not disturb the Next.js router.
 
 ### Your own event types
+
+The simplest way is `onCustom`. It gets each of your events once, by name,
+whether it came live on the run stream or from the thread record:
+
+```ts
+useAgentThread({
+  onCustom: (name, value) => {
+    if (name === 'MY_APP_EVENT') handle(value);
+  },
+});
+```
+
+`onEvent` sees every event, the platform's too, before the built-in reducer.
+Your events reach it with `type` set to their name and `payload` set to their
+value:
 
 ```ts
 useAgentThread({
@@ -257,13 +314,20 @@ Unlisted labels keep their defaults.
 ## Multiple tabs
 
 Two tabs on the same thread stay in sync: a message sent in one appears in the
-other, an edit truncates both, and a tab opened mid-run rebuilds what has
-happened so far and then follows along. You do not have to do anything for this
-— it falls out of hydrate-then-tail.
+other, an edit truncates both, an approval answered in one drops its card in
+the other (`HITL_RESPONSE`), a thread deleted in one resets the other
+(`THREAD_DELETED`), and a tab opened mid-run rebuilds what has happened so far
+and then follows along. You do not have to do anything for this
+— it falls out of hydrate-then-follow.
 
 ## Notes
 
 - The server is the only source of truth.
+- Switching threads clears the old thread's messages, cards and run at once,
+  and a slow answer for a thread you already left never lands.
+- Streamed text is shown once per animation frame, not re-rendered per token.
+- A generate-text agent streams nothing; its whole answer arrives as one
+  `TEXT_RESULT` and is shown as one entry.
 - Config is read fresh on every request, but an open stream keeps the URL it was
   opened with. Change routes at mount, not mid-run.
 - The hook is client-side. In Next.js App Router, the component using it needs

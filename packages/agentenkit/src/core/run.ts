@@ -1,16 +1,19 @@
-import type { RuntimePorts, RunInput, RunResult } from '../ports/runtime.js';
+import type { Attachment, RuntimePorts, RunInput, RunResult } from '../ports/runtime.js';
+import { QueueFullError, UnsupportedError } from '../ports/queue.js';
 import type { RegisteredAgent } from './agent.js';
 import { reclaimIfOrphaned } from './reclaim.js';
-import { runIdKey } from './keys.js';
+import { runIdKey, THREAD_KEY_TTL_SECONDS } from './keys.js';
 import { recordStoppedRun } from './stop.js';
 import { randomUUID } from 'node:crypto';
-import { publish, setThreadState, publishEvent } from './publish.js';
-import { mergeProviderOptions } from './types.js';
+import { ACTIVE_STATES, publish, publishEvent, transition } from './publish.js';
+import { mergeProviderOptions, type ExecutionState } from './types.js';
+import { enqueueJob } from './lease.js';
 
 /** The §5.1 behavior: heal orphans → billing pre-check (§4) → persist the user
- *  message → state RUNNING (hot + durable) → enqueue on the dispatch queue
+ *  message → state QUEUED (hot + durable) → enqueue on the dispatch queue
  *  (§2.8). Accepts no execution responsibility whatsoever — the queue does
- *  the rest, and the job dispatches back to THIS handle. */
+ *  the rest, and the job dispatches back to THIS handle. The worker that picks
+ *  the job up moves the thread to RUNNING. */
 export async function run(
   deps: RuntimePorts,
   agent: RegisteredAgent,
@@ -32,9 +35,8 @@ export async function run(
   const thread = await deps.storage.threads.get(threadId);
   if (!thread) return { accepted: false, threadId, error: 'Thread not found' };
   const initialState = thread.state;
-  if (state === 'RUNNING' || state === 'WAITING_FOR_INPUT' ||
-      thread.state === 'RUNNING' || thread.state === 'WAITING_FOR_INPUT') {
-    return { accepted: false, threadId, error: 'Thread has an active run' };
+  if (ACTIVE_STATES.includes(state as ExecutionState) || ACTIVE_STATES.includes(thread.state)) {
+    return { accepted: false, threadId, reason: 'active_run', error: 'Thread has an active run' };
   }
 
   // Billing pre-execution check (§4) — user-injected hook. A refusal is
@@ -44,14 +46,47 @@ export async function run(
     const check = await deps.config.billingPreCheck({
       threadId,
       state: input.state ?? {},
+      stage: 'dispatch',
       publishEvent: (type, payload, options) => publishEvent(deps, threadId, type, payload, options),
     });
     if (!check.ok) {
       const error = check.error ?? 'Billing check failed';
       await publish(deps, threadId, 'RUN_REFUSED', { reason: 'billing', error });
-      return { accepted: false, threadId, error };
+      return { accepted: false, threadId, reason: 'billing', error };
     }
   }
+
+  // Overload check (§2.8), BEFORE anything is written: a queue at its depth
+  // cap refuses the run outright, the thread stays as it was, and the caller
+  // can say "try again shortly". Only new work is refused here; a retry, a
+  // resume or an expiry belongs to a run already under way and always goes in.
+  if (deps.config.maxQueueDepth > 0) {
+    let ready: number | undefined;
+    try {
+      ready = (await deps.queue.stats()).ready;
+    } catch (err) {
+      if (!(err instanceof UnsupportedError)) throw err;
+    }
+    if (ready !== undefined && ready >= deps.config.maxQueueDepth) {
+      ((deps.log ?? console) as { warn?: (m: string, ...r: unknown[]) => void }).warn?.(
+        'run refused: queue full', { threadId, ready, maxQueueDepth: deps.config.maxQueueDepth },
+      );
+      await publish(deps, threadId, 'RUN_REFUSED', { reason: 'queue_full', error: new QueueFullError().message });
+      return { accepted: false, threadId, reason: 'queue_full', error: 'The assistant is busy right now. Try again shortly.' };
+    }
+  }
+
+  // A caller-named run (§2.1) is checked before anything is written: a reused
+  // id must refuse, never resend.
+  if (input.runId && (await deps.admin.runs.get(input.runId))) {
+    return { accepted: false, threadId, error: 'Run id already used' };
+  }
+  if (input.maxSteps !== undefined && (!Number.isInteger(input.maxSteps) || input.maxSteps < 0)) {
+    return { accepted: false, threadId, error: 'maxSteps must be zero or a positive number' };
+  }
+  // A run may cap itself below the config, never above it. 0 keeps the
+  // config's.
+  const maxSteps = Math.min(input.maxSteps ?? 0, deps.config.maxSteps);
 
   // Edit + resend (§5.1): the edited turn and everything it led to are
   // dropped, then the new text is appended in its place — one thread, no
@@ -71,23 +106,29 @@ export async function run(
 
   // The durable store already provides an atomic state claim. Do this before
   // editing or appending history, so only the winning send changes the thread.
-  const runId = randomUUID();
+  const runId = input.runId || randomUUID();
   const previousRunId = await deps.kv.get(runIdKey(threadId));
-  const admitted = await deps.storage.threads.claimState(threadId, initialState, 'RUNNING');
-  if (!admitted) return { accepted: false, threadId, error: 'Thread has an active run' };
+  // The thread now belongs to this run: every later state change names it, so
+  // a run that is stopped or replaced can never move the thread (§3.4).
+  const admitted = await transition(deps, threadId, {
+    from: [initialState], to: 'QUEUED', newRunId: runId, model,
+  });
+  if (!admitted) return { accepted: false, threadId, reason: 'active_run', error: 'Thread has an active run' };
 
   let installed = false;
   try {
-    await deps.kv.set(runIdKey(threadId), runId);
+    await deps.kv.set(runIdKey(threadId), runId, { exSeconds: THREAD_KEY_TTL_SECONDS });
     installed = true;
 
-    await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
-
-    // The run's durable record opens here (§2.9): a thread accumulates many runs
-    // and Thread.state only ever describes the latest, so this is the only place
-    // "what happened, how long, what did it cost" can be answered from.
+    // The run's durable record opens here (§2.9), QUEUED: no worker has it
+    // yet. A thread accumulates many runs and Thread.state only ever describes
+    // the latest, so this is the only place "what happened, how long, what did
+    // it cost" can be answered from. It remembers when it was enqueued, so the
+    // wait is visible while it lasts and measurable once it ends.
+    const enqueuedAt = new Date();
     await deps.admin.runs.start({
-      id: runId, threadId, agent: agent.name, model,
+      id: runId, threadId, agent: agent.name, model, state: 'QUEUED', enqueuedAt,
+      costBudgetMicros: input.costBudgetMicros ?? 0, maxSteps,
       // What this run was asked to do (§2.9) — without it a dashboard can show
       // that a run was slow but not what it was slow at.
       ...(deps.config.recordPayloads
@@ -116,7 +157,7 @@ export async function run(
 
     const userMessage = await deps.storage.messages.append(threadId, {
       role: 'user',
-      content: input.prompt,
+      content: userContent(input.prompt, input.attachments),
     });
 
     // The user's turn goes on the bus like everything else (§2.2). Without it a
@@ -129,25 +170,29 @@ export async function run(
       content: userMessage.content,
       agentId: userMessage.agentId,
       createdAt: userMessage.createdAt,
+      // The sender's own name for it (see RunInput.clientMessageId).
+      ...(input.clientMessageId ? { clientMessageId: input.clientMessageId } : {}),
     });
 
-    // Admission already set durable RUNNING. Never overwrite a stop that
+    // Admission already set durable QUEUED. Never overwrite a stop that
     // arrived while history was being persisted.
     if (!await dispatchActive(deps, threadId, runId)) {
       return { accepted: false, threadId, runId, error: 'Run was stopped before dispatch' };
     }
     // A durable run boundary lets reconnecting clients distinguish this turn's
-    // in-flight chunks from earlier completed turns.
-    await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
+    // in-flight chunks from earlier completed turns. It names the run and when
+    // it was accepted; the worker that picks it up publishes RUNNING with the
+    // moment work started, so a client's clock measures work, not waiting.
+    await publish(deps, threadId, 'STATE_CHANGE', { state: 'QUEUED', runId, enqueuedAt });
 
     // What started the thread (§2.9), recorded once: the first dispatched
     // run's parameters. A later run never overwrites it. Observability must
     // never fail a run, so this is best-effort.
     await deps.admin.threads
       .upsert({
-        id: threadId, state: 'RUNNING', model,
+        id: threadId, state: 'QUEUED', model,
         startedWith: {
-          runId, agent: agent.name, model, at: new Date(),
+          runId, agent: agent.name, model, at: enqueuedAt,
           ...(deps.config.recordPayloads
             ? {
                 prompt: capText(input.prompt, deps.config.payloadCapChars),
@@ -163,9 +208,12 @@ export async function run(
     if (!await dispatchActive(deps, threadId, runId)) {
       return { accepted: false, threadId, runId, error: 'Run was stopped before dispatch' };
     }
-    await deps.queue.enqueue({
+    await enqueueJob(deps, {
       threadId, runId, model, agent: agent.name,
-      enqueuedAt: Date.now(),
+      enqueuedAt: enqueuedAt.getTime(),
+      dispatchedAt: enqueuedAt.getTime(),
+      ...(maxSteps ? { maxSteps } : {}),
+      ...(input.partitionKey ? { partitionKey: input.partitionKey } : {}),
       // Persisted on the ticket so a worker — or a resume after an approval,
       // hours later, in another process — rehydrates the same state (§2.10).
       ...(input.state ? { state: input.state } : {}),
@@ -174,11 +222,14 @@ export async function run(
       providerOptions: input.providerOptions,
     });
 
-    return { accepted: true, threadId, runId, state: 'RUNNING' };
+    return { accepted: true, threadId, runId, state: 'QUEUED' };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     await failDispatch(deps, threadId, runId, model, error, installed ? undefined : previousRunId);
-    return { accepted: false, threadId, runId, error };
+    return {
+      accepted: false, threadId, runId, error,
+      ...(err instanceof QueueFullError ? { reason: 'queue_full' as const } : {}),
+    };
   }
 }
 
@@ -186,10 +237,10 @@ export async function run(
 async function dispatchActive(deps: RuntimePorts, threadId: string, runId: string): Promise<boolean> {
   const current = await deps.kv.get(runIdKey(threadId));
   const thread = await deps.storage.threads.get(threadId);
-  if (current === runId && thread?.state === 'RUNNING') return true;
+  if (current === runId && thread?.state === 'QUEUED') return true;
   await recordStoppedRun(deps, runId, new Date());
   if (current === runId && thread?.state === 'CANCELLED') {
-    await deps.kv.set(`agent:state:${threadId}`, 'CANCELLED');
+    await deps.kv.set(`agent:state:${threadId}`, 'CANCELLED', { exSeconds: THREAD_KEY_TTL_SECONDS });
   }
   return false;
 }
@@ -201,25 +252,24 @@ async function failDispatch(
   model: string, error: string,
   previousRunId?: string | null,
 ): Promise<void> {
-  const key = `agent:state:${threadId}`;
   const current = await deps.kv.get(runIdKey(threadId));
   // If installing the identity failed, the reservation can still be ours
   // under the prior id. Never close or modify that prior run's record.
   if (current !== runId && (previousRunId === undefined || current !== previousRunId)) return;
-  if (!await deps.storage.threads.claimState(threadId, 'RUNNING', 'FAILED')) return;
-  await deps.kv.set(key, 'FAILED');
-  await setThreadState(deps, threadId, 'FAILED', model);
+  if (!(await transition(deps, threadId, { from: ['QUEUED'], to: 'FAILED', runId, model }))) return;
+  const endedAt = new Date();
   try {
     const prior = await deps.admin.runs.get(runId);
     if (prior) {
-      const endedAt = new Date();
       await deps.admin.runs.patch(runId, {
         state: 'FAILED', stopReason: 'failed', error, endedAt,
         durationMs: endedAt.getTime() - new Date(prior.startedAt).getTime(),
       });
     }
   } catch { /* Operational history must not block dispatch recovery. */ }
-  await publish(deps, threadId, 'STATE_CHANGE', { state: 'FAILED', stopReason: 'failed', runId, error });
+  await publish(deps, threadId, 'STATE_CHANGE', {
+    state: 'FAILED', stopReason: 'failed', runId, error, endedAt,
+  });
 }
 
 /** The provider options a run is dispatched with (§3.1): config → spec →
@@ -235,6 +285,17 @@ function providerOptionsFor(
     input.providerOptions,
   );
   return merged && Object.keys(merged).length > 0 ? merged : null;
+}
+
+/** A user turn: plain text alone, or text plus the images attached to it
+ *  (§5.1), in the shape the model reads natively. */
+export function userContent(text: string, attachments?: Attachment[]): unknown {
+  const images = (attachments ?? []).filter((a) => a.url);
+  if (images.length === 0) return text;
+  return [
+    ...(text ? [{ type: 'text', text }] : []),
+    ...images.map((a) => ({ type: 'image', image: a.url, ...(a.mediaType ? { mimeType: a.mediaType } : {}) })),
+  ];
 }
 
 function capText(text: string, limit: number): string {

@@ -2,6 +2,8 @@ package core
 
 import (
 	"encoding/json"
+	"sync"
+	"time"
 
 	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/provider"
@@ -76,4 +78,73 @@ func drainStream(stream *goai.TextStream, onChunk func(provider.StreamChunk)) er
 		}
 	}
 	return stream.Err()
+}
+
+// chunkWindow is how long a merged delta is held before it goes out.
+const chunkWindow = 50 * time.Millisecond
+
+// chunkBatcher merges token deltas before they go out as events (§2.2).
+// Every published event costs a seq, a stored row and a bus send; one per
+// token is thousands a reply. Consecutive text (or reasoning) deltas are
+// joined into one delta of the same shape, so a client reads them exactly as
+// before. A held delta goes out after chunkWindow, or at once when any other
+// kind of chunk comes, or on flush: the loop flushes before a step is
+// committed, so its text is never published after the step that produced
+// it. Sends are made one at a time, in order.
+type chunkBatcher struct {
+	send  func(map[string]any)
+	mu    sync.Mutex
+	held  map[string]any
+	timer *time.Timer
+}
+
+func newChunkBatcher(send func(map[string]any)) *chunkBatcher {
+	return &chunkBatcher{send: send}
+}
+
+func isDelta(p map[string]any) bool {
+	t, _ := p["type"].(string)
+	_, text := p["textDelta"].(string)
+	return text && (t == "text-delta" || t == "reasoning")
+}
+
+// push takes one chunk payload. A delta is held; anything else is sent,
+// after what is held, before push returns.
+func (b *chunkBatcher) push(p map[string]any) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if isDelta(p) && b.held != nil && b.held["type"] == p["type"] {
+		b.held["textDelta"] = b.held["textDelta"].(string) + p["textDelta"].(string)
+		return
+	}
+	b.flushLocked()
+	if isDelta(p) {
+		held := make(map[string]any, len(p))
+		for k, v := range p {
+			held[k] = v
+		}
+		b.held = held
+		b.timer = time.AfterFunc(chunkWindow, b.flush)
+		return
+	}
+	b.send(p)
+}
+
+// flush sends what is held.
+func (b *chunkBatcher) flush() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.flushLocked()
+}
+
+func (b *chunkBatcher) flushLocked() {
+	if b.timer != nil {
+		b.timer.Stop()
+		b.timer = nil
+	}
+	if b.held != nil {
+		held := b.held
+		b.held = nil
+		b.send(held)
+	}
 }

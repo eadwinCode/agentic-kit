@@ -3,9 +3,11 @@ package inline
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/core"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
 
@@ -30,6 +32,8 @@ type Queue struct {
 	mu      sync.Mutex
 	handler Handler
 	pending map[*time.Timer]pendingJob
+	// unbound are jobs that came due before Bind: held, not dropped.
+	unbound []ports.RunJob
 	wg      sync.WaitGroup
 	ctx     context.Context
 }
@@ -51,12 +55,18 @@ func New(ctx context.Context) *Queue {
 }
 
 // Bind wires the worker. The queue and the worker each need the other, so
-// the queue is attached once the runtime exists. Nothing dispatches until
-// this runs.
+// the queue is attached once the runtime exists. A job that came due before
+// this runs is delivered now rather than lost.
 func (q *Queue) Bind(handler Handler) {
 	q.mu.Lock()
 	q.handler = handler
+	held := q.unbound
+	q.unbound = nil
 	q.mu.Unlock()
+	for _, job := range held {
+		q.wg.Add(1)
+		go q.run(handler, job)
+	}
 }
 
 func (q *Queue) Enqueue(_ context.Context, job ports.RunJob, opts *ports.EnqueueOptions) error {
@@ -77,20 +87,37 @@ func (q *Queue) Enqueue(_ context.Context, job ports.RunJob, opts *ports.Enqueue
 	q.wg.Add(1)
 	var timer *time.Timer
 	timer = time.AfterFunc(delay, func() {
-		defer q.wg.Done()
 		q.mu.Lock()
 		delete(q.pending, timer)
 		handler := q.handler
-		q.mu.Unlock()
-		if handler == nil || q.ctx.Err() != nil {
+		if handler == nil {
+			q.unbound = append(q.unbound, job)
+			q.mu.Unlock()
+			q.wg.Done()
 			return
 		}
-		// Detached on purpose: a queue consumer's failure is the worker's
-		// business (§2.8 redrive), never the enqueuer's.
-		_ = handler(q.ctx, job)
+		q.mu.Unlock()
+		q.run(handler, job)
 	})
 	q.pending[timer] = pendingJob{job: job, key: key, runAt: time.Now().Add(delay)}
 	return nil
+}
+
+// run hands one job to the worker, and marks it done.
+func (q *Queue) run(handler Handler, job ports.RunJob) {
+	defer q.wg.Done()
+	if q.ctx.Err() != nil {
+		// The queue was stopped: a job dropped without a trace looks like a
+		// queue that does nothing.
+		slog.Warn("inline job dropped: the queue was stopped", "thread", job.ThreadID, "run", job.RunID, "kind", string(job.Kind))
+		return
+	}
+	// Detached on purpose: a queue consumer's failure is the worker's
+	// business (§2.8 redrive), never the enqueuer's. A panic is caught so it
+	// ends this job, not the process.
+	if err := core.CallSafely(func() error { return handler(q.ctx, job) }); err != nil {
+		slog.Error("inline job failed", "thread", job.ThreadID, "run", job.RunID, "kind", string(job.Kind), "err", err)
+	}
 }
 
 // Cancel stops every timer waiting under key.
@@ -129,7 +156,7 @@ func (q *Queue) Find(_ context.Context, runID string) (*ports.QueuedJob, error) 
 func (q *Queue) Stats(_ context.Context) (ports.QueueStats, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	var s ports.QueueStats
+	s := ports.QueueStats{Ready: len(q.unbound)}
 	now := time.Now()
 	for _, p := range q.pending {
 		if p.runAt.After(now) {
@@ -142,14 +169,20 @@ func (q *Queue) Stats(_ context.Context) (ports.QueueStats, error) {
 }
 
 // Clear drops everything still scheduled: for tests and clean shutdown.
+// What it drops is logged.
 func (q *Queue) Clear() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	dropped := len(q.pending) + len(q.unbound)
 	for t := range q.pending {
 		if t.Stop() {
 			q.wg.Done()
 		}
 		delete(q.pending, t)
+	}
+	q.unbound = nil
+	if dropped > 0 {
+		slog.Warn("inline queue cleared with jobs still waiting", "jobs", dropped)
 	}
 }
 

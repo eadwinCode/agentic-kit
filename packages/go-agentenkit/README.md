@@ -33,7 +33,7 @@ drivers it imports.
 
 ## Running locally, with nothing to stand up
 
-Assembling the platform is four adapters and one wire, and seeing them is the point:
+Assembling the platform is five adapters and one wire, and seeing them is the point:
 swapping any of them for the durable equivalent later is then obvious rather than magic.
 
 ```go
@@ -65,7 +65,8 @@ func main() {
 	}
 	storage, _ := sqlite.New(db)
 	admin, _ := sqliteadmin.New(db)
-	kv, _ := sqlite.NewKv(db) // the seq counters live here: keep them as durable as the log
+	kv, _ := sqlite.NewKv(db)
+	streams, _ := sqlite.NewRunStreams(ctx, db, 0) // one short-lived stream per run segment
 	queue := inline.New(ctx)
 
 	rt, err := agentenkit.SetupAgentCore(ctx, agentenkit.RuntimeOptions{
@@ -73,6 +74,7 @@ func main() {
 		Admin:   admin,             // later: admin/postgres
 		Bus:     memory.NewBus(),   // later: adapters/redis
 		Kv:      kv,                // later: adapters/redis
+		Streams: streams,           // later: adapters/redis, adapters/postgres
 		Queue:   queue,             // later: adapters/qstash
 		ResolveModel: func(name string) (agentenkit.ResolvedModel, error) {
 			return agentenkit.ResolvedModel{
@@ -118,6 +120,7 @@ rt, err := agentenkit.SetupAgentCore(ctx, agentenkit.RuntimeOptions{
 	Storage: storage,                       // or Mongo / Dynamo / your DB
 	Bus:     redis.NewBus(rdb, 0),          // Ably / Kafka / Postgres LISTEN…
 	Kv:      redis.NewKv(rdb),
+	Streams: redis.NewRunStreams(rdb, redis.StreamsOptions{}),
 	Queue: qstash.New(qstash.Client{Token: os.Getenv("QSTASH_TOKEN")},
 		qstash.Options{URL: "https://app.example.com/api/queue/agent-run"}),
 	// Admin omitted on purpose: with AGENTIC_KIT_ADMIN_DATABASE_URL set, the
@@ -126,7 +129,30 @@ rt, err := agentenkit.SetupAgentCore(ctx, agentenkit.RuntimeOptions{
 })
 ```
 
-Or one Postgres for all four, no Redis and no queue service:
+The QStash consumer URL is public, so check that each delivery came from
+QStash before it reaches the worker. Otherwise anyone who finds the URL can run
+any agent under any tenant:
+
+```go
+keys := qstash.SigningKeys{
+	Current: os.Getenv("QSTASH_CURRENT_SIGNING_KEY"),
+	Next:    os.Getenv("QSTASH_NEXT_SIGNING_KEY"),
+}
+consumer := "https://app.example.com/api/queue/agent-run" // same as Options.URL
+http.Handle("/api/queue/agent-run", qstash.Middleware(keys, consumer, http.HandlerFunc(
+	func(w http.ResponseWriter, r *http.Request) {
+		var job agentenkit.RunJob
+		if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if _, err := rt.Worker.HandleJob(r.Context(), job); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	})))
+```
+
+Or one Postgres for all five, no Redis and no queue service:
 
 ```go
 pg, _ := sql.Open("pgx", url)
@@ -134,13 +160,23 @@ storage, _ := postgres.New(ctx, pg)
 kv, _ := postgres.NewKv(ctx, pg)
 queue, _ := postgres.NewQueue(ctx, pg, postgres.QueueOptions{})
 bus := postgres.NewBus(pg, pgxlisten.New(url), storage.Events(), kv, postgres.BusOptions{})
-rt, err := agentenkit.SetupAgentCore(ctx, agentenkit.RuntimeOptions{Storage: storage, Kv: kv, Bus: bus, Queue: queue, ResolveModel: resolve})
+streams, _ := postgres.NewRunStreams(ctx, pg, postgres.StreamsOptions{Listener: pgxlisten.New(url)})
+rt, err := agentenkit.SetupAgentCore(ctx, agentenkit.RuntimeOptions{
+	Storage: storage, Kv: kv, Bus: bus, Queue: queue, Streams: streams, ResolveModel: resolve,
+})
 queue.Bind(rt.Worker.Handler())
 ```
 
 The bus rides LISTEN/NOTIFY and routes an event past the 8000-byte cap by
 reference; the queue claims with `SKIP LOCKED` and renews its lease while a job
-runs. Both are in `adapters/postgres`; the listener is `adapters/postgres/pgxlisten`.
+runs; the run streams send `NOTIFY` when they write, so readers wake without
+polling. All are in `adapters/postgres`; the listener is
+`adapters/postgres/pgxlisten`.
+
+Leave `Streams` out and the runtime keeps run streams in memory and logs a
+warning once. Only that process can read them, so when web servers and workers
+run apart, pass a real one. Keep `StreamGrace` short on Redis (it is memory);
+it can be longer on Postgres or SQLite.
 
 ## Operations
 
@@ -152,30 +188,51 @@ chat.Stop(ctx, threadID, nil)                                              // on
 rt.HITL.Respond(ctx, agentenkit.RespondInput{ThreadID: threadID, ToolCallID: id, Approved: true})
 rt.GetThreadSnapshot(ctx, threadID, nil)                                   // hydrate a client
 stream, _ := rt.Events.SSE(r.Context(), threadID, agentenkit.SSEStateOptions{}) // then stream.ServeHTTP(w, r)
-events, _ := rt.Events.Follow(ctx, threadID, agentenkit.FollowStateOptions{})   // or range events.Events()
-rt.Events.Since(ctx, threadID, lastSeq, nil)                               // raw replay
+frames, _ := rt.Events.Follow(ctx, threadID, agentenkit.FollowStateOptions{})   // or range frames.Frames()
+rt.Streams.Read(ctx, streamID, "")                                         // one run stream, as an iter.Seq2
+rt.Events.Since(ctx, threadID, lastSeq, nil)                               // the thread record, raw
 rt.Worker.HandleJob(ctx, job)                                              // queue consumer
-rt.Events.PublishEvent(ctx, threadID, "MY_EVENT", payload, agentenkit.PublishStateOptions{}) // your own event
+rt.Events.PublishEvent(ctx, threadID, "MY_EVENT", payload, agentenkit.PublishStateOptions{}) // your own event, live only
+rt.PruneEvents(ctx, agentenkit.PruneOptions{DryRun: true})                 // after upgrading: clear old stream-only rows
 ```
+
+A follow yields `FollowFrame`s: `Kind` is `"thread"` (a record entry or a
+notice, in `Event`), `"stream"` (a run stream item, in `StreamID` and `Item`) or
+`"snapshot"` (sent once when the stream the client was reading is gone, in
+`Snapshot`). The cursor is one string, `<seq> <streamId> <offset>`; every SSE
+frame that moves it carries it as its `id:`, so EventSource sends it back as
+`Last-Event-ID`. `rt.Events.FollowRecord` is the old record-only follow.
 
 An SSE route is a few lines:
 
 ```go
-http.HandleFunc("/api/agent/events", func(w http.ResponseWriter, r *http.Request) {
+http.HandleFunc("/api/agent/stream", func(w http.ResponseWriter, r *http.Request) {
+	cursor := r.Header.Get("Last-Event-ID")
+	if cursor == "" {
+		cursor = r.URL.Query().Get("cursor")
+	}
+	if cursor == "" {
+		cursor = r.URL.Query().Get("since") // a bare record seq, from an older client
+	}
 	stream, err := rt.Events.SSE(r.Context(), r.URL.Query().Get("threadId"), agentenkit.SSEStateOptions{
-		SSEOptions: agentenkit.SSEOptions{FollowOptions: agentenkit.FollowOptions{Since: lastEventID(r)}},
+		FollowStateOptions: agentenkit.FollowStateOptions{
+			Cursor:        cursor,
+			LastMessageID: r.URL.Query().Get("lastMessageId"),
+		},
+		RetryMs: 2000,
 	})
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	stream.ServeHTTP(w, r) // returns when the client hangs up, and unsubscribes
+	stream.ServeHTTP(w, r) // returns when the client hangs up, and stops the follow
 })
 ```
 
-The `CHUNK` and `SUBAGENT_CHUNK` payloads use the same part shapes the TypeScript package
-publishes, so the [`use-agentenkit`](../use-agentenkit) React hook works against either
-runtime.
+The stream events, the frames and the cursor are the same JSON the TypeScript package
+sends, so the [`use-agentenkit`](../use-agentenkit) React hook works against either
+runtime. Opt-in: `SSEStateOptions{WireFormat: "ag-ui"}` sends AG-UI events instead; the
+default is the native frames.
 
 ## Tools and approvals
 
@@ -185,7 +242,8 @@ Tools are goai tools. Wrap them, or build them with the run state in hand:
 lookup := agentenkit.AgentTool("lookupInvoice", "Find one invoice",
 	func(ctx context.Context, in struct{ InvoiceID string `json:"invoiceId"` }, tc agentenkit.ToolContext) (string, error) {
 		// tc.State is the run state; tc.PublishEvent publishes on this thread.
-		_, _ = tc.PublishEvent(ctx, "LOOKUP", map[string]any{"id": in.InvoiceID}, agentenkit.PublishOptions{Notice: true})
+		// Live only by default; PublishOptions{Durable: true} keeps it in the thread record.
+		_, _ = tc.PublishEvent(ctx, "LOOKUP", map[string]any{"id": in.InvoiceID}, agentenkit.PublishOptions{})
 		return db.FindInvoice(ctx, in.InvoiceID, tc.State["orgId"].(string))
 	})
 
@@ -216,9 +274,9 @@ rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
 	},
 	// Runs after the last step and BEFORE the terminal state is written: commit
 	// what the run produced, bill it. An error fails the run; a stop arrives
-	// with Cancelled set on a cancelled ctx. Idempotent on RunID, please.
+	// with Cancelled set. Idempotent on RunID, please.
 	OnSettle: func(ctx context.Context, info agentenkit.RunFinishInfo) error {
-		return repo.Commit(context.WithoutCancel(ctx), info.RunID)
+		return repo.Commit(ctx, info.RunID)
 	},
 	OnFinish: func(info agentenkit.RunFinishInfo) { log.Println("done", info.RunID, info.State) },
 	Subagents: &agentenkit.SubagentsConfig{Profiles: map[string]agentenkit.SubagentProfile{
@@ -257,10 +315,11 @@ tc := agentenkit.ToolContextFrom(ctx) // state, tool call id, and PublishEvent
 
 | Port | Role | Reference adapters |
 | :--- | :--- | :--- |
-| `Storage` | threads / messages / events / usage, incl. atomic `ClaimState` | `adapters/postgres`, `adapters/sqlite`, `adapters/memory` |
+| `Storage` | threads / messages / the thread record / usage, incl. atomic `ClaimState` | `adapters/postgres`, `adapters/sqlite`, `adapters/memory` |
 | `EventBus` | live fan-out + HITL death notices (at-most-once) | `adapters/redis`, `adapters/upstash`, `adapters/memory` |
 | `Queue` | durable run dispatch (at-least-once) | `adapters/qstash`, `adapters/inline` (dev), `adapters/memory` |
-| `Kv` | hot state cache, HITL handoff keys, seq/attempt counters, run locks | `adapters/redis`, `adapters/upstash`, `adapters/sqlite`, `adapters/memory` |
+| `Kv` | hot state cache, HITL handoff keys, segment/attempt counters, run locks | `adapters/redis`, `adapters/upstash`, `adapters/sqlite`, `adapters/memory` |
+| `RunStreams` | one short-lived stream per run segment | `adapters/redis`, `adapters/upstash`, `adapters/postgres`, `adapters/sqlite`, `adapters/memory` (each `NewRunStreams`) |
 
 Implement any of them for your own stack; `core/` imports nothing else. The
 [memory adapters](./adapters/memory/memory.go) are a complete implementation used by the
@@ -310,7 +369,7 @@ own tables. You do not implement `AdminStore`; you read it back:
 rt.Admin.Overview(ctx, nil)                     // threads and runs by state, plus what's in flight
 rt.Admin.ListRuns(ctx, agentenkit.RunFilter{State: []agentenkit.ExecutionState{agentenkit.StateFailed}})
 rt.Admin.Stats(ctx, agentenkit.StatsRange{})   // p50/p95 duration and queue wait, tokens, failures
-rt.Admin.GetRun(ctx, runID)                     // one run: steps, nested runs, timeline, spend
+rt.Admin.GetRun(ctx, runID)                     // one run: steps, nested runs, its record entries, spend
 ```
 
 Its schema migrates itself, from numbered `.sql` files embedded in the binary

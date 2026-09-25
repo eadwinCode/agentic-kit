@@ -93,8 +93,10 @@ func TestSqliteStorage_DeleteFromAndClaimStateAndCascade(t *testing.T) {
 	mustEqual(t, got.State, ports.StateRunning, "state")
 	mustEqual(t, got.Model, "m", "model")
 
-	_ = s.Events().Append(ctx, th.ID, ports.AgentEvent{ThreadID: th.ID, Seq: 1, Type: "X", Payload: []byte(`{"a":1}`), CreatedAt: time.Now()}, sc)
-	_ = s.Events().Append(ctx, th.ID, ports.AgentEvent{ThreadID: th.ID, Seq: 2, Type: "Y", CreatedAt: time.Now()}, sc)
+	first, _ := s.Events().Append(ctx, th.ID, ports.NewThreadEvent{Type: "X", Payload: []byte(`{"a":1}`)}, sc)
+	second, _ := s.Events().Append(ctx, th.ID, ports.NewThreadEvent{Type: "Y"}, sc)
+	mustEqual(t, first.Seq, int64(1), "the store minted seq 1")
+	mustEqual(t, second.Seq, int64(2), "and then seq 2")
 	_ = s.Usage().Record(ctx, th.ID, ports.NewUsage{InputTokens: 1, OutputTokens: 2}, sc)
 	latest, _ := s.Events().Latest(ctx, th.ID, "X", sc)
 	mustEqual(t, string(latest.Payload), `{"a":1}`, "payload")

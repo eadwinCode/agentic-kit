@@ -76,6 +76,12 @@ a later mismatch is refused — a database that no longer matches the code is
 precisely what an operational store should tell you about. To change the schema,
 add the next number.
 
+**One admin database serves both runtimes.** A Go service and a TypeScript
+service can point at the same `AGENTIC_KIT_ADMIN_DATABASE_URL`: the migrations
+are the same SQL under the same versions. The two `0001` files were written
+apart and differ only in their header comment, so each runtime accepts the
+other's checksum for that one step.
+
 ## The reads
 
 ```ts
@@ -102,7 +108,20 @@ await runtime.admin.listSteps(runId);
 ```
 
 Percentiles are computed in the library, not in SQL, so every backing store
-reports them the same way.
+reports them the same way. Counts and token sums are grouped in the store and
+exact however many runs the window holds; the percentiles are over the newest
+runs (1,000 by default, `limit` to change it), and `sampled` says when the
+window held more. A thread listing reads the runs of exactly the threads it
+lists.
+
+Run counters are added in the store (`steps = steps + n`), so a nested run and
+its parent that close together both count. Durations and token counters are
+64-bit, so a run parked on an approval for weeks still has a correct
+`durationMs`.
+
+**Deleting a thread deletes its operational history.** `deleteThread` removes
+the thread's admin row, its runs and its steps with it, so a deleted thread
+does not live on in a dashboard.
 
 ## What started a thread
 
@@ -194,10 +213,11 @@ They answer different questions:
 
 | Question | Look at |
 | :--- | :--- |
-| What is this conversation showing right now? | the event log |
+| What is this conversation showing right now? | the thread record and its run stream |
 | How long did runs take last week? | the admin store |
 | What did step 3 of that failed run produce? | the admin store |
-| What should this client render next? | the event log |
+| What should this client render next? | the run stream |
 
-The event log is per-thread, replayable and client-facing. The admin store is
+The thread record and run streams are per-thread and client-facing; a run
+stream lives only a short while after its run. The admin store is
 cross-thread, aggregated and operator-facing.

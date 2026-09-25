@@ -85,13 +85,59 @@ func (k *Kv) IncrWithExpiry(ctx context.Context, key string, ttl time.Duration) 
 
 // Bus is an EventBus over Redis Pub/Sub.
 //
-// While subscribed, it emits a bus-only HEARTBEAT notice (seq 0, never
-// persisted) every heartbeat interval: the §2.5 watchdog pattern. Pub/sub is
-// at-most-once, so a distributor treats heartbeats as a trigger to re-check
-// for orphaned HITL waits.
+// One subscriber connection per process, shared by every subscription: a
+// channel is subscribed when its first handler arrives and unsubscribed
+// when its last one leaves. A connection per viewer would run a busy
+// deployment into Redis's maxclients. Each subscription has its own queue
+// and goroutine, so one slow handler holds up nobody else, and go-redis's
+// own buffer never fills and drops.
+//
+// While subscribed, a bus-only HEARTBEAT notice (seq 0, never persisted)
+// reaches every subscription each heartbeat interval, from one ticker per
+// process: the §2.5 watchdog pattern. Pub/sub is at-most-once, so a
+// distributor treats heartbeats as a trigger to re-check for orphaned HITL
+// waits, and a follower fills any gap from the log.
 type Bus struct {
 	client    goredis.UniversalClient
 	heartbeat time.Duration
+
+	mu     sync.Mutex
+	pubsub *goredis.PubSub
+	subs   map[string]map[int]*busSub
+	nextID int
+}
+
+// busSubQueue is how many events a subscription holds for a slow handler;
+// past it, events are dropped (at-most-once) and the follower refills from
+// the log.
+const busSubQueue = 1024
+
+type busSub struct {
+	threadID string
+	handler  func(ports.AgentEvent)
+	queue    chan ports.AgentEvent
+	done     chan struct{}
+}
+
+func (s *busSub) offer(e ports.AgentEvent) {
+	select {
+	case s.queue <- e:
+	default: // full: dropped; the log has every durable event
+	}
+}
+
+func (s *busSub) run() {
+	for {
+		select {
+		case <-s.done:
+			return
+		case e := <-s.queue:
+			func() {
+				defer func() { _ = recover() }() // a panicking handler must not kill the bus
+				s.handler(e)
+			}()
+		}
+	}
 }
 
 // NewBus wraps a client. A zero heartbeat means one minute.
@@ -99,7 +145,7 @@ func NewBus(client goredis.UniversalClient, heartbeat time.Duration) *Bus {
 	if heartbeat <= 0 {
 		heartbeat = time.Minute
 	}
-	return &Bus{client: client, heartbeat: heartbeat}
+	return &Bus{client: client, heartbeat: heartbeat, subs: map[string]map[int]*busSub{}}
 }
 
 func (b *Bus) Publish(ctx context.Context, threadID string, event ports.AgentEvent) error {
@@ -110,54 +156,85 @@ func (b *Bus) Publish(ctx context.Context, threadID string, event ports.AgentEve
 	return b.client.Publish(ctx, ThreadChannel(threadID), body).Err()
 }
 
-func (b *Bus) Subscribe(ctx context.Context, threadID string, handler func(ports.AgentEvent)) (func() error, error) {
-	sub := b.client.Subscribe(ctx, ThreadChannel(threadID))
-	if _, err := sub.Receive(ctx); err != nil {
-		_ = sub.Close()
-		return nil, err
+// start opens the shared subscriber connection and its two goroutines, on
+// the first subscription. Called with b.mu held.
+func (b *Bus) start() {
+	if b.pubsub != nil {
+		return
 	}
-	done := make(chan struct{})
-	var once sync.Once
-	var wg sync.WaitGroup
-	wg.Add(2)
+	b.pubsub = b.client.Subscribe(context.Background())
+	messages := b.pubsub.Channel()
 	go func() {
-		defer wg.Done()
-		ch := sub.Channel()
-		for {
-			select {
-			case <-done:
-				return
-			case msg, ok := <-ch:
-				if !ok {
-					return
-				}
-				var e ports.AgentEvent
-				if err := json.Unmarshal([]byte(msg.Payload), &e); err != nil {
-					continue // malformed frame: never kill the subscription
-				}
-				handler(e)
+		for msg := range messages {
+			var e ports.AgentEvent
+			if err := json.Unmarshal([]byte(msg.Payload), &e); err != nil {
+				continue // malformed frame: never kill the subscription
+			}
+			for _, s := range b.watching(msg.Channel) {
+				s.offer(e)
 			}
 		}
 	}()
 	go func() {
-		defer wg.Done()
 		ticker := time.NewTicker(b.heartbeat)
 		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				handler(ports.AgentEvent{ThreadID: threadID, Seq: 0, Type: "HEARTBEAT", Payload: json.RawMessage("null"), CreatedAt: time.Now()})
+		for range ticker.C {
+			for _, s := range b.watching("") {
+				s.offer(ports.AgentEvent{ThreadID: s.threadID, Seq: 0, Type: "HEARTBEAT", Payload: json.RawMessage("null"), CreatedAt: time.Now()})
 			}
 		}
 	}()
+}
+
+// watching is a snapshot of the subscriptions on a channel, or on every
+// channel when channel is empty.
+func (b *Bus) watching(channel string) []*busSub {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []*busSub
+	for ch, subs := range b.subs {
+		if channel != "" && ch != channel {
+			continue
+		}
+		for _, s := range subs {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (b *Bus) Subscribe(ctx context.Context, threadID string, handler func(ports.AgentEvent)) (func() error, error) {
+	channel := ThreadChannel(threadID)
+	b.mu.Lock()
+	b.start()
+	if len(b.subs[channel]) == 0 {
+		if err := b.pubsub.Subscribe(ctx, channel); err != nil {
+			b.mu.Unlock()
+			return nil, err
+		}
+	}
+	b.nextID++
+	id := b.nextID
+	if b.subs[channel] == nil {
+		b.subs[channel] = map[int]*busSub{}
+	}
+	sub := &busSub{threadID: threadID, handler: handler, queue: make(chan ports.AgentEvent, busSubQueue), done: make(chan struct{})}
+	b.subs[channel][id] = sub
+	b.mu.Unlock()
+	go sub.run()
+
+	var once sync.Once
 	return func() error {
 		var err error
 		once.Do(func() {
-			close(done)
-			err = sub.Close()
-			wg.Wait()
+			close(sub.done)
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			delete(b.subs[channel], id)
+			if len(b.subs[channel]) == 0 {
+				delete(b.subs, channel)
+				err = b.pubsub.Unsubscribe(context.Background(), channel)
+			}
 		})
 		return err
 	}, nil

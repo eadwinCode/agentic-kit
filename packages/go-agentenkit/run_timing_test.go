@@ -3,6 +3,7 @@ package agentenkit_test
 import (
 	"context"
 	"encoding/json"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 	"testing"
 	"time"
 
@@ -146,21 +147,24 @@ func TestLoop_PublishesAToolResultChunkPerLocalTool(t *testing.T) {
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
 	h.handleNext(t)
 
-	results := map[string]map[string]any{}
-	var lastResultSeq int64
-	for _, e := range h.events(ran.ThreadID, "CHUNK") {
-		p := payload(e)
-		if p["type"] == "tool-result" {
-			results[p["toolCallId"].(string)] = p
-			lastResultSeq = e.Seq
+	results := map[string]*ports.ToolCallResultEvent{}
+	lastResult, committed := -1, -1
+	for i, item := range runItems(t, h, ran.RunID) {
+		switch e := item.Event.(type) {
+		case *ports.ToolCallResultEvent:
+			results[e.ToolCallID] = e
+			lastResult = i
+		case *ports.StepFinishedEvent:
+			if committed < 0 {
+				committed = i
+			}
 		}
 	}
 	mustEqual(t, len(results), 2, "one result per executed tool; the parked call has none yet")
-	mustEqual(t, results["c1"]["toolName"], "lookup", "tool name")
-	mustEqual(t, results["c1"]["result"].(map[string]any)["found"], true, "the tool's own output")
-	mustEqual(t, results["c2"]["result"].(map[string]any)["error"], "boom", "a failed tool names its error")
-	committed := h.events(ran.ThreadID, "STEP_COMMITTED")
-	if len(committed) == 0 || committed[0].Seq < lastResultSeq {
+	mustEqual(t, results["c1"].ToolName, "lookup", "tool name")
+	mustEqual(t, string(results["c1"].Result), `{"found":true}`, "the tool's own output")
+	mustEqual(t, string(results["c2"].Result), `{"error":"boom"}`, "a failed tool names its error")
+	if committed < 0 || committed < lastResult {
 		t.Fatal("tool results must be published before the step commits")
 	}
 }
@@ -181,19 +185,20 @@ func TestLoop_ANestedRunsToolResultsRideItsOwnStream(t *testing.T) {
 	})
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
 	h.handleNext(t)
-	var nested []map[string]any
-	for _, e := range h.events(ran.ThreadID, "SUBAGENT_CHUNK") {
-		if chunk, _ := payload(e)["chunk"].(map[string]any); chunk["type"] == "tool-result" {
-			nested = append(nested, chunk)
+	var nested []*ports.ToolCallResultEvent
+	for _, item := range runItems(t, h, ran.RunID) {
+		switch e := item.Event.(type) {
+		case *ports.SubagentEventEvent:
+			if r, ok := e.Event.(*ports.ToolCallResultEvent); ok {
+				nested = append(nested, r)
+			}
+		case *ports.ToolCallResultEvent:
+			if e.ToolCallID == "c2" {
+				t.Fatal("a nested tool result leaked onto the main agent's events")
+			}
 		}
 	}
-	mustEqual(t, len(nested), 1, "the child's result on the child's stream")
-	mustEqual(t, nested[0]["toolCallId"], "c2", "call")
-	mustEqual(t, nested[0]["result"], "the answer", "output")
-
-	for _, e := range h.events(ran.ThreadID, "CHUNK") {
-		if p := payload(e); p["type"] == "tool-result" && p["toolCallId"] == "c2" {
-			t.Fatal("a nested tool result leaked onto the main stream")
-		}
-	}
+	mustEqual(t, len(nested), 1, "the child's result, wrapped as the child's")
+	mustEqual(t, nested[0].ToolCallID, "c2", "call")
+	mustEqual(t, string(nested[0].Result), `"the answer"`, "output")
 }

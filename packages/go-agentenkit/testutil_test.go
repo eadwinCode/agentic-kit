@@ -29,6 +29,18 @@ type step struct {
 	usage     *[2]int // prompt, completion; default 10, 5
 	delay     time.Duration
 	err       error
+	// noFinish ends the stream after the text with no finish chunk and no
+	// error: a provider that cut the stream short without saying so.
+	noFinish bool
+	// deltas streams the text as these separate chunks instead of one.
+	deltas []string
+	// reasonOnStepFinish ends the stream the way goai's OpenAI provider
+	// does: the finish reason on a step_finish chunk, then a finish chunk
+	// that carries the usage and no reason.
+	reasonOnStepFinish bool
+	// finishNoReason ends the stream with a finish chunk that has no reason
+	// and nothing before it saying why: a stream cut short.
+	finishNoReason bool
 }
 
 // scriptedModel plays back one scripted step per round-trip. The platform
@@ -124,11 +136,25 @@ func (m *scriptedModel) DoStream(ctx context.Context, p provider.GenerateParams)
 		if s.reasoning != "" {
 			ch <- provider.StreamChunk{Type: provider.ChunkReasoning, Text: s.reasoning}
 		}
-		if s.text != "" {
+		if len(s.deltas) > 0 {
+			for _, d := range s.deltas {
+				ch <- provider.StreamChunk{Type: provider.ChunkText, Text: d}
+			}
+		} else if s.text != "" {
 			ch <- provider.StreamChunk{Type: provider.ChunkText, Text: s.text}
 		}
 		for _, c := range s.calls {
 			ch <- provider.StreamChunk{Type: provider.ChunkToolCall, ToolCallID: c.id, ToolName: c.name, ToolInput: c.args}
+		}
+		if s.noFinish {
+			return
+		}
+		if s.reasonOnStepFinish {
+			ch <- provider.StreamChunk{Type: provider.ChunkStepFinish, FinishReason: finishOf(s)}
+		}
+		if s.reasonOnStepFinish || s.finishNoReason {
+			ch <- provider.StreamChunk{Type: provider.ChunkFinish, Usage: usageOf(s)}
+			return
 		}
 		ch <- provider.StreamChunk{Type: provider.ChunkFinish, FinishReason: finishOf(s), Usage: usageOf(s)}
 	}()

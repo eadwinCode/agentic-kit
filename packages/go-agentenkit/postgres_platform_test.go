@@ -36,7 +36,7 @@ func openPgPlatform(t *testing.T, prefix string, queueOpts pgstorage.QueueOption
 	t.Helper()
 	db := openPostgres(t)
 	ctx := context.Background()
-	for _, tbl := range []string{"jobs_control", "jobs", "kv", "usage", "events", "messages", "threads"} {
+	for _, tbl := range []string{"jobs_control", "jobs", "kv", "usage", "events", "messages", "threads", "migrations"} {
 		_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS "+prefix+tbl)
 	}
 	storage, err := pgstorage.New(ctx, db, pgstorage.WithPrefix(prefix))
@@ -141,7 +141,10 @@ func TestPostgresBus_DeliversLiveAndResolvesOversizedFrames(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = unsubscribe() })
 	// The LISTEN connection comes up asynchronously: publish until it hears us.
-	small := ports.AgentEvent{ThreadID: th.ID, Seq: 1, Type: "SMALL", Payload: json.RawMessage(`{"a":1}`), CreatedAt: time.Now()}
+	small, err := p.storage.Events().Append(ctx, th.ID, ports.NewThreadEvent{Type: "SMALL", Payload: json.RawMessage(`{"a":1}`)}, sc)
+	if err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	var first ports.AgentEvent
 	for {
@@ -172,9 +175,9 @@ func TestPostgresBus_DeliversLiveAndResolvesOversizedFrames(t *testing.T) {
 
 	// A durable event past the NOTIFY cap travels as a reference and is read
 	// back from the log
-	big := ports.AgentEvent{ThreadID: th.ID, Seq: 2, Type: "BIG", CreatedAt: time.Now(),
-		Payload: json.RawMessage(`{"blob":"` + strings.Repeat("x", 20_000) + `"}`)}
-	if err := p.storage.Events().Append(ctx, th.ID, big, sc); err != nil {
+	big, err := p.storage.Events().Append(ctx, th.ID, ports.NewThreadEvent{Type: "BIG",
+		Payload: json.RawMessage(`{"blob":"` + strings.Repeat("x", 20_000) + `"}`)}, sc)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := p.bus.Publish(ctx, th.ID, big); err != nil {
@@ -354,15 +357,12 @@ func TestPostgresBus_OversizedEventsOnScopedStorageAndReplayAfterReconnect(t *te
 		t.Cleanup(func() { _ = unsubscribe() })
 		tenants = append(tenants, tn)
 	}
-	// One seq counter per thread, kept like core keeps it, so the bus can
-	// anchor a replay on it.
-	next := map[string]int64{}
+	// The store mints each thread's seq, so the bus can anchor a replay on
+	// it.
 	publish := func(tn *tenant, typ string, payload string) ports.AgentEvent {
 		t.Helper()
-		next[tn.thread]++
-		_, _ = p.kv.Incr(ctx, agentenkit.SeqKey(tn.thread))
-		e := ports.AgentEvent{ThreadID: tn.thread, Seq: next[tn.thread], Type: typ, Payload: json.RawMessage(payload), CreatedAt: time.Now()}
-		if err := p.storage.Events().Append(ctx, tn.thread, e, tn.sc); err != nil {
+		e, err := p.storage.Events().Append(ctx, tn.thread, ports.NewThreadEvent{Type: typ, Payload: json.RawMessage(payload)}, tn.sc)
+		if err != nil {
 			t.Fatal(err)
 		}
 		if err := bus.Publish(ctx, tn.thread, e); err != nil {
@@ -421,7 +421,11 @@ func TestPostgresBus_OversizedEventsOnScopedStorageAndReplayAfterReconnect(t *te
 	// listener, the big one still lands, in order, from the kv reference.
 	big := `{"blob":"` + strings.Repeat("x", 20_000) + `"}`
 	for _, tn := range tenants {
-		base := next[tn.thread]
+		last, _ := p.storage.Events().ListSince(ctx, tn.thread, -1, tn.sc)
+		var base int64
+		if len(last) > 0 {
+			base = last[len(last)-1].Seq
+		}
 		publish(tn, "SMALL", `{"n":1}`)
 		publish(tn, "BIG", big)
 		publish(tn, "SMALL", `{"n":3}`)

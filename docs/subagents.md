@@ -42,11 +42,24 @@ and is resumed where it stopped rather than restarted.
 
 ## Named profiles
 
-> Go runtime.
-
 The default child is a generalist with one persona and the shared tools.
 When delegation should go to specialists — a page manager, a copywriter, an
 analyst — name them:
+
+```ts
+subagents: {
+  profiles: {
+    'page-manager': {
+      description: 'edits and reorders the pages of the site',
+      systemFn: pageManagerPrompt,
+      model: 'gpt-4o-mini',
+      tools: pageTools,
+      maxSteps: 20,
+    },
+    copywriter: { description: 'writes headings and body copy', system: 'You write clean copy.' },
+  },
+},
+```
 
 ```go
 Subagents: &agentenkit.SubagentsConfig{
@@ -66,7 +79,7 @@ Subagents: &agentenkit.SubagentsConfig{
 With profiles set, `spawnSubagent`'s description lists the names and what
 each one does, and `name` must be one of them; an unknown name comes back to
 the model as a tool error, not a crash. The child takes the profile's
-persona (`SystemFn` wins over `System`), model, tools and step cap. Everything
+persona (`systemFn` wins over `system`), model, tools and step cap. Everything
 else is unchanged: it is still a run, it still parks for approval, and it is
 re-entered under the same profile after one.
 
@@ -85,16 +98,25 @@ The result handed back to the parent is capped at
 | Setting | Default | Meaning |
 | :--- | :--- | :--- |
 | `subagentMaxDepth` | 2 | How deep nesting may go |
-| `subagentMaxConcurrent` | 3 | Children running at once per run |
+| `subagentMaxConcurrent` | 3 | Children running at once per run, at each depth |
 | `subagentMaxSteps` | 10 | Model round trips per child |
 | `subagentResultCapChars` | 8000 | Characters returned to the parent |
 
 Depth 2 means a child may spawn a grandchild, and there it stops. Exceeding the
 cap is reported to the caller as a tool result, not raised as a crash.
 
+The concurrency cap belongs to one run: another run's children never take its
+slots. And each depth has slots of its own. A parent keeps its slot while its
+child runs, so a single pool for every depth would let three children each wait
+for a slot only a finished child can free, and the run would never end. Waiting
+for a slot ends at once when the run is stopped.
+
 ## Failure is a result, not a crash
 
-A child that fails reports back to its parent instead of killing the run. The
+A child that fails reports back to its parent instead of killing the run. A
+child whose model stream ended with no finish counts as failed too: its partial
+text is not a result. A child cut off by a user stop is recorded `CANCELLED`, and
+the stop ends the whole run. The
 parent's model sees a failed tool result and decides what to do — retry
 differently, work around it, or tell the user. That is usually what you want; an
 agent whose helper failed is not an agent that should stop existing.
@@ -111,9 +133,12 @@ you can see the split — but the cap is enforced across the whole tree.
 
 ## Watching them
 
-Four event types describe a child's life: `SUBAGENT_STARTED`, `SUBAGENT_CHUNK`,
-`SUBAGENT_COMPLETED`, `SUBAGENT_FAILED`. `use-agentenkit` turns them into a
-`subagents` array:
+Three run stream events describe a child's life: `SUBAGENT_STARTED`
+(`subagentId`, `name`, `depth`), `SUBAGENT_EVENT` (one of the child's own
+stream events, wrapped, with its `subagentId`) and `SUBAGENT_FINISHED`
+(`status` is `completed`, `failed` or `cancelled`, with an `error` when it
+has one). They travel on the parent run's stream. `use-agentenkit` turns them
+into a `subagents` array:
 
 ```tsx
 {subagents.map((s) => (
@@ -125,6 +150,7 @@ Four event types describe a child's life: `SUBAGENT_STARTED`, `SUBAGENT_CHUNK`,
 ))}
 ```
 
-Those events only replay while a run is unfinished. On a completed thread the
-hook rebuilds each card from the durable run rows and the child's persisted
-turns instead, so a reload does not lose a subagent's output.
+Those events live only as long as the run stream (`streamGraceMs` after the
+segment ends). On a finished thread the hook rebuilds each card from the
+durable run rows and the child's persisted turns instead, so a reload does not
+lose a subagent's output.

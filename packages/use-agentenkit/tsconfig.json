@@ -13,5 +13,8 @@
     "isolatedModules": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*", "test/**/*"]
+  "include": ["src/**/*", "test/**/*"],
+  // The end-to-end test runs the agentenkit runtime from its source, which is
+  // typechecked under that package's own settings, not these stricter ones.
+  "exclude": ["test/e2e.test.tsx"]
 }

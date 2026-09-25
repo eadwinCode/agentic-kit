@@ -9,6 +9,7 @@ import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters
 import { runIdKey } from '../src/core/keys.js';
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
 import type { RuntimeOptions } from '../src/ports/runtime.js';
+import { parseLockValue } from '../src/core/lease.js';
 
 /** Pull the newest user message out of the SDK-level prompt so the mock can
  *  answer the message it was actually given — that is how these tests tell
@@ -85,17 +86,17 @@ describe('stop, then send another message right away (§2.1)', () => {
     const threadId = first.threadId;
     const workerA = runtime.worker.handleJob(queue.items[0]!);
     await sleep(30);
-    expect(await kv.get(`agent:lock:${threadId}`)).toBe(first.runId!);
+    expect(parseLockValue(await kv.get(`agent:lock:${threadId}`)).runId).toBe(first.runId!);
 
     // 2. Stop.
     expect((await chat.stop(threadId)).accepted).toBe(true);
     expect(await kv.get(`agent:state:${threadId}`)).toBe('CANCELLED');
 
     // 3. A new message lands before worker A's next poll: the state key is
-    //    back to RUNNING, so it can no longer carry the stop.
+    //    back to QUEUED, so it can no longer carry the stop.
     const second = await chat.run({ threadId, prompt: 'message B' });
     expect(second.runId).not.toBe(first.runId);
-    expect(await kv.get(`agent:state:${threadId}`)).toBe('RUNNING');
+    expect(await kv.get(`agent:state:${threadId}`)).toBe('QUEUED');
 
     // Worker B finds the lock held by the older run and re-dispatches itself
     // instead of dropping the message.
@@ -115,7 +116,7 @@ describe('stop, then send another message right away (§2.1)', () => {
     expect((await storage.threads.get(threadId))!.state).toBe('COMPLETED');
     // The stopped run wrote no state of its own: no second CANCELLED after
     // the new run's RUNNING.
-    expect(states(bus)).toEqual(['RUNNING', 'CANCELLED', 'RUNNING', 'COMPLETED']);
+    expect(states(bus)).toEqual(['QUEUED', 'RUNNING', 'CANCELLED', 'QUEUED', 'RUNNING', 'COMPLETED']);
   }, 20_000);
 
   it('a plain stop with no follow-up message still finalizes CANCELLED', async () => {
@@ -137,7 +138,9 @@ describe('stop, then send another message right away (§2.1)', () => {
 
     expect(state.aborted).toBe(true);
     expect((await storage.threads.get(ran.threadId))!.state).toBe('CANCELLED');
-    expect(states(bus)).toEqual(['RUNNING', 'CANCELLED', 'CANCELLED']);
+    // One CANCELLED: the stop's. The worker's own finish loses the
+    // compare-and-set to it and says nothing.
+    expect(states(bus)).toEqual(['QUEUED', 'RUNNING', 'CANCELLED']);
   }, 20_000);
 });
 
@@ -152,7 +155,7 @@ describe('run identity (§2.1)', () => {
     expect(await chat.execute({ threadId: ran.threadId, runId: ran.runId, model: 'gpt-4o' }))
       .toBe('stale');
     // It touched neither the state the newer run owns nor the conversation.
-    expect(await kv.get(`agent:state:${ran.threadId}`)).toBe('RUNNING');
+    expect(await kv.get(`agent:state:${ran.threadId}`)).toBe('QUEUED');
     expect(storage.messages.store.get(ran.threadId)!.map((m) => m.role)).toEqual(['user']);
   });
 
@@ -170,8 +173,9 @@ describe('run identity (§2.1)', () => {
     const second = await chat.run({ threadId, prompt: 'b' });
     await workerA; // finalizes CANCELLED — for a run that no longer owns the thread
 
-    expect(await kv.get(`agent:state:${threadId}`)).toBe('RUNNING');
-    expect((await storage.threads.get(threadId))!.state).toBe('RUNNING');
+    // The newer run is still waiting for a worker, untouched.
+    expect(await kv.get(`agent:state:${threadId}`)).toBe('QUEUED');
+    expect((await storage.threads.get(threadId))!.state).toBe('QUEUED');
     expect(await kv.get(runIdKey(threadId))).toBe(second.runId!);
     // The tokens it did spend are still billed (§4).
     expect(storage.usage.recorded.length).toBeGreaterThan(0);
@@ -226,9 +230,11 @@ describe('lock conflicts (§2.8)', () => {
   });
 
   it('gives up with FAILED when the lock never clears', async () => {
+    // A held lock is waited out for at least one lease: redrives of 2s then
+    // 3s (capped at the 3s lease) have waited 5s, so the third arrival gives up.
     const { runtime, storage, queue, kv } = await makeRuntime(
       slowModel({ aborted: false }),
-      { runMaxAttempts: 2 },
+      { runMaxAttempts: 2, runLockLeaseSeconds: 3 },
     );
     const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 
@@ -268,6 +274,6 @@ describe('a failing provider call (§2.8)', () => {
     expect(await kv.get(`agent:lock:${ran.threadId}`)).toBeNull();
     // The failure reached the redrive policy rather than vanishing.
     expect(queue.items).toHaveLength(2);
-    expect(await kv.get(`agent:attempts:${ran.threadId}`)).toBe('1');
+    expect(await kv.get(`agent:attempts:${ran.runId}`)).toBe('1'); // counted per run
   }, 10_000);
 });

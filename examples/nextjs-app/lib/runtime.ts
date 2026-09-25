@@ -10,6 +10,7 @@ import {
   QStashQueue,
   RedisBus,
   RedisKv,
+  RedisRunStreams,
   setupAgentCore,
 } from 'agentenkit';
 import { modelIds, modelPrices, modelRegistry, modelWindows } from './models'; // §2.3 — models in your shape
@@ -51,6 +52,10 @@ export const runtime = await setupAgentCore({
     { url: `${process.env.APP_URL!}/api/queue/agent-run` },
   ),
   kv: new RedisKv(redis),
+  // A run's live events: one short-lived Redis Stream per run segment, which
+  // any process can read, so a tab that reconnects mid-run picks up where it
+  // left off. Kept 10 minutes after the segment ends (config.streamGraceMs).
+  streams: new RedisRunStreams(redis),
 
   // Demo settings (§2.5): a 5-minute approval window so expiry is observable —
   // an unanswered park is resolved as the timeout denial ("user had no

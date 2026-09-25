@@ -209,7 +209,7 @@ describe('AGENTIC_KIT_ADMIN_DATABASE_URL (§2.9)', () => {
 
       const { rows } = await pool.query('SELECT * FROM agentic_runs WHERE id = $1', [ran.runId]);
       expect(rows[0].state).toBe('COMPLETED');
-      expect(rows[0].totalTokens).toBe(15);
+      expect(Number(rows[0].totalTokens)).toBe(15); // BIGINT: pg hands it back as a string
 
       // The thread index is the platform's own, written on every transition.
       const threads = await pool.query('SELECT * FROM agentic_threads WHERE id = $1', [ran.threadId]);

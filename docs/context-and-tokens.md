@@ -9,10 +9,21 @@ budget; you never have to prune by hand.
 ```
 budget = min(model contextWindow, contextCeilingTokens) - contextOutputReserveTokens
 
-if estimate(history) > budget × compactionTrigger:
-    keep the last  budget × contextTailShare  verbatim
-    summarize everything before it into one system message
+prompt = the latest summary + the messages after the last one it covers
+if estimate(prompt) > budget × compactionTrigger:
+    keep the last  budget × contextTailShare  verbatim, starting at a user turn
+    summarize everything before it (the last summary included) into one new
+    system message that records the last message it covers
 ```
+
+The summary records which message it covers up to, and from then on the
+prompt carries the summary and only what came after. So a thread compacts
+once each time it grows past the trigger, never on every run after, and the
+summary call only ever reads the last summary plus the turns since. The kept
+tail always starts at a user turn, so it can never open on a tool result whose
+call went into the summary. A single turn larger than the whole window is sent
+as it is, with a warning logged: the estimate is rough, and the provider
+decides.
 
 | Setting | Default | Meaning |
 | :--- | :--- | :--- |
@@ -32,10 +43,12 @@ config: { compactionModel: 'claude-haiku' }
 
 The call is billed like any other, under `kind: 'compaction'`, so what the
 platform's own housekeeping costs is visible on its own (see
-[Cost and pricing](./cost-and-pricing.md)).
+[Cost and pricing](./cost-and-pricing.md)). It is billed to the run it served,
+so it is on that run's bill and counts toward its cost cap, and a stop cancels
+it like any other call of the run.
 
-The summary is persisted as a `system` message and a `CONTEXT_COMPACTED` event
-is published. Reading current load:
+The summary is persisted as a `system` message and a `CONTEXT_COMPACTED` entry
+is added to the thread record. Reading current load:
 
 ```ts
 const usage = await runtime.getThreadUsage(threadId);
@@ -90,8 +103,10 @@ doubles the bill:
 | OpenAI | `promptTokens` **includes** the cached ones | `promptTokens − cached` |
 | Anthropic | `cacheReadInputTokens` sits **alongside** input | as reported |
 
-The library handles both. `totalTokens` matches what the provider billed either
-way.
+The library handles both. `totalTokens` is always `input + cached + output`,
+worked out by the library rather than taken from the provider, whose own total
+does not mean the same thing everywhere (Anthropic's leaves the cache reads
+out).
 
 Cache hits are reported **only** in provider metadata — the SDK's `usage` object
 has no field for them. Any code that attributes spend from `usage` alone reports
@@ -105,7 +120,10 @@ await chat.run({ prompt: 'hi', tokenBudget: 50_000 });
 
 Order: run input → agent spec → `config.tokenBudget`. Undefined means unbounded
 apart from `maxSteps`. Spend is checked between steps against a ledger shared
-with nested runs.
+with nested runs. The ledger counts the **whole run**: each segment starts from
+what the run already spent (before a park, before a retry, and the
+platform's compaction calls), so a run that parks three times does not get
+three budgets.
 
 There is a money cap in the same shape, once a pricer is configured:
 
@@ -125,7 +143,7 @@ config: {
   billingPreCheck: async ({ threadId, state, publishEvent }) => {
     const org = await orgById(state.orgId);
     if (org.credits > 0) return { ok: true };
-    await publishEvent('CREDIT_LIMIT', { resetAt: org.periodEndsAt });
+    await publishEvent('CREDIT_LIMIT', { resetAt: org.periodEndsAt }, { durable: true });
     return { ok: false, error: 'Out of credits' };
   },
 }
@@ -134,7 +152,9 @@ config: {
 A rejected run writes no message and returns `accepted: false` with your
 error. It does publish: your own event, if the check sent one, and the
 platform's `RUN_REFUSED` with the error, so the chat can show the refusal
-where the user is looking rather than only in an HTTP response.
+where the user is looking rather than only in an HTTP response. `RUN_REFUSED`
+is kept in the thread record; your own event is kept only with
+`{ durable: true }`, as above.
 
 Mid-run, the budget is the credit check. When the run's cumulative spend
 crosses `tokenBudget` between steps, the platform publishes

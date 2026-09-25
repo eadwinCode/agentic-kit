@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/admin/migrate"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
 
@@ -30,14 +31,13 @@ func NewKv(ctx context.Context, db *sql.DB, opts ...Option) (*Kv, error) {
 		o(s)
 	}
 	k := &Kv{db: db, table: s.prefix + "kv"}
-	for _, stmt := range []string{
-		`CREATE TABLE IF NOT EXISTS ` + k.table + ` (
-		   key TEXT PRIMARY KEY, value TEXT NOT NULL, "expiresAt" TIMESTAMPTZ)`,
-		`CREATE INDEX IF NOT EXISTS ` + k.table + `_expires ON ` + k.table + `("expiresAt") WHERE "expiresAt" IS NOT NULL`,
-	} {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return nil, fmt.Errorf("postgres kv schema: %w", err)
-		}
+	if err := migrateSchema(ctx, db, s.prefix, "kv", []migrate.Migration{
+		migrate.NewMigration("kv_0001_init",
+			`CREATE TABLE IF NOT EXISTS `+k.table+` (
+			   key TEXT PRIMARY KEY, value TEXT NOT NULL, "expiresAt" TIMESTAMPTZ)`,
+			`CREATE INDEX IF NOT EXISTS `+k.table+`_expires ON `+k.table+`("expiresAt") WHERE "expiresAt" IS NOT NULL`),
+	}); err != nil {
+		return nil, err
 	}
 	return k, nil
 }
@@ -55,28 +55,38 @@ func (k *Kv) Get(ctx context.Context, key string) (string, bool, error) {
 	return value, true, nil
 }
 
-func expiryAt(d time.Duration) sql.NullTime {
+// ttlMs is a TTL as bound milliseconds, NULL for none. The expiry itself is
+// computed in SQL as now() + ttl, on the database's clock: every expiry check
+// compares against now() too, and a worker whose own clock runs behind would
+// otherwise write a run lock that the database treats as nearly expired.
+func ttlMs(d time.Duration) sql.NullInt64 {
 	if d <= 0 {
-		return sql.NullTime{}
+		return sql.NullInt64{}
 	}
-	return sql.NullTime{Time: time.Now().Add(d), Valid: true}
+	return sql.NullInt64{Int64: d.Milliseconds(), Valid: true}
+}
+
+// expiresAt is the SQL for an expiry n milliseconds from now, where n is the
+// bound parameter; NULL stays NULL.
+func expiresAt(n int) string {
+	return fmt.Sprintf(`now() + $%d * interval '1 millisecond'`, n)
 }
 
 func (k *Kv) Set(ctx context.Context, key, value string, opts ports.SetOptions) (bool, error) {
 	if !opts.OnlyIfNotExists {
 		_, err := k.db.ExecContext(ctx,
-			`INSERT INTO `+k.table+` (key, value, "expiresAt") VALUES ($1, $2, $3)
+			`INSERT INTO `+k.table+` (key, value, "expiresAt") VALUES ($1, $2, `+expiresAt(3)+`)
 			 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "expiresAt" = EXCLUDED."expiresAt"`,
-			key, value, expiryAt(opts.Expiry))
+			key, value, ttlMs(opts.Expiry))
 		return err == nil, err
 	}
 	// SET NX in one statement (§3.4): the insert wins on a missing key, the
 	// update wins only over an expired row, and a live row updates nothing.
 	res, err := k.db.ExecContext(ctx,
-		`INSERT INTO `+k.table+` AS kv (key, value, "expiresAt") VALUES ($1, $2, $3)
+		`INSERT INTO `+k.table+` AS kv (key, value, "expiresAt") VALUES ($1, $2, `+expiresAt(3)+`)
 		 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "expiresAt" = EXCLUDED."expiresAt"
 		 WHERE kv."expiresAt" IS NOT NULL AND kv."expiresAt" <= now()`,
-		key, value, expiryAt(opts.Expiry))
+		key, value, ttlMs(opts.Expiry))
 	if err != nil {
 		return false, err
 	}
@@ -106,23 +116,34 @@ func (k *Kv) Incr(ctx context.Context, key string) (int64, error) {
 	return strconv.ParseInt(value, 10, 64)
 }
 
-// DeleteExpired drops rows past their expiry. Expiry is already enforced on
-// read, so this is housekeeping: call it from a periodic job.
+// DeleteExpired drops rows past their expiry, in batches of 1,000 so a large
+// backlog never holds one long lock on the table the run locks live in.
+// Expiry is already enforced on read, so this is housekeeping: the Postgres
+// bus runs it every few minutes (its parked oversized frames are rows here);
+// without the bus, call it from a periodic job.
 func (k *Kv) DeleteExpired(ctx context.Context) (int64, error) {
-	res, err := k.db.ExecContext(ctx, `DELETE FROM `+k.table+` WHERE "expiresAt" IS NOT NULL AND "expiresAt" <= now()`)
-	if err != nil {
-		return 0, err
+	var total int64
+	for {
+		res, err := k.db.ExecContext(ctx, `DELETE FROM `+k.table+` WHERE key IN (
+			SELECT key FROM `+k.table+` WHERE "expiresAt" IS NOT NULL AND "expiresAt" <= now() LIMIT 1000)`)
+		if err != nil {
+			return total, err
+		}
+		n, err := res.RowsAffected()
+		total += n
+		if err != nil || n < 1000 {
+			return total, err
+		}
 	}
-	return res.RowsAffected()
 }
 
 // SetIfValue is the compare-and-set half of a lease renewal (§3.4): the
 // write lands only while the row still holds expected and is not expired.
 func (k *Kv) SetIfValue(ctx context.Context, key, expected, value string, ttl time.Duration) (bool, error) {
 	res, err := k.db.ExecContext(ctx,
-		`UPDATE `+k.table+` SET value = $3, "expiresAt" = $4
+		`UPDATE `+k.table+` SET value = $3, "expiresAt" = `+expiresAt(4)+`
 		 WHERE key = $1 AND value = $2 AND ("expiresAt" IS NULL OR "expiresAt" > now())`,
-		key, expected, value, expiryAt(ttl))
+		key, expected, value, ttlMs(ttl))
 	if err != nil {
 		return false, err
 	}
@@ -146,12 +167,12 @@ func (k *Kv) DelIfValue(ctx context.Context, key, expected string) (bool, error)
 func (k *Kv) IncrWithExpiry(ctx context.Context, key string, ttl time.Duration) (int64, error) {
 	var value string
 	err := k.db.QueryRowContext(ctx,
-		`INSERT INTO `+k.table+` AS kv (key, value, "expiresAt") VALUES ($1, '1', $2)
+		`INSERT INTO `+k.table+` AS kv (key, value, "expiresAt") VALUES ($1, '1', `+expiresAt(2)+`)
 		 ON CONFLICT (key) DO UPDATE SET
 		   value = CASE WHEN kv."expiresAt" IS NOT NULL AND kv."expiresAt" <= now() THEN '1'
 		                ELSE (kv.value::bigint + 1)::text END,
 		   "expiresAt" = CASE WHEN kv."expiresAt" IS NOT NULL AND kv."expiresAt" <= now() THEN EXCLUDED."expiresAt" ELSE kv."expiresAt" END
-		 RETURNING value`, key, expiryAt(ttl)).Scan(&value)
+		 RETURNING value`, key, ttlMs(ttl)).Scan(&value)
 	if err != nil {
 		return 0, err
 	}

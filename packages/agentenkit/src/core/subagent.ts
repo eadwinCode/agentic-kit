@@ -9,11 +9,11 @@ import type {
   RunRecord,
   SubagentsConfig,
 } from './types.js';
-import { wireId } from './types.js';
+import { wireId, type SubagentProfile } from './types.js';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { RegisteredAgent } from './agent.js';
 import { publish, withPublishEvent } from './publish.js';
-import { HITL_PARKED, withHitl, type HitlFrame } from './hitl.js';
+import { HITL_PARKED, RunStoppedError, withHitl, type HitlFrame, type ParkBox } from './hitl.js';
 import { withRunState, type AgentRunState } from './state.js';
 import { markPromptCaching } from './cache.js';
 import { promptMessages, repairDanglingToolCalls } from './messages.js';
@@ -25,7 +25,8 @@ import { runLoop, type LoopOutcome, type RunLedger } from './loop.js';
 export interface SubagentCtx {
   threadId: string;
   depth: number; // 0 = called from the main agent
-  sem: Semaphore; // per-run concurrency cap
+  /** This run's subagent cap (§2.7): see RunSlots. */
+  slots: RunSlots;
   ports: RuntimePorts; // the §3.2 ports bundle
   /** Delegation config carried from the parent's spec (§2.7): flavor,
    *  default model, and extra tools for every spawned child. */
@@ -53,27 +54,47 @@ export interface SubagentCtx {
   billingRunId?: string;
   providerOptions?: ProviderOptions;
   abortSignal?: AbortSignal;
+  /** True once the run lock is gone (see LoopInput.fenced). */
+  fenced?: () => boolean;
+  /** The segment's park box, shared by every depth (see ParkBox). */
+  parks?: ParkBox;
+  /** Calls whose tool failed, shared by every depth (see chunkPayload). */
+  toolErrors?: Map<string, string>;
   /** The run's state, handed down unchanged (§2.10). */
   state?: AgentRunState;
 }
 
-/** Run-scoped semaphore: sibling subagents queue instead of running away (§2.7) */
+/** A concurrency cap: sibling subagents queue instead of running away (§2.7).
+ *  See RunSlots for how a run uses them. */
 export class Semaphore {
   private active = 0;
   private waiters: (() => void)[] = [];
   constructor(private readonly limit: number) {}
 
-  async acquire(): Promise<() => void> {
-    await new Promise<void>((resolve) => {
-      if (this.active < this.limit) {
+  /** Take a slot, waiting for one. A wait the signal aborts gives up with the
+   *  signal's reason instead of waiting on for ever. */
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    await new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(signal.reason ?? new Error('aborted'));
+        return;
+      }
+      if (this.active < Math.max(this.limit, 1)) {
         this.active++;
         resolve();
-      } else {
-        this.waiters.push(() => {
-          this.active++;
-          resolve();
-        });
+        return;
       }
+      const take = () => {
+        signal?.removeEventListener('abort', giveUp);
+        this.active++;
+        resolve();
+      };
+      const giveUp = () => {
+        this.waiters = this.waiters.filter((w) => w !== take);
+        reject(signal?.reason ?? new Error('aborted'));
+      };
+      signal?.addEventListener('abort', giveUp, { once: true });
+      this.waiters.push(take);
     });
     let released = false;
     return () => {
@@ -85,9 +106,67 @@ export class Semaphore {
   }
 }
 
+/** One run's subagent cap (§2.7): `subagentMaxConcurrent` children at a time at
+ *  each depth. Made per run, so one run's children never wait on another
+ *  run's. And each depth has slots of its own: a parent holds its slot while
+ *  its child runs, so if parent and child shared one pool, a full level of
+ *  parents would each wait for a slot only a finished child can free, and
+ *  never finish. */
+export class RunSlots {
+  private byDepth = new Map<number, Semaphore>();
+  constructor(private readonly limit: number) {}
+
+  acquire(depth: number, signal?: AbortSignal): Promise<() => void> {
+    let sem = this.byDepth.get(depth);
+    if (!sem) {
+      sem = new Semaphore(this.limit);
+      this.byDepth.set(depth, sem);
+    }
+    return sem.acquire(signal);
+  }
+}
+
+/** A named specialist (§2.7), or undefined when the config has no profiles
+ *  or none by that name. */
+function profileFor(ctx: SubagentCtx, name: string | undefined): SubagentProfile | undefined {
+  const profiles = ctx.sub.profiles;
+  return name && profiles && Object.hasOwn(profiles, name) ? profiles[name] : undefined;
+}
+
+/** The unwrapped toolset a nested run owns: its profile's when it has one,
+ *  the shared delegation tools otherwise. The resolved park executes the
+ *  approved tool from here. */
+export function nestedRawTools(ctx: SubagentCtx, d: NestedDescriptor | undefined): Record<string, any> {
+  return ((d && profileFor(ctx, d.name)?.tools) ?? ctx.sub.tools ?? {}) as Record<string, any>;
+}
+
+function nestedModelName(ctx: SubagentCtx, profile: SubagentProfile | undefined, requested?: string): string {
+  return requested || profile?.model || ctx.sub.model || 'gpt-4o';
+}
+
+/** The specialists, sorted, for the tool's description and its errors. */
+function profileNames(ctx: SubagentCtx): string[] {
+  return Object.keys(ctx.sub.profiles ?? {}).sort();
+}
+
+/** The delegation tool's description. With profiles, the model is told
+ *  exactly who it can delegate to. */
+function spawnDescription(ctx: SubagentCtx): string {
+  const desc = 'Delegates a self-contained task to a subagent with an isolated context';
+  const names = profileNames(ctx);
+  if (names.length === 0) return desc;
+  const list = names
+    .map((name) => {
+      const d = ctx.sub.profiles![name]!.description;
+      return d ? `${name} (${d})` : name;
+    })
+    .join('; ');
+  return `${desc}. name MUST be one of the available subagents: ${list}`;
+}
+
 export function spawnSubagentTool(ctx: SubagentCtx) {
   return tool({
-    description: 'Delegates a self-contained task to a subagent with an isolated context',
+    description: spawnDescription(ctx),
     parameters: z.object({
       name: z.string().describe('Short name for the sub-task'),
       instructions: z
@@ -104,8 +183,14 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
       if (depth > ctx.ports.config.subagentMaxDepth) {
         return { error: `Max subagent depth (${ctx.ports.config.subagentMaxDepth}) reached` };
       }
+      // With profiles, an unknown name is ordinary bad input reported to the
+      // model, never a crash (§2.7).
+      const profile = profileFor(ctx, name);
+      if (profileNames(ctx).length > 0 && !profile) {
+        return { error: `Unknown subagent ${JSON.stringify(name)}; use one of: ${profileNames(ctx).join(', ')}` };
+      }
 
-      const release = await ctx.sem.acquire();
+      const release = await ctx.slots.acquire(depth, opts.abortSignal ?? ctx.abortSignal);
       try {
         // A nested run is a run (§2.9): same table, distinguished by depth and
         // a parent. Its id is also the agentId its messages and events carry.
@@ -116,7 +201,7 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
           parentRunId: ctx.agentId ?? ctx.resume.runId ?? null,
           depth,
           agent: name,
-          model: model ?? ctx.sub.model ?? 'gpt-4o',
+          model: nestedModelName(ctx, profile, model),
           // A nested run's "prompt" is the brief it was delegated (§2.7).
           ...(ctx.ports.config.recordPayloads
             ? {
@@ -135,7 +220,7 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
         const descriptor: NestedDescriptor = {
           agentId: run.id,
           name,
-          model: model ?? ctx.sub.model ?? 'gpt-4o',
+          model: nestedModelName(ctx, profile, model),
           depth,
         };
 
@@ -156,6 +241,13 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
               ...ctx.frames,
             ],
           );
+
+          // Stopped or cut short, the child did not finish: its partial text
+          // is not a result. The catch below records which.
+          if (outcome.aborted) throw new RunStoppedError(new Error('stopped'));
+          if (outcome.interrupted) {
+            throw new Error(`step ${outcome.steps + 1} ended without a finish`);
+          }
 
           if (outcome.parked) {
             // The child is suspended, not finished: leave its SubagentRun
@@ -178,6 +270,7 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
           };
         } catch (err) {
           const cancelled =
+            err instanceof RunStoppedError ||
             (await ctx.ports.kv.get(`agent:state:${ctx.threadId}`)) === 'CANCELLED';
           const state = cancelled ? 'CANCELLED' : 'FAILED';
           const message = err instanceof Error ? err.message : String(err);
@@ -192,7 +285,7 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
 
           // A user stop tears the whole run down (§2.1), so that one keeps
           // propagating.
-          if (cancelled) throw err;
+          if (cancelled) throw new RunStoppedError(err);
 
           // Anything else is reported TO THE PARENT as the delegation's
           // result, the same way an approved tool's failure is reported to the
@@ -216,7 +309,7 @@ function maybeCache(ports: RuntimePorts, messages: any[]): any[] {
   return ports.config.promptCaching ? markPromptCaching(messages) : messages;
 }
 
-async function closeNested(
+export async function closeNested(
   ctx: SubagentCtx,
   run: RunRecord,
   outcome: LoopOutcome | null,
@@ -250,7 +343,7 @@ function nestedTools(
   abortSignal?: AbortSignal,
 ): Record<string, any> {
   const raw: Record<string, any> = {
-    ...(ctx.sub.tools ?? {}),
+    ...nestedRawTools(ctx, d),
     spawnSubagent: spawnSubagentTool({
       ...ctx,
       depth: d.depth,
@@ -270,6 +363,8 @@ function nestedTools(
         agentId: d.agentId,
         frames,
         nested: d,
+        parks: ctx.parks,
+        toolErrors: ctx.toolErrors,
       }),
     ),
     ctx.state ?? {},
@@ -328,6 +423,11 @@ export async function runNestedAgent(
   }
 
   const { resolved, modelKey } = resolveNestedModel(ctx, d.model);
+  // A profile brings its own persona and step cap (§2.7); the descriptor
+  // carries the name, so a re-entry after an approval finds the same one.
+  const profile = profileFor(ctx, d.name);
+  let maxSteps = ports.config.subagentMaxSteps;
+  if (profile?.maxSteps && profile.maxSteps > 0 && profile.maxSteps < maxSteps) maxSteps = profile.maxSteps;
   const outcome = await runLoop(
     ports,
     ctx.agent,
@@ -348,8 +448,9 @@ export async function runNestedAgent(
         repairDanglingToolCalls(promptMessages(persisted) as any[]),
       ),
       tools: nestedTools(ctx, d, frames, abortSignal),
-      maxSteps: ports.config.subagentMaxSteps,
+      maxSteps,
       abortSignal: abortSignal ?? new AbortController().signal,
+      fenced: ctx.fenced,
       providerOptions: ctx.providerOptions,
       tokenBudget: ctx.tokenBudget,
       // Money is capped and billed at the RUN, not per child (§2.7, §4): the
@@ -360,9 +461,13 @@ export async function runNestedAgent(
       modelKey,
       modelId: wireId(resolved, modelKey),
       agentName: d.name,
-      system: `You are the "${d.name}" subagent. Complete the task, then stop.`,
+      system: profile?.system || `You are the "${d.name}" subagent. Complete the task, then stop.`,
+      ...(profile?.systemFn ? { systemFn: profile.systemFn } : {}),
+      ...(profile?.prepareStep ? { prepareStep: profile.prepareStep } : {}),
+      state: ctx.state ?? {},
       cacheSystemPrompt: ports.config.promptCaching,
-      onChunk: async (chunk) => {
+      toolErrors: ctx.toolErrors,
+      publishChunk: async (chunk) => {
         // Namespaced into the shared thread event log → same multi-user pipeline (§2.2)
         await publish(ports, threadId, 'SUBAGENT_CHUNK', { agentId: d.agentId, chunk });
       },

@@ -2,19 +2,22 @@ import { generateText, streamText } from 'ai';
 import type { LanguageModel } from 'ai';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { AgentKind, ProviderOptions } from './types.js';
+import type { AgentRunState } from './state.js';
+import type { PrepareStepFn, SystemFn } from '../ports/runtime.js';
 import type { RegisteredAgent } from './agent.js';
 import { systemCacheMessage } from './cache.js';
 import {
   fillTokens,
   providerMeta,
-  recordCall,
+  type RunLedger,
   type TokenAttribution,
 } from './usage.js';
 import { estimateTokens } from './context.js';
 import type { NewUsage } from './types.js';
-import { drainOrThrow } from './stream.js';
+import { ChunkBatcher, chunkPayload, drainOrThrow } from './stream.js';
 import { publish, publishNotice } from './publish.js';
 import { HITL_PARKED } from './hitl.js';
+import { RunLockLostError } from './lease.js';
 
 /** True for the sentinel a parked `requiresConfirmation` tool returns (§2.5).
  *  It is never a real tool result and is never persisted. */
@@ -82,6 +85,10 @@ export async function executeStep(
     onFinish: _userOnFinish,
     onStepFinish: userOnStepFinish,
     system: specSystem,
+    // Platform hooks, not SDK options: the engine calls these itself.
+    systemFn: _systemFn,
+    prepareStep: _prepareStep,
+    onSettle: _onSettle,
     ...userArgs
   } = agent.args as Record<string, any>;
 
@@ -146,7 +153,10 @@ export async function executeStep(
       providerMetadata: meta as any,
       response: { id: (response as any)?.id, headers: (response as any)?.headers },
       streamedText: call.partial?.text || text,
-      finished: true,
+      // The SDK makes up a finish when the provider's stream closes without
+      // one, with reason 'unknown'. A step like that did not finish: the
+      // provider cut it short without saying so.
+      finished: finishReason !== 'unknown',
     };
   }
 
@@ -179,12 +189,7 @@ function capValue(value: unknown, limit: number): unknown {
   return json.length <= limit ? value : `${json.slice(0, limit)}…`;
 }
 
-/** Tokens a run has spent, main agent and nested runs together (§2.7). Shared
- *  by reference so a child's spend counts against the run's safety cap the
- *  moment it happens — a budget that ignores delegated work is not a budget. */
-export interface RunLedger {
-  tokensUsed: number;
-}
+export { RunLedger, seedRunLedger } from './usage.js';
 
 export interface LoopInput {
   /** Whose stream this loop persists to (§2.7). `null` is the main agent. */
@@ -200,6 +205,13 @@ export interface LoopInput {
   tools: Record<string, any>;
   maxSteps: number;
   abortSignal: AbortSignal;
+  /** True once the run lock is gone (§3.4): another worker may own the
+   *  thread, so this loop must not write another step to it. */
+  fenced?: () => boolean;
+  /** Writes the parks raised during a step, once that step is saved (see
+   *  ParkBox). Only the main loop sets it: a nested run's parks wait for the
+   *  main agent's step. */
+  commitParks?: () => Promise<void>;
   providerOptions?: ProviderOptions;
   /** Cumulative cap for the whole run, checked against the shared ledger. */
   tokenBudget?: number;
@@ -218,9 +230,22 @@ export interface LoopInput {
   /** The name that goes on the bill line: the registered handle for the main
    *  run, the delegation's name for a nested one. */
   agentName?: string;
+  /** Every raw chunk, as the SDK streams it: the host's own callback. */
   onChunk?: (chunk: unknown) => Promise<void>;
+  /** Publishes a chunk as an event. Deltas reach it merged (see ChunkBatcher),
+   *  and everything a step streamed is out before the step is committed. */
+  publishChunk?: (chunk: unknown) => Promise<void>;
+  /** Calls whose tool failed (see withHitl), for their tool-result chunk. */
+  toolErrors?: Map<string, string>;
   /** Persona for a nested run; omitted, the agent's own spec `system` stands. */
   system?: string;
+  /** Builds the persona per step with the run's state (§3.1); wins over
+   *  `system`. What the agent is acting on may change between steps. */
+  systemFn?: SystemFn;
+  /** Edits the prompt for one step, just before it is sent. See PrepareStepFn. */
+  prepareStep?: PrepareStepFn;
+  /** The run's state (§2.10), handed to `systemFn` and `prepareStep`. */
+  state?: AgentRunState;
   /** Carry the system prompt as a stamped message rather than the SDK's
    *  `system:` string, so it can hold a cache breakpoint (§2.6). */
   cacheSystemPrompt?: boolean;
@@ -238,6 +263,9 @@ export interface LoopOutcome {
   parkedToolCallId?: string;
   /** The abort signal fired mid-loop — a user stop (§2.1). */
   aborted: boolean;
+  /** The last model call ended without a finish and without a user stop,
+   *  and no error said why. The run must not be taken as finished. */
+  interrupted: boolean;
   /** Iterations this loop completed (§2.9). */
   steps: number;
   /** The run hit its money cap and stopped between steps (§4). */
@@ -274,6 +302,7 @@ export async function runLoop(
   let stepsLeft = input.maxSteps;
   let stepsRun = 0;
   let costExhausted = false;
+  let interrupted = false;
   // The input count of the last finished call. A call cut off before its
   // finish never reports one, and its prompt was the same size as the
   // previous step's plus a little, so this is the honest floor to bill.
@@ -282,22 +311,53 @@ export async function runLoop(
   while (stepsLeft > 0 && !input.abortSignal.aborted) {
     stepsLeft--;
     const stepStartedAt = Date.now();
+    // Built per step with the run's state (§3.1): what the agent is acting
+    // on may have changed since the last step. A throw fails the step.
+    const system = input.systemFn ? await input.systemFn(threadId, input.state ?? {}) : input.system;
+    const prompt = input.prepareStep
+      ? await input.prepareStep(threadId, input.state ?? {}, input.messages)
+      : input.messages;
+    // One round trip is bounded in wall time when stepTimeoutMs is set: a
+    // model that accepts the call and never answers ends this step like any
+    // failed step, and the run takes the retry policy (§2.8).
+    const stepAbort = new AbortController();
+    const onRunAbort = () => stepAbort.abort(input.abortSignal.reason);
+    input.abortSignal.addEventListener('abort', onRunAbort, { once: true });
+    let stepTimedOut = false;
+    const stepLimit = deps.config.stepTimeoutMs;
+    const stepTimer = stepLimit > 0
+      ? setTimeout(() => { stepTimedOut = true; stepAbort.abort(new Error('step timed out')); }, stepLimit)
+      : undefined;
+    const timeoutError = () =>
+      new Error(`step ${stepsRun + 1} ran longer than ${stepLimit}ms`);
     const partial = { text: '' };
     let step: StepResult;
+    const batcher = input.publishChunk ? new ChunkBatcher(input.publishChunk) : null;
     try {
       step = await executeStep(agent, {
         kind: input.kind,
         model: input.model,
-        messages: input.messages,
+        messages: prompt,
         tools: input.tools,
         providerOptions: input.providerOptions,
-        abortSignal: input.abortSignal,
-        onChunk: input.kind === 'stream-text' ? input.onChunk : undefined,
-        system: input.system,
+        abortSignal: stepAbort.signal,
+        onChunk:
+          input.kind === 'stream-text'
+            ? async (chunk: unknown) => {
+                const published = chunkPayload(chunk, input.toolErrors);
+                if (published !== null) await batcher?.push(published);
+                await input.onChunk?.(chunk);
+              }
+            : undefined,
+        system,
         cacheSystemPrompt: input.cacheSystemPrompt,
         partial,
       });
+      await batcher?.flush(); // the step's text is out before anything below
     } catch (err) {
+      await batcher?.flush();
+      clearTimeout(stepTimer);
+      input.abortSignal.removeEventListener('abort', onRunAbort);
       // The call ended without a finish: a user stop, or the provider failing
       // part way. Either way the provider billed for what it had already
       // produced, so the call is recorded rather than dropped — with
@@ -312,46 +372,50 @@ export async function runLoop(
         lastInput || estimateTokens(input.messages),
       );
       if (cut.totalTokens > 0) {
-        const priced = await recordCall(deps, threadId, cut);
+        const priced = await ledger.record(deps, threadId, cut);
         addAttribution(attribution, priced);
         tokensUsed += priced.totalTokens;
-        ledger.tokensUsed += priced.totalTokens;
       }
       if (input.abortSignal.aborted) break; // user stop mid-step
+      if (stepTimedOut) throw timeoutError(); // → §2.8 retry policy
       throw err; // real failure → §2.8 redrive policy
     }
-
-    // Per-step durability (§5.6): append this step's turns BEFORE the next
-    // step. A parked HITL tool result (the sentinel) is NOT a real result —
-    // it is skipped here; the resumed segment appends the user's verdict.
-    const persisted = step.responseMessages.filter((m) => {
-      if (m.role !== 'tool') return true;
-      const parts = Array.isArray(m.content) ? m.content : [];
-      return !parts.some((p: any) => isParked(p?.result));
-    });
-    for (const m of persisted) {
-      await deps.storage.messages.append(threadId, {
-        role: m.role as any,
-        content: m.content,
-        agentId: input.agentId,
-      });
+    clearTimeout(stepTimer);
+    input.abortSignal.removeEventListener('abort', onRunAbort);
+    if (stepTimedOut && !step.finished && !input.abortSignal.aborted) {
+      // The step's own deadline cut the stream: billed like any cut call,
+      // then a failure for the retry policy.
+      const cut = unfinishedUsage(input, stepsRun + 1, partial.text, 'error', lastInput || estimateTokens(input.messages));
+      if (cut.totalTokens > 0) {
+        const priced = await ledger.record(deps, threadId, cut);
+        addAttribution(attribution, priced);
+        tokensUsed += priced.totalTokens;
+      }
+      throw timeoutError();
     }
-    input.messages.push(...step.responseMessages);
+    if (!step.finished) {
+      // The stream ended with no finish and no error. Billed like any call cut
+      // short, then handed back unfinished: the caller retries it rather than
+      // taking the partial step as the run's end.
+      const cut = unfinishedUsage(
+        input,
+        stepsRun + 1,
+        partial.text,
+        input.abortSignal.aborted ? 'aborted' : 'error',
+        lastInput || estimateTokens(input.messages),
+      );
+      if (cut.totalTokens > 0) {
+        const priced = await ledger.record(deps, threadId, cut);
+        addAttribution(attribution, priced);
+        tokensUsed += priced.totalTokens;
+      }
+      if (!input.abortSignal.aborted) interrupted = true;
+      break;
+    }
 
-    // A replay boundary (§2.2). Everything this step produced is now durable
-    // history, so a reconnecting client must NOT also replay its chunks — it
-    // would render the same text twice, once from the message and once from
-    // the stream that produced it. Persisted (not a bus notice) because the
-    // snapshot needs its seq to know where durable ends and live begins.
-    await publish(deps, threadId, 'STEP_COMMITTED', {
-      index: stepsRun,
-      agentId: input.agentId,
-    });
-
-    // One priced usage row per model call (§4), then the same counters
-    // accumulated across the segment's steps and into the run-wide ledger the
-    // safety caps are checked against (§2.7).
-    const priced = await recordCall(deps, threadId, {
+    // One priced usage row per model call (§4), recorded below once the step
+    // is committed.
+    const stepUsage: NewUsage = {
       runId: input.billingRunId,
       agentId: input.agentId,
       agentName: input.agentName,
@@ -362,11 +426,69 @@ export async function runLoop(
       outcome: 'finished',
       providerMetadata: providerMeta(step.providerMetadata, step.response),
       ...fillTokens(step.usage as any, step.providerMetadata),
+    };
+
+    // The step is done, and its messages are the first thing it writes. A
+    // worker that lost the lock meanwhile must not write them: the next
+    // holder may already be writing its own. The call itself did happen and
+    // the provider billed it, so its usage is still recorded.
+    if (input.fenced?.()) {
+      await ledger.record(deps, threadId, stepUsage);
+      throw new RunLockLostError();
+    }
+
+    // Per-step durability (§5.6): append this step's turns BEFORE the next
+    // step. A parked HITL tool result (the sentinel) is NOT a real result —
+    // it is skipped here; the resumed segment appends the user's verdict. Only
+    // the parked parts go: another tool in the same step that already ran
+    // keeps its result, or the model would be told it never did.
+    const persisted = step.responseMessages.flatMap((m) => {
+      if (m.role !== 'tool') return [m];
+      const parts = Array.isArray(m.content) ? m.content : [];
+      const kept = parts.filter((p: any) => !isParked(p?.result));
+      if (kept.length === 0) return [];
+      return [kept.length === parts.length ? m : { ...m, content: kept }];
     });
+    for (const m of persisted) {
+      await deps.storage.messages.append(threadId, {
+        role: m.role as any,
+        content: m.content,
+        agentId: input.agentId,
+      });
+    }
+    input.messages.push(...step.responseMessages);
+
+    // One priced usage row per model call (§4), booked on the run-wide ledger
+    // the caps are checked against (§2.7). Written as soon as the step's
+    // messages are, before anything else: a crash after this point resumes
+    // from the saved step and never runs the call again, so its row must
+    // already be there.
+    const priced = await ledger.record(deps, threadId, stepUsage);
+
+    // A replay boundary (§2.2). Everything this step produced is now durable
+    // history, so a reconnecting client must NOT also replay its chunks — it
+    // would render the same text twice, once from the message and once from
+    // the stream that produced it. Persisted (not a bus notice) because the
+    // snapshot needs its seq to know where durable ends and live begins.
+    // It carries the step's finish and usage: a run stream turns it into
+    // its STEP_FINISHED, at the moment the step is saved.
+    await publish(deps, threadId, 'STEP_COMMITTED', {
+      index: stepsRun,
+      agentId: input.agentId,
+      step: stepsRun + 1,
+      finishReason: step.finishReason,
+      inputTokens: priced.inputTokens,
+      cachedInputTokens: priced.cacheReadInputTokens,
+      outputTokens: priced.outputTokens,
+      totalTokens: priced.totalTokens,
+    });
+    // The step is durable now, tool calls included, so the parks it raised
+    // can be written: WAITING_FOR_INPUT and the approval requests.
+    await input.commitParks?.();
+
     lastInput = priced.inputTokens;
     addAttribution(attribution, priced);
     tokensUsed += priced.totalTokens;
-    ledger.tokensUsed += priced.totalTokens;
     lastText = step.text ?? '';
     lastFinishReason = step.finishReason;
     stepsRun += 1;
@@ -388,9 +510,11 @@ export async function runLoop(
       tools: (step.toolResults ?? [])
         .map((r: any) => r?.toolName)
         .filter(Boolean) as string[],
+      at: new Date(),
       ...(deps.config.recordPayloads
         ? {
-            text: cap(step.text, deps.config.payloadCapChars),
+            // Left out when empty, as the Go runtime does.
+            ...(step.text ? { text: cap(step.text, deps.config.payloadCapChars) } : {}),
             toolCalls: (step.toolResults ?? []).map((r: any) => ({
               toolName: r?.toolName,
               args: capValue(r?.args, deps.config.payloadCapChars),
@@ -423,33 +547,22 @@ export async function runLoop(
       break;
     }
 
-    // The money cap (§4), checked in the same place and the same way. It reads
-    // the run's spend back from the store rather than from a counter in this
-    // process: a run that parked and resumed in another worker must not get
-    // its cap reset, and a nested run's calls have to count against the same
-    // cap.
+    // The money cap (§4), checked in the same place and the same way, against
+    // the same shared ledger: a nested run's calls count against it, and a
+    // run that parked or retried starts from what it already spent (see
+    // seedRunLedger).
     //
     // It only ever sees priced calls: with no pricer configured nothing is
     // ever spent and the cap never fires.
-    if (input.costBudgetMicros) {
-      try {
-        const spent = await deps.storage.usage.total(threadId, { runId: input.billingRunId });
-        if (spent.costMicros >= input.costBudgetMicros) {
-          await publish(deps, threadId, 'COST_BUDGET_EXHAUSTED', {
-            agentId: input.agentId,
-            costMicros: spent.costMicros,
-            costBudgetMicros: input.costBudgetMicros,
-            currency: spent.currency,
-          });
-          costExhausted = true;
-          break;
-        }
-      } catch (err) {
-        (deps.log ?? console).error('cost budget not checked', {
-          run: input.billingRunId,
-          err,
-        });
-      }
+    if (input.costBudgetMicros && ledger.costMicros >= input.costBudgetMicros) {
+      await publish(deps, threadId, 'COST_BUDGET_EXHAUSTED', {
+        agentId: input.agentId,
+        costMicros: ledger.costMicros,
+        costBudgetMicros: input.costBudgetMicros,
+        ...(ledger.currency ? { currency: ledger.currency } : {}),
+      });
+      costExhausted = true;
+      break;
     }
 
     // 'tool-calls' → the SDK executed the step's tools; the loop feeds the
@@ -465,6 +578,7 @@ export async function runLoop(
     parked,
     parkedToolCallId,
     aborted: input.abortSignal.aborted,
+    interrupted,
     steps: stepsRun,
     costExhausted,
   };

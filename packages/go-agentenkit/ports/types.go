@@ -63,6 +63,23 @@ type ThreadDTO struct {
 	UpdatedAt time.Time      `json:"updatedAt"`
 }
 
+// ThreadTransition is one compare-and-set on a thread's state (§3.4). It
+// lands only while the thread is in one of From AND still belongs to RunID,
+// so a run that has been stopped or replaced can never move the thread
+// again: its write simply loses.
+type ThreadTransition struct {
+	From []ExecutionState
+	To   ExecutionState
+	// RunID is the run the caller acts for. The transition lands only while
+	// the thread's current run is this one, or the thread has no run
+	// recorded yet (a thread from before run ids were stored). Empty means
+	// any run.
+	RunID string
+	// NewRunID makes the thread belong to a new run: set by run admission.
+	// Empty keeps the current one.
+	NewRunID string
+}
+
 // MessageDTO is one persisted turn.
 //
 // Content is the message body as JSON, in the same shapes the TypeScript
@@ -118,16 +135,38 @@ type NewMessage struct {
 	Content json.RawMessage
 }
 
-// AgentEvent is an append-only event log entry: the replay source for SSE
-// (re)connects and the durable record of INPUT_REQUIRED (HITL) requests. Seq
-// is assigned by the engine via Kv.Incr before append (§3.4). Seq 0 marks a
-// bus-only notice that is never persisted.
+// AgentEvent is an event on a thread: an entry in the thread record, or a
+// live notice. Seq is the record's order, minted by the store on insert
+// (EventStore.Append). Seq 0 marks a notice, which is never stored.
 type AgentEvent struct {
 	ThreadID  string          `json:"threadId"`
 	Seq       int64           `json:"seq"`
 	Type      string          `json:"type"`
 	Payload   json.RawMessage `json:"payload"`
 	CreatedAt time.Time       `json:"createdAt"`
+	// RunID is the run the entry belongs to, when it belongs to one.
+	RunID string `json:"runId,omitempty"`
+}
+
+// NewThreadEvent is an entry for the thread record, before the store gives
+// it its seq.
+type NewThreadEvent struct {
+	Type    string
+	Payload json.RawMessage
+	RunID   string
+	// CreatedAt is when it happened; now when zero.
+	CreatedAt time.Time
+}
+
+// ThreadEventFilter picks record entries: all of them by default, oldest
+// first.
+type ThreadEventFilter struct {
+	Types []string
+	RunID string
+	// After, when set, keeps only entries after this seq.
+	After *int64
+	// Limit, when above zero, caps how many come back.
+	Limit int
 }
 
 // PayloadInto decodes the event payload into v.
@@ -178,6 +217,10 @@ type RunRecord struct {
 	// settles exactly once: a worker that ends it, or a stop that ends it
 	// while no worker holds it. Unset until then.
 	SettledAt *time.Time `json:"settledAt,omitempty"`
+	// SettlingAt is when a settle claimed the run and started its hook. It
+	// is cleared when the settle ends; one left behind for long is a settler
+	// that died, and the next settle takes the run over.
+	SettlingAt *time.Time `json:"settlingAt,omitempty"`
 	// Steps is loop iterations completed, summed across every segment.
 	Steps             int `json:"steps"`
 	InputTokens       int `json:"inputTokens"`
@@ -263,17 +306,32 @@ type UsageTotals struct {
 	// CostMicros is the summed cost, in millionths of one Currency unit.
 	// 1_000_000 is one dollar when Currency is "USD".
 	CostMicros int64 `json:"costMicros"`
-	// Currency is the unit CostMicros is in, empty when nothing was priced.
-	// One deployment should price in ONE currency: these are summed, not
-	// converted.
+	// Currency is the unit CostMicros is in: the first currency priced,
+	// empty when nothing was. Money is never converted, so a call priced in
+	// another currency is left out of CostMicros and counted in Unpriced;
+	// Costs has every currency's own total.
 	Currency string `json:"currency,omitempty"`
-	// Unpriced is how many calls had no cost, because no pricer answered for
-	// them. Above zero, CostMicros is a floor and not the whole bill.
+	// Unpriced is how many calls CostMicros leaves out: calls no pricer
+	// answered for, and calls priced in another currency. Above zero,
+	// CostMicros is a floor and not the whole bill.
 	Unpriced int `json:"unpriced"`
-	// Lines is the same spend grouped by agent and model: one line per pair,
-	// which is the shape a bill wants. Summing the lines gives the totals
-	// above.
+	// Costs is the money per currency, in the order each was first seen.
+	// One run is only ever priced in one currency (a second one is refused
+	// when the call is recorded), so a run's bill has at most one entry; a
+	// thread whose pricer changed currency between runs can have more.
+	Costs []CurrencyCost `json:"costs,omitempty"`
+	// Lines is the same spend grouped by agent, model and currency: one
+	// line per agent and model, which is the shape a bill wants. Summing
+	// the lines of one currency gives that currency's entry in Costs.
 	Lines []UsageLine `json:"lines,omitempty"`
+}
+
+// CurrencyCost is the money spent in one currency (§4).
+type CurrencyCost struct {
+	Currency   string `json:"currency"`
+	CostMicros int64  `json:"costMicros"`
+	// Calls is how many calls were priced in this currency.
+	Calls int `json:"calls"`
 }
 
 // UsageLine is one agent's spend on one model, summed over its calls (§4).
@@ -283,8 +341,11 @@ type UsageLine struct {
 	AgentID   string `json:"agentId,omitempty"`
 	AgentName string `json:"agentName,omitempty"`
 	// Model is the registry key; ModelID the wire id the provider reported.
-	Model                 string `json:"model,omitempty"`
-	ModelID               string `json:"modelId,omitempty"`
+	Model   string `json:"model,omitempty"`
+	ModelID string `json:"modelId,omitempty"`
+	// Currency is the unit CostMicros is in, empty when none of the
+	// line's calls was priced.
+	Currency              string `json:"currency,omitempty"`
 	InputTokens           int    `json:"inputTokens"`
 	CacheReadInputTokens  int    `json:"cacheReadInputTokens"`
 	CacheWriteInputTokens int    `json:"cacheWriteInputTokens"`
@@ -301,78 +362,57 @@ type UsageLine struct {
 // UsageAggregator sums usage rows into the shape Total must return: the four
 // counters, the money, and one Line per agent and model.
 //
-// A storage adapter that can group in the database should do that instead.
-// This is for the ones that cannot, and for anyone writing their own adapter:
-// feed every matching row through Add and Totals gives back exactly what the
-// port promises, lines in first-seen order.
-type UsageAggregator struct {
-	total UsageTotals
-	index map[usageLineKey]int
-}
-
-type usageLineKey struct{ agentID, agentName, model, modelID string }
+// A storage adapter that can group in the database should do that instead
+// (see UsageLineMerger). This is for the ones that cannot, and for anyone
+// writing their own adapter: feed every matching row through Add and Totals
+// gives back exactly what the port promises, lines in first-seen order.
+type UsageAggregator struct{ merge UsageLineMerger }
 
 // Add books one call.
 func (a *UsageAggregator) Add(u NewUsage) {
-	if a.index == nil {
-		a.index = map[usageLineKey]int{}
+	l := UsageLine{
+		AgentID: u.AgentID, AgentName: u.AgentName, Model: u.Model, ModelID: u.ModelID,
+		InputTokens: u.InputTokens, CacheReadInputTokens: u.CacheReadInputTokens,
+		CacheWriteInputTokens: u.CacheWriteInputTokens, OutputTokens: u.OutputTokens,
+		ReasoningTokens: u.ReasoningTokens, Calls: 1,
 	}
-	a.total.Add(u.Totals())
-
-	key := usageLineKey{u.AgentID, u.AgentName, u.Model, u.ModelID}
-	i, ok := a.index[key]
-	if !ok {
-		i = len(a.total.Lines)
-		a.index[key] = i
-		a.total.Lines = append(a.total.Lines, UsageLine{
-			AgentID: u.AgentID, AgentName: u.AgentName, Model: u.Model, ModelID: u.ModelID,
-		})
-	}
-	line := &a.total.Lines[i]
-	line.InputTokens += u.InputTokens
-	line.CacheReadInputTokens += u.CacheReadInputTokens
-	line.CacheWriteInputTokens += u.CacheWriteInputTokens
-	line.OutputTokens += u.OutputTokens
-	line.ReasoningTokens += u.ReasoningTokens
-	line.Calls++
 	if u.Estimated {
-		line.Estimated++
+		l.Estimated = 1
 	}
-	// Money is summed in ONE currency: the first one seen. A row priced in
-	// another currency cannot be added to it, so it counts as unpriced and
-	// the total stays a floor rather than a mix of units. Totals() above
-	// already added the row's cost; take it back out here.
+	unpriced := 1
 	if u.Cost != nil {
-		if a.total.Currency == "" {
-			a.total.Currency = u.Cost.Currency
-		}
-		if u.Cost.Currency == a.total.Currency {
-			line.CostMicros += u.Cost.Micros
-		} else {
-			a.total.CostMicros -= u.Cost.Micros
-			a.total.Unpriced++
-		}
+		l.Currency, l.CostMicros, unpriced = u.Cost.Currency, u.Cost.Micros, 0
 	}
+	a.merge.Add(l, l.Currency, u.TotalTokens(), unpriced)
 }
 
 // Totals is everything added so far.
-func (a *UsageAggregator) Totals() UsageTotals { return a.total }
+func (a *UsageAggregator) Totals() UsageTotals { return a.merge.Totals() }
+
+type usageLineKey struct{ agentID, agentName, model, modelID string }
 
 // UsageLineMerger rebuilds UsageTotals from grouped rows that a SQL adapter
 // read GROUP BY agent, model AND currency. Grouping by currency is what keeps
 // a sum honest; merging here is what keeps one agent's spend on one model a
-// single line. Money is summed in the first currency seen; a group priced in
-// another currency counts as unpriced instead of being added to it.
+// single line.
+//
+// The rules, the same in every adapter and in the TS runtime: CostMicros is
+// summed in the first currency seen, and a group priced in another currency
+// counts as unpriced there instead of being added. Costs keeps every
+// currency's own total. A line takes the currency of the first priced group
+// on it; a group priced in a different currency gets a line of its own, and
+// unpriced groups join the first line of their agent and model.
 type UsageLineMerger struct {
 	total UsageTotals
-	index map[usageLineKey]int
+	lines map[usageLineKey][]int
+	costs map[string]int
 }
 
 // Add books one grouped row: its line, the currency its cost is in, its
 // summed total tokens and how many of its calls were unpriced.
 func (m *UsageLineMerger) Add(l UsageLine, currency string, totalTokens, unpriced int) {
-	if m.index == nil {
-		m.index = map[usageLineKey]int{}
+	if m.lines == nil {
+		m.lines, m.costs = map[usageLineKey][]int{}, map[string]int{}
 	}
 	m.total.InputTokens += l.InputTokens
 	m.total.CachedInputTokens += l.CacheReadInputTokens
@@ -380,26 +420,49 @@ func (m *UsageLineMerger) Add(l UsageLine, currency string, totalTokens, unprice
 	m.total.TotalTokens += totalTokens
 	m.total.Unpriced += unpriced
 
-	priced := l.Calls - unpriced
-	if currency != "" && m.total.Currency == "" {
-		m.total.Currency = currency
-	}
-	if currency != "" && currency != m.total.Currency {
-		// Another unit: cannot be added to the total, so its calls are
-		// reported as unpriced and the total stays a floor.
-		m.total.Unpriced += priced
+	if currency == "" {
 		l.CostMicros = 0
+	} else {
+		priced := l.Calls - unpriced
+		i, ok := m.costs[currency]
+		if !ok {
+			i = len(m.total.Costs)
+			m.costs[currency] = i
+			m.total.Costs = append(m.total.Costs, CurrencyCost{Currency: currency})
+		}
+		m.total.Costs[i].CostMicros += l.CostMicros
+		m.total.Costs[i].Calls += priced
+		if m.total.Currency == "" {
+			m.total.Currency = currency
+		}
+		if currency == m.total.Currency {
+			m.total.CostMicros += l.CostMicros
+		} else {
+			// Another unit: it cannot be added to CostMicros, so its calls
+			// count as unpriced there and CostMicros stays a floor.
+			m.total.Unpriced += priced
+		}
 	}
-	m.total.CostMicros += l.CostMicros
+	l.Currency = currency
 
 	key := usageLineKey{l.AgentID, l.AgentName, l.Model, l.ModelID}
-	i, ok := m.index[key]
-	if !ok {
-		m.index[key] = len(m.total.Lines)
+	at := -1
+	for _, i := range m.lines[key] {
+		c := m.total.Lines[i].Currency
+		if currency == "" || c == currency || c == "" {
+			at = i
+			break
+		}
+	}
+	if at < 0 {
+		m.lines[key] = append(m.lines[key], len(m.total.Lines))
 		m.total.Lines = append(m.total.Lines, l)
 		return
 	}
-	line := &m.total.Lines[i]
+	line := &m.total.Lines[at]
+	if line.Currency == "" {
+		line.Currency = currency
+	}
 	line.InputTokens += l.InputTokens
 	line.CacheReadInputTokens += l.CacheReadInputTokens
 	line.CacheWriteInputTokens += l.CacheWriteInputTokens
@@ -596,6 +659,12 @@ type RunJob struct {
 	// time and `agent:run:{threadId}` holds its id; a job whose id no longer
 	// matches has been replaced and must not execute.
 	RunID string `json:"runId,omitempty"`
+	// DispatchID names THIS enqueue of the run: a fresh dispatch, a retry, a
+	// resume each get their own. A queue that delivers one job twice
+	// delivers the same DispatchID, which is how the run lock tells a
+	// duplicate apart from another delivery of the same run (§3.4). Stamped
+	// by the platform when it enqueues; empty on jobs written before it.
+	DispatchID string `json:"dispatchId,omitempty"`
 	// EnqueuedAt is epoch milliseconds at THIS enqueue (§2.9): the queue
 	// wait a worker measures on pickup.
 	EnqueuedAt int64 `json:"enqueuedAt,omitempty"`
@@ -761,9 +830,9 @@ type BillingCheck struct {
 	// either field and the segment runs with the lowered cap; raising is
 	// ignored. Nil at dispatch.
 	Budget *RunBudget
-	// PublishEvent publishes a durable event on the thread; Notice for a
-	// bus-only one.
-	PublishEvent func(ctx context.Context, typ string, payload any, notice bool) (AgentEvent, error)
+	// PublishEvent publishes an event on the thread: live only, or also
+	// kept in the thread record when durable.
+	PublishEvent func(ctx context.Context, typ string, payload any, durable bool) (AgentEvent, error)
 }
 
 // AgentConfig tunes the platform. Build one with DefaultConfig and change
@@ -808,6 +877,19 @@ type AgentConfig struct {
 	// RefusedQueueFull so a host can answer 503 with a Retry-After. Zero is
 	// no bound. A queue adapter may enforce its own cap on top.
 	MaxQueueDepth int
+	// StreamGrace is how long a run stream is kept after its segment ends.
+	// A tab that reconnects within it resumes inside the stream; one that
+	// comes later gets a snapshot, which has the final text in the messages.
+	StreamGrace time.Duration
+	// StreamTTL is how long a stream lives if nothing ever closes it: the
+	// last guard when the worker and the sweep both failed.
+	StreamTTL time.Duration
+	// StreamFlush is how long stream events wait to be appended together. A
+	// step end, a tool result, a park and a close go out at once. Zero sends
+	// every event as it comes.
+	StreamFlush time.Duration
+	// StreamFlushEvents appends at once when this many stream events wait.
+	StreamFlushEvents int
 	// TokenBudget is the default per-run token budget (input + output). Zero
 	// means unbounded apart from MaxSteps.
 	TokenBudget int
@@ -863,6 +945,45 @@ type AgentConfig struct {
 	ProviderOptions ProviderOptions
 }
 
+// mergeConfig fills c's never-zero fields from d.
+func mergeConfig(c, d AgentConfig) AgentConfig {
+	orDur := func(v *time.Duration, def time.Duration) {
+		if *v == 0 {
+			*v = def
+		}
+	}
+	orInt := func(v *int, def int) {
+		if *v == 0 {
+			*v = def
+		}
+	}
+	orFloat := func(v *float64, def float64) {
+		if *v == 0 {
+			*v = def
+		}
+	}
+	orDur(&c.HITLTTL, d.HITLTTL)
+	orDur(&c.StopPoll, d.StopPoll)
+	orDur(&c.RunLockLease, d.RunLockLease)
+	orInt(&c.MaxSteps, d.MaxSteps)
+	orInt(&c.RunMaxAttempts, d.RunMaxAttempts)
+	orInt(&c.SubagentMaxDepth, d.SubagentMaxDepth)
+	orInt(&c.SubagentMaxConcurrent, d.SubagentMaxConcurrent)
+	orInt(&c.SubagentMaxSteps, d.SubagentMaxSteps)
+	orInt(&c.SubagentResultCapChars, d.SubagentResultCapChars)
+	orInt(&c.PayloadCapChars, d.PayloadCapChars)
+	orDur(&c.StreamGrace, d.StreamGrace)
+	orDur(&c.StreamTTL, d.StreamTTL)
+	orInt(&c.StreamFlushEvents, d.StreamFlushEvents)
+	orInt(&c.ContextCeilingTokens, d.ContextCeilingTokens)
+	orFloat(&c.CompactionTrigger, d.CompactionTrigger)
+	orFloat(&c.ContextTailShare, d.ContextTailShare)
+	if c.CompactionModel == "" {
+		c.CompactionModel = d.CompactionModel
+	}
+	return c
+}
+
 // DefaultConfig returns the defaults the TypeScript package ships with.
 func DefaultConfig() AgentConfig {
 	return AgentConfig{
@@ -887,14 +1008,27 @@ func DefaultConfig() AgentConfig {
 		RunLockLease:               2 * time.Minute,
 		RunRetryBackoff:            5 * time.Second,
 		RunRetryBackoffMax:         2 * time.Minute,
+		StreamGrace:                10 * time.Minute,
+		StreamTTL:                  24 * time.Hour,
+		StreamFlush:                50 * time.Millisecond,
+		StreamFlushEvents:          32,
 	}
 }
 
-// ResolveConfig validates a config. A nil config means the defaults.
+// ResolveConfig merges a config over the defaults and validates it. A nil
+// config means the defaults.
+//
+// A field left at its zero value takes the default when zero can never be a
+// working value for it (a step cap, a lease, a poll, a window): a partial
+// config such as &AgentConfig{MaxSteps: 5} keeps every other default rather
+// than turning them all to zero. A field where zero is a real choice (no
+// retry backoff, no timeout, no budget) keeps what was given. The two
+// booleans, RecordPayloads and PromptCaching, cannot tell "false" from "left
+// out": start from DefaultConfig to keep them on.
 func ResolveConfig(partial *AgentConfig) (AgentConfig, error) {
 	config := DefaultConfig()
 	if partial != nil {
-		config = *partial
+		config = mergeConfig(*partial, config)
 	}
 	if config.SubagentMaxSteps < 1 || config.SubagentMaxSteps > config.MaxSteps {
 		// A subagent must never get a looser step ceiling than its parent run (§2.7)
@@ -914,6 +1048,12 @@ func ResolveConfig(partial *AgentConfig) (AgentConfig, error) {
 	}
 	if config.StepTimeout < 0 || config.SegmentTimeout < 0 || config.MaxQueueWait < 0 || config.MaxQueueDepth < 0 {
 		return config, errors.New("invalid config: StepTimeout, SegmentTimeout, MaxQueueWait and MaxQueueDepth must not be negative")
+	}
+	if config.StreamFlush < 0 {
+		return config, fmt.Errorf("invalid config: StreamFlush (%s) must not be negative", config.StreamFlush)
+	}
+	if config.StreamGrace < time.Millisecond || config.StreamTTL < time.Millisecond || config.StreamFlushEvents < 1 {
+		return config, errors.New("invalid config: StreamGrace and StreamTTL must be at least 1ms, StreamFlushEvents at least 1")
 	}
 	if config.RunLockLease < time.Second {
 		// The lease is the only thing that heals a crashed worker's lock (§3.4)

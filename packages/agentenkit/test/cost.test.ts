@@ -179,7 +179,7 @@ describe('cost as part of the usage store (§4)', () => {
     // The bill is the lines: one per agent and model, ready to charge.
     expect(got?.usage.lines).toEqual([
       {
-        agentId: null, agentName: 'chat', model: 'gpt-4o', modelId: 'gpt-4o-2024-11-20',
+        agentId: null, agentName: 'chat', model: 'gpt-4o', modelId: 'gpt-4o-2024-11-20', currency: 'USD',
         inputTokens: 20, cacheReadInputTokens: 0, cacheWriteInputTokens: 0,
         outputTokens: 10, reasoningTokens: 0, calls: 2, estimated: 0, costMicros: 500,
       },

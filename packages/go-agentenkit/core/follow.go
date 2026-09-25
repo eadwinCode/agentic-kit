@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
@@ -46,6 +47,20 @@ func (s *EventStream) setErr(err error) {
 	s.mu.Unlock()
 }
 
+// maxLiveQueue caps the events a follower holds for a slow consumer. Past
+// it the queue is dropped and the follower reads what it missed back from
+// storage instead: the log has every durable event, so nothing is lost but
+// notices, which nobody needs twice.
+const maxLiveQueue = 10_000
+
+// gapRetries and gapWait bound how long a follower waits for a missing seq
+// to reach storage: another process may have taken seq N, and still be
+// writing it, when seq N+1 arrives on the bus.
+const (
+	gapRetries = 3
+	gapWait    = 50 * time.Millisecond
+)
+
 // FollowEvents streams a thread's events, replay then live.
 //
 // The ordering here is the whole point, and it is easy to get wrong in a
@@ -56,12 +71,17 @@ func (s *EventStream) setErr(err error) {
 //  2. Never emit at or below the cursor. The client would render it twice.
 //  3. seq == 0 is a bus-only notice (heartbeats, death notices). Always
 //     forward it, never let it move the cursor.
+//  4. Never skip a seq. The bus is at-most-once and does not promise order:
+//     an event can be dropped, or arrive after the one published behind it.
+//     An event that jumps past the next seq first has the gap read back from
+//     storage, in order.
 func FollowEvents(ctx context.Context, deps ports.RuntimePorts, threadID string, opts FollowOptions) (*EventStream, error) {
 	var (
-		mu      sync.Mutex
-		live    bool
-		pending []ports.AgentEvent // published while the replay is still running
-		queue   []ports.AgentEvent // published once live, waiting for the consumer
+		mu       sync.Mutex
+		live     bool
+		pending  []ports.AgentEvent // published while the replay is still running
+		queue    []ports.AgentEvent // published once live, waiting for the consumer
+		overflow bool               // the queue was dropped: read storage instead
 	)
 	wake := make(chan struct{}, 1)
 	notify := func() {
@@ -78,6 +98,9 @@ func FollowEvents(ctx context.Context, deps ports.RuntimePorts, threadID string,
 			pending = append(pending, e)
 			mu.Unlock()
 			return
+		}
+		if len(queue) >= maxLiveQueue {
+			queue, overflow = nil, true
 		}
 		queue = append(queue, e)
 		mu.Unlock()
@@ -96,17 +119,6 @@ func FollowEvents(ctx context.Context, deps ports.RuntimePorts, threadID string,
 			close(s.ch)
 		}()
 		lastSeq := opts.Since
-		// Rules 2 and 3 in one place, so no caller has to remember them.
-		admit := func(e ports.AgentEvent) bool {
-			if e.Seq == 0 {
-				return true // a notice: forward, but do not advance
-			}
-			if e.Seq <= lastSeq {
-				return false
-			}
-			lastSeq = e.Seq
-			return true
-		}
 		emit := func(e ports.AgentEvent) bool {
 			select {
 			case s.ch <- e:
@@ -115,19 +127,62 @@ func FollowEvents(ctx context.Context, deps ports.RuntimePorts, threadID string,
 				return false
 			}
 		}
+		// fromStorage emits every stored event after lastSeq and before
+		// upTo (0 = all of them), in order.
+		fromStorage := func(upTo int64) (bool, error) {
+			stored, err := deps.Storage.Events.ListSince(ctx, threadID, lastSeq)
+			if err != nil {
+				return false, err
+			}
+			for _, e := range stored {
+				if upTo > 0 && e.Seq >= upTo {
+					break
+				}
+				if e.Seq > lastSeq {
+					if !emit(e) {
+						return false, nil
+					}
+					lastSeq = e.Seq
+				}
+			}
+			return true, nil
+		}
+		// Rules 2 to 4 in one place, so no caller has to remember them.
+		deliver := func(e ports.AgentEvent) bool {
+			if e.Seq == 0 {
+				return emit(e) // a notice: forward, but do not advance
+			}
+			for try := 0; e.Seq > max(lastSeq, 0)+1 && try < gapRetries; try++ {
+				if try > 0 {
+					select {
+					case <-time.After(gapWait):
+					case <-ctx.Done():
+						return false
+					}
+				}
+				ok, err := fromStorage(e.Seq)
+				if err != nil {
+					break // the live event still goes out; the gap stays
+				}
+				if !ok {
+					return false
+				}
+			}
+			if e.Seq <= lastSeq {
+				return true
+			}
+			lastSeq = e.Seq
+			return emit(e)
+		}
 		if ctx.Err() != nil {
 			return
 		}
 		// …then the durable log…
-		replay, err := deps.Storage.Events.ListSince(ctx, threadID, opts.Since)
-		if err != nil {
+		if ok, err := fromStorage(0); err != nil {
 			s.setErr(err)
 			return
-		}
-		for _, e := range replay {
-			if admit(e) && !emit(e) {
-				return
-			}
+		} else if !ok {
+			return
 		}
 		// …then whatever arrived behind it, in order.
 		mu.Lock()
@@ -137,17 +192,26 @@ func FollowEvents(ctx context.Context, deps ports.RuntimePorts, threadID string,
 		mu.Unlock()
 		sort.SliceStable(behind, func(i, j int) bool { return behind[i].Seq < behind[j].Seq })
 		for _, e := range behind {
-			if admit(e) && !emit(e) {
+			if !deliver(e) {
 				return
 			}
 		}
 		for {
 			mu.Lock()
-			batch := queue
-			queue = nil
+			batch, dropped := queue, overflow
+			queue, overflow = nil, false
 			mu.Unlock()
+			if dropped {
+				// The consumer fell too far behind: catch up from the log.
+				if ok, err := fromStorage(0); err != nil || !ok {
+					if err != nil {
+						s.setErr(err)
+					}
+					return
+				}
+			}
 			for _, e := range batch {
-				if admit(e) && !emit(e) {
+				if !deliver(e) {
 					return
 				}
 			}

@@ -298,14 +298,16 @@ describe('subagents (§2.7)', () => {
 
     await act(async () => {
       emit({ seq: 8, type: 'SUBAGENT_STARTED', payload: { agentId: 'sub_1', name: 'mailer', depth: 1 } });
-      emit({ seq: 9, type: 'SUBAGENT_CHUNK', payload: { agentId: 'sub_1', chunk: { textDelta: 'working' } } });
+      emit({ seq: 9, type: 'SUBAGENT_CHUNK', payload: { agentId: 'sub_1', chunk: { type: 'reasoning', textDelta: 'hmm ' } } });
+      emit({ seq: 10, type: 'SUBAGENT_CHUNK', payload: { agentId: 'sub_1', chunk: { type: 'text-delta', textDelta: 'working' } } });
     });
+    // The child's answer only: its thinking is not what it said.
     expect(view.result.current.subagents).toMatchObject([
       { agentId: 'sub_1', name: 'mailer', depth: 1, status: 'RUNNING', text: 'working' },
     ]);
 
     await act(async () => {
-      emit({ seq: 10, type: 'SUBAGENT_FAILED', payload: { agentId: 'sub_1', error: 'unknown model' } });
+      emit({ seq: 11, type: 'SUBAGENT_FAILED', payload: { agentId: 'sub_1', error: 'unknown model' } });
     });
     // A failed child reports to its parent; the reason has to survive.
     expect(view.result.current.subagents[0]).toMatchObject({
@@ -344,16 +346,19 @@ describe('run and stop (§2.1)', () => {
     expect(body.providerOptions).toEqual({ openai: { serviceTier: 'flex' } });
   });
 
-  it('reports a rejected run instead of leaving the UI stuck on RUNNING', async () => {
-    const { view } = await mount({ runResult: { accepted: false, error: 'Thread has an active run' } });
+  it('undoes a refused send and says why, without failing the thread', async () => {
+    const { view } = await mount({ runResult: { accepted: false, error: 'Out of credits' } });
+    const before = view.result.current.entries;
 
     await act(async () => {
       const r = await view.result.current.run('hi');
       expect(r.accepted).toBe(false);
     });
 
-    expect(view.result.current.agentState).toBe('FAILED');
-    expect(view.result.current.activity.detail).toContain('Thread has an active run');
+    // The optimistic turn is gone and the thread is as it was.
+    expect(view.result.current.entries).toEqual(before);
+    expect(view.result.current.agentState).toBe('COMPLETED');
+    expect(view.result.current.error).toContain('Out of credits');
   });
 
   it('stops the open thread', async () => {

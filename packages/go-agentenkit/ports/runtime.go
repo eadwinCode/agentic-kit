@@ -2,6 +2,7 @@ package ports
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 
 	"github.com/zendev-sh/goai"
@@ -19,6 +20,8 @@ type RuntimePorts struct {
 	Bus     EventBus
 	Queue   Queue
 	Kv      Kv
+	// Streams holds the run streams, one per segment; nil writes none.
+	Streams RunStreams
 	// ResolveModel is user-provided model resolution (§3.3): models can live
 	// in any shape on the consumer side; the platform only sees ResolvedModel.
 	ResolveModel func(modelName string) (ResolvedModel, error)
@@ -61,6 +64,11 @@ type RuntimeOptions struct {
 	Bus   EventBus
 	Queue Queue
 	Kv    Kv
+	// Streams holds short-lived logs, one per run segment: where a run's
+	// live events go. Nil keeps them in memory, which only this process can
+	// read: fine for one process, not for web servers and workers that run
+	// apart.
+	Streams RunStreams
 	// ResolveModel turns a registry key into a provider instance and a
 	// context window.
 	ResolveModel func(modelName string) (ResolvedModel, error)
@@ -114,6 +122,11 @@ type RunInput struct {
 	// backlog from starving the others. Opaque to the platform; empty means
 	// one shared lane.
 	PartitionKey string
+	// ClientMessageID is the sending client's own name for the user turn.
+	// It comes back on the turn's MESSAGE_APPENDED, so the client that sent
+	// it can swap its optimistic copy for the real one by id, never by
+	// matching text. Opaque to the platform, and not stored.
+	ClientMessageID string
 }
 
 // Attachment is one image on a user turn: a URL the provider can fetch, or
@@ -140,8 +153,9 @@ type PrepareStepFunc func(ctx context.Context, threadID string, state AgentRunSt
 // SettleFunc runs after a run's last step and BEFORE its terminal
 // STATE_CHANGE is written (§5.6): the place to commit what the run produced
 // so every client sees it settled the moment the state flips. An error fails
-// the run. A user stop reaches it with a cancelled ctx and Cancelled set;
-// storage work in the hook should use context.WithoutCancel.
+// the run. A user stop reaches it with Cancelled set, on a ctx that is not
+// cancelled, so the hook's own writes land; tell a stop apart by Cancelled,
+// never by ctx.Err().
 //
 // It may run more than once for one run: a worker that dies inside it is
 // redelivered. Keep it idempotent on RunID.
@@ -212,10 +226,60 @@ type ThreadSnapshot struct {
 	// Runs are the runs on this thread (§2.7), so a reconnecting client
 	// rebuilds its subagent panel.
 	Runs []RunRecord `json:"runs"`
-	// LastEventSeq is the cursor for starting live replay.
+	// LastEventSeq is the thread record's last seq.
 	LastEventSeq int64 `json:"lastEventSeq"`
-	// ActiveEvents are only the unfinished run's events.
+	// ActiveEvents are the unfinished run's record entries: its open park,
+	// a refusal.
 	ActiveEvents []AgentEvent `json:"activeEvents"`
+	// Stream is the run stream in flight, or one that just ended: what the
+	// messages do not have yet, and where a live read picks up.
+	Stream *SnapshotStream `json:"stream"`
+}
+
+// SnapshotStream is the run stream a snapshot carries: the segment in
+// flight, or one that ended a moment ago, so a tab that loads just as a run
+// ends still sees its end.
+type SnapshotStream struct {
+	StreamID string `json:"streamId"`
+	RunID    string `json:"runId"`
+	// Items are what the messages do not have yet: each agent's events
+	// after its last finished step. A finished step is in the messages
+	// already, and showing its deltas too would put its text on screen
+	// twice.
+	Items []StreamItem `json:"items"`
+	// End is the stream's end, when it has one.
+	End StreamEnd `json:"-"`
+	// Offset is where a live read picks up: the last offset the stream
+	// held, cut items included. Empty for a stream with nothing in it.
+	Offset string `json:"offset"`
+}
+
+// MarshalJSON writes End as its event JSON, or null, and Offset as null
+// when empty, as the TS runtime does.
+func (s SnapshotStream) MarshalJSON() ([]byte, error) {
+	var end json.RawMessage = []byte("null")
+	if s.End != nil {
+		b, err := EncodeStreamEvent(s.End)
+		if err != nil {
+			return nil, err
+		}
+		end = b
+	}
+	var offset *string
+	if s.Offset != "" {
+		offset = &s.Offset
+	}
+	items := s.Items
+	if items == nil {
+		items = []StreamItem{}
+	}
+	return json.Marshal(struct {
+		StreamID string          `json:"streamId"`
+		RunID    string          `json:"runId"`
+		Items    []StreamItem    `json:"items"`
+		End      json.RawMessage `json:"end"`
+		Offset   *string         `json:"offset"`
+	}{s.StreamID, s.RunID, items, end, offset})
 }
 
 // RunFinishInfo is handed to a spec's OnFinish after the platform finalized

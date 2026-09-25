@@ -24,9 +24,9 @@ Router; the shape is the same anywhere.
 
 ```ts
 export async function POST(req: NextRequest) {
-  const { threadId, prompt, model, editMessageId } = await req.json();
+  const { threadId, prompt, model, editMessageId, clientMessageId } = await req.json();
 
-  const result = await chat.run({ threadId, prompt, model, editMessageId });
+  const result = await chat.run({ threadId, prompt, model, editMessageId, clientMessageId });
   if (!result.accepted) return NextResponse.json(result, { status: 409 });
 
   return NextResponse.json(result, { status: 202 });
@@ -36,9 +36,15 @@ export async function POST(req: NextRequest) {
 `202`, not `200`: the run has been accepted, not completed. A `409` means the
 thread already has an active run — stop it first, or wait.
 
-The Go runtime also accepts `runId` (name the run yourself; a reused id is a
+`run()` also accepts `runId` (name the run yourself; a reused id is a
 `409`), `maxSteps` (cap the run below the config's ceiling) and `attachments`
 (`[{url, mediaType}]`, images on the user turn).
+
+`clientMessageId` is the sending client's own name for the user turn. It comes
+back on the turn's `MESSAGE_APPENDED`, which is how `use-agentenkit` swaps its
+optimistic copy for the real one. Pass it through, or the hook falls back to
+matching the turn by its text. `model` may be absent: the hook sends none
+unless told to, and the agent's own model is used.
 
 `editMessageId` replaces that user turn and drops everything after it, then
 answers again. Only a user turn may be edited: cutting from anywhere else can
@@ -83,15 +89,23 @@ export async function GET(req: NextRequest) {
 }
 ```
 
-The snapshot carries `thread`, `messages`, `runs`, `lastEventSeq` and
-`activeEvents`. A client renders the messages, applies `activeEvents` to restore
-whatever the in-flight run has produced but not yet committed, then opens the
-stream at `lastEventSeq`. Each of `runs` carries its `startedAt` and, once it
-ended, its `endedAt`.
+The snapshot carries `thread`, `messages`, `runs`, `lastEventSeq`,
+`activeEvents` and `stream`:
 
-`activeEvents` deliberately excludes stream chunks from steps that are already
-durable. Replaying those on top of the messages would render each finished step
-twice.
+| Field | What it is |
+| :--- | :--- |
+| `messages` | Every saved message. A finished step's text is here. |
+| `runs` | Nested runs, each with its `startedAt` and, once it ended, its `endedAt`. |
+| `lastEventSeq` | The thread record's last `seq`. |
+| `activeEvents` | The unfinished run's record entries: its open park, a refusal. |
+| `stream` | `{ streamId, runId, items, end, offset }` for the latest segment's run stream, while it is open or ended less than a minute ago. `null` otherwise. |
+
+A client renders the messages, applies `activeEvents`, shows `stream.items`
+after the messages, then opens the live stream from there.
+
+`stream.items` leaves out each agent's content up to its last finished step,
+because that part is already in the messages. Showing it again would render
+each finished step twice.
 
 ## Live stream
 
@@ -99,25 +113,59 @@ The one endpoint with real logic — so the logic is in the runtime, not in your
 handler.
 
 ```ts
-const { stream, headers } = runtime.events.sse(threadId, { since, signal });
+const { stream, headers } = runtime.events.sse(threadId, { cursor, lastMessageId, signal });
 ```
 
 You get back a `ReadableStream<Uint8Array>` of SSE frames and the headers to
 serve it with. Not a `Response`, because half the ecosystem has none.
 
+### What it sends
+
+Each SSE message is one frame, as JSON:
+
+| Frame | What it is |
+| :--- | :--- |
+| `{ kind: 'thread', event }` | A thread record entry, or a live notice (`seq: 0`) such as `STATE_CHANGE` |
+| `{ kind: 'stream', streamId, item }` | One item from a run stream: a typed event with its `offset` |
+| `{ kind: 'snapshot', snapshot }` | The stream the client was reading is gone; here is a fresh snapshot |
+
+The follow reads the thread record from the cursor's `seq`, and the run
+stream the cursor names from its offset. When a new segment starts, its
+`RUN_STARTED` entry moves the read to the new stream. When the stream the
+client was reading is gone (past its grace window), the follow sends one
+`snapshot` frame on the same connection — the messages after
+`lastMessageId`, the record state, and the open stream — and carries on from
+there. No second request, no reload.
+
+See [Run streams](./run-streams.md) for the events a stream carries.
+
+### The cursor
+
+The cursor is one string: `<seq> <streamId> <offset>`, with `-` for a part the
+client does not have. For example `42 run_abc:2 1718-0`.
+
+Every frame that moves the cursor carries it as its SSE `id:`. EventSource
+keeps the last id it saw and sends it back as `Last-Event-ID` when it
+reconnects, so a reconnect picks up exactly where it stopped. A notice
+(`seq: 0`) carries no `id:`, so it never moves the cursor.
+
+A bare number is read as a record `seq` alone, which is what older clients
+send.
+
 ### What it does for you
 
-Three rules, each of which is a real bug when a handler gets it wrong:
+The rules, each of which is a real bug when a handler gets it wrong:
 
 1. **Subscribe before replaying.** An event published between the replay
    finishing and the tail starting is otherwise lost for ever.
 2. **Never emit at or below the cursor.** The client would render it twice.
-3. **A bus-only notice (`seq === 0`) is forwarded but never moves the cursor** —
-   and is sent *without* an `id:` line. EventSource stores any id it sees and
-   returns it as `Last-Event-ID`, so stamping `id: 0` on a heartbeat would
-   rewind a reconnecting client to the start of the thread.
+3. **Never skip a seq.** A record entry that arrives out of order has the gap
+   read back from storage first.
+4. **A notice is forwarded but never moves the cursor**, and is sent without
+   an `id:` line.
+5. **A gone stream becomes one snapshot**, not an error.
 
-It also unsubscribes when the client hangs up, when the signal aborts, or when
+It also stops reading when the client hangs up, when the signal aborts, or when
 the consumer stops iterating — a subscription that outlives its reader leaks one
 per reconnect.
 
@@ -125,20 +173,25 @@ per reconnect.
 
 | Option | Meaning |
 | :--- | :--- |
-| `since` | Resume after this seq. `-1` (default) replays from the start. |
+| `cursor` | Where the client is: the `<seq> <streamId> <offset>` string (or a parsed `ThreadCursor`). Absent, it follows from now: the record from the start, and the run stream in flight from what the messages lack. |
+| `since` | A bare record seq, for an older client. Used when there is no `cursor`. |
+| `lastMessageId` | The last message the client has, so a `snapshot` frame carries only newer ones. |
 | `signal` | Abort to stop the stream and unsubscribe. **Pass it.** |
 | `retryMs` | Emitted once up front: how long a browser waits before reconnecting. |
+| `wireFormat` | `'ag-ui'` sends [AG-UI](https://docs.ag-ui.com) events instead of the frames above. Opt-in; the default is the native frames. |
 | `state` | Run state, if your storage is tenant-scoped. |
 
 ### Reading the cursor
 
-The same three lines in every framework:
+The same line in every framework: the header first, then the query.
 
 ```ts
-const raw = headerOrQuery('last-event-id') ?? query('since');
-const parsed = raw === null ? -1 : Number(raw);
-const since = Number.isFinite(parsed) ? parsed : -1;   // a bad cursor replays
+const cursor = header('last-event-id') ?? query('cursor') ?? query('since');   // a bad cursor is no cursor
+const lastMessageId = query('lastMessageId') ?? undefined;
 ```
+
+`runtime.events.sse` and `follow` take the string as it is. There is no need
+to parse it.
 
 ---
 
@@ -150,11 +203,15 @@ Anywhere `Response` is native, serve the stream directly.
 // Next.js App Router
 export async function GET(req: NextRequest) {
   const threadId = req.nextUrl.searchParams.get('threadId')!;
-  const raw = req.headers.get('last-event-id') ?? req.nextUrl.searchParams.get('since');
-  const parsed = raw === null ? -1 : Number(raw);
+  const cursor =
+    req.headers.get('last-event-id') ??
+    req.nextUrl.searchParams.get('cursor') ??
+    req.nextUrl.searchParams.get('since');
+  const lastMessageId = req.nextUrl.searchParams.get('lastMessageId') ?? undefined;
 
   const { stream, headers } = runtime.events.sse(threadId, {
-    since: Number.isFinite(parsed) ? parsed : -1,
+    cursor,
+    lastMessageId,
     signal: req.signal,
   });
 
@@ -165,11 +222,11 @@ export async function GET(req: NextRequest) {
 ```ts
 // Hono
 app.get('/api/agent/stream', (c) => {
-  const raw = c.req.header('last-event-id') ?? c.req.query('since');
-  const parsed = raw === undefined ? -1 : Number(raw);
+  const cursor = c.req.header('last-event-id') ?? c.req.query('cursor') ?? c.req.query('since');
 
   const { stream, headers } = runtime.events.sse(c.req.query('threadId')!, {
-    since: Number.isFinite(parsed) ? parsed : -1,
+    cursor,
+    lastMessageId: c.req.query('lastMessageId'),
     signal: c.req.raw.signal,
   });
 
@@ -179,98 +236,101 @@ app.get('/api/agent/stream', (c) => {
 
 ### Express and Fastify
 
-Node has no `Response`, so use the event iterator and write frames yourself.
-`sseFrame` is the same encoder the stream uses.
-
-```ts
-import { SSE_HEADERS, sseFrame } from 'agentenkit';
-
-app.get('/api/agent/stream', async (req, res) => {
-  const raw = (req.headers['last-event-id'] as string) ?? (req.query.since as string);
-  const parsed = raw === undefined ? -1 : Number(raw);
-
-  // Node gives you no AbortSignal — make one and tie it to the socket, or the
-  // subscription outlives the client.
-  const abort = new AbortController();
-  res.on('close', () => abort.abort());
-
-  res.writeHead(200, SSE_HEADERS);
-  res.flushHeaders?.();
-
-  try {
-    for await (const event of runtime.events.follow(String(req.query.threadId), {
-      since: Number.isFinite(parsed) ? parsed : -1,
-      signal: abort.signal,
-    })) {
-      res.write(sseFrame(event));
-    }
-  } finally {
-    res.end();
-  }
-});
-```
-
-Prefer to pipe? Node ≥ 18 can adapt the web stream:
+Node has no `Response`. Node 18 and later can adapt the web stream:
 
 ```ts
 import { Readable } from 'node:stream';
 
-const { stream, headers } = runtime.events.sse(threadId, { since, signal: abort.signal });
-res.writeHead(200, headers);
-Readable.fromWeb(stream as any).pipe(res);
+app.get('/api/agent/stream', (req, res) => {
+  const cursor =
+    (req.headers['last-event-id'] as string | undefined) ??
+    (req.query.cursor as string | undefined) ??
+    (req.query.since as string | undefined);
+
+  // Node gives you no AbortSignal — make one and tie it to the socket, or the
+  // follow outlives the client.
+  const abort = new AbortController();
+  res.on('close', () => abort.abort());
+
+  const { stream, headers } = runtime.events.sse(String(req.query.threadId), {
+    cursor,
+    lastMessageId: req.query.lastMessageId as string | undefined,
+    signal: abort.signal,
+  });
+  res.writeHead(200, headers);
+  res.flushHeaders?.();
+  Readable.fromWeb(stream as any).pipe(res);
+});
+```
+
+Prefer to write frames yourself? `follow` yields the frames, and `followFrame`
+is the same encoder the stream uses. It moves the cursor you give it:
+
+```ts
+import { SSE_HEADERS, followFrame, parseCursor } from 'agentenkit';
+
+const at = parseCursor(cursor) ?? { seq: -1 };
+res.writeHead(200, SSE_HEADERS);
+for await (const frame of runtime.events.follow(threadId, { cursor, lastMessageId, signal: abort.signal })) {
+  res.write(followFrame(frame, at));
+}
+res.end();
 ```
 
 ### NestJS
 
-Nest's `@Sse()` wants an `Observable<MessageEvent>`. RxJS 7 takes an async
-iterable directly, so the iterator drops straight in:
+The simplest route in Nest is a plain `@Get` that pipes the stream, the same
+as Express:
 
 ```ts
-import { Controller, Query, Req, Sse, type MessageEvent } from '@nestjs/common';
-import { from, map, type Observable } from 'rxjs';
+import { Controller, Get, Headers, Query, Req, Res } from '@nestjs/common';
+import { Readable } from 'node:stream';
 
 @Controller('api/agent')
 export class AgentStreamController {
-  @Sse('stream')
+  @Get('stream')
   stream(
     @Query('threadId') threadId: string,
-    @Query('since') since: string | undefined,
+    @Query('cursor') cursor: string | undefined,
+    @Query('lastMessageId') lastMessageId: string | undefined,
+    @Headers('last-event-id') lastEventId: string | undefined,
     @Req() req: any,
-  ): Observable<MessageEvent> {
+    @Res() res: any,
+  ) {
     const abort = new AbortController();
     req.on('close', () => abort.abort());
-    const parsed = since === undefined ? -1 : Number(since);
 
-    return from(
-      runtime.events.follow(threadId, {
-        since: Number.isFinite(parsed) ? parsed : -1,
-        signal: abort.signal,
-      }),
-    ).pipe(
-      // Carry the seq as the SSE id so a reconnect resumes — but NOT for a
-      // seq-0 notice, which would rewind the cursor.
-      map((event) => ({
-        data: event as unknown as Record<string, unknown>,
-        ...(event.seq !== 0 ? { id: String(event.seq) } : {}),
-      })),
-    );
+    const { stream, headers } = runtime.events.sse(threadId, {
+      cursor: lastEventId ?? cursor,
+      lastMessageId,
+      signal: abort.signal,
+    });
+    res.writeHead(200, headers);
+    Readable.fromWeb(stream as any).pipe(res);
   }
 }
 ```
 
-Nest reads `Last-Event-ID` as a plain header if you prefer it to the query
-parameter — inject it with `@Headers('last-event-id')`.
+`@Sse()` works too, but then you set each message's `id` yourself: use
+`followFrame` as above, or the cursor goes missing and a reconnect starts over.
 
 ### Something else entirely
 
-`follow` is just an async iterable of events. A WebSocket, a long-poll, a log
+`follow` is just an async iterable of frames. A WebSocket, a long-poll, a log
 shipper, a test — all the same shape:
 
 ```ts
-for await (const event of runtime.events.follow(threadId, { signal })) {
-  socket.send(JSON.stringify(event));
+for await (const frame of runtime.events.follow(threadId, { cursor, signal })) {
+  socket.send(JSON.stringify(frame));
 }
 ```
+
+Only need one run? `runtime.streams.read(streamId, after, signal)` reads one
+run stream on its own, live until it ends. It throws `StreamGoneError` once
+the stream is past its grace window.
+
+Want the thread record alone, as before run streams? `runtime.events.followRecord(threadId, { since, signal })`
+yields plain events, with no stream frames.
 
 ### Heal a parked approval on connect
 
@@ -308,6 +368,17 @@ approval, outlives this HTTP response.
 Delivery is at-least-once, so double dispatch is possible; the per-thread run
 lock makes it a no-op.
 
+`handleJob` throws `UnknownAgentError` for a job naming an agent this process
+does not have, so a queue that retries on failure keeps the job rather than
+losing it. A long-lived worker passes `{ signal }` and aborts it on shutdown:
+the segment stops at once and the job goes back on the queue without spending
+an attempt.
+
+When your queue gives up on a job (its attempts are spent), call
+`runtime.worker.handleDeadJob(job, attempts, cause)`: the run behind it is
+failed with the reason and settled, so its thread does not read `QUEUED` or
+`RUNNING` for ever. A job whose run has already moved on is left alone.
+
 > **This endpoint must be authenticated.** It executes agents. See
 > [Production](./production.md#security).
 
@@ -321,7 +392,7 @@ if (process.env.INLINE_WORKER === '1') {
   waitUntil(runtime.worker.handleJob({
     threadId: result.threadId,
     runId: result.runId,        // the run id run() enqueued — required
-    model: model ?? 'gpt-4o',
+    model: model ?? 'gpt-4o',   // the agent's own model when the client sent none
     agent: chat.name,
   }));
 }

@@ -165,7 +165,7 @@ func ExecuteStep(ctx context.Context, agent *RegisteredAgent, call StepCall) (*S
 		// The text is accumulated as it goes, so a call cut off half way still
 		// knows how much it produced and can be billed for it (§4).
 		var streamed strings.Builder
-		var finished, sawToolDelta bool
+		var sawFinish, sawReason, sawToolDelta bool
 		drainErr := drainStream(stream, func(chunk provider.StreamChunk) {
 			// Everything the model produced counts as output when a call is
 			// cut off: the answer, its thinking, and the tool arguments,
@@ -186,10 +186,18 @@ func ExecuteStep(ctx context.Context, agent *RegisteredAgent, call StepCall) (*S
 			// Whether the call ran to its end is decided by what this loop
 			// SAW, not by whether the stream reported an error: a stop that
 			// tears the provider down mid-call does not always surface as one
-			// (§4). The finish chunk arriving is the only reliable "this
-			// completed".
+			// (§4). It completed when the finish chunk arrived AND the model
+			// gave a finish reason. goai's OpenAI stream puts that reason on
+			// the step_finish chunk and ends with a finish chunk that carries
+			// only the usage; its tool loop puts it on the finish chunk. A
+			// stream that closed with no reason anywhere was cut short
+			// without saying so, which is not a finish (the TS runtime reads
+			// the SDK's 'unknown' the same way).
+			if (chunk.Type == provider.ChunkFinish || chunk.Type == provider.ChunkStepFinish) && chunk.FinishReason != "" {
+				sawReason = true
+			}
 			if chunk.Type == provider.ChunkFinish {
-				finished = true
+				sawFinish = true
 			}
 			if call.OnChunk != nil {
 				call.OnChunk(chunk)
@@ -200,7 +208,7 @@ func ExecuteStep(ctx context.Context, agent *RegisteredAgent, call StepCall) (*S
 		})
 		release()
 		streamedText = streamed.String()
-		if drainErr != nil || !finished {
+		if drainErr != nil || !sawFinish || !sawReason {
 			// The call ended without finishing: a provider failure, or a stop
 			// that tore it down mid-stream. goai ends every other path with a
 			// finish chunk, and drops that chunk exactly when its own context
@@ -295,12 +303,37 @@ func capValue(raw json.RawMessage, limit int) json.RawMessage {
 	return TextContent(capText(string(raw), limit))
 }
 
-// RunLedger is the tokens a run has spent, main agent and nested runs
-// together (§2.7). Shared so a child's spend counts against the run's safety
-// cap the moment it happens.
+// RunLedger is what a run has spent, main agent and nested runs together
+// (§2.7): its tokens, its money and the one currency that money is in.
+// Shared so a child's spend counts against the run's caps the moment it
+// happens.
+//
+// A run's ledger starts from what the run already spent (SeedRunLedger): its
+// earlier segments, before a park or a retry, count against the same caps.
+// After that it is kept in memory, so the caps are checked without reading
+// every usage row back after every step.
 type RunLedger struct {
 	mu         sync.Mutex
 	tokensUsed int
+	costMicros int64
+	currency   string
+}
+
+// SeedRunLedger starts a ledger from the run's usage rows (§4). A failed
+// read is logged and the ledger starts from zero: a run is not failed over
+// its caps' bookkeeping.
+func SeedRunLedger(ctx context.Context, deps ports.RuntimePorts, threadID, runID string) *RunLedger {
+	l := &RunLedger{}
+	if runID == "" {
+		return l
+	}
+	spent, err := deps.Storage.Usage.Total(context.WithoutCancel(ctx), threadID, ports.UsageFilter{RunID: runID})
+	if err != nil {
+		Logger(deps).Error("run spend not read; the caps count from zero this segment", "run", runID, "err", err)
+		return l
+	}
+	l.tokensUsed, l.costMicros, l.currency = spent.TotalTokens, spent.CostMicros, spent.Currency
+	return l
 }
 
 // Add books tokens onto the ledger.
@@ -317,7 +350,46 @@ func (l *RunLedger) TokensUsed() int {
 	return l.tokensUsed
 }
 
+// Spent is the money the run has spent, and the currency it is in.
+func (l *RunLedger) Spent() (int64, string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.costMicros, l.currency
+}
+
+// Record prices one call, stores its row and books it (§4). A run is priced
+// in one currency: a call priced in another is stored unpriced, with an
+// error logged, rather than mixed into a bill that cannot add it up.
+func (l *RunLedger) Record(ctx context.Context, deps ports.RuntimePorts, threadID string, u ports.NewUsage) ports.NewUsage {
+	u = price(ctx, deps, u)
+	if l != nil && u.Cost != nil {
+		l.mu.Lock()
+		if l.currency == "" {
+			l.currency = u.Cost.Currency
+		}
+		if u.Cost.Currency != l.currency {
+			Logger(deps).Error("usage priced in a second currency; stored unpriced",
+				"run", u.RunID, "model", u.Model, "currency", u.Cost.Currency, "runCurrency", l.currency)
+			u.Cost = nil
+		}
+		l.mu.Unlock()
+	}
+	store(ctx, deps, threadID, u)
+	if l != nil {
+		l.mu.Lock()
+		l.tokensUsed += u.TotalTokens()
+		if u.Cost != nil {
+			l.costMicros += u.Cost.Micros
+		}
+		l.mu.Unlock()
+	}
+	return u
+}
+
 // LoopInput seeds a loop.
+// ErrRunLockLost ends a loop whose run lock was lost between steps (§3.4).
+var ErrRunLockLost = errors.New("agentenkit: run lock lost")
+
 type LoopInput struct {
 	// AgentID is whose stream this loop persists to (§2.7). Empty is the
 	// main agent.
@@ -336,7 +408,15 @@ type LoopInput struct {
 	// can still be finalized.
 	GenCtx context.Context
 	// Aborted reports whether the platform cancelled GenCtx on purpose.
-	Aborted         func() bool
+	Aborted func() bool
+	// CommitParks writes the parks raised during a step, once that step is
+	// saved (see ParkBox). Only the main loop sets it: a nested run's parks
+	// wait for the main agent's step. Nil commits nothing.
+	CommitParks func(ctx context.Context) error
+	// Fenced reports that the run lock is gone (§3.4): another worker may
+	// own the thread, so this loop must not write another step to it. Nil
+	// means never.
+	Fenced          func() bool
 	ProviderOptions ports.ProviderOptions
 	// TokenBudget is the cumulative cap for the whole run, checked against
 	// the shared ledger.
@@ -357,7 +437,12 @@ type LoopInput struct {
 	// AgentName is the name that goes on the bill line: the registered
 	// handle for the main run, the delegation's name for a nested one.
 	AgentName string
-	OnChunk   func(provider.StreamChunk)
+	// OnChunk sees every raw chunk: the host's own callback.
+	OnChunk func(provider.StreamChunk)
+	// PublishChunk publishes a chunk as an event. Deltas reach it merged
+	// (see chunkBatcher), and everything a step streamed is out before the
+	// step is committed.
+	PublishChunk func(payload map[string]any)
 	// System is the persona for a nested run; empty keeps the spec's.
 	System string
 	// SystemFn builds the persona per step (§3.1); it wins over System and
@@ -383,6 +468,11 @@ type LoopOutcome struct {
 	ParkedToolCallID string
 	// Aborted: the platform cancelled the run mid-loop, a user stop (§2.1).
 	Aborted bool
+	// Interrupted: the last model call ended without a finish and without a
+	// user stop, and no error said why. The caller works out the cause (a
+	// lost lock, a segment deadline, a stream the provider cut short); the
+	// run must not be taken as finished.
+	Interrupted bool
 	// Steps is the iterations this loop completed (§2.9).
 	Steps int
 	// CostExhausted: the run hit its money cap and stopped between steps (§4).
@@ -443,8 +533,19 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		stepsLeft--
 		stepStartedAt := time.Now()
 		var onChunk func(provider.StreamChunk)
+		var batcher *chunkBatcher
 		if input.Kind == ports.KindStreamText {
-			onChunk = input.OnChunk
+			if input.PublishChunk != nil {
+				batcher = newChunkBatcher(input.PublishChunk)
+			}
+			onChunk = func(c provider.StreamChunk) {
+				if batcher != nil {
+					batcher.push(ChunkPayload(c))
+				}
+				if input.OnChunk != nil {
+					input.OnChunk(c)
+				}
+			}
 		}
 		system := input.System
 		if input.SystemFn != nil {
@@ -478,6 +579,9 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		})
 		stepTimedOut := deps.Config.StepTimeout > 0 && errors.Is(stepCtx.Err(), context.DeadlineExceeded) && genCtx.Err() == nil
 		cancelStep()
+		if batcher != nil {
+			batcher.flush() // the step's text is out before anything below
+		}
 		if stepTimedOut {
 			if err == nil {
 				err = context.DeadlineExceeded
@@ -500,15 +604,27 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 				lastInput = EstimateMessages(messages)
 			}
 			if u := unfinishedUsage(input, out.Steps+1, step, outcome, lastInput); u.TotalTokens() > 0 {
-				u = RecordCall(ctx, deps, threadID, u)
+				u = ledger.Record(ctx, deps, threadID, u)
 				out.Attribution.Add(u.Totals())
 				out.TokensUsed += u.TotalTokens()
-				ledger.Add(u.TotalTokens())
 			}
-			if err == nil || aborted() {
+			if aborted() {
 				break // user stop mid-step
 			}
+			if err == nil {
+				out.Interrupted = true
+				break
+			}
 			return out, err // real failure → §2.8 redrive policy
+		}
+
+		// The step is done, and its messages are the first thing it writes.
+		// A worker that lost the lock meanwhile must not write them: the
+		// next holder may already be writing its own. The call itself did
+		// happen and the provider billed it, so its usage is still recorded.
+		if input.Fenced != nil && input.Fenced() {
+			ledger.Record(ctx, deps, threadID, usageOf(input, out.Steps+1, ports.KindStep, step, ports.UsageFinished))
+			return out, ErrRunLockLost
 		}
 
 		// Per-step durability (§5.6): append this step's turns BEFORE the next
@@ -526,6 +642,13 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			}
 		}
 		messages = append(messages, step.ResponseMessages...)
+
+		// One priced usage row per model call (§4), booked on the run-wide
+		// ledger the caps are checked against (§2.7). Written as soon as the
+		// step's messages are, before anything else: a crash after this
+		// point resumes from the saved step and never runs the call again,
+		// so its row must already be there.
+		u := ledger.Record(ctx, deps, threadID, usageOf(input, out.Steps+1, ports.KindStep, step, ports.UsageFinished))
 
 		// goai runs a step's tools after the step finishes and streams no
 		// tool-result chunk for them, so a client would keep showing the call
@@ -547,21 +670,28 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		// A replay boundary (§2.2): everything this step produced is durable
 		// history now, so a reconnecting client must NOT also replay its
 		// chunks. Persisted (not a notice) because the snapshot needs its seq.
+		// It carries the step's finish and usage: a run stream turns it into
+		// its STEP_FINISHED, at the moment the step is saved.
+		a := u.Totals()
 		if _, err := Publish(ctx, deps, threadID, "STEP_COMMITTED", map[string]any{
 			"index": out.Steps, "agentId": nullable(input.AgentID),
+			"step": out.Steps + 1, "finishReason": string(step.FinishReason),
+			"inputTokens": a.InputTokens, "cachedInputTokens": a.CachedInputTokens,
+			"outputTokens": a.OutputTokens, "totalTokens": a.TotalTokens,
 		}); err != nil {
 			return out, err
 		}
+		// The step is durable now, tool calls included, so the parks it
+		// raised can be written: WAITING_FOR_INPUT and the approval requests.
+		if input.CommitParks != nil {
+			if err := input.CommitParks(ctx); err != nil {
+				return out, err
+			}
+		}
 
-		// One priced usage row per model call (§4), then the same counters
-		// accumulated across the segment's steps and into the run-wide ledger
-		// the safety caps are checked against (§2.7).
-		u := RecordCall(ctx, deps, threadID, usageOf(input, out.Steps+1, ports.KindStep, step, ports.UsageFinished))
-		a := u.Totals()
 		lastInput = u.InputTokens
 		out.Attribution.Add(a)
 		out.TokensUsed += a.TotalTokens
-		ledger.Add(a.TotalTokens)
 		out.Text = step.Text
 		out.FinishReason = step.FinishReason
 		out.Steps++
@@ -597,7 +727,7 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		if input.RunID != "" {
 			_ = deps.Admin.Steps().Record(ctx, marker)
 		}
-		_ = PublishNotice(ctx, deps, threadID, "STEP_FINISHED", marker)
+		_ = PublishNotice(ctx, deps, threadID, "STEP_FINISHED", stepFinishedPayload(marker))
 
 		// §2.5 park: a RequiresConfirmation tool returned the sentinel; the
 		// segment ends here on WAITING_FOR_INPUT (set by ParkForApproval).
@@ -622,23 +752,23 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			break
 		}
 
-		// The money cap (§4), checked in the same place and the same way. It
-		// reads the run's spend back from the store rather than from a
-		// counter in this process: a run that parked and resumed in another
-		// worker must not get its cap reset, and a nested run's calls have to
-		// count against the same cap.
+		// The money cap (§4), checked in the same place and the same way,
+		// against the same shared ledger: a nested run's calls count against
+		// it, and a run that parked or retried starts from what it already
+		// spent (see SeedRunLedger).
 		//
 		// It only ever sees priced calls: with no Pricer configured nothing is
 		// ever spent and the cap never fires.
 		if input.CostBudgetMicros > 0 {
-			spent, err := deps.Storage.Usage.Total(ctx, threadID, ports.UsageFilter{RunID: input.BillingRunID})
-			if err != nil {
-				Logger(deps).Error("cost budget not checked", "run", input.BillingRunID, "err", err)
-			} else if spent.CostMicros >= input.CostBudgetMicros {
-				_, _ = Publish(ctx, deps, threadID, "COST_BUDGET_EXHAUSTED", map[string]any{
-					"agentId": nullable(input.AgentID), "costMicros": spent.CostMicros,
-					"costBudgetMicros": input.CostBudgetMicros, "currency": spent.Currency,
-				})
+			if spent, currency := ledger.Spent(); spent >= input.CostBudgetMicros {
+				exhausted := map[string]any{
+					"agentId": nullable(input.AgentID), "costMicros": spent,
+					"costBudgetMicros": input.CostBudgetMicros,
+				}
+				if currency != "" { // left out when unset, as TS does
+					exhausted["currency"] = currency
+				}
+				_, _ = Publish(ctx, deps, threadID, "COST_BUDGET_EXHAUSTED", exhausted)
 				out.CostExhausted = true
 				break
 			}
@@ -686,4 +816,14 @@ func unfinishedUsage(input LoopInput, step int, s *StepResult, outcome ports.Usa
 		u.OutputTokens, u.Estimated = estimateTokens([]byte(s.StreamedText)), true
 	}
 	return u
+}
+
+// stepFinishedPayload is the STEP_FINISHED notice: the step record, with the
+// main agent's stream named null rather than "", as the TS runtime sends it.
+func stepFinishedPayload(marker ports.StepRecord) map[string]any {
+	raw, _ := json.Marshal(marker)
+	var out map[string]any
+	_ = json.Unmarshal(raw, &out)
+	out["agentId"] = nullable(marker.AgentID)
+	return out
 }

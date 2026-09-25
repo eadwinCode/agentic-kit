@@ -10,6 +10,7 @@ import (
 	"github.com/zendev-sh/goai/provider"
 
 	agentenkit "github.com/eadwinCode/agentic-kit/packages/go-agentenkit"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
 
 func TestEngineLoop_FeedsToolResultsBackAndPersistsPerStep(t *testing.T) {
@@ -89,8 +90,17 @@ func TestEngineLoop_BudgetIsCheckedBetweenSteps(t *testing.T) {
 	mustEqual(t, len(exhausted), 1, "TOKEN_BUDGET_EXHAUSTED")
 	mustEqual(t, payload(exhausted[0])["tokensUsed"], float64(120), "tokensUsed on the event")
 	mustEqual(t, payload(exhausted[0])["tokenBudget"], float64(100), "tokenBudget on the event")
-	changes := h.events(ran.ThreadID, "STATE_CHANGE")
-	if exhausted[0].Seq >= changes[len(changes)-1].Seq {
+	sent := h.events(ran.ThreadID, "")
+	exhaustedAt, terminalAt := -1, -1
+	for i, e := range sent {
+		switch e.Type {
+		case "TOKEN_BUDGET_EXHAUSTED":
+			exhaustedAt = i
+		case "STATE_CHANGE":
+			terminalAt = i
+		}
+	}
+	if exhaustedAt < 0 || exhaustedAt >= terminalAt {
 		t.Fatal("must be published before the terminal STATE_CHANGE")
 	}
 }
@@ -115,10 +125,15 @@ func TestEngineLoop_OneShotPublishesTextResult(t *testing.T) {
 	one := h.rt.CreateGenerateTextAgent(agentenkit.GenerateTextAgentSpec{Name: "one", Model: "gpt-4o"})
 	ran := h.run(t, one, agentenkit.RunInput{Prompt: "q"})
 	h.handleNext(t)
-	mustEqual(t, len(h.events(ran.ThreadID, "CHUNK")), 0, "chunks")
-	results := h.events(ran.ThreadID, "TEXT_RESULT")
-	mustEqual(t, len(results), 1, "TEXT_RESULT events")
-	mustEqual(t, payload(results[0])["text"], "final answer", "text")
+	// The text rides on the stream's end; there are no deltas to stream.
+	items := runItems(t, h, ran.RunID)
+	for _, i := range items {
+		if _, ok := i.Event.(*ports.TextMessageContentEvent); ok {
+			t.Fatal("a one-shot agent streams no deltas")
+		}
+	}
+	end := items[len(items)-1].Event.(*ports.RunFinishedEvent)
+	mustEqual(t, end.Text, "final answer", "text")
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "state")
 	mustStrings(t, h.roles(ran.ThreadID), []string{"user", "assistant"}, "roles")
 }
@@ -132,13 +147,13 @@ func TestEngineLoop_StreamPublishesChunksInAISDKShape(t *testing.T) {
 	})
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
 	h.handleNext(t)
-	chunks := h.events(ran.ThreadID, "CHUNK")
-	if len(chunks) == 0 {
-		t.Fatal("no CHUNK events")
+	var text []string
+	for _, i := range runItems(t, h, ran.RunID) {
+		if c, ok := i.Event.(*ports.TextMessageContentEvent); ok {
+			text = append(text, c.Delta)
+		}
 	}
-	first := payload(chunks[0])
-	mustEqual(t, first["type"], "text-delta", "first chunk type")
-	mustEqual(t, first["textDelta"], "hello", "textDelta")
+	mustStrings(t, text, []string{"hello"}, "the text on the run stream")
 	if len(seen) == 0 {
 		t.Fatal("user OnChunk never fired")
 	}
@@ -150,7 +165,7 @@ func TestEngineLoop_StreamPublishesChunksInAISDKShape(t *testing.T) {
 func TestReconnect_ReplaysOnlyTheUncommittedStep(t *testing.T) {
 	var snap *agentenkit.ThreadSnapshot
 	var threadID string
-	h := makeRuntime(t, scripted(
+	h, streams := streamRuntime(t, scripted(
 		step{text: "PART ONE. ", calls: []call{{"c1", "probe", `{"n":1}`}}},
 		step{text: "PART TWO. ", calls: []call{{"c2", "probe", `{"n":2}`}}},
 		step{text: "DONE."},
@@ -179,10 +194,23 @@ func TestReconnect_ReplaysOnlyTheUncommittedStep(t *testing.T) {
 			}
 		}
 	}
+	// What a client that reconnected at the snapshot holds once the step in
+	// flight finishes: the snapshot's stream items, then that step's events
+	// that came after the snapshot's offset.
 	replayed := ""
-	for _, e := range snap.ActiveEvents {
-		if e.Type == "CHUNK" && payload(e)["type"] == "text-delta" {
-			replayed += payload(e)["textDelta"].(string)
+	text := func(items []ports.StreamItem) {
+		for _, i := range items {
+			if c, ok := i.Event.(*ports.TextMessageContentEvent); ok {
+				replayed += c.Delta
+			}
+		}
+	}
+	text(snap.Stream.Items)
+	after, _ := streams.Snapshot(h.ctx, snap.Stream.StreamID, snap.Stream.Offset)
+	for i, item := range after.Items {
+		if s, ok := item.Event.(*ports.StepFinishedEvent); ok && s.AgentID == nil {
+			text(after.Items[:i])
+			break
 		}
 	}
 	mustEqual(t, assistantText, "PART ONE. ", "durable text")

@@ -17,7 +17,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/core"
@@ -37,6 +40,10 @@ func Open(filename string) (*sql.DB, error) {
 			// SQLite serialises writers anyway, and an in-memory database is
 			// per connection: one connection is the only correct pool size.
 			db.SetMaxOpenConns(1)
+			if err := Tune(db); err != nil {
+				_ = db.Close()
+				return nil, err
+			}
 			return db, nil
 		}
 	}
@@ -96,6 +103,22 @@ var usageColumns = map[string]string{
 }
 
 // addMissing adds any of cols the table does not have yet.
+// Tune sets a file up for more than one process (§3.4): WAL lets readers
+// run beside the one writer, and busy_timeout makes a writer wait up to five
+// seconds for the lock rather than fail at once with SQLITE_BUSY. Open calls
+// it; call it yourself on a handle you opened some other way. An in-memory
+// database keeps its own journal mode, which is fine.
+func Tune(db *sql.DB) error {
+	for _, pragma := range []string{`PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=5000`} {
+		rows, err := db.Query(pragma) // both answer with a row
+		if err != nil {
+			return fmt.Errorf("sqlite %s: %w", pragma, err)
+		}
+		_ = rows.Close()
+	}
+	return nil
+}
+
 func addMissing(db *sql.DB, table string, cols map[string]string) error {
 	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
 	if err != nil {
@@ -136,6 +159,27 @@ func New(db *sql.DB) (*Storage, error) {
 		if _, err := db.Exec(stmt); err != nil {
 			return nil, fmt.Errorf("sqlite storage schema: %w", err)
 		}
+	}
+	// The thread's current run, for ThreadTransition's compare-and-set.
+	// The run a record entry belongs to.
+	if err := addMissing(db, "events", map[string]string{"runId": "TEXT"}); err != nil {
+		return nil, err
+	}
+	if err := addMissing(db, "threads", map[string]string{"runId": "TEXT"}); err != nil {
+		return nil, err
+	}
+	// One event per seq on a thread: a counter that restarted must fail its
+	// write, never land a second event under a seq clients already have. A
+	// log from before this check may already hold duplicates; the index is
+	// then left off and said so, rather than refusing to start.
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS events_thread_seq_unique ON events(threadId, seq)`); err != nil {
+		slog.Warn("event seq uniqueness not enforced: the log already holds duplicate seqs", "err", err)
+	}
+	// The same for messages: two appends that raced to one seq must not both
+	// land, or a turn's order would depend on which row the database returns
+	// first.
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS messages_thread_seq_unique ON messages(threadId, seq)`); err != nil {
+		slog.Warn("message seq uniqueness not enforced: the table already holds duplicate seqs", "err", err)
 	}
 	if err := addMissing(db, "usage", usageColumns); err != nil {
 		return nil, err
@@ -212,27 +256,55 @@ func (t threads) SetState(ctx context.Context, threadID string, state ports.Exec
 }
 
 func (t threads) Delete(ctx context.Context, threadID string, _ ports.StorageContext) error {
-	res, err := t.db.ExecContext(ctx, `DELETE FROM threads WHERE id = ?`, threadID)
+	// One transaction: a thread is gone with everything it owned, or not at
+	// all. No FK cascade here: the cascade is spelled out, so a caller can
+	// read exactly what is removed.
+	tx, err := t.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, `DELETE FROM threads WHERE id = ?`, threadID)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("unknown thread %s", threadID)
 	}
-	// No FK cascade here: the cascade is spelled out, so a caller can read
-	// exactly what is removed.
 	for _, table := range []string{"messages", "events", "usage"} {
-		if _, err := t.db.ExecContext(ctx, `DELETE FROM `+table+` WHERE threadId = ?`, threadID); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE threadId = ?`, threadID); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (t threads) ClaimState(ctx context.Context, threadID string, from, to ports.ExecutionState, _ ports.StorageContext) (bool, error) {
 	// The §3.4 compare-and-set: one conditional UPDATE, so exactly one caller can win.
 	res, err := t.db.ExecContext(ctx, `UPDATE threads SET state = ?, updatedAt = ? WHERE id = ? AND state = ?`,
 		string(to), ms(time.Now()), threadID, string(from))
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+func (t threads) Transition(ctx context.Context, threadID string, tr ports.ThreadTransition, _ ports.StorageContext) (bool, error) {
+	if len(tr.From) == 0 {
+		return false, nil
+	}
+	// One conditional UPDATE, so exactly one caller can win (§3.4). A thread
+	// with no run recorded yet (from before the column) matches any run.
+	args := []any{string(tr.To), ms(time.Now()), tr.NewRunID, threadID, tr.RunID, tr.RunID}
+	marks := make([]string, len(tr.From))
+	for i, s := range tr.From {
+		args = append(args, string(s))
+		marks[i] = "?"
+	}
+	res, err := t.db.ExecContext(ctx,
+		`UPDATE threads SET state = ?, updatedAt = ?, runId = COALESCE(NULLIF(?, ''), runId)
+		 WHERE id = ? AND (? = '' OR runId IS NULL OR runId = ?) AND state IN (`+strings.Join(marks, ", ")+`)`, args...)
 	if err != nil {
 		return false, err
 	}
@@ -324,9 +396,11 @@ func scanEvent(row interface{ Scan(...any) error }) (*ports.AgentEvent, error) {
 	var e ports.AgentEvent
 	var payload sql.NullString
 	var created int64
-	if err := row.Scan(&e.ThreadID, &e.Seq, &e.Type, &payload, &created); err != nil {
+	var runID sql.NullString
+	if err := row.Scan(&e.ThreadID, &e.Seq, &e.Type, &payload, &created, &runID); err != nil {
 		return nil, err
 	}
+	e.RunID = runID.String
 	if payload.Valid {
 		e.Payload = json.RawMessage(payload.String)
 	} else {
@@ -353,12 +427,55 @@ func (e events) query(ctx context.Context, q string, args ...any) ([]ports.Agent
 	return out, rows.Err()
 }
 
-const eventCols = `threadId, seq, type, payload, createdAt`
+const eventCols = `threadId, seq, type, payload, createdAt, runId`
 
-func (e events) Append(ctx context.Context, threadID string, ev ports.AgentEvent, _ ports.StorageContext) error {
-	_, err := e.db.ExecContext(ctx, `INSERT INTO events (id,threadId,seq,type,payload,createdAt) VALUES (?,?,?,?,?,?)`,
-		core.NewID(), threadID, ev.Seq, ev.Type, string(core.MarshalPayload(ev.Payload)), ms(ev.CreatedAt))
-	return err
+// Append mints the seq in the insert itself: SQLite runs one writer at a
+// time, so no two appends on a thread read the same MAX.
+func (e events) Append(ctx context.Context, threadID string, in ports.NewThreadEvent, _ ports.StorageContext) (ports.AgentEvent, error) {
+	at := in.CreatedAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+	payload := core.MarshalPayload(in.Payload)
+	var runID any
+	if in.RunID != "" {
+		runID = in.RunID
+	}
+	ev := ports.AgentEvent{ThreadID: threadID, Type: in.Type, Payload: payload, CreatedAt: fromMs(ms(at)), RunID: in.RunID}
+	err := e.db.QueryRowContext(ctx,
+		`INSERT INTO events (id,threadId,seq,type,payload,createdAt,runId)
+		 SELECT ?,?,COALESCE(MAX(seq),0)+1,?,?,?,? FROM events WHERE threadId = ?
+		 RETURNING seq`,
+		core.NewID(), threadID, in.Type, string(payload), ms(at), runID, threadID).Scan(&ev.Seq)
+	return ev, err
+}
+
+func (e events) List(ctx context.Context, threadID string, f ports.ThreadEventFilter, _ ports.StorageContext) ([]ports.AgentEvent, error) {
+	where := []string{"threadId = ?"}
+	args := []any{threadID}
+	if f.Types != nil {
+		marks := strings.TrimSuffix(strings.Repeat("?,", len(f.Types)), ",")
+		if marks == "" {
+			marks = "NULL"
+		}
+		where = append(where, "type IN ("+marks+")")
+		for _, t := range f.Types {
+			args = append(args, t)
+		}
+	}
+	if f.RunID != "" {
+		where = append(where, "runId = ?")
+		args = append(args, f.RunID)
+	}
+	if f.After != nil {
+		where = append(where, "seq > ?")
+		args = append(args, *f.After)
+	}
+	q := `SELECT ` + eventCols + ` FROM events WHERE ` + strings.Join(where, " AND ") + ` ORDER BY seq`
+	if f.Limit > 0 {
+		q += " LIMIT " + strconv.Itoa(f.Limit)
+	}
+	return e.query(ctx, q, args...)
 }
 
 func (e events) ListSince(ctx context.Context, threadID string, sinceSeq int64, _ ports.StorageContext) ([]ports.AgentEvent, error) {
@@ -375,6 +492,54 @@ func (e events) Latest(ctx context.Context, threadID, typ string, _ ports.Storag
 
 func (e events) ListByType(ctx context.Context, threadID, typ string, _ ports.StorageContext) ([]ports.AgentEvent, error) {
 	return e.query(ctx, `SELECT `+eventCols+` FROM events WHERE threadId = ? AND type = ? ORDER BY seq`, threadID, typ)
+}
+
+func (e events) Prune(ctx context.Context, types []string, limit int, dryRun bool) (map[string]int64, error) {
+	counts := map[string]int64{}
+	marks := strings.TrimSuffix(strings.Repeat("?,", len(types)), ",")
+	if marks == "" {
+		return counts, nil
+	}
+	args := make([]any, len(types))
+	for i, t := range types {
+		args[i] = t
+	}
+	if dryRun {
+		rows, err := e.db.QueryContext(ctx, `SELECT type, COUNT(*) FROM events WHERE type IN (`+marks+`) GROUP BY type`, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var typ string
+			var n int64
+			if err := rows.Scan(&typ, &n); err != nil {
+				return nil, err
+			}
+			counts[typ] = n
+		}
+		return counts, rows.Err()
+	}
+	rows, err := e.db.QueryContext(ctx, `SELECT id, type FROM events WHERE type IN (`+marks+`) LIMIT ?`, append(args, limit)...)
+	if err != nil {
+		return nil, err
+	}
+	var ids []any
+	for rows.Next() {
+		var id, typ string
+		if err := rows.Scan(&id, &typ); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+		counts[typ]++
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return counts, nil
+	}
+	_, err = e.db.ExecContext(ctx, `DELETE FROM events WHERE id IN (`+strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")+`)`, ids...)
+	return counts, err
 }
 
 type usage struct{ db *sql.DB }

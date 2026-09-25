@@ -132,8 +132,9 @@ func (a *app) getWeather() agentenkit.Tool {
 		func(ctx context.Context, in struct {
 			City string `json:"city" jsonschema:"description=City name"`
 		}, tc agentenkit.ToolContext) (string, error) {
-			// A notice: live only, never replayed. Right for a progress tick.
-			_, _ = tc.PublishEvent(ctx, "PROGRESS", map[string]any{"label": "Checking the weather in " + in.City}, agentenkit.PublishOptions{Notice: true})
+			// Live only (the default): on the run stream, never kept. Right for a
+			// progress tick.
+			_, _ = tc.PublishEvent(ctx, "PROGRESS", map[string]any{"label": "Checking the weather in " + in.City}, agentenkit.PublishOptions{})
 			time.Sleep(300 * time.Millisecond)
 			h := fnv.New32a()
 			h.Write([]byte(strings.ToLower(in.City)))
@@ -189,7 +190,7 @@ func (a *app) renderDesign() agentenkit.Tool {
 			Brief string `json:"brief" jsonschema:"description=What to design, with colours and mood"`
 		}, tc agentenkit.ToolContext) (string, error) {
 			for _, stage := range []string{"Sketching layout", "Choosing a palette", "Rendering preview"} {
-				_, _ = tc.PublishEvent(ctx, "PROGRESS", map[string]any{"label": stage + "…"}, agentenkit.PublishOptions{Notice: true})
+				_, _ = tc.PublishEvent(ctx, "PROGRESS", map[string]any{"label": stage + "…"}, agentenkit.PublishOptions{})
 				select {
 				case <-time.After(500 * time.Millisecond):
 				case <-ctx.Done():
@@ -200,7 +201,7 @@ func (a *app) renderDesign() agentenkit.Tool {
 			a.previews.Store(id, renderSVG(in.Brief))
 			url := "/api/previews/" + id + ".svg"
 			// Durable: in the log, replayed to a client that reconnects mid-run.
-			if _, err := tc.PublishEvent(ctx, "DESIGN_PREVIEW", map[string]any{"url": url, "brief": in.Brief}, agentenkit.PublishOptions{}); err != nil {
+			if _, err := tc.PublishEvent(ctx, "DESIGN_PREVIEW", map[string]any{"url": url, "brief": in.Brief}, agentenkit.PublishOptions{Durable: true}); err != nil {
 				return "", err
 			}
 			return jsonString(map[string]any{"url": url}), nil
@@ -215,7 +216,7 @@ func (a *app) sendEmail() agentenkit.Tool {
 			Body    string `json:"body"`
 		}, tc agentenkit.ToolContext) (string, error) {
 			// Only reached after a human approved the park (§2.5).
-			_, _ = tc.PublishEvent(ctx, "EMAIL_SENT", map[string]any{"to": in.To, "subject": in.Subject}, agentenkit.PublishOptions{})
+			_, _ = tc.PublishEvent(ctx, "EMAIL_SENT", map[string]any{"to": in.To, "subject": in.Subject}, agentenkit.PublishOptions{Durable: true})
 			return jsonString(map[string]any{"status": "SENT", "to": in.To, "subject": in.Subject}), nil
 		})
 }
@@ -232,7 +233,7 @@ func (a *app) askDesignQuestions() agentenkit.Tool {
 			}
 			var answers map[string]string
 			_ = json.Unmarshal(tc.Approval.Payload, &answers)
-			_, _ = tc.PublishEvent(ctx, "QUESTIONS_ANSWERED", map[string]any{"answers": answers}, agentenkit.PublishOptions{})
+			_, _ = tc.PublishEvent(ctx, "QUESTIONS_ANSWERED", map[string]any{"answers": answers}, agentenkit.PublishOptions{Durable: true})
 			return jsonString(map[string]any{"answers": answers}), nil
 		})
 }

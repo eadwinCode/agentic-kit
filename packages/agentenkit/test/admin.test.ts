@@ -45,8 +45,10 @@ describe('run records (§2.9)', () => {
     const ran = await chat.run({ prompt: 'hi' });
     const open = (await r.runtime.admin.getRun(ran.runId!))!;
     expect(open.run).toMatchObject({
-      id: ran.runId, threadId: ran.threadId, agent: 'chat', model: 'gpt-4o', state: 'RUNNING',
+      id: ran.runId, threadId: ran.threadId, agent: 'chat', model: 'gpt-4o', state: 'QUEUED',
     });
+    // It opens QUEUED, with the time it was accepted: no worker has it yet.
+    expect(open.run.enqueuedAt).toBeInstanceOf(Date);
     expect(open.run.endedAt ?? null).toBeNull();
 
     await r.runtime.worker.handleJob(r.queue.items[0]!);
@@ -257,7 +259,7 @@ describe('what a run was dispatched with (§2.9)', () => {
     expect(run.prompt ?? null).toBeNull();
     expect(run.runState ?? null).toBeNull();
     // Timings and identity are not payloads and stay either way.
-    expect(run).toMatchObject({ agent: 'chat', model: 'gpt-4o', state: 'RUNNING' });
+    expect(run).toMatchObject({ agent: 'chat', model: 'gpt-4o', state: 'QUEUED' });
   });
 });
 

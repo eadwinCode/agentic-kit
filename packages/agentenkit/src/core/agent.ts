@@ -11,7 +11,6 @@ import type {
   SubagentsConfig,
 } from '../ports/runtime.js';
 import { execute, executeWithPolicy } from './engine.js';
-import { Semaphore } from './subagent.js';
 import { run } from './run.js';
 import { stop } from './stop.js';
 
@@ -33,7 +32,6 @@ export interface RegisteredAgent {
   };
   /** The user's generation args — spread first, platform keys last (§3.1). */
   args: Record<string, any>;
-  sem: Semaphore;
 }
 
 /** Normalize the delegation config: `false`/`undefined` = off; `true` = defaults. */
@@ -48,7 +46,11 @@ export function normalizeSubagents(
  *  (§2.10). A handle outlives many runs, so it cannot hold fixed ports. */
 export type ScopeFn = (state?: AgentRunState, runId?: string) => RuntimePorts;
 
-function createHandle(scope: ScopeFn, agent: RegisteredAgent): AgentHandle {
+/** Finds a registered agent by name: a stop needs it to settle a run no
+ *  worker holds (§5.6). */
+export type AgentLookup = (name: string) => RegisteredAgent | null;
+
+function createHandle(scope: ScopeFn, agent: RegisteredAgent, lookup: AgentLookup): AgentHandle {
   return {
     name: agent.name,
     kind: agent.kind,
@@ -56,34 +58,42 @@ function createHandle(scope: ScopeFn, agent: RegisteredAgent): AgentHandle {
     executeWithPolicy: (input: ExecuteInput, policy?: { maxAttempts?: number }) =>
       executeWithPolicy(scope(input.state, input.runId), agent, input, policy),
     run: (input: RunInput) => run(scope(input.state), agent, input),
-    stop: (threadId: string, state?: AgentRunState) => stop(scope(state), threadId),
+    stop: (threadId: string, state?: AgentRunState) => stop(scope(state), threadId, { agent: lookup }),
   };
 }
 
+/** Build a handle, and put its registry entry in `agents` when given, so a
+ *  lookup by name finds it. */
 export function createStreamTextAgent(
   scope: ScopeFn,
   spec: StreamTextAgentSpec,
+  agents?: Map<string, RegisteredAgent>,
 ): AgentHandle {
   const { name, model, subagents, tokenBudget, costBudgetMicros, providerOptions, ...args } = spec;
-  return createHandle(scope, {
+  return registered(scope, {
     name,
     kind: 'stream-text',
     spec: { model, subagents, tokenBudget, costBudgetMicros, providerOptions },
     args: args as Record<string, any>,
-    sem: new Semaphore(scope().config.subagentMaxConcurrent),
-  });
+  }, agents);
+}
+
+function registered(scope: ScopeFn, agent: RegisteredAgent, agents?: Map<string, RegisteredAgent>): AgentHandle {
+  agents?.set(agent.name, agent);
+  const lookup: AgentLookup = (name) => agents?.get(name) ?? (name === agent.name ? agent : null);
+  return createHandle(scope, agent, lookup);
 }
 
 export function createGenerateTextAgent(
   scope: ScopeFn,
   spec: GenerateTextAgentSpec,
+  agents?: Map<string, RegisteredAgent>,
 ): AgentHandle {
   const { name, model, subagents, tokenBudget, costBudgetMicros, providerOptions, ...args } = spec;
-  return createHandle(scope, {
+  return registered(scope, {
     name,
     kind: 'generate-text',
     spec: { model, subagents, tokenBudget, costBudgetMicros, providerOptions },
     args: args as Record<string, any>,
-    sem: new Semaphore(scope().config.subagentMaxConcurrent),
-  });
+  }, agents);
 }

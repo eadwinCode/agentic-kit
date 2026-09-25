@@ -219,7 +219,8 @@ func TestLock_IsRenewedWhileTheSegmentRuns(t *testing.T) {
 		_, _ = h.rt.Worker.HandleJob(h.ctx, job)
 	}()
 	time.Sleep(1200 * time.Millisecond) // past the lease: only a renewal keeps it
-	mustEqual(t, h.kvGet(agentenkit.RunLockKey(ran.ThreadID)), ran.RunID, "the lock is still this worker's")
+	holder, _ := agentenkit.ParseLockValue(h.kvGet(agentenkit.RunLockKey(ran.ThreadID)))
+	mustEqual(t, holder, ran.RunID, "the lock is still this worker's")
 	<-done
 	mustEqual(t, h.kvGet(agentenkit.RunLockKey(ran.ThreadID)), "", "released at the end")
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "completed")
@@ -320,6 +321,44 @@ func TestReclaim_AThreadWithNoLockAndNoJobIsRedispatched(t *testing.T) {
 	mustEqual(t, h.queue.Items()[0].Kind, agentenkit.JobReclaim, "as a reclaim")
 	mustEqual(t, h.queue.Keys()[0], "reclaim:"+ran.RunID, "once per run")
 	mustEqual(t, h.queue.Items()[0].State["tenant"], "acme", "with the run's state")
+	h.drain(t)
+	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "the run finished")
+}
+
+// findlessQueue cannot look a job up, like QStash.
+type findlessQueue struct{ ports.Queue }
+
+func (findlessQueue) Find(context.Context, string) (*ports.QueuedJob, error) {
+	return nil, ports.ErrUnsupported
+}
+
+// With a queue that cannot find jobs, only time says a job is lost: past the
+// lock lease AND past the queue wait limit, whichever is longer.
+func TestReclaim_AQueueThatCannotFindJobsRedispatchesAfterTheLongestWait(t *testing.T) {
+	h := makeRuntimeOpts(t, scripted(step{text: "ok"}),
+		func(o *agentenkit.RuntimeOptions) { o.Queue = findlessQueue{o.Queue} },
+		func(c *agentenkit.AgentConfig) {
+			c.RunLockLease = time.Second
+			c.MaxQueueWait = 2 * time.Second
+			c.RunRetryBackoff = 0
+		})
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
+	h.queue.Shift() // the queue lost the job
+
+	time.Sleep(1050 * time.Millisecond)
+	report, err := h.rt.ReclaimStuckRuns(h.ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustEqual(t, report.Redispatched, 0, "past the lease, but a job may still wait up to 2s")
+	time.Sleep(time.Second)
+	report, err = h.rt.ReclaimStuckRuns(h.ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustEqual(t, report.Redispatched, 1, "re-dispatched")
+	mustEqual(t, h.queue.Items()[0].Kind, agentenkit.JobReclaim, "as a reclaim")
 	h.drain(t)
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "the run finished")
 }
@@ -484,9 +523,11 @@ func TestDispatch_AnUnknownAgentIsAnErrorNotASilentSuccess(t *testing.T) {
 	}
 }
 
-// Deleting a parked thread closes its open run record, and the expiry that
-// later finds no thread does nothing.
-func TestDelete_AParkedThreadsOpenRunRecordIsClosed(t *testing.T) {
+// Deleting a parked thread takes its operational history with it (§3.2):
+// no run, step or thread row is left in the admin store, and the expiry that
+// later finds no thread does nothing. The same case runs in the TS package
+// (test/admin-store.test.ts).
+func TestDelete_ADeletedThreadLeavesNothingInTheAdminStore(t *testing.T) {
 	h := hitlSetup(t)
 	ran := h.run(t, h.chat, agentenkit.RunInput{Prompt: "delete"})
 	h.handleNext(t)
@@ -494,12 +535,15 @@ func TestDelete_AParkedThreadsOpenRunRecordIsClosed(t *testing.T) {
 	if err != nil || !res.Accepted {
 		t.Fatalf("delete: %v %+v", err, res)
 	}
-	rec, _ := h.admin.Runs().Get(h.ctx, ran.RunID)
-	if rec.EndedAt == nil {
-		t.Fatal("the open record is closed with the thread")
+	if rec, _ := h.admin.Runs().Get(h.ctx, ran.RunID); rec != nil {
+		t.Fatalf("the run record is gone with the thread: %+v", rec)
 	}
-	mustEqual(t, rec.State, agentenkit.StateCancelled, "state")
-	mustEqual(t, rec.StopReason, "deleted", "why")
+	if th, _ := h.admin.Threads().Get(h.ctx, ran.ThreadID); th != nil {
+		t.Fatal("the admin thread row is gone too")
+	}
+	if steps, _ := h.admin.Steps().ListByThread(h.ctx, ran.ThreadID); len(steps) != 0 {
+		t.Fatalf("and its steps: %d left", len(steps))
+	}
 	h.drain(t) // the expiry finds no thread
 	mustEqual(t, h.model.Calls(), 1, "nothing ran after the delete")
 }
@@ -557,8 +601,9 @@ func TestSnapshot_AQueuedThreadIsActiveFromItsAcceptance(t *testing.T) {
 	mustEqual(t, snap.Thread.State, agentenkit.StateQueued, "state")
 	mustEqual(t, len(snap.Runs), 1, "the run is on the snapshot")
 	mustEqual(t, snap.Runs[0].State, agentenkit.StateQueued, "as queued")
-	if len(snap.ActiveEvents) == 0 || payload(snap.ActiveEvents[0])["state"] != "QUEUED" {
-		t.Fatalf("the active window starts at the acceptance: %+v", snap.ActiveEvents)
+	// Not picked up yet: no segment has started, so there is no stream.
+	if snap.Stream != nil {
+		t.Fatalf("a queued run has no stream yet: %+v", snap.Stream)
 	}
 }
 

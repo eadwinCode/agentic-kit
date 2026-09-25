@@ -17,13 +17,32 @@ func publishN(t *testing.T, h *harness, threadID string, types ...string) []agen
 	t.Helper()
 	var out []agentenkit.AgentEvent
 	for _, typ := range types {
-		e, err := core.Publish(h.ctx, h.rt.Ports(nil), threadID, typ, map[string]any{"t": typ})
+		// An app's own durable events: stored in the thread record, then sent.
+		e, err := core.PublishEvent(h.ctx, h.rt.Ports(nil), threadID, typ, map[string]any{"t": typ}, core.PublishOptions{Durable: true})
 		if err != nil {
 			t.Fatal(err)
 		}
 		out = append(out, e)
 	}
 	return out
+}
+
+// recvThread is the next thread event a follow sends, stream frames skipped.
+func recvThread(t *testing.T, stream *core.FrameStream) agentenkit.AgentEvent {
+	t.Helper()
+	for {
+		select {
+		case f, ok := <-stream.Frames():
+			if !ok {
+				t.Fatal("stream closed")
+			}
+			if f.Kind == core.FrameKindThread {
+				return *f.Event
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for an event")
+		}
+	}
 }
 
 func recv(t *testing.T, ch <-chan agentenkit.AgentEvent) agentenkit.AgentEvent {
@@ -49,10 +68,10 @@ func TestFollow_ReplaysTheDurableLogThenGoesLiveInOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustEqual(t, recv(t, stream.Events()).Type, "A", "first")
-	mustEqual(t, recv(t, stream.Events()).Type, "B", "second")
+	mustEqual(t, recvThread(t, stream).Type, "A", "first")
+	mustEqual(t, recvThread(t, stream).Type, "B", "second")
 	publishN(t, h, "th", "C")
-	mustEqual(t, recv(t, stream.Events()).Type, "C", "live")
+	mustEqual(t, recvThread(t, stream).Type, "C", "live")
 }
 
 func TestFollow_ResumesAfterACursorAndNeverResends(t *testing.T) {
@@ -61,11 +80,11 @@ func TestFollow_ResumesAfterACursorAndNeverResends(t *testing.T) {
 	ctx, cancel := context.WithCancel(h.ctx)
 	defer cancel()
 	stream, _ := h.rt.Events.Follow(ctx, "th", agentenkit.FollowStateOptions{FollowOptions: agentenkit.FollowOptions{Since: evs[1].Seq}})
-	mustEqual(t, recv(t, stream.Events()).Type, "C", "only what the client lacks")
+	mustEqual(t, recvThread(t, stream).Type, "C", "only what the client lacks")
 	// A stale republish at or below the cursor is dropped
 	_ = h.bus.Publish(h.ctx, "th", evs[0])
 	publishN(t, h, "th", "D")
-	mustEqual(t, recv(t, stream.Events()).Type, "D", "stale event skipped")
+	mustEqual(t, recvThread(t, stream).Type, "D", "stale event skipped")
 }
 
 // replayHook publishes an event on the bus while the replay is still
@@ -114,13 +133,13 @@ func TestFollow_ForwardsANoticeWithoutMovingTheCursor(t *testing.T) {
 	defer cancel()
 	stream, _ := h.rt.Events.Follow(ctx, "th", agentenkit.FollowStateOptions{})
 	evs := publishN(t, h, "th", "A")
-	mustEqual(t, recv(t, stream.Events()).Type, "A", "A")
+	mustEqual(t, recvThread(t, stream).Type, "A", "A")
 	_ = core.PublishNotice(h.ctx, h.rt.Ports(nil), "th", "HEARTBEAT", nil)
-	mustEqual(t, recv(t, stream.Events()).Seq, int64(0), "notice forwarded")
+	mustEqual(t, recvThread(t, stream).Seq, int64(0), "notice forwarded")
 	// The cursor still sits at A: a replay of A is dropped, B goes through
 	_ = h.bus.Publish(h.ctx, "th", evs[0])
 	publishN(t, h, "th", "B")
-	mustEqual(t, recv(t, stream.Events()).Type, "B", "B")
+	mustEqual(t, recvThread(t, stream).Type, "B", "B")
 }
 
 func TestFollow_UnsubscribesWhenTheRequestIsCancelled(t *testing.T) {
@@ -129,7 +148,7 @@ func TestFollow_UnsubscribesWhenTheRequestIsCancelled(t *testing.T) {
 	stream, _ := h.rt.Events.Follow(ctx, "th", agentenkit.FollowStateOptions{})
 	mustEqual(t, h.bus.Subscribers("th"), 1, "subscribed")
 	cancel()
-	for range stream.Events() {
+	for range stream.Frames() {
 	}
 	mustEqual(t, h.bus.Subscribers("th"), 0, "unsubscribed")
 	if stream.Err() != nil {
@@ -156,7 +175,7 @@ func TestSSE_ServesRetryThenFramesAndUnsubscribesOnHangUp(t *testing.T) {
 	h := makeRuntime(t, scripted())
 	publishN(t, h, "th", "A")
 	ctx, cancel := context.WithCancel(h.ctx)
-	stream, err := h.rt.Events.SSE(ctx, "th", agentenkit.SSEStateOptions{SSEOptions: agentenkit.SSEOptions{RetryMs: 3000}})
+	stream, err := h.rt.Events.SSE(ctx, "th", agentenkit.SSEStateOptions{RetryMs: 3000})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +192,7 @@ func TestSSE_ServesRetryThenFramesAndUnsubscribesOnHangUp(t *testing.T) {
 	if !strings.HasPrefix(body, "retry: 3000\n\n") {
 		t.Fatalf("body: %q", body)
 	}
-	if !strings.Contains(body, "id: 1\n") {
+	if !strings.Contains(body, "id: 1 - -\n") {
 		t.Fatalf("frame missing: %q", body)
 	}
 	mustEqual(t, rec.Header().Get("Content-Type"), "text/event-stream; charset=utf-8", "header")

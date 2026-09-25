@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 
-type State = 'IDLE' | 'RUNNING' | 'WAITING_FOR_INPUT' | 'CANCELLED' | 'COMPLETED' | 'FAILED';
+type State = 'IDLE' | 'QUEUED' | 'RUNNING' | 'WAITING_FOR_INPUT' | 'CANCELLED' | 'COMPLETED' | 'FAILED';
 interface Tokens {
   inputTokens: number; cachedInputTokens: number; outputTokens: number; totalTokens: number;
 }
@@ -73,7 +73,7 @@ const split = (t: Tokens) =>
 
 const FILTERS: Array<{ label: string; state?: State[] }> = [
   { label: 'All' },
-  { label: 'In flight', state: ['RUNNING', 'WAITING_FOR_INPUT'] },
+  { label: 'In flight', state: ['QUEUED', 'RUNNING', 'WAITING_FOR_INPUT'] },
   { label: 'Completed', state: ['COMPLETED'] },
   { label: 'Failed', state: ['FAILED'] },
   { label: 'Stopped', state: ['CANCELLED'] },

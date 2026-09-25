@@ -26,6 +26,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io/fs"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -35,6 +36,24 @@ type Migration struct {
 	Version  string
 	SQL      string
 	Checksum string
+	// Optional marks a step that may fail on data it cannot change, such as
+	// a unique index over rows an older release left duplicated. It runs
+	// under a savepoint: a failure is rolled back and reported to
+	// Dialect.Skipped, the rest of the run goes on, and the step is tried
+	// again on the next start.
+	Optional bool
+	// Equivalent are other checksums this step is known to be the same as:
+	// the same SQL, recorded under a different text by the TS runtime. A
+	// database migrated by either runtime is then accepted by both.
+	Equivalent []string
+}
+
+// NewMigration is a migration built in code rather than read from a file,
+// for a schema whose names are only known at run time (a table prefix).
+func NewMigration(version string, statements ...string) Migration {
+	body := strings.Join(statements, ";\n") + ";\n"
+	sum := sha256.Sum256([]byte(body))
+	return Migration{Version: version, SQL: body, Checksum: hex.EncodeToString(sum[:])}
 }
 
 // Load reads every .sql file in dir, in filename order. Nested directories
@@ -75,12 +94,23 @@ type Dialect struct {
 	Ledger string
 	// Insert records one applied migration, with two bind parameters.
 	Insert string
+	// Applied reads the ledger back: version and checksum. Empty reads
+	// agentic_migrations.
+	Applied string
 	// Lock is run first inside each migration's transaction so two workers
 	// starting together cannot both apply the same file. Empty for a
 	// database that serialises writers by itself.
 	Lock string
 	// Placeholder is how this database spells a bind parameter.
 	Placeholder string
+	// Skipped is told about an Optional step that failed and was left for
+	// the next start. Nil ignores it.
+	Skipped func(version string, err error)
+	// Begin opens the migration's transaction. SQLite's is BEGIN IMMEDIATE:
+	// a plain BEGIN takes the write lock only at the first write, so two
+	// processes that both read the ledger first both fail with SQLITE_BUSY
+	// instead of one waiting for the other.
+	Begin string
 	// Repair runs once BEFORE the migration files, inside their transaction. It exists for the one
 	// thing portable SQL cannot express: SQLite has no ADD COLUMN IF NOT
 	// EXISTS, so a database left behind by an older release needs a PRAGMA
@@ -102,8 +132,8 @@ type Execer interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
-// SQLite needs no lock: the driver holds one connection and the database
-// takes one writer at a time.
+// SQLite needs no lock: the database takes one writer at a time, and BEGIN
+// IMMEDIATE makes a second process wait for it.
 var SQLite = Dialect{
 	Name: "sqlite",
 	Ledger: `CREATE TABLE IF NOT EXISTS agentic_migrations (
@@ -111,6 +141,7 @@ var SQLite = Dialect{
 	Insert: `INSERT INTO agentic_migrations (version, checksum, appliedAt)
 	         VALUES (?, ?, CAST(strftime('%s','now') AS INTEGER) * 1000)`,
 	Placeholder: "?",
+	Begin:       "BEGIN IMMEDIATE",
 }
 
 // Postgres takes a transaction-scoped advisory lock, so several workers
@@ -144,11 +175,26 @@ var Postgres = Dialect{
 // One consequence worth knowing: a migration that cannot run inside a
 // transaction (CREATE INDEX CONCURRENTLY, say) does not belong in a file here.
 func Run(ctx context.Context, db *sql.DB, d Dialect, ms []Migration) error {
-	tx, err := db.BeginTx(ctx, nil)
+	// One connection, with the transaction opened by hand: database/sql
+	// cannot ask for SQLite's BEGIN IMMEDIATE.
+	tx, err := db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("%s migrations: %w", d.Name, err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer tx.Close()
+	begin := d.Begin
+	if begin == "" {
+		begin = "BEGIN"
+	}
+	if _, err := tx.ExecContext(ctx, begin); err != nil {
+		return fmt.Errorf("%s migrations: %w", d.Name, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = tx.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
+		}
+	}()
 
 	if d.Lock != "" {
 		if _, err := tx.ExecContext(ctx, d.Lock); err != nil {
@@ -164,36 +210,59 @@ func Run(ctx context.Context, db *sql.DB, d Dialect, ms []Migration) error {
 		}
 	}
 
-	applied, err := appliedVersions(ctx, tx)
+	applied, err := appliedVersions(ctx, tx, d.Applied)
 	if err != nil {
 		return fmt.Errorf("%s migrations: %w", d.Name, err)
 	}
 	for _, m := range ms {
 		if sum, ok := applied[m.Version]; ok {
-			if sum != m.Checksum {
+			if sum != m.Checksum && !slices.Contains(m.Equivalent, sum) {
 				return fmt.Errorf(
 					"%s migrations: %s changed after it was applied: the database no longer matches the code",
 					d.Name, m.Version)
 			}
 			continue
 		}
+		if m.Optional {
+			if _, err := tx.ExecContext(ctx, "SAVEPOINT optional_step"); err != nil {
+				return fmt.Errorf("%s migrations: %s: %w", d.Name, m.Version, err)
+			}
+		}
+		var stepErr error
 		for _, stmt := range Statements(m.SQL) {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
-				return fmt.Errorf("%s migrations: %s: %w (in: %s)", d.Name, m.Version, err, firstLine(stmt))
+				stepErr = fmt.Errorf("%s migrations: %s: %w (in: %s)", d.Name, m.Version, err, firstLine(stmt))
+				break
 			}
+		}
+		if stepErr != nil && !m.Optional {
+			return stepErr
+		}
+		if stepErr != nil {
+			if _, err := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT optional_step"); err != nil {
+				return fmt.Errorf("%s migrations: %s: %w", d.Name, m.Version, err)
+			}
+			if d.Skipped != nil {
+				d.Skipped(m.Version, stepErr)
+			}
+			continue // not recorded: tried again on the next start
 		}
 		if _, err := tx.ExecContext(ctx, d.Insert, m.Version, m.Checksum); err != nil {
 			return fmt.Errorf("%s migrations: %s: %w", d.Name, m.Version, err)
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	if _, err := tx.ExecContext(ctx, "COMMIT"); err != nil {
 		return fmt.Errorf("%s migrations: %w", d.Name, err)
 	}
+	committed = true
 	return nil
 }
 
-func appliedVersions(ctx context.Context, tx *sql.Tx) (map[string]string, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT version, checksum FROM agentic_migrations`)
+func appliedVersions(ctx context.Context, tx Execer, query string) (map[string]string, error) {
+	if query == "" {
+		query = `SELECT version, checksum FROM agentic_migrations`
+	}
+	rows, err := tx.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}

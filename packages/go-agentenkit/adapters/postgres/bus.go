@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/core"
@@ -76,29 +77,61 @@ type Bus struct {
 	channel string
 }
 
-// subscription is one handler on one thread, with the cursor the reconnect
-// replay resumes from.
+// subQueueCap is how many events a subscription holds for a slow handler.
+// Past it the subscription stops taking events and, once it catches up,
+// reads what it missed from the durable log: at-most-once for notices,
+// nothing lost that was stored.
+const subQueueCap = 1024
+
+// sweepEvery is how often the bus clears expired kv rows, its parked frames
+// among them.
+const sweepEvery = 5 * time.Minute
+
+// subscription is one handler on one thread, with its own queue and its own
+// goroutine: the one listener goroutine only ever hands events over, so a
+// slow handler, or a slow replay, holds up nobody else.
 type subscription struct {
 	threadID string
 	// ctx is the subscriber's own context. Its run state (§2.10) scopes the
-	// replay's storage reads, and its end ends the replays.
+	// replay's storage reads, and its end ends the subscription.
 	ctx     context.Context
 	handler func(ports.AgentEvent)
+	queue   chan item
+	done    chan struct{}
+	// behind is set when the queue was full: the next item first catches up
+	// from the log.
+	behind atomic.Bool
 
-	mu sync.Mutex
-	// lastSeq is the highest durable seq delivered so far; 0 before the first.
+	// lastSeq is the highest durable seq delivered so far; 0 before the
+	// first. Only the subscription's goroutine touches it.
 	lastSeq int64
 	// anchor is the thread's seq counter when the subscription opened: where
 	// a replay starts when nothing durable was delivered yet.
 	anchor int64
 }
 
+// item is one thing for a subscription to do: deliver an event, read a
+// frame whose kv copy is gone back from the log, or replay what a dropped
+// connection missed.
+type item struct {
+	event  *ports.AgentEvent
+	lookup *frame
+	replay bool
+}
+
+// offer queues an item without ever blocking the listener.
+func (s *subscription) offer(it item) {
+	select {
+	case s.queue <- it:
+	default:
+		s.behind.Store(true)
+	}
+}
+
 // deliver hands an event to the handler, once: a durable event at or below
 // the cursor was delivered already, live or by a replay. Notices (seq 0)
 // always go through and never move the cursor.
 func (s *subscription) deliver(e ports.AgentEvent) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if e.Seq > 0 {
 		if e.Seq <= s.lastSeq {
 			return
@@ -108,10 +141,8 @@ func (s *subscription) deliver(e ports.AgentEvent) {
 	s.handler(e)
 }
 
-// replayFrom is the cursor a reconnect replay resumes after.
+// replayFrom is the cursor a replay resumes after.
 func (s *subscription) replayFrom() int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.lastSeq > 0 {
 		return s.lastSeq
 	}
@@ -125,6 +156,45 @@ func (s *subscription) replayFrom() int64 {
 // scope is the storage context the subscriber's replay reads with.
 func (s *subscription) scope() ports.StorageContext {
 	return ports.StorageContext{State: core.RunStateFromContext(s.ctx)}
+}
+
+// run is the subscription's goroutine.
+func (b *Bus) run(s *subscription) {
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-s.ctx.Done():
+			return
+		case it := <-s.queue:
+			if it.replay || s.behind.Swap(false) {
+				b.replay(s)
+			}
+			switch {
+			case it.event != nil:
+				s.deliver(*it.event)
+			case it.lookup != nil:
+				if e, ok := b.lookup(s, *it.lookup); ok {
+					s.deliver(e)
+				}
+			}
+		}
+	}
+}
+
+// replay reads what the subscription missed from the log, from its own
+// cursor, with its own scope.
+func (b *Bus) replay(s *subscription) {
+	if s.ctx.Err() != nil {
+		return
+	}
+	rows, err := b.events.ListSince(s.ctx, s.threadID, s.replayFrom(), s.scope())
+	if err != nil {
+		return // the next event, or the client's own reconnect, catches up
+	}
+	for _, e := range rows {
+		s.deliver(e)
+	}
 }
 
 // BusOptions tunes NewBus.
@@ -258,10 +328,30 @@ func (b *Bus) start() {
 	go func() {
 		_ = b.listener.Listen(context.Background(), b.channel, b.receive)
 	}()
+	// One heartbeat for every subscription in the process, not a ticker each.
+	go func() {
+		ticker := time.NewTicker(b.heartbeat)
+		defer ticker.Stop()
+		for range ticker.C {
+			for _, s := range b.watching("") {
+				s.offer(item{event: &ports.AgentEvent{ThreadID: s.threadID, Seq: 0, Type: "HEARTBEAT", Payload: json.RawMessage("null"), CreatedAt: time.Now()}})
+			}
+		}
+	}()
+	// Expired kv rows, parked frames among them, are cleared now and then.
+	// A frame cannot be deleted once read: another process may still need it.
+	go func() {
+		ticker := time.NewTicker(sweepEvery)
+		defer ticker.Stop()
+		for range ticker.C {
+			_, _ = b.kv.DeleteExpired(context.Background())
+		}
+	}()
 }
 
-// receive is one notification off the wire, fanned out to the thread's
-// subscribers.
+// receive is one notification off the wire, handed to the thread's
+// subscriptions. It never blocks on a handler: each subscription has its own
+// queue and goroutine.
 func (b *Bus) receive(payload string) {
 	var f frame
 	if json.Unmarshal([]byte(payload), &f) != nil {
@@ -276,44 +366,39 @@ func (b *Bus) receive(payload string) {
 		return // nobody here is watching that thread
 	}
 	e, ok := b.resolve(context.Background(), f)
-	if !ok {
-		// The reference expired before the notification arrived. The log
-		// still has a durable event; each subscriber reads it its own way.
-		for _, s := range subs {
-			if e, ok := b.lookup(s, f); ok {
-				s.deliver(e)
-			}
-		}
-		return
-	}
 	for _, s := range subs {
-		s.deliver(e)
+		if ok {
+			ev := e
+			s.offer(item{event: &ev})
+		} else {
+			// The reference expired before the notification arrived. The
+			// log still has a durable event; each subscriber reads it its
+			// own way, on its own goroutine.
+			fr := f
+			s.offer(item{lookup: &fr})
+		}
 	}
 }
 
 // connected runs on every fresh LISTEN connection. Anything published while
-// the previous one was down never reached this process; each subscriber
-// reads what it missed from the log, from its own cursor, with its own
-// scope. Synchronous on purpose: the listener reads nothing off the new
-// connection until this returns, so the replay lands before whatever comes
-// in live, and the cursor keeps the two from overlapping.
+// the previous one was down never reached this process, so each
+// subscription is told to read what it missed from the log. The replay
+// itself runs on the subscription's goroutine, in order with the events
+// queued behind it, so the listener goes straight back to reading.
 func (b *Bus) connected() {
 	for _, s := range b.watching("") {
-		if s.ctx.Err() != nil {
-			continue
-		}
-		rows, err := b.events.ListSince(s.ctx, s.threadID, s.replayFrom(), s.scope())
-		if err != nil {
-			continue // the next NOTIFY, or the client's own reconnect, catches up
-		}
-		for _, e := range rows {
-			s.deliver(e)
+		if s.ctx.Err() == nil {
+			s.offer(item{replay: true})
 		}
 	}
 }
+
 func (b *Bus) Subscribe(ctx context.Context, threadID string, handler func(ports.AgentEvent)) (func() error, error) {
 	b.start()
-	sub := &subscription{threadID: threadID, ctx: ctx, handler: handler}
+	sub := &subscription{
+		threadID: threadID, ctx: ctx, handler: handler,
+		queue: make(chan item, subQueueCap), done: make(chan struct{}),
+	}
 	// Where the thread's log stands right now, for a replay that has nothing
 	// delivered to resume from. Best effort: an unreadable counter only
 	// means such a replay starts from the beginning.
@@ -328,26 +413,12 @@ func (b *Bus) Subscribe(ctx context.Context, threadID string, handler func(ports
 	}
 	b.subs[threadID][id] = sub
 	b.mu.Unlock()
+	go b.run(sub)
 
-	done := make(chan struct{})
 	var once sync.Once
-	go func() {
-		ticker := time.NewTicker(b.heartbeat)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				sub.deliver(ports.AgentEvent{ThreadID: threadID, Seq: 0, Type: "HEARTBEAT", Payload: json.RawMessage("null"), CreatedAt: time.Now()})
-			}
-		}
-	}()
 	return func() error {
 		once.Do(func() {
-			close(done)
+			close(sub.done)
 			b.mu.Lock()
 			delete(b.subs[threadID], id)
 			if len(b.subs[threadID]) == 0 {

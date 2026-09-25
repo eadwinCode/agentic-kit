@@ -112,6 +112,19 @@ func (t gatedThreads) List(ctx context.Context, f ports.AdminThreadFilter) ([]po
 	return t.inner.List(ctx, f)
 }
 
+func (t gatedThreads) Get(ctx context.Context, threadID string) (*ports.AdminThread, error) {
+	if err := t.gate.Wait(ctx); err != nil {
+		return nil, err
+	}
+	return t.inner.Get(ctx, threadID)
+}
+func (t gatedThreads) Delete(ctx context.Context, threadID string) error {
+	if err := t.gate.Wait(ctx); err != nil {
+		return err
+	}
+	return t.inner.Delete(ctx, threadID)
+}
+
 type gatedRuns struct {
 	inner ports.RunStore
 	gate  *Gate
@@ -128,6 +141,30 @@ func (r gatedRuns) Patch(ctx context.Context, runID string, p ports.RunPatch) er
 		return err
 	}
 	return r.inner.Patch(ctx, runID, p)
+}
+func (r gatedRuns) Increment(ctx context.Context, runID string, d ports.RunDeltas) error {
+	if err := r.gate.Wait(ctx); err != nil {
+		return err
+	}
+	return r.inner.Increment(ctx, runID, d)
+}
+func (r gatedRuns) Totals(ctx context.Context, f ports.RunFilter) (ports.RunTotals, error) {
+	if err := r.gate.Wait(ctx); err != nil {
+		return ports.RunTotals{}, err
+	}
+	return r.inner.Totals(ctx, f)
+}
+func (r gatedRuns) ClaimSettle(ctx context.Context, runID, token string, staleBefore time.Time) (bool, error) {
+	if err := r.gate.Wait(ctx); err != nil {
+		return false, err
+	}
+	return r.inner.ClaimSettle(ctx, runID, token, staleBefore)
+}
+func (r gatedRuns) EndSettle(ctx context.Context, runID, token string, settled bool) error {
+	if err := r.gate.Wait(ctx); err != nil {
+		return err
+	}
+	return r.inner.EndSettle(ctx, runID, token, settled)
 }
 func (r gatedRuns) Get(ctx context.Context, runID string) (*ports.RunRecord, error) {
 	if err := r.gate.Wait(ctx); err != nil {

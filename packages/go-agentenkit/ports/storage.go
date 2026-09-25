@@ -42,6 +42,12 @@ type ThreadStore interface {
 	// transition. Must be atomic: a single conditional UPDATE or equivalent
 	// (§2.5, §2.8).
 	ClaimState(ctx context.Context, threadID string, from, to ExecutionState, sc StorageContext) (bool, error)
+	// Transition is the compare-and-set every run state change goes
+	// through: true iff THIS caller moved the thread (see ThreadTransition).
+	// It must also record the thread's current run, which the adapter
+	// keeps beside the state. Atomic, like ClaimState: one conditional
+	// UPDATE or equivalent.
+	Transition(ctx context.Context, threadID string, t ThreadTransition, sc StorageContext) (bool, error)
 }
 
 // MessageScope decides WHOSE turns List returns (§2.7):
@@ -70,15 +76,32 @@ type MessageStore interface {
 	DeleteFrom(ctx context.Context, threadID, messageID string, sc StorageContext) (int, error)
 }
 
-// EventStore is the events section of Storage.
+// EventStore is the thread record: the few events that must outlive a run
+// (parks and their answers, refusals, budget stops, compaction, each
+// segment's start and end, and an app's own events published durable). A
+// run's live events go to its run stream, never here, so this grows with
+// runs, not with tokens.
 type EventStore interface {
-	Append(ctx context.Context, threadID string, e AgentEvent, sc StorageContext) error
-	// ListSince returns all events after the cursor, ascending by seq (§2.2).
+	// Append stores an entry and mints its seq: the thread's next, one
+	// higher than any it holds. Two appends on one thread never get the
+	// same seq.
+	Append(ctx context.Context, threadID string, e NewThreadEvent, sc StorageContext) (AgentEvent, error)
+	// List returns entries by filter, ascending by seq.
+	List(ctx context.Context, threadID string, f ThreadEventFilter, sc StorageContext) ([]AgentEvent, error)
+	// ListSince returns all entries after the cursor, ascending by seq.
 	ListSince(ctx context.Context, threadID string, sinceSeq int64, sc StorageContext) ([]AgentEvent, error)
 	// Latest returns the most recent event of a type, or nil, nil.
 	Latest(ctx context.Context, threadID, typ string, sc StorageContext) (*AgentEvent, error)
 	// ListByType returns every event of a type, ascending by seq.
 	ListByType(ctx context.Context, threadID, typ string, sc StorageContext) ([]AgentEvent, error)
+}
+
+// EventPruner is what an EventStore may add to back PruneEvents: one batch
+// of it. Prune deletes up to limit entries of these types, on every thread,
+// and says how many of each went. With dryRun it deletes nothing and counts
+// every entry of these types instead.
+type EventPruner interface {
+	Prune(ctx context.Context, types []string, limit int, dryRun bool) (map[string]int64, error)
 }
 
 // UsageStore is the usage section of Storage: one row per model call (§4).

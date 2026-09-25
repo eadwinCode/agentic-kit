@@ -102,8 +102,8 @@ describe('run admission and dispatch recovery', () => {
     reject(new Error('late failure'));
     const failed = await first;
     expect((await r.admin.runs.get(failed.runId!))!.state).toBe('CANCELLED');
-    expect((await r.admin.runs.get(second.runId!))!.state).toBe('RUNNING');
-    expect((await r.storage.threads.get(thread.id))!.state).toBe('RUNNING');
+    expect((await r.admin.runs.get(second.runId!))!.state).toBe('QUEUED');
+    expect((await r.storage.threads.get(thread.id))!.state).toBe('QUEUED');
   });
 
   it('honours a stop while the admitted send is still persisting its message', async () => {

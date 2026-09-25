@@ -20,6 +20,12 @@ export interface AdminStore {
     upsert(thread: NewAdminThread): Promise<void>;
     countByState(): Promise<Partial<Record<ExecutionState, number>>>;
     list(filter: AdminThreadFilter): Promise<AdminThread[]>;
+    /** One thread, or null when it was never seen. */
+    get(threadId: string): Promise<AdminThread | null>;
+    /** Remove a thread with its runs and steps: what a deleted thread leaves
+     *  behind in operational history (§3.2). An unknown thread is not an
+     *  error. */
+    delete(threadId: string): Promise<void>;
   };
   runs: {
     start(run: NewRunRecord): Promise<RunRecord>;
@@ -31,6 +37,23 @@ export interface AdminStore {
     /** Counts by state across every run. The "what is happening right now"
      *  aggregate, pushed down so it never drags rows into memory. */
     countByState(): Promise<Partial<Record<ExecutionState, number>>>;
+    /** Claim the right to run a run's settle hook (§5.6), in one conditional
+     *  write: it wins only while the run is not settled and no other claim on
+     *  it is newer than `staleBefore`. A claim older than that belongs to a
+     *  settler that died, and is taken over. False when the run is unknown,
+     *  settled, or claimed by someone else. */
+    claimSettle(runId: string, token: string, staleBefore: Date): Promise<boolean>;
+    /** Add to a run's counters in one write (`SET steps = steps + n`), so two
+     *  segments that close together both count. An unknown run is not an
+     *  error. */
+    increment(runId: string, deltas: RunDeltas): Promise<void>;
+    /** Count and sum every run the filter matches, grouped in the store:
+     *  exact however many runs there are. `limit` and `before` are ignored. */
+    totals(filter: RunFilter): Promise<RunTotals>;
+    /** End a claim made with `token`. `settled` marks the run settled for
+     *  good; otherwise the claim is dropped so a later settle can run the hook
+     *  again. A claim that was taken over is left alone. */
+    endSettle(runId: string, token: string, settled: boolean): Promise<void>;
   };
   steps: {
     record(step: NewStepRecord): Promise<void>;
@@ -114,8 +137,47 @@ export interface RunFilter {
   state?: ExecutionState[];
   agent?: string;
   threadId?: string;
+  /** Only runs on these threads. Omitted or empty means every thread. */
+  threadIds?: string[];
   since?: Date;
   until?: Date;
+  /** Only runs that have ended and whose settle has not run (§5.6): what the
+   *  late-settle sweep looks for. */
+  unsettled?: boolean;
+  /** Only runs at this depth: 0 is a dispatched run. Omitted is every depth. */
+  depth?: number;
+  /** Pages through a listing: only runs that sort after this one, newest
+   *  first by start time and then by id. Pass the last run of the previous
+   *  page. */
+  before?: RunCursor;
   /** Newest first. Implementations cap this — core passes a bounded value. */
   limit?: number;
+}
+
+/** Amounts to add to a run's counters (see `runs.increment`). */
+export interface RunDeltas {
+  steps: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+/** What `runs.totals` counts over a set of runs. Tokens are summed from the
+ *  run records: tokens only, no money. */
+export interface RunTotals {
+  runs: number;
+  byState: Partial<Record<ExecutionState, number>>;
+  byStopReason: Record<string, number>;
+  steps: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+/** A place in a run listing (see `RunFilter.before`). */
+export interface RunCursor {
+  startedAt: Date;
+  id: string;
 }

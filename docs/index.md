@@ -46,6 +46,6 @@ features:
   - title: Bring your own UI
     details: >-
       use-agentenkit is a React hook with every route, label and transport under
-      your control — and the event log is a public contract you can build any
-      client over.
+      your control — and the follow's frames are a public contract you can
+      build any client over, in our shape or as AG-UI.
 ---

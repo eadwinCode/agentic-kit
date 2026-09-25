@@ -44,6 +44,38 @@ export function promptMessage(m: { role: string; content: unknown }): { role: st
   return { role: m.role, content: c };
 }
 
+const CONTEXT_SUMMARY = 'CONTEXT_SUMMARY';
+
+/** Reads a stored message as a compaction summary: whether it is one, and the
+ *  last message it covers (null on one written before the mark). */
+export function summaryOf(m: { content: unknown }): { coversUpTo: string | null } | null {
+  const c = m.content as { type?: unknown; coversUpTo?: unknown } | null;
+  if (!c || typeof c !== 'object' || Array.isArray(c) || c.type !== CONTEXT_SUMMARY) return null;
+  return { coversUpTo: typeof c.coversUpTo === 'string' ? c.coversUpTo : null };
+}
+
+/** The part of a stored history that goes to the model (§2.6): the latest
+ *  compaction summary, then only the messages after the last one it covers.
+ *  Everything before is in the summary already, and sending it again would
+ *  undo the compaction. A summary written before the cover mark existed covers
+ *  nothing known, so every summary is left out and the whole history goes; the
+ *  next compaction writes a proper one. */
+export function promptHistory<T extends { id: string; content: unknown }>(history: T[]): T[] {
+  let latest = -1;
+  let covers: string | null = null;
+  history.forEach((m, i) => {
+    const s = summaryOf(m);
+    if (s) {
+      latest = i;
+      covers = s.coversUpTo;
+    }
+  });
+  if (latest < 0) return history;
+  const coveredAt = covers === null ? -1 : history.findIndex((m) => m.id === covers);
+  const rest = history.slice(coveredAt + 1).filter((m) => !summaryOf(m));
+  return coveredAt >= 0 ? [history[latest]!, ...rest] : rest;
+}
+
 /** `promptMessage` over a whole history. */
 export const promptMessages = (messages: Array<{ role: string; content: unknown }>) =>
   messages.map(promptMessage);
@@ -54,8 +86,11 @@ export const DANGLING_CALL_RESULT = {
 };
 
 /** Close every assistant tool call that has no tool result before the next
- *  turn. Idempotent. */
-export function repairDanglingToolCalls<T extends MessageLike>(messages: T[]): T[] {
+ *  turn, and drop every tool result whose call is not in the history before
+ *  it (an orphan: its call was cut away, or the result was written first).
+ *  Strict providers reject both. Idempotent. */
+export function repairDanglingToolCalls<T extends MessageLike>(input: T[]): T[] {
+  const messages = dropOrphanResults(input);
   const out: T[] = [];
   for (let i = 0; i < messages.length; i += 1) {
     const m = messages[i]!;
@@ -85,6 +120,29 @@ export function repairDanglingToolCalls<T extends MessageLike>(messages: T[]): T
     out.push(...messages.slice(i + 1, j));
     out.push({ role: 'tool', content: missing } as T);
     i = j - 1;
+  }
+  return out;
+}
+
+/** Tool results whose call has not appeared yet are dropped; a tool message
+ *  left with no parts goes with them. */
+function dropOrphanResults<T extends MessageLike>(messages: T[]): T[] {
+  const called = new Set<string>();
+  const out: T[] = [];
+  for (const m of messages) {
+    if (m.role === 'assistant') {
+      for (const p of parts(m.content)) {
+        if (p.type === 'tool-call' && p.toolCallId) called.add(p.toolCallId);
+      }
+    }
+    if (m.role !== 'tool' || !Array.isArray(m.content)) {
+      out.push(m);
+      continue;
+    }
+    const all = parts(m.content);
+    const kept = all.filter((p) => p.type !== 'tool-result' || !p.toolCallId || called.has(p.toolCallId));
+    if (kept.length === all.length) out.push(m);
+    else if (kept.length > 0) out.push({ ...m, content: kept } as T);
   }
   return out;
 }

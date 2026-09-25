@@ -1,5 +1,7 @@
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { RunFilter, StepRecord, ThreadStart } from '../ports/admin.js';
+import { UnsupportedError, type QueueStats } from '../ports/queue.js';
+import { STREAM_ONLY_TYPES } from './prune.js';
 import type {
   AgentEvent,
   ExecutionState,
@@ -22,9 +24,17 @@ export interface RunStats {
   /** Wall time from enqueue to finish, over runs that ended. A parked run
    *  legitimately includes however long the human took (§2.5). */
   duration: Percentiles | null;
-  /** Time spent waiting for a worker — the backlog signal (§2.8). */
+  /** Time spent waiting for a worker — the backlog signal (§2.8). A run still
+   *  waiting counts with the time it has waited so far, so the number rises
+   *  while a backlog grows, not after it clears. */
   queued: Percentiles | null;
+  /** How many runs in the window are still QUEUED. */
+  waiting: number;
   failed: number;
+  /** True when the window held more runs than the percentiles were worked
+   *  out over. The counts and token sums are exact either way; the
+   *  percentiles are then over the newest runs only. */
+  sampled?: boolean;
 }
 
 export interface AdminOverview {
@@ -34,8 +44,17 @@ export interface AdminOverview {
   threads: Partial<Record<ExecutionState, number>>;
   /** Every run ever, by state, unbounded by the stats window. */
   runsByState: Partial<Record<ExecutionState, number>>;
-  /** Runs still in flight, newest first. */
+  /** Every run queued, running or waiting on a human, from `runsByState`: the
+   *  number to show, where `active` is a bounded sample. */
+  activeTotal: number;
+  /** Runs still in flight, newest first, at most `activeLimit`. */
   active: RunRecord[];
+  /** The cap on `active`; when `activeTotal` is above it the list is a
+   *  sample. */
+  activeLimit: number;
+  /** What the queue says about itself: ready, delayed, in flight, dead, the
+   *  oldest wait. Absent when the queue adapter cannot count. */
+  queue?: QueueStats;
 }
 
 /** A thread with its runs rolled up (§2.9) — what a listing needs to rank and
@@ -49,6 +68,9 @@ export interface ThreadSummary {
   /** Runs on this thread, nested ones included. */
   runs: number;
   steps: number;
+  /** Summed from the run records. In a list that is tokens only, with no
+   *  money; `getThread` reads the thread's usage rows instead, so its tokens
+   *  carry the cost too (§4). */
   tokens: UsageTotals;
   /** Summed run durations. Not wall time: nested runs overlap their parent. */
   durationMs: number;
@@ -72,8 +94,9 @@ export interface RunDetail {
   steps: StepRecord[];
   /** Nested runs spawned beneath it (§2.7) — the same RunRecord shape. */
   subagents: RunRecord[];
-  /** The run's events with CHUNKs stripped — the readable spine, not the
-   *  token-by-token firehose. */
+  /** The run's entries in the thread record — each segment's start and
+   *  end, its parks and their answers, a refusal, a budget stop: the
+   *  readable spine. Its steps are in `steps`. */
   events: AgentEvent[];
   /** What this run spent, nested runs included (§4): tokens, money, and a
    *  line per agent and model. Read from the usage rows, so it is the same
@@ -100,6 +123,8 @@ export function summarise(runs: RunRecord[]): RunStats {
   const durations: number[] = [];
   const queued: number[] = [];
   let failed = 0;
+  let waiting = 0;
+  const now = Date.now();
 
   for (const r of runs) {
     byState[r.state] = (byState[r.state] ?? 0) + 1;
@@ -109,7 +134,14 @@ export function summarise(runs: RunRecord[]): RunStats {
     tokens.outputTokens += r.outputTokens;
     tokens.totalTokens += r.totalTokens;
     if (typeof r.durationMs === 'number') durations.push(r.durationMs);
-    if (typeof r.queuedMs === 'number') queued.push(r.queuedMs);
+    if (r.state === 'QUEUED' && r.enqueuedAt) {
+      // Still waiting: a live sample, so the percentile moves while the
+      // backlog grows rather than once it has cleared.
+      queued.push(now - new Date(r.enqueuedAt).getTime());
+      waiting += 1;
+    } else if (typeof r.queuedMs === 'number') {
+      queued.push(r.queuedMs);
+    }
     if (r.state === 'FAILED') failed += 1;
   }
 
@@ -120,6 +152,7 @@ export function summarise(runs: RunRecord[]): RunStats {
     tokens,
     duration: percentiles(durations),
     queued: percentiles(queued),
+    waiting,
     failed,
   };
 }
@@ -141,20 +174,59 @@ export async function runStats(
 ): Promise<RunStats> {
   // Percentiles are computed here rather than pushed into the adapter, so an
   // adapter only ever writes filters it can express in one indexed query.
-  return summarise(await listRuns(deps, { ...range, limit: range.limit ?? 1_000 }));
+  return statsOver(deps, { since: range.since, until: range.until }, range.limit ?? 1_000);
 }
+
+/** `summarise` over the newest `sample` runs, with the counts and token sums
+ *  taken exact from the store, whatever the window holds. */
+async function statsOver(deps: RuntimePorts, filter: RunFilter, sample: number): Promise<RunStats> {
+  const [runs, totals] = await Promise.all([
+    listRuns(deps, { ...filter, limit: sample }),
+    deps.admin.runs.totals(filter),
+  ]);
+  return {
+    ...summarise(runs),
+    total: totals.runs,
+    byState: totals.byState,
+    byStopReason: totals.byStopReason,
+    failed: totals.byState.FAILED ?? 0,
+    waiting: totals.byState.QUEUED ?? 0,
+    tokens: {
+      ...EMPTY,
+      inputTokens: totals.inputTokens, cachedInputTokens: totals.cachedInputTokens,
+      outputTokens: totals.outputTokens, totalTokens: totals.totalTokens,
+    },
+    sampled: totals.runs > runs.length,
+  };
+}
+
+/** The cap on an overview's `active` sample. */
+const ACTIVE_LIMIT = 50;
 
 export async function overview(
   deps: RuntimePorts,
   range: { since?: Date } = {},
 ): Promise<AdminOverview> {
-  const [threads, runsByState, recent, active] = await Promise.all([
+  const [threads, runsByState, runs, active] = await Promise.all([
     deps.admin.threads.countByState(),
     deps.admin.runs.countByState(),
-    listRuns(deps, { since: range.since, limit: 1_000 }),
-    deps.admin.runs.list({ state: ['RUNNING', 'WAITING_FOR_INPUT'], limit: 50 }),
+    statsOver(deps, { since: range.since }, 1_000),
+    deps.admin.runs.list({ state: ['QUEUED', 'RUNNING', 'WAITING_FOR_INPUT'], limit: ACTIVE_LIMIT }),
   ]);
-  return { runs: summarise(recent), threads, runsByState, active };
+  const activeTotal = (runsByState.QUEUED ?? 0) + (runsByState.RUNNING ?? 0) + (runsByState.WAITING_FOR_INPUT ?? 0);
+  // The queue's own numbers ride the same response every dashboard already
+  // fetches. A queue that cannot count leaves the field out.
+  let queue: QueueStats | undefined;
+  try {
+    queue = await deps.queue.stats();
+  } catch (err) {
+    if (!(err instanceof UnsupportedError)) {
+      ((deps.log ?? console) as { warn?: (m: string, ...r: unknown[]) => void }).warn?.(
+        'queue stats not read for the overview', { err },
+      );
+    }
+  }
+  return { runs, threads, runsByState, activeTotal, active, activeLimit: ACTIVE_LIMIT, ...(queue ? { queue } : {}) };
 }
 
 /** A run's steps, in order (§2.9). Rows in the platform's own store rather
@@ -202,16 +274,18 @@ function rollUp(thread: {
   };
 }
 
-/** Threads with their runs rolled up, newest activity first (§2.9). One pass
- *  over the window's runs rather than a query per thread. */
+/** Threads with their runs rolled up, newest activity first (§2.9). One read
+ *  of those threads' runs rather than a query per thread. */
 export async function listThreads(
   deps: RuntimePorts,
   filter: { state?: ExecutionState[]; since?: Date; limit?: number } = {},
 ): Promise<ThreadSummary[]> {
-  const [threads, runs] = await Promise.all([
-    deps.admin.threads.list({ ...filter, limit: filter.limit ?? DEFAULT_LIMIT }),
-    deps.admin.runs.list({ since: filter.since, limit: 5_000 }),
-  ]);
+  const threads = await deps.admin.threads.list({ ...filter, limit: filter.limit ?? DEFAULT_LIMIT });
+  // The runs of exactly the threads listed, not the latest few thousand
+  // overall: a busy system would otherwise roll some threads up short.
+  const runs = threads.length
+    ? await deps.admin.runs.list({ threadIds: threads.map((t) => t.id), limit: 100_000 })
+    : [];
   const byThread = new Map<string, RunRecord[]>();
   for (const r of runs) {
     const list = byThread.get(r.threadId) ?? [];
@@ -230,8 +304,7 @@ export async function getThread(
     deps.admin.runs.listByThread(threadId),
     deps.admin.steps.listByThread(threadId),
   ]);
-  const rows = await deps.admin.threads.list({ limit: 5_000 });
-  const thread = rows.find((t) => t.id === threadId);
+  const thread = await deps.admin.threads.get(threadId);
   if (!thread && runs.length === 0) return null;
 
   const base = thread ?? {
@@ -241,7 +314,16 @@ export async function getThread(
     firstSeenAt: runs.at(-1)?.startedAt ?? new Date(),
     updatedAt: runs[0]?.startedAt ?? new Date(),
   };
-  return { thread: rollUp(base, runs), runs, steps };
+  const thread_ = rollUp(base, runs);
+  // The money lives on the usage rows, not the run records: read it from
+  // there, the same number a bill is built from. The view still renders with
+  // the records' tokens when the read fails.
+  try {
+    thread_.tokens = await deps.storage.usage.total(threadId, {});
+  } catch (err) {
+    (deps.log ?? console).error('thread usage not read', { thread: threadId, err });
+  }
+  return { thread: thread_, runs, steps };
 }
 
 export async function getRun(deps: RuntimePorts, runId: string): Promise<RunDetail | null> {
@@ -251,7 +333,7 @@ export async function getRun(deps: RuntimePorts, runId: string): Promise<RunDeta
   const [steps, siblings, events, usage] = await Promise.all([
     listSteps(deps, runId),
     deps.admin.runs.listByThread(run.threadId),
-    deps.storage.events.listSince(run.threadId, -1),
+    runEvents(deps, run),
     // Spend per run, from the one place money lives (§4). Best effort: a run
     // view must still render when the usage read fails.
     deps.storage.usage.total(run.threadId, { runId }).catch((err) => {
@@ -267,12 +349,22 @@ export async function getRun(deps: RuntimePorts, runId: string): Promise<RunDeta
     steps,
     // Its children: same table, distinguished by depth (§2.7).
     subagents: siblings.filter((c: RunRecord) => c.parentRunId === runId),
-    // CHUNK is the token firehose; a timeline wants the spine.
-    events: events.filter((e: AgentEvent) => {
-      if (e.type === 'CHUNK' || e.type === 'SUBAGENT_CHUNK') return false;
-      const at = new Date(e.createdAt).getTime();
-      return at >= from && at <= to;
-    }),
+    events,
     usage,
   };
+}
+
+/** A run's entries in the thread record. A thread written before entries
+ *  named their run has none by id; its log is read by the run's time
+ *  window instead, without the chunks. */
+async function runEvents(deps: RuntimePorts, run: RunRecord): Promise<AgentEvent[]> {
+  const own = await deps.storage.events.list(run.threadId, { runId: run.id });
+  if (own.length > 0) return own;
+  const from = new Date(run.startedAt).getTime();
+  const to = run.endedAt ? new Date(run.endedAt).getTime() : Infinity;
+  return (await deps.storage.events.listSince(run.threadId, -1)).filter((e) => {
+    if (STREAM_ONLY_TYPES.includes(e.type)) return false;
+    const at = new Date(e.createdAt).getTime();
+    return at >= from && at <= to;
+  });
 }

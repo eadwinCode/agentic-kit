@@ -45,6 +45,18 @@ export const runtime = await setupAgentCore({
 export const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 ```
 
+`PrismaStorage` orders a thread's messages by a `seq` column (`BigInt
+@default(autoincrement())` on `Message`), not by `createdAt`: a tool call and
+its result can share a millisecond. An existing database gets the column from
+the example's `20260926000000_message_seq` migration, which numbers the rows
+already there in their old order (`createdAt`, then `id`). Copy it into your
+own migrations and run `prisma generate`.
+
+The example's migrations create the whole schema the adapter writes to,
+including the usage table's billing columns
+(`20260927000000_token_usage_billing`): `prisma migrate deploy` on a fresh
+database is all a deploy needs.
+
 ## Deployment shapes
 
 **Serverless.** The natural fit: `run()` returns in milliseconds, and the queue
@@ -143,5 +155,7 @@ approvals hold no lock, so a long human wait does not enter into it.
 ## Upgrading
 
 Both packages are pre-1.0. Pin exact versions and read the release notes; the
-event log shape and the port signatures are the two surfaces most likely to
-move.
+wire frames and the port signatures are the two surfaces most likely to move.
+After upgrading to run streams, run `runtime.pruneEvents()` (Go:
+`rt.PruneEvents`) once to clear the old stream-only rows from the events
+table; see [Run streams](./run-streams.md).

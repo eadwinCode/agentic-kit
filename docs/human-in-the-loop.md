@@ -21,12 +21,18 @@ const sendEmail = markRequiresConfirmation(
 
 **A durable state transition that holds no process.**
 
-When the model calls a marked tool, the platform:
+When the model calls a marked tool, the platform first finishes and saves the
+step that made the call, then:
 
-1. writes an `INPUT_REQUIRED` event carrying the tool name and arguments,
-2. moves the thread to `WAITING_FOR_INPUT`,
+1. moves the thread to `WAITING_FOR_INPUT`,
+2. writes an `INPUT_REQUIRED` event carrying the tool name and arguments,
 3. schedules the expiry as a *delayed queue message*,
 4. ends the run segment and **releases the run lock**.
+
+Nothing is written while the step is still running. A step that fails after a
+tool asked for approval parks nothing and is retried; a stop that lands first
+wins, and the park is skipped. An answer can therefore never arrive for a tool
+call the history does not have yet.
 
 No worker is blocked. No promise is pending. No memory is held. A thread can
 wait for a week, across deploys and restarts, and cost nothing.
@@ -48,10 +54,15 @@ await runtime.hitl.respond({
 ```
 
 `delivered: false` means the wait is gone: it expired, it was already answered,
-or the thread moved on. Show it as "too late", not as an error.
+or the thread moved on. Show it as "too late", not as an error. The first answer
+wins: a second one, from another tab or a retry, gets `This request was already
+answered` and never replaces the first.
 
 On approval the tool runs and the run resumes **where it stopped** — the step is
-not replayed. On denial the tool returns a denial result and the model continues
+not replayed. The answer is kept until the tool's result is saved, and the
+tool's output is kept as soon as it returns, so a worker that dies in between
+does not lose the approval and does not run the tool a second time: the retry
+saves the output it already has. On denial the tool returns a denial result and the model continues
 from there. The model decides what to do about being refused; that is a
 conversation, not an error.
 
@@ -138,6 +149,13 @@ Practical consequences:
 A subagent can park too. The `INPUT_REQUIRED` event carries the asking run's
 name and depth, so a card can say "mailer" rather than an opaque id, and the
 frame stack unwinds the answer back through the nesting levels.
+
+A child that fails while the answer is unwinding is reported to the level above
+as the delegation's result, exactly as a live delegation reports it, and the
+run goes on. An unwind cut short by a dead worker carries on from the first
+level still waiting when the job comes back. Only the current run's requests
+are ever open: one left behind by an earlier run (a failed one, or turns an
+edit cut away) is ignored.
 
 ## Building the UI
 

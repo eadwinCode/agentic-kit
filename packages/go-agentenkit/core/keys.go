@@ -17,7 +17,9 @@ func StateKey(threadID string) string { return "agent:state:" + threadID }
 // RunLockKey is the per-thread run lock (§3.4).
 func RunLockKey(threadID string) string { return "agent:lock:" + threadID }
 
-// SeqKey is the per-thread event sequence counter (§3.4).
+// SeqKey is the per-thread event counter older releases kept in the kv.
+// The thread record now mints its own seq; only a thread delete still
+// clears it.
 func SeqKey(threadID string) string { return "agent:seq:" + threadID }
 
 // AttemptsKey counts §2.8 failure retries of ONE run. Keyed by the run, so
@@ -39,6 +41,14 @@ func CounterScope(threadID, runID string) string {
 // past any retry backoff, short enough that a counter a crash left behind
 // does not sit in the kv for ever.
 const counterTTL = 6 * time.Hour
+
+// ThreadKeyTTL is how long a thread's hot keys (state, current run, event
+// seq) live after they were last written. The durable row is the truth;
+// these only save a read, so a thread idle past this simply reads storage
+// again, and its seq counter carries on from the stored events (see
+// nextSeq). Without an expiry, every thread ever run keeps three keys in
+// the kv for ever.
+const ThreadKeyTTL = 30 * 24 * time.Hour
 
 // RunIDKey holds the thread's CURRENT run id (§2.1).
 //
@@ -72,7 +82,7 @@ func ClaimRun(ctx context.Context, deps ports.RuntimePorts, threadID string) (st
 // ClaimRunAs is ClaimRun with a caller-chosen id (§2.1). The caller has
 // already checked the id is unused.
 func ClaimRunAs(ctx context.Context, deps ports.RuntimePorts, threadID, runID string) (string, error) {
-	if _, err := deps.Kv.Set(ctx, RunIDKey(threadID), runID, ports.SetOptions{}); err != nil {
+	if _, err := deps.Kv.Set(ctx, RunIDKey(threadID), runID, ports.SetOptions{Expiry: ThreadKeyTTL}); err != nil {
 		return "", err
 	}
 	return runID, nil
@@ -98,3 +108,7 @@ func NewID() string {
 	hex.Encode(out[24:36], b[10:16])
 	return string(out[:])
 }
+
+// ActiveStates are the states a run is still going in: the ones a stop or a
+// failure can end.
+var ActiveStates = []ports.ExecutionState{ports.StateQueued, ports.StateRunning, ports.StateWaitingForInput}

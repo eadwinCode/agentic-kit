@@ -17,8 +17,10 @@ package pricing
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"strings"
+	"sync"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
@@ -30,6 +32,10 @@ const USD = "USD"
 // currency. A price of 3.0 for input means $3.00 per million input tokens,
 // which is how every provider publishes them, so a price list can be typed
 // straight off their pricing page.
+//
+// A cache rate left at zero is taken as not given: those tokens are priced at
+// InputPerMillion, and a warning is logged once per model. Cache tokens are
+// never free, and a price list that forgot them must not bill them at 0.
 type ModelPrice struct {
 	InputPerMillion      float64
 	CacheReadPerMillion  float64
@@ -88,17 +94,35 @@ func (t Table) priceIn(currency string, u ports.NewUsage) (*ports.Cost, error) {
 	if !ok {
 		return nil, nil // unknown model: let the next pricer try
 	}
+	cacheRead, cacheWrite := p.CacheReadPerMillion, p.CacheWritePerMillion
+	if cacheRead == 0 && u.CacheReadInputTokens > 0 {
+		cacheRead = p.InputPerMillion
+		warnOnce(u.Model+"\x00read", "price table has no cache read rate; cache reads priced as input", u.Model)
+	}
+	if cacheWrite == 0 && u.CacheWriteInputTokens > 0 {
+		cacheWrite = p.InputPerMillion
+		warnOnce(u.Model+"\x00write", "price table has no cache write rate; cache writes priced as input", u.Model)
+	}
 	// tokens/1_000_000 × pricePerMillion is the cost in currency units, and
 	// micros is that × 1_000_000. The two cancel: tokens × pricePerMillion
 	// IS the micro-unit cost, with no float scaling in between.
 	micros := float64(u.InputTokens)*p.InputPerMillion +
-		float64(u.CacheReadInputTokens)*p.CacheReadPerMillion +
-		float64(u.CacheWriteInputTokens)*p.CacheWritePerMillion +
+		float64(u.CacheReadInputTokens)*cacheRead +
+		float64(u.CacheWriteInputTokens)*cacheWrite +
 		float64(u.OutputTokens)*p.OutputPerMillion +
 		float64(u.ReasoningTokens)*p.ReasoningPerMillion
 	return &ports.Cost{
 		Micros: int64(math.Round(micros)), Currency: currency, Source: "table",
 	}, nil
+}
+
+// warned keeps warnOnce to one line per model and rate.
+var warned sync.Map
+
+func warnOnce(key, msg, model string) {
+	if _, seen := warned.LoadOrStore(key, true); !seen {
+		slog.Default().Warn(msg, "model", model)
+	}
 }
 
 // ReceiptReader pulls a cost out of what the provider attached to the
@@ -120,7 +144,9 @@ func ReceiptIn(currency string, read ReceiptReader) ports.Pricer {
 			return nil, nil
 		}
 		micros, ok := read(u.ProviderMetadata)
-		if !ok {
+		if !ok || micros < 0 {
+			// No receipt, or one that makes no sense: a negative cost is
+			// not believed, and the call is left for the next pricer.
 			return nil, nil
 		}
 		return &ports.Cost{Micros: micros, Currency: currency, Source: "receipt"}, nil

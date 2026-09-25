@@ -1,0 +1,22 @@
+{"type":"RUN_STARTED","threadId":"t1","runId":"r1","streamId":"r1:1","segment":1}
+{"type":"TEXT_MESSAGE_START","messageId":"m1","role":"assistant"}
+{"type":"TEXT_MESSAGE_CONTENT","messageId":"m1","delta":"Hello"}
+{"type":"TEXT_MESSAGE_END","messageId":"m1"}
+{"type":"REASONING_START","messageId":"m1"}
+{"type":"REASONING_CONTENT","messageId":"m1","delta":"thinking"}
+{"type":"REASONING_END","messageId":"m1"}
+{"type":"TOOL_CALL_START","toolCallId":"c1","toolName":"search"}
+{"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta":"{\"q\":"}
+{"type":"TOOL_CALL_END","toolCallId":"c1","toolName":"search","args":{"q":"x"}}
+{"type":"TOOL_CALL_RESULT","toolCallId":"c1","toolName":"search","result":["a","b"]}
+{"type":"SOURCE","source":{"url":"https://example.com"}}
+{"type":"STEP_FINISHED","step":1,"agentId":null,"finishReason":"stop","usage":{"inputTokens":10,"cachedInputTokens":2,"outputTokens":5,"totalTokens":17}}
+{"type":"MESSAGE_APPENDED","message":{"id":"m2","role":"user","content":"hi","agentId":null,"createdAt":"2026-09-25T10:00:00.000Z"},"clientMessageId":"local-1"}
+{"type":"INPUT_REQUIRED","toolCallId":"c2","toolName":"wipe","agentId":null,"arguments":{},"inputSchema":null,"frames":[],"reason":"approval","expiresAt":"2026-09-25T11:00:00.000Z"}
+{"type":"SUBAGENT_STARTED","subagentId":"sub_1","name":"research","depth":1}
+{"type":"SUBAGENT_EVENT","subagentId":"sub_1","event":{"type":"TEXT_MESSAGE_CONTENT","messageId":"m3","delta":"x"}}
+{"type":"SUBAGENT_FINISHED","subagentId":"sub_1","status":"failed","error":"boom"}
+{"type":"CUSTOM","name":"SEARCH_PROGRESS","value":{"done":3,"of":10}}
+{"type":"RUN_FINISHED","status":"finished","usage":{"inputTokens":10,"cachedInputTokens":2,"outputTokens":5,"totalTokens":17},"costs":[{"currency":"USD","micros":1200}],"finishReason":"stop"}
+{"type":"RUN_FINISHED","status":"parked"}
+{"type":"RUN_ERROR","status":"lost","error":"worker lost"}

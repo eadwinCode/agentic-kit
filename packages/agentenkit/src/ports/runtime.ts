@@ -20,14 +20,20 @@ import type { TokenAttribution } from '../core/usage.js';
 import type { Storage } from './storage.js';
 import type { AdminStore, RunFilter, StepRecord } from './admin.js';
 import type { AgentRunState, BoundStorage } from '../core/state.js';
-import type { FollowOptions, SseOptions, SseStream } from '../core/follow.js';
+import type { FollowFrame, FollowOptions, FollowThreadOptions, SseStream, ThreadCursor } from '../core/follow.js';
+import type { StreamItem } from '../core/stream-events.js';
+import type { StreamSnapshot } from './streams.js';
 import type { PublishEventOptions } from '../core/publish.js';
+import type { SnapshotStream } from '../core/snapshot.js';
+import type { PruneOptions, PruneReport } from '../core/prune.js';
+import type { WireFormat } from '../core/agui.js';
 
 export type { AdminStore, NewStepRecord, RunFilter, StepRecord } from './admin.js';
 export type { AgentRunState, BoundStorage, StorageContext } from '../core/state.js';
 import type { EventBus } from './bus.js';
 import type { Queue } from './queue.js';
 import type { Kv } from './kv.js';
+import type { RunStreams } from './streams.js';
 import type { ExecuteInput, ExecuteOutcome } from '../core/engine.js';
 import type {
   AdminOverview,
@@ -59,6 +65,8 @@ export interface RuntimePorts {
   bus: EventBus;
   queue: Queue;
   kv: Kv;
+  /** Run streams, one per segment; absent, none are written. */
+  streams?: RunStreams;
   /** User-provided model resolution (§3.3): models can live in any shape on
    *  the consumer side — the platform only ever sees `ResolvedModel`. */
   resolveModel(modelName: string): ResolvedModel;
@@ -99,6 +107,10 @@ export interface RuntimeOptions {
   bus: EventBus;
   queue: Queue;
   kv: Kv;
+  /** Short-lived logs, one per run segment: where a run's live events go.
+   *  Omitted, they are kept in memory, which only this process can read —
+   *  fine for one process, not for web servers and workers that run apart. */
+  streams?: RunStreams;
   /** Models can come in any shape — config files, a database, provider SDKs.
    *  The platform only ever sees the resolved `ResolvedModel`. */
   resolveModel(modelName: string): ResolvedModel;
@@ -142,11 +154,43 @@ export interface RunInput {
    *  from the AI SDK (§3.1). Merged over the spec default: the execute
    *  input wins per provider namespace. */
   providerOptions?: ProviderOptions;
+  /** Name the run yourself (§2.1): your own records can be keyed by it
+   *  before dispatch, and the worker sees the same id. Reusing one is
+   *  refused, never silently re-run. */
+  runId?: string;
+  /** Cap this run's round trips below the config's `maxSteps`; a larger
+   *  value is clamped to it. */
+  maxSteps?: number;
+  /** Images the user sent with the prompt. They are stored as image parts on
+   *  the user message and reach the model natively. */
+  attachments?: Attachment[];
+  /** The caller's tenant, written on the dispatch ticket so a queue that
+   *  spreads its claims across partitions can keep one tenant's backlog from
+   *  starving the others. Opaque to the platform. */
+  partitionKey?: string;
+  /** The sending client's own name for the user turn. It comes back on the
+   *  turn's MESSAGE_APPENDED, so the client that sent it can swap its
+   *  optimistic copy for the real one by id, never by matching text. Opaque
+   *  to the platform, and not stored. */
+  clientMessageId?: string;
 }
+
+/** An image on a user turn: a URL the provider can fetch, or a data: URL. */
+export interface Attachment {
+  url: string;
+  mediaType?: string;
+}
+
+/** Why a run was refused, for a host that answers differently to each:
+ *  `active_run` (the thread already has one), `queue_full` (try again
+ *  shortly), `billing` (the billing check said no). */
+export type RefusedReason = 'active_run' | 'queue_full' | 'billing';
 
 export interface RunResult {
   accepted: boolean;
   threadId: string;
+  /** For the refusals a host acts on. */
+  reason?: RefusedReason;
   /** This run's id (§2.1) — the same one carried by the enqueued job. An
    *  in-process worker must pass it back, or its dispatch has no identity. */
   runId?: string;
@@ -190,12 +234,16 @@ export interface ThreadUsage {
   model: string;
 }
 
-/** What the platform hands a spec's `onFinish` once the run is finalized. */
+/** What the platform hands a spec's `onSettle` and `onFinish`. */
 export interface RunFinishInfo {
   threadId: string;
   runId?: string;
   state: ExecutionState;
   stopReason: string;
+  /** A user stop (§2.1). */
+  cancelled: boolean;
+  /** Why the run failed, when it did. */
+  error?: string;
   tokensUsed: number;
   /** The tokens THIS segment spent. A run that parked and resumed finishes
    *  once, so this is the last segment, not the whole run — and it is tokens
@@ -209,9 +257,49 @@ export interface RunFinishInfo {
    *  `unpriced` above zero means some calls went unpriced and `costMicros` is
    *  a floor. */
   usage: UsageTotals;
+  /** Set when the platform could not read the run's rows back. `usage` is
+   *  then zeroed, and a hook that bills from it should refuse to settle
+   *  rather than charge nothing: throw from `onSettle` and the run fails
+   *  instead of going free. */
+  usageError?: unknown;
 }
 
+/** A spec's settle hook (§5.6): where a run is charged. It runs once per run,
+ *  whatever way the run ends — completed, stopped (while running, queued or
+ *  parked), failed, or found later by the late-settle sweep — before the
+ *  terminal state is written when a worker ends the run. A throw fails a run
+ *  that was going to complete, and leaves the run unsettled so a later
+ *  settle runs it again.
+ *
+ *  Make it idempotent by `runId`. Once is kept by a claim on the run record,
+ *  but a hook slower than the claim (10 minutes), or a mark that could not be
+ *  written, can see the same run twice. */
+export type SettleFn = (info: RunFinishInfo) => void | Promise<void>;
+
+/** Builds the persona per step with the run's state (§3.1). It wins over the
+ *  static `system` when set. A throw fails the step, like a model error. */
+export type SystemFn = (threadId: string, state: AgentRunState) => string | Promise<string>;
+
+/** Edits the prompt for one step, just before it is sent (§3.1): `messages` is
+ *  the history the platform assembled (compacted, repaired, cache-stamped) and
+ *  what comes back is what the model sees. It is the place for context that
+ *  must NOT be saved — a screenshot the model should look at once, an editor
+ *  snapshot — because anything added here is gone on the next step unless it
+ *  is added again. */
+export type PrepareStepFn = (
+  threadId: string,
+  state: AgentRunState,
+  messages: Array<any>,
+) => Array<any> | Promise<Array<any>>;
+
 /** Durable state used to hydrate a client before it starts live event replay. */
+/** Where a follow starts: `cursor` (a ThreadCursor, or its wire string as an
+ *  SSE Last-Event-ID carries it), or a bare record seq `since`. */
+export interface FollowStartOptions extends Omit<FollowThreadOptions, 'cursor'> {
+  cursor?: ThreadCursor | string | null;
+  since?: number;
+}
+
 export interface ThreadSnapshot {
   thread: ThreadDTO;
   messages: MessageDTO[];
@@ -219,10 +307,13 @@ export interface ThreadSnapshot {
    *  reconnecting client rebuilds its subagent panel without depending on
    *  events that only replay while a run is unfinished. */
   runs: RunRecord[];
-  /** Cursor for starting live replay without duplicating snapshot state. */
+  /** The thread record's last seq. */
   lastEventSeq: number;
-  /** Only the unfinished run's events, used to restore transient activity. */
+  /** The unfinished run's record entries: its open park, a refusal. */
   activeEvents: AgentEvent[];
+  /** The run stream in flight, or one that just ended: what the messages
+   *  do not have yet, and where a live read picks up. */
+  stream: SnapshotStream | null;
 }
 
 /** Everything streamText accepts except the platform-owned keys (§3.1).
@@ -250,8 +341,14 @@ export type StreamTextAgentSpec = {
     | 'maxSteps' | 'onStepFinish' | 'onError' | 'onFinish' | 'onChunk'> & {
   /** `system` is allowed here (static persona); per-run system is not. */
   system?: string;
+  /** The persona built per step with the run's state; wins over `system`. */
+  systemFn?: SystemFn;
+  /** Edits the prompt per step, for context that must not be saved. */
+  prepareStep?: PrepareStepFn;
   tools?: ToolSet;
   onChunk?: (para: any) => void | Promise<void>;   // chained after platform persistence
+  /** Charges the run (§5.6). See SettleFn. */
+  onSettle?: SettleFn;
   /** Fires once, after the platform finalized the run, with what the run did
    *  and what it spent (§4). */
   onFinish?: (info: RunFinishInfo) => void | Promise<void>;
@@ -268,9 +365,27 @@ export type GenerateTextAgentSpec = {
 } & Omit<Parameters<typeof import('ai').generateText>[0],
     'model' | 'messages' | 'prompt' | 'abortSignal' | 'onFinish' | 'onStepFinish'> & {
   tools?: ToolSet;
+  /** The persona built per step with the run's state; wins over `system`. */
+  systemFn?: SystemFn;
+  /** Edits the prompt per step, for context that must not be saved. */
+  prepareStep?: PrepareStepFn;
+  /** Charges the run (§5.6). See SettleFn. */
+  onSettle?: SettleFn;
   /** Fires once, after the platform finalized the run (§4). */
   onFinish?: (info: RunFinishInfo) => void | Promise<void>;
 };
+
+/** What a stuck-run sweep did. */
+export interface ReclaimReport {
+  /** How many run records the sweep looked at. */
+  checked: number;
+  /** How many runs went back on the queue or were moved to their end state. */
+  redispatched: number;
+  /** How many ended runs had their settle run late. */
+  settled: number;
+  /** How many runs the sweep could not act on. */
+  errors: number;
+}
 
 /** An executor bound to a generation flavor and to the user's generation
  *  arguments (§3). Returned by the `create*Agent` factories. */
@@ -280,8 +395,9 @@ export interface AgentHandle {
 
   /** Worker-side only (§5.6). Throws on failure — see executeWithPolicy.
    *  Returns 'lock-conflict' when another worker owns the thread's run lock
-   *  (nothing was executed) and 'stale' when a newer run has replaced this
-   *  one (§2.1, §2.8). */
+   *  (nothing was executed), 'stale' when a newer run has replaced this
+   *  one (§2.1, §2.8), and 'lock-lost' when this worker could not keep the
+   *  lock and stopped early (§3.4). */
   execute(input: ExecuteInput): Promise<ExecuteOutcome>;
 
   /** execute + §2.8 failure policy: redrive < maxAttempts, else finalize FAILED */
@@ -320,6 +436,14 @@ export interface AgentCore {
    *  Refused while a run is active; stop() first. */
   deleteThread(threadId: string, state?: AgentRunState): Promise<DeleteThreadResult>;
 
+  /** The backstop for a run that nothing is working on (§2.5, §2.8): a QUEUED
+   *  or RUNNING record older than `olderThanMs` whose lock nobody holds and
+   *  whose job is gone is re-dispatched, and an ended record older than that
+   *  whose settle never ran is settled. Call it from a periodic job. It pages
+   *  through every such run. A record with no recorded state is read with an
+   *  empty state. */
+  reclaimStuckRuns(olderThanMs: number): Promise<ReclaimReport>;
+
   hitl: {
     respond(input: RespondInput): Promise<RespondResult>;
     reclaimIfOrphaned(threadId: string, state?: AgentRunState): Promise<boolean>;
@@ -328,31 +452,59 @@ export interface AgentCore {
   events: {
     since(threadId: string, sinceSeq: number, state?: AgentRunState): Promise<AgentEvent[]>;
     subscribe(threadId: string, handler: (event: AgentEvent) => void): Promise<() => void>;
-    /** Replay then live, as one sequence, with the cursor discipline already
-     *  applied (§2.2): subscribe before replaying, never emit at or below the
-     *  cursor, forward a seq-0 notice without moving it.
+    /** A thread live, as one sequence of frames (§2.2): its record entries
+     *  and notices, and its run streams — the stream the cursor names read on
+     *  from its offset, the next segment's from its RUN_STARTED, and one
+     *  SNAPSHOT frame when the stream the client was reading is gone.
      *
-     *  Framework-neutral — an async iterable is something Express, Nest, Hono,
-     *  Next or a plain worker can each consume in their own way. Pass a signal,
-     *  or the subscription outlives the client. */
+     *  `cursor` is where the client is: the SSE `id:` it last saw
+     *  (Last-Event-ID), as a string or parsed. `since` is a bare record seq,
+     *  as older clients send. Framework-neutral — an async iterable is
+     *  something Express, Nest, Hono, Next or a plain worker can each consume
+     *  in their own way. Pass a signal, or the follow outlives the client. */
     follow(
+      threadId: string,
+      options?: FollowStartOptions & { state?: AgentRunState },
+    ): AsyncGenerator<FollowFrame>;
+    /** `follow`, encoded as Server-Sent Events. Each frame that moves the
+     *  cursor carries it as its `id:`. `wireFormat: 'ag-ui'` sends AG-UI
+     *  events instead of our frames (opt-in). Returns the stream and the
+     *  headers rather than a Response, because half the ecosystem has none. */
+    sse(
+      threadId: string,
+      options?: FollowStartOptions & { retryMs?: number; wireFormat?: WireFormat; state?: AgentRunState },
+    ): SseStream;
+    /** The thread record and its notices alone, as before run streams: no
+     *  stream frames. */
+    followRecord(
       threadId: string,
       options?: FollowOptions & { state?: AgentRunState },
     ): AsyncGenerator<AgentEvent>;
-    /** `follow`, encoded as Server-Sent Events. Returns the stream and the
-     *  headers rather than a Response, because half the ecosystem has none. */
-    sse(threadId: string, options?: SseOptions & { state?: AgentRunState }): SseStream;
     /** Publish an event of your own on a thread, from anywhere on the server
      *  — a webhook, a cron job, a route. Tools get the same thing bound to
-     *  their thread as `publishEvent` on their options. Durable by default;
-     *  `{ durable: false }` is a bus-only notice. Platform event types are
-     *  refused. */
+     *  their thread as `publishEvent` on their options. Live only by default;
+     *  `{ durable: true }` also keeps it in the thread record. Platform event
+     *  types are refused. */
     publishEvent(
       threadId: string,
       type: string,
       payload: unknown,
       options?: PublishEventOptions & { state?: AgentRunState },
     ): Promise<AgentEvent>;
+  };
+
+  /** Delete the stream-only rows (chunks, step markers, state changes…)
+   *  releases before run streams left in the event table, a batch at a
+   *  time. Nothing reads them any more; an app's own types are kept. Run it
+   *  when it suits you, after upgrading: `{ dryRun: true }` counts first. */
+  pruneEvents(options?: PruneOptions): Promise<PruneReport>;
+
+  /** A run stream by id, for a caller that only cares about one run: its
+   *  items after `after`, live until it closes. Throws StreamGoneError once
+   *  the stream is past its grace window. */
+  streams: {
+    read(streamId: string, after: string | null, signal?: AbortSignal): AsyncIterable<StreamItem>;
+    snapshot(streamId: string, after?: string | null): Promise<StreamSnapshot | null>;
   };
 
   /** Agent factories — see §4. Each call registers a handle under `spec.name`. */
@@ -387,6 +539,20 @@ export interface AgentCore {
    *  delivery (the per-thread run lock, §3.4). The HTTP layer only verifies
    *  signatures, parses JSON, and calls this. */
   worker: {
-    handleJob(job: RunJob): Promise<{ accepted: boolean; reason?: string }>;
+    /** Run one job. Throws `UnknownAgentError` for a job naming an agent this
+     *  process does not have, so a queue that retries on failure keeps it.
+     *  Abort `signal` on shutdown: the segment stops at once and the job goes
+     *  back on the queue without spending an attempt. */
+    handleJob(job: RunJob, options?: { signal?: AbortSignal }): Promise<{ accepted: boolean; reason?: string }>;
+    /** What a queue calls when it gives up on a job (§2.8): the run behind it
+     *  is failed with the reason and settled, so its thread does not read
+     *  QUEUED or RUNNING for ever. A job whose run has already moved on is
+     *  left alone. */
+    handleDeadJob(job: RunJob, attempts: number, cause: unknown): Promise<void>;
   };
+
+  /** The ports bundle, scoped to a run's state when one is given (§2.10): for
+   *  a host that reads storage, publishes or checks the kv the way the
+   *  platform does. */
+  ports(state?: AgentRunState): RuntimePorts;
 }
