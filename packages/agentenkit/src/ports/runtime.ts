@@ -142,6 +142,11 @@ export interface RunInput {
    *  from the AI SDK (§3.1). Merged over the spec default: the execute
    *  input wins per provider namespace. */
   providerOptions?: ProviderOptions;
+  /** The sending client's own name for the user turn. It comes back on the
+   *  turn's MESSAGE_APPENDED, so the client that sent it can swap its
+   *  optimistic copy for the real one by id, never by matching text. Opaque
+   *  to the platform, and not stored. */
+  clientMessageId?: string;
 }
 
 export interface RunResult {

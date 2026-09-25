@@ -15,6 +15,7 @@ import type {
   AgentState,
   Attachment,
   ChatEntry,
+  ConnectionState,
   EntryPart,
   MessageRole,
   PendingInput,
@@ -48,11 +49,21 @@ export interface UseAgentThread {
    *  Hydrated from the snapshot, then kept from `STATE_CHANGE` alone; null
    *  before the first run. */
   currentRun: ThreadRun | null;
+  /** Where the live stream stands. `closed` means the transport gave up; the
+   *  hook re-reads the thread and opens a new stream on its own. */
+  connection: ConnectionState;
+  /** Why the last send did not go through, or why the server refused it
+   *  (RUN_REFUSED). A send that fails leaves the conversation as it was and
+   *  says so here, rather than marking the thread FAILED. Cleared by the next
+   *  send that is accepted. */
+  error: string | null;
   loadThreads: () => Promise<void>;
   loadUsage: (threadId?: string) => Promise<void>;
   newThread: () => void;
   selectThread: (threadId: string) => void;
   deleteThread: (threadId: string) => Promise<boolean>;
+  /** Refused, with `error` set, while a run is queued, running or waiting on
+   *  an approval, or while an earlier send is still in flight. */
   run: (prompt: string, options?: RunOptions) => Promise<RunResult>;
   /** False on refusal or transport failure; activity.detail explains why. */
   stop: () => Promise<boolean>;
@@ -73,6 +84,14 @@ export interface RunOptions {
   /** Anything else the run route accepts — merged into the request body. */
   [key: string]: unknown;
 }
+
+/** States in which a thread already has a run: a new one is refused. */
+const ACTIVE: readonly AgentState[] = ['QUEUED', 'RUNNING', 'WAITING_FOR_INPUT'];
+
+/** How long a closed stream waits before the thread is read again, doubled
+ *  per try up to the cap. */
+const RECONNECT_BASE_MS = 1_000;
+const RECONNECT_MAX_MS = 30_000;
 
 /** Mark the call a result belongs to as done (or failed) on the entry that
  *  announced it, so a tool card can flip state in place. */
@@ -96,18 +115,21 @@ function settleToolCall(entries: ChatEntry[], toolCallId: string, result: unknow
 
 /** The run a STATE_CHANGE speaks for, with the clock it carries:
  *  `enqueuedAt` while the run waits for a worker, `startedAt` once one has
- *  it, `endedAt` once it ended. An event without a run id says nothing about
- *  timing and leaves what is known. */
-function runFromStateChange(prev: ThreadRun | null, state: AgentState, p: any): ThreadRun | null {
+ *  it, `endedAt` once it ended. A server that leaves a clock off still gets
+ *  a timer: the frame's own `createdAt` is when the change happened. An event
+ *  without a run id says nothing about timing and leaves what is known. */
+function runFromStateChange(prev: ThreadRun | null, state: AgentState, p: any, at?: string): ThreadRun | null {
   if (typeof p?.runId !== 'string') return prev;
   const same = prev?.id === p.runId;
   const next: ThreadRun = { id: p.runId };
-  const enqueuedAt = typeof p.enqueuedAt === 'string' ? p.enqueuedAt : same ? prev?.enqueuedAt : undefined;
+  const clock = (key: 'enqueuedAt' | 'startedAt' | 'endedAt', now: boolean) =>
+    typeof p[key] === 'string' ? p[key] : same && prev?.[key] ? prev[key] : now ? at : undefined;
+  const enqueuedAt = clock('enqueuedAt', state === 'QUEUED');
   if (enqueuedAt) next.enqueuedAt = enqueuedAt;
-  const startedAt = typeof p.startedAt === 'string' ? p.startedAt : same ? prev?.startedAt : undefined;
+  const startedAt = clock('startedAt', state === 'RUNNING' || state === 'WAITING_FOR_INPUT');
   if (startedAt) next.startedAt = startedAt;
   if (state === 'COMPLETED' || state === 'FAILED' || state === 'CANCELLED') {
-    const endedAt = typeof p.endedAt === 'string' ? p.endedAt : same ? prev?.endedAt : undefined;
+    const endedAt = clock('endedAt', true);
     if (endedAt) next.endedAt = endedAt;
   }
   return next;
@@ -128,6 +150,35 @@ function latestRun(runs: readonly ThreadSnapshot['runs'][number][] | undefined):
   if (latest.startedAt && latest.state !== 'QUEUED') run.startedAt = latest.startedAt;
   if (latest.endedAt) run.endedAt = latest.endedAt;
   return run;
+}
+
+/** Streamed text not yet shown: deltas are gathered here and shown once per
+ *  frame, rather than re-rendering the conversation on every token. */
+type Pending = { kind: 'text' | 'reasoning'; text: string; seq: number };
+
+/** Add streamed text to the conversation: onto the live entry of its kind
+ *  when that is the last one, as a new live entry otherwise. */
+function appendDelta(prev: ChatEntry[], d: Pending): ChatEntry[] {
+  const prefix = d.kind === 'text' ? 'live:assistant:' : 'live:reasoning:';
+  const last = prev.at(-1);
+  if (last?.kind === d.kind && last.id.startsWith(prefix) && !last.agentId) {
+    const text = last.text + d.text;
+    return [...prev.slice(0, -1), { ...last, text, parts: [{ type: d.kind, text }] }];
+  }
+  return [
+    ...prev,
+    { id: `${prefix}${d.seq}`, kind: d.kind, role: 'assistant', text: d.text, parts: [{ type: d.kind, text: d.text }] },
+  ];
+}
+
+/** Run `fn` on the next frame, or soon after where there are no frames. */
+function nextFrame(fn: () => void): () => void {
+  if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+    const id = window.requestAnimationFrame(fn);
+    return () => window.cancelAnimationFrame(id);
+  }
+  const id = setTimeout(fn, 16);
+  return () => clearTimeout(id);
 }
 
 /** Hydrates durable messages first, then resumes the canonical event stream at
@@ -153,7 +204,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
   const [threadId, setThreadId] = useState<string | undefined>(initialThreadId);
   const [entries, setEntries] = useState<ChatEntry[]>([]);
   const [agentState, setAgentState] = useState<AgentState>('IDLE');
-  const [activity, setActivity] = useState<AgentActivity>(() =>
+  const [activity, setActivityState] = useState<AgentActivity>(() =>
     stateActivity('IDLE', resolved.labels),
   );
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -165,8 +216,26 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
   const [threadsLoading, setThreadsLoading] = useState(resolved.loadThreadsOnMount);
   const [usage, setUsage] = useState<ThreadUsage | null>(null);
   const [currentRun, setCurrentRun] = useState<ThreadRun | null>(null);
+  const [connection, setConnection] = useState<ConnectionState>('connecting');
+  const [error, setError] = useState<string | null>(null);
+  /** Bumped to read the thread again and open a new stream after the old one
+   *  closed for good. */
+  const [reloadKey, setReloadKey] = useState(0);
   const threadRef = useRef<string | undefined>(threadId);
   threadRef.current = threadId;
+  /** What the last render showed, for `run()` to put back if a send fails. */
+  const shownRef = useRef({ entries, agentState, activity, pendingInputs, subagents, currentRun });
+  shownRef.current = { entries, agentState, activity, pendingInputs, subagents, currentRun };
+  /** The activity as last set, so a delta only re-renders when the phase
+   *  actually changes. */
+  const activityRef = useRef(activity);
+  const setActivity = useCallback((next: AgentActivity | ((current: AgentActivity) => AgentActivity)) => {
+    setActivityState((current) => {
+      const value = typeof next === 'function' ? next(current) : next;
+      activityRef.current = value;
+      return value;
+    });
+  }, []);
   /** When each run ended, as its terminal STATE_CHANGE said. A stop is
    *  accepted before the worker that held the run has torn down, so a
    *  snapshot taken in between can still lack the end; the event's word
@@ -179,6 +248,64 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
   /** Results already visible from the durable messages, kept apart from the
    *  calls: a live result must still render after its live call did. */
   const seenToolResults = useRef<Set<string>>(new Set());
+  /** The seq of the last event applied. An event at or below it is one this
+   *  client already has — a replay, or a transport that resent — and is
+   *  dropped before anything sees it. Notices (seq 0) always pass. */
+  const lastSeqRef = useRef(-1);
+  /** Streamed text waiting for the next frame. */
+  const pendingDeltas = useRef<Pending[]>([]);
+  const cancelFlush = useRef<(() => void) | null>(null);
+  /** A send is on its way: a second one would race it (two threads made by
+   *  two fast sends on a new thread). */
+  const sending = useRef(false);
+  /** Only the latest thread-list request may land. */
+  const threadsRequest = useRef(0);
+  /** Closed streams in a row, for the reconnect backoff. */
+  const reconnectTries = useRef(0);
+  /** The thread the per-thread state belongs to. */
+  const shownThread = useRef<string | undefined>(threadId);
+
+  /** Show the streamed text gathered so far, in one render. */
+  const flushDeltas = useCallback(() => {
+    cancelFlush.current?.();
+    cancelFlush.current = null;
+    const batch = pendingDeltas.current;
+    if (batch.length === 0) return;
+    pendingDeltas.current = [];
+    setEntries((prev) => batch.reduce(appendDelta, prev));
+  }, []);
+
+  const queueDelta = useCallback(
+    (d: Pending) => {
+      const batch = pendingDeltas.current;
+      const last = batch.at(-1);
+      if (last?.kind === d.kind) last.text += d.text;
+      else batch.push({ ...d });
+      cancelFlush.current ??= nextFrame(() => {
+        cancelFlush.current = null;
+        flushDeltas();
+      });
+    },
+    [flushDeltas],
+  );
+
+  /** Everything that belongs to one thread, back to empty. */
+  const clearThreadState = useCallback(() => {
+    cancelFlush.current?.();
+    cancelFlush.current = null;
+    pendingDeltas.current = [];
+    lastSeqRef.current = -1;
+    // runEndings stays: it is keyed by run id, and a stop's end must outlive
+    // a switch away and back.
+    seenToolCalls.current = new Set();
+    seenToolResults.current = new Set();
+    setEntries([]);
+    setSubagents([]);
+    setPendingInputs([]);
+    setUsage(null);
+    setCurrentRun(null);
+    setError(null);
+  }, []);
 
   /** One place where the caller's headers and fetch are applied. */
   const request = useCallback(async (url: string, init: RequestInit = {}) => {
@@ -221,19 +348,21 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
     [request],
   );
 
-  /** Thread picker / sidebar: best-effort refresh, most recent first. */
+  /** Thread picker / sidebar: best-effort refresh, most recent first. Only
+   *  the latest request lands: an older, slower answer never replaces it. */
   const loadThreads = useCallback(async () => {
     const cfg = cfgRef.current;
+    const mine = ++threadsRequest.current;
     try {
       setThreadsLoading(true);
       const res = await request(cfg.baseUrl + cfg.routes.threads);
-      if (!res.ok) return;
+      if (!res.ok || mine !== threadsRequest.current) return;
       const data = await res.json();
-      setThreads(data.threads ?? []);
+      if (mine === threadsRequest.current) setThreads(data.threads ?? []);
     } catch {
       // sidebar is best-effort — ignore transport errors
     } finally {
-      setThreadsLoading(false);
+      if (mine === threadsRequest.current) setThreadsLoading(false);
     }
   }, [request]);
 
@@ -253,16 +382,13 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
 
   /** Start a new thread: clear the pointer so the next run creates one. */
   const newThread = useCallback(() => {
+    clearThreadState();
+    shownThread.current = undefined;
     setThreadId(undefined);
-    setEntries([]);
-    setSubagents([]);
-    setPendingInputs([]);
-    setUsage(null);
-    setCurrentRun(null);
     setAgentState('IDLE');
     setActivity(stateActivity('IDLE', cfgRef.current.labels));
     cfgRef.current.persistence?.clear();
-  }, []);
+  }, [clearThreadState, setActivity]);
 
   /** Select an existing thread — hydration and stream resume run in the
    *  threadId effect below. */
@@ -301,9 +427,33 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
 
   const applyEvent = useCallback(
     (data: StreamEvent) => {
+      // Already applied: a replay the snapshot covered, or a transport that
+      // resent after reconnecting. Dropped before anything sees it.
+      if (data.seq !== 0 && data.seq <= lastSeqRef.current) return;
+      if (data.seq !== 0) lastSeqRef.current = data.seq;
+
       const cfg = cfgRef.current;
       const { labels, format } = cfg;
       const p = data.payload ?? {};
+
+      // Streamed text is gathered and shown once per frame; the activity only
+      // changes when the phase does.
+      if (data.type === 'CHUNK' && (p?.type === 'text-delta' || p?.type === 'reasoning')) {
+        if (cfg.onEvent?.(data) === true) return;
+        const kind = p.type === 'text-delta' ? 'text' : 'reasoning';
+        const phase = kind === 'text' ? 'responding' : 'thinking';
+        if (activityRef.current.phase !== phase) {
+          setActivity({ phase, label: kind === 'text' ? labels.responding : labels.thinking });
+        }
+        // Providers that do not expose reasoning send none; an empty one is
+        // only a phase change.
+        if (typeof p.textDelta === 'string' && p.textDelta) {
+          queueDelta({ kind, text: p.textDelta, seq: data.seq });
+        }
+        return;
+      }
+      // Anything else lands after the text before it.
+      flushDeltas();
 
       // The app sees every event first, and can claim it.
       if (cfg.onEvent?.(data) === true) return;
@@ -315,7 +465,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
           if (typeof p.runId === 'string' && typeof p.endedAt === 'string') {
             runEndings.current.set(p.runId, p.endedAt);
           }
-          setCurrentRun((prev) => runFromStateChange(prev, nextState, p));
+          setCurrentRun((prev) => runFromStateChange(prev, nextState, p, data.createdAt));
           if (nextState === 'RUNNING') {
             // The park was resolved: every child that was waiting is re-entered
             // where it stopped.
@@ -332,7 +482,12 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
             ) {
               return current;
             }
-            return stateActivity(nextState, labels);
+            // The park already said what it waits on: a tool waiting on its
+            // own work is not "waiting for approval".
+            if (nextState === 'WAITING_FOR_INPUT' && current.phase === 'waiting-input') return current;
+            const next = stateActivity(nextState, labels);
+            // A failure says why.
+            return nextState === 'FAILED' && typeof p.error === 'string' ? { ...next, detail: p.error } : next;
           });
           if (nextState !== 'WAITING_FOR_INPUT') setPendingInputs([]);
           // Terminal states land in the durable thread row — refresh the
@@ -344,9 +499,10 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
           break;
         }
 
-        // Another client sent a message on this thread. The sending client
-        // added it to its own state before the request went out, so this is
-        // where every OTHER one learns what was asked.
+        // Another client sent a message on this thread, or this one's send
+        // was confirmed. The sending client added it to its own state before
+        // the request went out, so this is where every OTHER one learns what
+        // was asked.
         case 'MESSAGE_APPENDED': {
           const entry = messageToEntry(
             {
@@ -361,11 +517,14 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
           setEntries((prev) => {
             // Already have it — a replayed event, or our own optimistic copy
             // now confirmed. Replace the optimistic one so the real id lands
-            // (editing a message needs it), otherwise it would show twice.
+            // (editing a message needs it), otherwise it would show twice. It
+            // is found by the id this client gave it; a server that does not
+            // echo one is matched by text.
             if (prev.some((e) => e.id === entry.id)) return prev;
-            const optimistic = prev.findIndex(
-              (e) => e.id.startsWith('optimistic:user:') && e.text === entry.text,
-            );
+            const optimistic =
+              typeof p.clientMessageId === 'string'
+                ? prev.findIndex((e) => e.id === `optimistic:user:${p.clientMessageId}`)
+                : prev.findIndex((e) => e.id.startsWith('optimistic:user:') && e.text === entry.text);
             if (optimistic !== -1) {
               const next = [...prev];
               next[optimistic] = entry;
@@ -386,58 +545,52 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
           break;
         }
 
+        // A generate-text agent streams nothing: its whole answer arrives here.
+        case 'TEXT_RESULT': {
+          if (typeof p.text !== 'string' || !p.text) break;
+          setEntries((prev) => [
+            ...prev,
+            {
+              id: `live:text-result:${data.seq}`,
+              kind: 'text',
+              role: 'assistant',
+              text: p.text,
+              parts: [{ type: 'text', text: p.text }],
+            },
+          ]);
+          break;
+        }
+
+        // The thread is gone, deleted here or elsewhere: start afresh.
+        case 'THREAD_DELETED': {
+          if (!p.threadId || p.threadId === threadRef.current) {
+            newThread();
+            void loadThreads();
+          }
+          break;
+        }
+
+        // An approval was answered, here or in another tab: its card goes.
+        case 'HITL_RESPONSE': {
+          setPendingInputs((prev) => prev.filter((r) => r.toolCallId !== p.toolCallId));
+          break;
+        }
+
+        // The server would not start the run: billing, a full queue.
+        case 'RUN_REFUSED': {
+          const why = typeof p.error === 'string' ? p.error : String(p.reason ?? '');
+          setError(why || labels.runRefused);
+          setActivity({ phase: 'failed', label: labels.runRefused, ...(why ? { detail: why } : {}) });
+          break;
+        }
+
         case 'CHUNK': {
-          if (p?.type === 'text-delta' && typeof p.textDelta === 'string') {
-            setActivity({ phase: 'responding', label: labels.responding });
-            setEntries((prev) => {
-              const last = prev.at(-1);
-              if (last?.kind === 'text' && last.id.startsWith('live:assistant:') && !last.agentId) {
-                const text = last.text + p.textDelta;
-                return [...prev.slice(0, -1), { ...last, text, parts: [{ type: 'text', text }] }];
-              }
-              return [
-                ...prev,
-                {
-                  id: `live:assistant:${data.seq}`,
-                  kind: 'text',
-                  role: 'assistant',
-                  text: p.textDelta,
-                  parts: [{ type: 'text', text: p.textDelta }],
-                },
-              ];
-            });
-          } else if (p?.type === 'reasoning') {
-            // The model's thinking, streamed like the answer but kept apart so
-            // a UI can show it live and fold it away after. Providers that do
-            // not expose reasoning never send these.
-            setActivity({ phase: 'thinking', label: labels.thinking });
-            if (typeof p.textDelta === 'string' && p.textDelta) {
-              setEntries((prev) => {
-                const last = prev.at(-1);
-                if (last?.kind === 'reasoning' && last.id.startsWith('live:reasoning:')) {
-                  const text = last.text + p.textDelta;
-                  return [...prev.slice(0, -1), { ...last, text, parts: [{ type: 'reasoning', text }] }];
-                }
-                return [
-                  ...prev,
-                  {
-                    id: `live:reasoning:${data.seq}`,
-                    kind: 'reasoning',
-                    role: 'assistant',
-                    text: p.textDelta,
-                    parts: [{ type: 'reasoning', text: p.textDelta }],
-                  },
-                ];
-              });
-            }
-          } else if (p?.type === 'source') {
+          if (p?.type === 'source') {
             setActivity({ phase: 'thinking', label: labels.reviewingSources });
           } else if (p?.type === 'tool-call-streaming-start' || p?.type === 'tool-call-delta') {
-            setActivity({
-              phase: 'tool-call',
-              label: labels.preparingToolCall,
-              detail: p.toolName,
-            });
+            if (activityRef.current.phase !== 'tool-call' || activityRef.current.detail !== p.toolName) {
+              setActivity({ phase: 'tool-call', label: labels.preparingToolCall, detail: p.toolName });
+            }
           } else if (p?.type === 'tool-call') {
             if (p.toolCallId && seenToolCalls.current.has(p.toolCallId)) break; // already durable
             if (p.toolCallId) seenToolCalls.current.add(p.toolCallId);
@@ -557,9 +710,12 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
           break;
 
         case 'SUBAGENT_CHUNK':
+          // The child's answer only: its thinking and its tool traffic are
+          // not what it said.
+          if (p.chunk?.type !== 'text-delta' || typeof p.chunk.textDelta !== 'string') break;
           setSubagents((prev) =>
             prev.map((s) =>
-              s.agentId === p.agentId ? { ...s, text: s.text + (p.chunk?.textDelta ?? '') } : s,
+              s.agentId === p.agentId ? { ...s, text: s.text + p.chunk.textDelta } : s,
             ),
           );
           break;
@@ -582,7 +738,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
           break;
       }
     },
-    [loadThreads, loadUsage],
+    [flushDeltas, loadThreads, loadUsage, newThread, queueDelta, setActivity],
   );
 
   useEffect(() => {
@@ -590,22 +746,32 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
     const cfg = cfgRef.current;
     cfg.persistence?.save(threadId);
 
+    // Another thread's messages, cards and run must not stay on screen while
+    // this one loads. A thread this client just created keeps what it shows:
+    // that is its own optimistic turn.
+    if (shownThread.current !== undefined && shownThread.current !== threadId) clearThreadState();
+    shownThread.current = threadId;
+
     let cancelled = false;
     let stream: { close(): void } | undefined;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    // A slow answer for a thread the user already left must not land.
+    const abort = new AbortController();
     setHistoryLoading(true);
+    setConnection('connecting');
     setActivity({ phase: 'loading', label: cfg.labels.loading });
 
     void (async () => {
       try {
-        const res = await request(
-          routeUrl(cfg.routes.history, { threadId }, cfg.baseUrl),
-        );
+        const res = await request(routeUrl(cfg.routes.history, { threadId }, cfg.baseUrl), {
+          signal: abort.signal,
+        });
+        if (cancelled) return;
         if (res.status === 404) {
           cfg.persistence?.clear();
+          clearThreadState();
+          shownThread.current = undefined;
           setThreadId(undefined);
-          setEntries([]);
-          setUsage(null);
-          setCurrentRun(null);
           setAgentState('IDLE');
           setActivity(stateActivity('IDLE', cfg.labels));
           return;
@@ -613,6 +779,12 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
         if (!res.ok) throw new Error(`History request failed (${res.status})`);
         const snapshot = (await res.json()) as ThreadSnapshot;
         if (cancelled) return;
+
+        // The snapshot is the whole durable truth: a re-read after a closed
+        // stream starts from it too, with nothing streamed half-shown.
+        cancelFlush.current?.();
+        cancelFlush.current = null;
+        pendingDeltas.current = [];
 
         // A nested run's turns live in the same log under its own agentId.
         // They are its transcript, not the main conversation's.
@@ -690,25 +862,56 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
         setAgentState(snapshot.thread.state);
         setActivity(stateActivity(snapshot.thread.state, cfg.labels));
 
+        // The active run's events are at or below the snapshot's cursor, so
+        // the cursor starts before them; after, it is the snapshot's.
+        lastSeqRef.current = -1;
         for (const event of snapshot.activeEvents) applyEvent(event);
+        flushDeltas();
+        lastSeqRef.current = Math.max(lastSeqRef.current, snapshot.lastEventSeq);
 
         stream = cfg.openStream(
-          routeUrl(cfg.routes.stream, { threadId, since: snapshot.lastEventSeq }, cfg.baseUrl),
+          routeUrl(cfg.routes.stream, { threadId, since: lastSeqRef.current }, cfg.baseUrl),
           {
-            onMessage: (raw) => applyEvent(JSON.parse(raw) as StreamEvent),
-            onError: () => {
-              // EventSource reconnects on its own; keep the last meaningful
-              // activity instead of presenting a transient network failure.
+            onMessage: (raw) => {
+              let event: StreamEvent;
+              try {
+                event = JSON.parse(raw) as StreamEvent;
+              } catch {
+                return; // a frame that is not an event: nothing to show
+              }
+              applyEvent(event);
             },
+            onError: () => {
+              // The transport retries on its own; keep the last meaningful
+              // activity rather than showing a passing network blip.
+              if (!cancelled) setConnection('reconnecting');
+            },
+            onOpen: () => {
+              if (cancelled) return;
+              reconnectTries.current = 0;
+              setConnection('open');
+            },
+            onClose: () => {
+              // The transport gave up for good (a 401, a 404): read the
+              // thread again and open a new stream from where it stands,
+              // waiting longer each time it happens in a row.
+              if (cancelled) return;
+              setConnection('closed');
+              const wait = Math.min(RECONNECT_BASE_MS * 2 ** reconnectTries.current, RECONNECT_MAX_MS);
+              reconnectTries.current += 1;
+              retry = setTimeout(() => setReloadKey((k) => k + 1), wait);
+            },
+            getCursor: () => lastSeqRef.current,
           },
         );
-      } catch (error) {
+        setConnection('open');
+      } catch (err) {
         if (cancelled) return;
         setAgentState('FAILED');
         setActivity({
           phase: 'failed',
           label: cfgRef.current.labels.loadFailed,
-          detail: error instanceof Error ? error.message : String(error),
+          detail: err instanceof Error ? err.message : String(err),
         });
       } finally {
         if (!cancelled) setHistoryLoading(false);
@@ -717,15 +920,35 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
 
     return () => {
       cancelled = true;
+      abort.abort();
+      if (retry) clearTimeout(retry);
       stream?.close();
+      flushDeltas();
     };
-  }, [applyEvent, loadUsage, request, threadId]);
+  }, [applyEvent, clearThreadState, flushDeltas, loadUsage, request, setActivity, threadId, reloadKey]);
 
   const run = useCallback(
     async (prompt: string, options: RunOptions = {}): Promise<RunResult> => {
       const cfg = cfgRef.current;
       const { model = cfg.defaultModel, editMessageId, attachments, ...rest } = options;
+      const shown = shownRef.current;
 
+      // One run at a time: a send while one is going would wipe its approval
+      // cards, and two fast sends on a new thread would make two threads.
+      if (sending.current || ACTIVE.includes(shown.agentState)) {
+        setError(cfg.labels.runBusy);
+        return { accepted: false, threadId: threadRef.current, error: cfg.labels.runBusy };
+      }
+      // A turn the server has not confirmed has no id it knows.
+      if (editMessageId?.startsWith('optimistic:')) {
+        setError(cfg.labels.editUnconfirmed);
+        return { accepted: false, threadId: threadRef.current, error: cfg.labels.editUnconfirmed };
+      }
+      sending.current = true;
+
+      // Named here, echoed back on the turn's MESSAGE_APPENDED, so the real
+      // message replaces exactly this optimistic one.
+      const clientMessageId = `cm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       setEntries((prev) => {
         // An edit replaces that turn and everything it led to, mirroring what
         // the server is about to do to the durable history.
@@ -737,7 +960,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
         }
         return [
           ...kept,
-          { id: `optimistic:user:${Date.now()}`, kind: 'text', role: 'user', text: prompt, parts },
+          { id: `optimistic:user:${clientMessageId}`, kind: 'text', role: 'user', text: prompt, parts },
         ];
       });
       setSubagents([]);
@@ -753,32 +976,43 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
         const response = await postJson(cfg.baseUrl + cfg.routes.run, {
           threadId: threadRef.current,
           prompt,
-          model,
+          // Left out when unset: the server then uses the agent's own model.
+          ...(model !== undefined ? { model } : {}),
           editMessageId,
           attachments,
+          clientMessageId,
           ...rest,
         });
-        const data = (await response.json()) as RunResult;
-        if (!response.ok || !data.accepted) {
-          throw new Error(data.error ?? `Run request failed (${response.status})`);
+        // The status first: an error page is not JSON, and its parse error
+        // would hide what actually went wrong.
+        const data = (await response.json().catch(() => null)) as RunResult | null;
+        if (!response.ok || !data?.accepted) {
+          throw new Error(data?.error ?? `Run request failed (${response.status})`);
         }
+        setError(null);
         if (data.threadId) setThreadId(data.threadId);
         // The stream usually names the run first; a late answer must not
         // wipe the start it already carried.
         if (data.runId) setCurrentRun((prev) => (prev?.id === data.runId ? prev : { id: data.runId! }));
         void loadThreads(); // the sidebar reflects a new thread immediately
         return data;
-      } catch (error) {
-        setAgentState('FAILED');
-        setActivity({
-          phase: 'failed',
-          label: cfg.labels.runFailed,
-          detail: error instanceof Error ? error.message : String(error),
-        });
-        return { accepted: false, threadId: threadRef.current, error: String(error) };
+      } catch (err) {
+        // Nothing was sent: the conversation goes back to exactly what it
+        // was, and the reason is shown apart from the thread's own state.
+        const why = err instanceof Error ? err.message : String(err);
+        setEntries(shown.entries);
+        setSubagents(shown.subagents);
+        setPendingInputs(shown.pendingInputs);
+        setCurrentRun(shown.currentRun);
+        setAgentState(shown.agentState);
+        setActivity(shown.activity);
+        setError(why);
+        return { accepted: false, threadId: threadRef.current, error: why };
+      } finally {
+        sending.current = false;
       }
     },
-    [loadThreads, postJson],
+    [loadThreads, postJson, setActivity],
   );
 
   const stop = useCallback(async () => {
@@ -789,14 +1023,14 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
       const response = await postJson(cfg.baseUrl + cfg.routes.stop, { threadId: requestedThread });
       await checkControlResponse(response, 'accepted', cfg.labels.stopFailed);
       return true;
-    } catch (error) {
+    } catch (err) {
       if (threadRef.current === requestedThread) setActivity({
         phase: 'failed', label: cfg.labels.stopFailed,
-        detail: error instanceof Error ? error.message : String(error),
+        detail: err instanceof Error ? err.message : String(err),
       });
       return false;
     }
-  }, [postJson]);
+  }, [postJson, setActivity]);
 
   const respondToInput = useCallback(
     async (toolCallId: string, approved: boolean, payload?: unknown) => {
@@ -818,15 +1052,15 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
             : current);
         }
         return true;
-      } catch (error) {
+      } catch (err) {
         if (threadRef.current === requestedThread) setActivity({
           phase: 'failed', label: cfg.labels.responseFailed,
-          detail: error instanceof Error ? error.message : String(error),
+          detail: err instanceof Error ? err.message : String(err),
         });
         return false;
       }
     },
-    [postJson],
+    [postJson, setActivity],
   );
 
   return {
@@ -841,6 +1075,8 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
     threadsLoading,
     usage,
     currentRun,
+    connection,
+    error,
     loadThreads,
     loadUsage,
     newThread,

@@ -30,6 +30,8 @@ export default function Page() {
     threads,
     threadsLoading,
     usage,
+    connection,
+    error,
     selectThread,
     deleteThread,
     newThread,
@@ -153,6 +155,11 @@ export default function Page() {
             {activity.detail && <span>{activity.detail}</span>}
           </div>
         </section>
+      )}
+      {/* A send that did not go through leaves the thread as it was, and says why here. */}
+      {error && <p className="send-error" role="alert">{error}</p>}
+      {threadId && (connection === 'reconnecting' || connection === 'closed') && (
+        <p className="connection" aria-live="polite">Reconnecting to the live stream…</p>
       )}
 
       <section className="thread">

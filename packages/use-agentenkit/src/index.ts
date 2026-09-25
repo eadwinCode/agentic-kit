@@ -46,6 +46,7 @@ export type { ToolCallOutcomes } from './format.js';
 export type {
   AgentState,
   AgentActivity,
+  ConnectionState,
   ActivityPhase,
   Attachment,
   ChatEntry,

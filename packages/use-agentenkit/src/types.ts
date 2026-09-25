@@ -65,6 +65,11 @@ export type ActivityPhase =
   | 'stopped'
   | 'failed';
 
+/** Where the live stream stands: being opened, open, retrying after a
+ *  dropped connection, or closed for good (the hook then re-reads the thread
+ *  and opens a new one). */
+export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed';
+
 export interface AgentActivity {
   phase: ActivityPhase;
   label: string;
@@ -177,6 +182,8 @@ export interface StreamEvent {
   seq: number;
   type: string;
   payload: any;
+  /** When the server wrote it, ISO time. */
+  createdAt?: string;
 }
 
 export interface SnapshotRun {

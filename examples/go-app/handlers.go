@@ -74,6 +74,8 @@ func (a *app) run(w http.ResponseWriter, r *http.Request) {
 		EditMessageID string                   `json:"editMessageId"`
 		TokenBudget   int                      `json:"tokenBudget"`
 		State         agentenkit.AgentRunState `json:"state"`
+		// The client's own name for the turn, echoed on MESSAGE_APPENDED.
+		ClientMessageID string `json:"clientMessageId"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"accepted": false, "error": err.Error()})
@@ -92,7 +94,8 @@ func (a *app) run(w http.ResponseWriter, r *http.Request) {
 		ThreadID: body.ThreadID, Prompt: body.Prompt, Model: body.Model,
 		EditMessageID: body.EditMessageID, TokenBudget: budget,
 		// The run state (§2.10): reaches every storage call, tool and nested run.
-		State: body.State,
+		State:           body.State,
+		ClientMessageID: body.ClientMessageID,
 	})
 	if err != nil {
 		fail(w, err)

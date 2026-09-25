@@ -114,6 +114,11 @@ type RunInput struct {
 	// backlog from starving the others. Opaque to the platform; empty means
 	// one shared lane.
 	PartitionKey string
+	// ClientMessageID is the sending client's own name for the user turn.
+	// It comes back on the turn's MESSAGE_APPENDED, so the client that sent
+	// it can swap its optimistic copy for the real one by id, never by
+	// matching text. Opaque to the platform, and not stored.
+	ClientMessageID string
 }
 
 // Attachment is one image on a user turn: a URL the provider can fetch, or

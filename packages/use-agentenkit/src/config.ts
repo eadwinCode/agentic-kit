@@ -70,6 +70,12 @@ export interface ActivityLabels {
   stopped: string;
   failed: string;
   runFailed: string;
+  /** `run()` was called while a run is still going, or a send is in flight. */
+  runBusy: string;
+  /** An edit named a message the server has not confirmed yet. */
+  editUnconfirmed: string;
+  /** The server refused the run (billing, a full queue): RUN_REFUSED. */
+  runRefused: string;
   stopFailed: string;
   responseFailed: string;
   loadFailed: string;
@@ -96,6 +102,9 @@ export const defaultLabels: ActivityLabels = {
   stopped: 'Stopped',
   failed: 'Failed',
   runFailed: 'Could not start run',
+  runBusy: 'A run is already in progress',
+  editUnconfirmed: 'That message is not saved yet',
+  runRefused: 'Run refused',
   stopFailed: 'Could not stop run',
   responseFailed: 'Could not send response',
   loadFailed: 'Could not load conversation',
@@ -162,7 +171,9 @@ export function browserPersistence(storageKey = 'use-agentenkit:last-thread'): T
       }
       const url = new URL(window.location.href);
       url.searchParams.set('threadId', threadId);
-      window.history.replaceState({}, '', url);
+      // The router's own state is passed through: replacing it with {} breaks
+      // the Next.js App Router, which keeps its tree there.
+      window.history.replaceState(window.history.state, '', url);
     },
     clear: () => {
       if (!canUseDom()) return;
@@ -173,7 +184,7 @@ export function browserPersistence(storageKey = 'use-agentenkit:last-thread'): T
       }
       const url = new URL(window.location.href);
       url.searchParams.delete('threadId');
-      window.history.replaceState({}, '', url);
+      window.history.replaceState(window.history.state, '', url);
     },
   };
 }
@@ -181,7 +192,17 @@ export function browserPersistence(storageKey = 'use-agentenkit:last-thread'): T
 export interface StreamHandlers {
   /** One event frame, still encoded. */
   onMessage: (data: string) => void;
+  /** A transient failure: the transport is reconnecting on its own. */
   onError: (error: unknown) => void;
+  /** The stream is open, first time or after a reconnect. Optional for a
+   *  transport to call: the hook takes a stream it was handed as open. */
+  onOpen?: () => void;
+  /** The stream is closed for good: the transport gave up (a 401, a 404).
+   *  The hook re-reads the thread and opens a new stream, with a backoff. */
+  onClose?: () => void;
+  /** The seq of the last event the hook applied. A transport that reconnects
+   *  on its own resumes after it, so nothing is shown twice or missed. */
+  getCursor: () => number;
 }
 
 export interface StreamSubscription {
@@ -194,10 +215,14 @@ export interface StreamSubscription {
  *  browser's property API. */
 export type OpenStream = (url: string, handlers: StreamHandlers) => StreamSubscription;
 
-export const browserEventStream: OpenStream = (url, { onMessage, onError }) => {
+export const browserEventStream: OpenStream = (url, { onMessage, onError, onOpen, onClose }) => {
   const source = new EventSource(url);
+  source.onopen = () => onOpen?.();
   source.onmessage = (event) => onMessage(event.data);
-  source.onerror = (event) => onError(event);
+  // EventSource retries a dropped connection on its own, and gives up for
+  // good on an HTTP error (a 401, a 404): it is then CLOSED, and only a new
+  // stream can carry on.
+  source.onerror = (event) => (source.readyState === EventSource.CLOSED ? onClose?.() : onError(event));
   return { close: () => source.close() };
 };
 
@@ -216,7 +241,8 @@ export interface AgentRunConfig {
    *  CANNOT send headers — so `headers` does not reach the stream. An API
    *  behind a bearer token needs its own implementation here (or a cookie). */
   openStream?: OpenStream;
-  /** Used by `run()` when the caller names no model. */
+  /** Used by `run()` when the caller names no model. Unset (the default)
+   *  sends none, and the server uses the agent's own model. */
   defaultModel?: string;
   /** `false` keeps the thread id in memory only. */
   persistence?: ThreadPersistence | false;
@@ -240,7 +266,7 @@ export interface ResolvedConfig {
   fetch: FetchLike;
   headers: () => HeadersInit | Promise<HeadersInit>;
   openStream: OpenStream;
-  defaultModel: string;
+  defaultModel: string | undefined;
   persistence: ThreadPersistence | null;
   labels: ActivityLabels;
   format: EntryFormat;
@@ -260,7 +286,7 @@ export function resolveConfig(config: AgentRunConfig = {}): ResolvedConfig {
     fetch: config.fetch ?? ((...args) => globalThis.fetch(...args)),
     headers: typeof headers === 'function' ? headers : () => headers ?? {},
     openStream: config.openStream ?? browserEventStream,
-    defaultModel: config.defaultModel ?? 'gpt-4o',
+    defaultModel: config.defaultModel,
     persistence:
       config.persistence === false ? null : (config.persistence ?? browserPersistence()),
     labels: { ...defaultLabels, ...config.labels },

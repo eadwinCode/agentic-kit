@@ -135,6 +135,8 @@ export async function run(
       content: userMessage.content,
       agentId: userMessage.agentId,
       createdAt: userMessage.createdAt,
+      // The sender's own name for it (see RunInput.clientMessageId).
+      ...(input.clientMessageId ? { clientMessageId: input.clientMessageId } : {}),
     });
 
     // Admission already set durable QUEUED. Never overwrite a stop that

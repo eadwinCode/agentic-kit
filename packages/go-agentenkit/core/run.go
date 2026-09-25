@@ -265,10 +265,14 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 	// The user's turn goes on the bus like everything else (§2.2). Without it
 	// a second client watching the same thread sees the reply stream in with
 	// no question in front of it.
-	if _, err := Publish(ctx, deps, threadID, "MESSAGE_APPENDED", map[string]any{
+	appended := map[string]any{
 		"id": userMessage.ID, "role": userMessage.Role, "content": userMessage.Content,
 		"agentId": nullable(userMessage.AgentID), "createdAt": userMessage.CreatedAt,
-	}); err != nil {
+	}
+	if input.ClientMessageID != "" {
+		appended["clientMessageId"] = input.ClientMessageID // the sender's own name for it
+	}
+	if _, err := Publish(ctx, deps, threadID, "MESSAGE_APPENDED", appended); err != nil {
 		return ports.RunResult{}, err
 	}
 

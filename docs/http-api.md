@@ -24,9 +24,9 @@ Router; the shape is the same anywhere.
 
 ```ts
 export async function POST(req: NextRequest) {
-  const { threadId, prompt, model, editMessageId } = await req.json();
+  const { threadId, prompt, model, editMessageId, clientMessageId } = await req.json();
 
-  const result = await chat.run({ threadId, prompt, model, editMessageId });
+  const result = await chat.run({ threadId, prompt, model, editMessageId, clientMessageId });
   if (!result.accepted) return NextResponse.json(result, { status: 409 });
 
   return NextResponse.json(result, { status: 202 });
@@ -39,6 +39,12 @@ thread already has an active run — stop it first, or wait.
 The Go runtime also accepts `runId` (name the run yourself; a reused id is a
 `409`), `maxSteps` (cap the run below the config's ceiling) and `attachments`
 (`[{url, mediaType}]`, images on the user turn).
+
+`clientMessageId` is the sending client's own name for the user turn. It comes
+back on the turn's `MESSAGE_APPENDED`, which is how `use-agentenkit` swaps its
+optimistic copy for the real one. Pass it through, or the hook falls back to
+matching the turn by its text. `model` may be absent: the hook sends none
+unless told to, and the agent's own model is used.
 
 `editMessageId` replaces that user turn and drops everything after it, then
 answers again. Only a user turn may be edited: cutting from anywhere else can
