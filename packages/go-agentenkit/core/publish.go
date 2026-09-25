@@ -129,6 +129,40 @@ func WithPublishEvent(deps ports.RuntimePorts, threadID string, tools []ports.To
 	return out
 }
 
+// StateChange is one run state change (§3.4): see Transition.
+type StateChange struct {
+	From []ports.ExecutionState
+	To   ports.ExecutionState
+	// RunID is the run the caller acts for; the change lands only while the
+	// thread still belongs to it. Empty means any run.
+	RunID string
+	// NewRunID makes the thread belong to a new run (run admission).
+	NewRunID string
+	// Model is the thread's model, for the admin view; looked up when empty.
+	Model string
+}
+
+// Transition is the one way a run moves its thread's state (§3.4). It is a
+// compare-and-set on the durable row, on the state AND the run that owns the
+// thread, and only the caller that wins it writes the hot cache and the
+// admin view. So a stop is never overwritten by a finish, and a stopped or
+// replaced run can never move the thread again: its change simply loses.
+// Returns whether this caller made the change. Publishing the STATE_CHANGE
+// is left to the caller, whose payload differs per change.
+func Transition(ctx context.Context, deps ports.RuntimePorts, threadID string, c StateChange) (bool, error) {
+	won, err := deps.Storage.Threads.Transition(ctx, threadID, ports.ThreadTransition{
+		From: c.From, To: c.To, RunID: c.RunID, NewRunID: c.NewRunID,
+	})
+	if err != nil || !won {
+		return false, err
+	}
+	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(c.To), ports.SetOptions{}); err != nil {
+		return true, err
+	}
+	upsertAdminThread(ctx, deps, threadID, c.To, c.Model)
+	return true, nil
+}
+
 // SetThreadState moves a thread to a new state on BOTH the caller's storage
 // and the platform's own operational view (§2.9).
 //
@@ -141,6 +175,11 @@ func SetThreadState(ctx context.Context, deps ports.RuntimePorts, threadID strin
 	if err := deps.Storage.Threads.SetState(ctx, threadID, state); err != nil {
 		return err
 	}
+	upsertAdminThread(ctx, deps, threadID, state, model)
+	return nil
+}
+
+func upsertAdminThread(ctx context.Context, deps ports.RuntimePorts, threadID string, state ports.ExecutionState, model string) {
 	resolved := model
 	if resolved == "" {
 		if t, err := deps.Storage.Threads.Get(ctx, threadID); err == nil && t != nil {
@@ -152,5 +191,4 @@ func SetThreadState(ctx context.Context, deps ports.RuntimePorts, threadID strin
 	}
 	// Observability must never be able to fail a transition that succeeded.
 	_ = deps.Admin.Threads().Upsert(ctx, ports.NewAdminThread{ID: threadID, State: state, Model: resolved})
-	return nil
 }

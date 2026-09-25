@@ -1,8 +1,16 @@
 import type { Migration, MigrationDialect, MigrationDriver } from '../runner.js';
 import { sql as init } from './0001-init.js';
+import { sql as runSettledAt } from './0002-run-settled-at.js';
+import { sql as runEnqueuedAt } from './0003-run-enqueued-at.js';
 
 /** The admin migrations for SQLite, in apply order. Append only. */
-export const migrations: Migration[] = [{ version: '0001_init', sql: init }];
+export const migrations: Migration[] = [
+  { version: '0001_init', sql: init },
+  // Named and worded exactly as the Go runtime's, so both record the same
+  // version and checksum.
+  { version: '0002_run_settled_at', sql: runSettledAt },
+  { version: '0003_run_enqueued_at', sql: runEnqueuedAt },
+];
 
 /** Columns added after the first release, per table. SQLite cannot express
  *  ADD COLUMN IF NOT EXISTS, so these are checked against the live table. */

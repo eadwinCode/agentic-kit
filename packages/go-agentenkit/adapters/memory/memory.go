@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -363,11 +364,13 @@ func (q *Queue) Drain(ctx context.Context, handler func(ctx context.Context, job
 // Storage is a full in-memory Storage: tests, demos, and a template for
 // custom adapters.
 type Storage struct {
-	mu       sync.Mutex
-	threads  map[string]*ports.ThreadDTO
-	messages map[string][]ports.MessageDTO
-	events   map[string][]ports.AgentEvent
-	usage    []usageRow
+	mu      sync.Mutex
+	threads map[string]*ports.ThreadDTO
+	// threadRuns is each thread's current run (ThreadTransition).
+	threadRuns map[string]string
+	messages   map[string][]ports.MessageDTO
+	events     map[string][]ports.AgentEvent
+	usage      []usageRow
 	// LastContext is the StorageContext of the most recent call, so a test
 	// can prove the run state reached the adapter (§2.10).
 	LastContext ports.StorageContext
@@ -385,9 +388,10 @@ type usageRow struct {
 // NewStorage makes an empty Storage.
 func NewStorage() *Storage {
 	return &Storage{
-		threads:  map[string]*ports.ThreadDTO{},
-		messages: map[string][]ports.MessageDTO{},
-		events:   map[string][]ports.AgentEvent{},
+		threads:    map[string]*ports.ThreadDTO{},
+		threadRuns: map[string]string{},
+		messages:   map[string][]ports.MessageDTO{},
+		events:     map[string][]ports.AgentEvent{},
 	}
 }
 
@@ -494,6 +498,7 @@ func (t threads) Delete(_ context.Context, threadID string, sc ports.StorageCont
 	delete(t.s.threads, threadID)
 	delete(t.s.messages, threadID)
 	delete(t.s.events, threadID)
+	delete(t.s.threadRuns, threadID)
 	kept := t.s.usage[:0]
 	for _, u := range t.s.usage {
 		if u.threadID != threadID {
@@ -514,6 +519,25 @@ func (t threads) ClaimState(_ context.Context, threadID string, from, to ports.E
 	}
 	th.State = to
 	th.UpdatedAt = time.Now()
+	return true, nil
+}
+
+func (t threads) Transition(_ context.Context, threadID string, tr ports.ThreadTransition, sc ports.StorageContext) (bool, error) {
+	t.s.mu.Lock()
+	defer t.s.mu.Unlock()
+	t.s.saw(sc)
+	th, ok := t.s.threads[threadID]
+	if !ok || !slices.Contains(tr.From, th.State) {
+		return false, nil
+	}
+	if current := t.s.threadRuns[threadID]; tr.RunID != "" && current != "" && current != tr.RunID {
+		return false, nil
+	}
+	th.State = tr.To
+	th.UpdatedAt = time.Now()
+	if tr.NewRunID != "" {
+		t.s.threadRuns[threadID] = tr.NewRunID
+	}
 	return true, nil
 }
 

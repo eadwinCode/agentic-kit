@@ -9,6 +9,9 @@ if tonumber(ARGV[3]) > 0 then redis.call('SET', KEYS[1], ARGV[2], 'PX', ARGV[3])
 return 1`;
 export const DEL_IF_VALUE_SCRIPT = `if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
 return redis.call('DEL', KEYS[1])`;
+export const INCR_WITH_EXPIRY_SCRIPT = `local n = redis.call('INCR', KEYS[1])
+if n == 1 and tonumber(ARGV[1]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
+return n`;
 
 /** Minimal structural type of the @upstash/redis client we use — the real
  *  client satisfies it without importing the SDK here. */
@@ -51,6 +54,9 @@ export class UpstashKv implements Kv {
   }
   async delIfValue(key: string, expected: string) {
     return Number(await this.redis.eval(DEL_IF_VALUE_SCRIPT, [key], [expected])) === 1;
+  }
+  async incrWithExpiry(key: string, exSeconds: number) {
+    return Number(await this.redis.eval(INCR_WITH_EXPIRY_SCRIPT, [key], [Math.round(exSeconds * 1000)]));
   }
 }
 

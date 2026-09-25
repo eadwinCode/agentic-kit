@@ -562,22 +562,26 @@ describe('a nested run that fails (§2.7)', () => {
   });
 
   it('a user stop still tears the whole run down', async () => {
+    let threadId = '';
     const model = new MockLanguageModelV1({
       provider: 'mock',
       modelId: 'mock-stopped-child',
-      doStream: async ({ prompt }: any) =>
-        isChild(prompt)
-          ? Promise.reject(new Error('aborted'))
-          : stream([
-              call('parent_call_1', 'spawnSubagent', { name: 'helper', instructions: 'do it' }),
-              finish('tool-calls'),
-            ]),
+      doStream: async ({ prompt }: any) => {
+        if (!isChild(prompt)) {
+          return stream([
+            call('parent_call_1', 'spawnSubagent', { name: 'helper', instructions: 'do it' }),
+            finish('tool-calls'),
+          ]);
+        }
+        // The user pressed stop while the child was in flight.
+        await r.kv.set(`agent:state:${threadId}`, 'CANCELLED');
+        throw new Error('aborted');
+      },
     });
     const r = await makeRuntime(model);
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', subagents: true });
     const ran = await chat.run({ prompt: 'delegate' });
-    // The user pressed stop while the child was in flight.
-    await r.kv.set(`agent:state:${ran.threadId}`, 'CANCELLED');
+    threadId = ran.threadId;
 
     await chat.executeWithPolicy({ threadId: ran.threadId, runId: ran.runId, model: 'gpt-4o' });
 

@@ -1,8 +1,16 @@
 import type { Migration, MigrationDialect } from '../runner.js';
 import { sql as init } from './0001-init.js';
+import { sql as runSettledAt } from './0002-run-settled-at.js';
+import { sql as runEnqueuedAt } from './0003-run-enqueued-at.js';
 
 /** The admin migrations for Postgres, in apply order. Append only. */
-export const migrations: Migration[] = [{ version: '0001_init', sql: init }];
+export const migrations: Migration[] = [
+  { version: '0001_init', sql: init },
+  // Named and worded exactly as the Go runtime's, so both record the same
+  // version and checksum.
+  { version: '0002_run_settled_at', sql: runSettledAt },
+  { version: '0003_run_enqueued_at', sql: runEnqueuedAt },
+];
 
 /** Postgres takes a transaction-scoped advisory lock, so several workers
  *  starting at once queue rather than racing on the same DDL. The key is

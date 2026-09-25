@@ -1,4 +1,4 @@
-import type { AgentEvent, ExecutionState, NewMessage, NewUsage, ThreadDTO, UsageFilter, UsageTotals } from '../core/types.js';
+import type { AgentEvent, ExecutionState, NewMessage, NewUsage, ThreadDTO, ThreadTransition, UsageFilter, UsageTotals } from '../core/types.js';
 import { emptyTotals } from '../core/usage.js';
 import type { Storage } from '../ports/storage.js';
 
@@ -10,7 +10,14 @@ export interface PrismaLike {
     findMany(a: { orderBy: { updatedAt: 'desc' } }): Promise<ThreadDTO[]>;
     create(a: { data: { model?: string } }): Promise<ThreadDTO>;
     update(a: { where: { id: string }; data: { state: ExecutionState } }): Promise<unknown>;
-    updateMany(a: { where: { id: string; state: ExecutionState }; data: { state: ExecutionState } }): Promise<{ count: number }>;
+    updateMany(a: {
+      where: {
+        id: string;
+        state: ExecutionState | { in: ExecutionState[] };
+        OR?: Array<{ runId: string | null }>;
+      };
+      data: { state: ExecutionState; runId?: string };
+    }): Promise<{ count: number }>;
     delete(a: { where: { id: string } }): Promise<unknown>;
     groupBy(a: { by: ['state']; _count: { _all: true } }): Promise<
       Array<{ state: ExecutionState; _count: { _all: number } }>
@@ -115,6 +122,20 @@ export class PrismaStorage implements Storage {
       const res = await this.prisma.thread.updateMany({
         where: { id: threadId, state: from },
         data: { state: to },
+      });
+      return res.count > 0;
+    },
+    transition: async (threadId: string, tr: ThreadTransition) => {
+      if (tr.from.length === 0) return false;
+      // Single conditional UPDATE — the atomicity contract (§3.4). A thread
+      // with no run recorded yet (from before the column) matches any run.
+      const res = await this.prisma.thread.updateMany({
+        where: {
+          id: threadId,
+          state: { in: tr.from },
+          ...(tr.runId ? { OR: [{ runId: tr.runId }, { runId: null }] } : {}),
+        },
+        data: { state: tr.to, ...(tr.newRunId ? { runId: tr.newRunId } : {}) },
       });
       return res.count > 0;
     },

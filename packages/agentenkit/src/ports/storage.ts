@@ -8,6 +8,7 @@ import type {
   UsageFilter,
   UsageTotals,
   ThreadDTO,
+  ThreadTransition,
 } from '../core/types.js';
 
 /** Persistence port for a caller's OWN data (§3.2): threads, messages, events,
@@ -42,6 +43,11 @@ export interface Storage {
       to: ExecutionState,
       ctx: StorageContext,
     ): Promise<boolean>;
+    /** The compare-and-set every run state change goes through: true iff THIS
+     *  caller moved the thread (see ThreadTransition). The adapter keeps the
+     *  thread's current run beside its state. Atomic, like `claimState`: one
+     *  conditional UPDATE or equivalent. */
+    transition(threadId: string, t: ThreadTransition, ctx: StorageContext): Promise<boolean>;
   };
   messages: {
     append(threadId: string, message: NewMessage, ctx: StorageContext): Promise<MessageDTO>;

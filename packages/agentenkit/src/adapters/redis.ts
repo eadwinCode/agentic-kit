@@ -1,7 +1,7 @@
 import type { AgentEvent } from '../core/types.js';
 import type { Kv } from '../ports/kv.js';
 import type { EventBus } from '../ports/bus.js';
-import { DEL_IF_VALUE_SCRIPT, SET_IF_VALUE_SCRIPT, THREAD_CHANNEL } from './upstash.js';
+import { DEL_IF_VALUE_SCRIPT, INCR_WITH_EXPIRY_SCRIPT, SET_IF_VALUE_SCRIPT, THREAD_CHANNEL } from './upstash.js';
 
 /** Minimal structural type of a node-redis (v4) client — the real client
  *  satisfies it without importing the SDK here. Works against any Redis:
@@ -64,6 +64,13 @@ export class RedisKv implements Kv {
   async delIfValue(key: string, expected: string) {
     const n = await this.redis.eval(DEL_IF_VALUE_SCRIPT, { keys: [key], arguments: [expected] });
     return Number(n) === 1;
+  }
+  async incrWithExpiry(key: string, exSeconds: number) {
+    const n = await this.redis.eval(INCR_WITH_EXPIRY_SCRIPT, {
+      keys: [key],
+      arguments: [String(Math.round(exSeconds * 1000))],
+    });
+    return Number(n);
   }
 }
 

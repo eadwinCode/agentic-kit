@@ -46,11 +46,21 @@ func StopRun(ctx context.Context, deps ports.RuntimePorts, threadID string, opts
 		return ports.StopResult{}, err
 	}
 	endedAt := time.Now()
-	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateCancelled), ports.SetOptions{}); err != nil {
+	// A compare-and-set on the state and the run (§3.4): a finish, a failure
+	// or a newer run that got there first keeps its own ending, and this stop
+	// is refused with the state it found.
+	won, err := Transition(ctx, deps, threadID, StateChange{
+		From: ActiveStates, To: ports.StateCancelled, RunID: runID, Model: thread.Model,
+	})
+	if err != nil {
 		return ports.StopResult{}, err
 	}
-	if err := SetThreadState(ctx, deps, threadID, ports.StateCancelled, thread.Model); err != nil {
-		return ports.StopResult{}, err
+	if !won {
+		state := "unknown"
+		if now, err := deps.Storage.Threads.Get(ctx, threadID); err == nil && now != nil {
+			state = string(now.State)
+		}
+		return ports.StopResult{Accepted: false, Error: fmt.Sprintf("Cannot stop thread in state %s", state)}, nil
 	}
 	if runID != "" {
 		recordStoppedRun(ctx, deps, runID, endedAt)

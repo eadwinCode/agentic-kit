@@ -1,5 +1,5 @@
 import type { RuntimePorts } from '../ports/runtime.js';
-import type { ExecutionState } from './types.js';
+import type { ExecutionState, ThreadTransition } from './types.js';
 import type { AgentEvent } from './types.js';
 
 /** Persist to the replayable event log, then fan out live to all subscribers
@@ -113,6 +113,49 @@ export function withPublishEvent(
   return out;
 }
 
+/** A non-terminal STATE_CHANGE: the state, the run it belongs to, and when
+ *  that run started, read off its record. Every STATE_CHANGE names its run,
+ *  so a client keeps one timer per run and never refetches history to find
+ *  its start. */
+export async function runStatePayload(
+  deps: RuntimePorts,
+  state: ExecutionState,
+  runId?: string,
+): Promise<Record<string, unknown>> {
+  const p: Record<string, unknown> = { state };
+  if (!runId) return p;
+  p.runId = runId;
+  try {
+    const rec = await deps.admin.runs.get(runId);
+    if (rec) p.startedAt = rec.startedAt;
+  } catch {
+    // The timer is a nicety; a missing record never fails a transition.
+  }
+  return p;
+}
+
+/** The states a run is still going in: the ones a stop or a failure can end. */
+export const ACTIVE_STATES: ExecutionState[] = ['QUEUED', 'RUNNING', 'WAITING_FOR_INPUT'];
+
+/** The one way a run moves its thread's state (§3.4). A compare-and-set on
+ *  the durable row, on the state AND the run that owns the thread, and only
+ *  the caller that wins it writes the hot cache and the admin view. So a stop
+ *  is never overwritten by a finish, and a stopped or replaced run can never
+ *  move the thread again: its change simply loses. Returns whether this
+ *  caller made the change. Publishing the STATE_CHANGE is left to the caller,
+ *  whose payload differs per change. */
+export async function transition(
+  deps: RuntimePorts,
+  threadId: string,
+  change: ThreadTransition & { model?: string },
+): Promise<boolean> {
+  const { model, ...t } = change;
+  if (!(await deps.storage.threads.transition(threadId, t))) return false;
+  await deps.kv.set(`agent:state:${threadId}`, t.to);
+  await upsertAdminThread(deps, threadId, t.to, model);
+  return true;
+}
+
 /** Move a thread to a new state on BOTH the caller's storage and the
  *  platform's own operational view (§2.9).
  *
@@ -128,6 +171,15 @@ export async function setThreadState(
   model?: string,
 ): Promise<void> {
   await deps.storage.threads.setState(threadId, state);
+  await upsertAdminThread(deps, threadId, state, model);
+}
+
+async function upsertAdminThread(
+  deps: RuntimePorts,
+  threadId: string,
+  state: ExecutionState,
+  model?: string,
+): Promise<void> {
   try {
     const resolved = model ?? (await deps.storage.threads.get(threadId))?.model ?? 'unknown';
     await deps.admin.threads.upsert({ id: threadId, state, model: resolved });

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type {
-  AgentEvent, ExecutionState, MessageDTO, NewMessage, NewUsage, ThreadDTO, UsageFilter, UsageTotals,
+  AgentEvent, ExecutionState, MessageDTO, NewMessage, NewUsage, ThreadDTO, UsageFilter, UsageTotals, ThreadTransition,
 } from '../core/types.js';
 import { emptyTotals } from '../core/usage.js';
 import type { Storage } from '../ports/storage.js';
@@ -140,6 +140,8 @@ export class SqliteStorage implements Storage {
       costSource: 'TEXT',
     });
     this.db.prepare('CREATE INDEX IF NOT EXISTS usage_run ON usage(runId, createdAt)').run();
+    // The thread's current run, for ThreadTransition's compare-and-set.
+    this.addMissing('threads', { runId: 'TEXT' });
   }
 
   private addMissing(table: string, cols: Record<string, string>) {
@@ -202,6 +204,20 @@ export class SqliteStorage implements Storage {
         this.write(`DELETE FROM ${t} WHERE threadId = ?`, threadId);
       }
       this.write('DELETE FROM threads WHERE id = ?', threadId);
+    },
+    transition: async (threadId: string, tr: ThreadTransition) => {
+      if (tr.from.length === 0) return false;
+      // One conditional UPDATE, so exactly one caller can win (§3.4): the
+      // driver's change count says whether it was this one. A thread with no
+      // run recorded yet (from before the column) matches any run.
+      const res = this.db
+        .prepare(
+          `UPDATE threads SET state = ?, updatedAt = ?, runId = COALESCE(NULLIF(?, ''), runId)
+           WHERE id = ? AND (? = '' OR runId IS NULL OR runId = ?)
+             AND state IN (${tr.from.map(() => '?').join(', ')})`,
+        )
+        .run(tr.to, Date.now(), tr.newRunId ?? '', threadId, tr.runId ?? '', tr.runId ?? '', ...tr.from);
+      return Number((res as { changes?: number | bigint } | undefined)?.changes ?? 0) > 0;
     },
     claimState: async (threadId: string, from: ExecutionState, to: ExecutionState) => {
       // The §3.4 compare-and-set: one conditional UPDATE, so exactly one

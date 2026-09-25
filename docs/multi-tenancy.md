@@ -103,6 +103,19 @@ export class TenantStorage implements Storage {
       return count === 1;
     },
 
+    // The same, for every run state change: the state AND the thread's
+    // current run (see Ports and adapters).
+    transition: async (threadId, t, ctx) => {
+      const { count } = await this.db.thread.updateMany({
+        where: {
+          id: threadId, orgId: ctx.state.orgId, state: { in: t.from },
+          ...(t.runId ? { OR: [{ runId: t.runId }, { runId: null }] } : {}),
+        },
+        data: { state: t.to, ...(t.newRunId ? { runId: t.newRunId } : {}) },
+      });
+      return count === 1;
+    },
+
     delete: async (threadId, ctx) => {
       await this.db.thread.deleteMany({ where: { id: threadId, orgId: ctx.state.orgId } });
     },

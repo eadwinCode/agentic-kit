@@ -47,7 +47,8 @@ export default function Page() {
   // Same for thought blocks.
   const [openThoughts, setOpenThoughts] = useState<Record<string, boolean>>({});
   // One button, two jobs: while a run is live it stops; otherwise it sends.
-  const running = agentState === 'RUNNING' || agentState === 'WAITING_FOR_INPUT';
+  const running =
+    agentState === 'QUEUED' || agentState === 'RUNNING' || agentState === 'WAITING_FOR_INPUT';
   const waiting = agentState === 'WAITING_FOR_INPUT';
   const canSend = !historyLoading && !running && prompt.trim().length > 0;
 

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { RespondInput, RespondResult } from '../ports/runtime.js';
 import type { AgentEvent, NestedDescriptor, ResumeInfo } from './types.js';
-import { publish, setThreadState } from './publish.js';
+import { publish, runStatePayload, transition } from './publish.js';
 import { currentRunId } from './keys.js';
 import { reclaimIfOrphaned } from './reclaim.js';
 import { enqueueJob } from './lease.js';
@@ -186,8 +186,17 @@ export function withHitl(
 export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise<void> {
   const ttlMs = i.ttlMs && i.ttlMs > 0 ? i.ttlMs : deps.config.hitlTtlMs;
   const expiresAt = new Date(Date.now() + ttlMs).toISOString();
-  await deps.kv.set(`agent:state:${i.threadId}`, 'WAITING_FOR_INPUT');
-  await setThreadState(deps, i.threadId, 'WAITING_FOR_INPUT', i.resume.model);
+  // Only while the run still owns a going thread (§3.4). A step can park
+  // several calls, so the thread may already be WAITING. A run that was
+  // stopped meanwhile parks nothing: the stop has ended it, and a later prompt
+  // repairs the call it left without a result.
+  const parked = await transition(deps, i.threadId, {
+    from: ['RUNNING', 'WAITING_FOR_INPUT'],
+    to: 'WAITING_FOR_INPUT',
+    runId: i.resume.runId,
+    model: i.resume.model,
+  });
+  if (!parked) return;
   await publish(deps, i.threadId, 'INPUT_REQUIRED', {
     toolCallId: i.toolCallId,
     toolName: i.toolName,
@@ -204,7 +213,10 @@ export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise
     reason: i.reason ?? REASON_APPROVAL,
     expiresAt,
   });
-  await publish(deps, i.threadId, 'STATE_CHANGE', { state: 'WAITING_FOR_INPUT' });
+  // The park names its run and when the run started, like every other
+  // STATE_CHANGE, so a client keeps its timer without refetching history.
+  const runId = await currentRunId(deps, i.threadId);
+  await publish(deps, i.threadId, 'STATE_CHANGE', await runStatePayload(deps, 'WAITING_FOR_INPUT', runId));
 
   // Best-effort, and deliberately last. The park is ALREADY durable by this
   // point — state flipped on both homes, INPUT_REQUIRED on the event log — so
@@ -218,7 +230,7 @@ export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise
       deps,
       {
         threadId: i.threadId,
-        runId: await currentRunId(deps, i.threadId),
+        runId,
         model: i.resume.model,
         agent: i.resume.agent,
         ...(i.resume.tokenBudget !== undefined ? { tokenBudget: i.resume.tokenBudget } : {}),

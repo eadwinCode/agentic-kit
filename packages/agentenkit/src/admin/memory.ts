@@ -43,8 +43,9 @@ export class MemoryAdminStore implements AdminStore {
   runs = {
     start: async (r: NewRunRecord) => {
       const rec: RunRecord = {
-        parentRunId: null, depth: 0, prompt: null, tokenBudget: null, runState: null, providerOptions: null, ...r,
-        state: 'RUNNING', startedAt: new Date(), steps: 0, attempts: 0,
+        parentRunId: null, depth: 0, prompt: null, tokenBudget: null, runState: null, providerOptions: null,
+        enqueuedAt: null, ...r,
+        state: r.state ?? 'RUNNING', startedAt: new Date(), steps: 0, attempts: 0,
         inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0,
       };
       this.runRows.set(rec.id, rec);

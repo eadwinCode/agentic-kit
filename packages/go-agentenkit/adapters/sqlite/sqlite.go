@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/core"
@@ -137,6 +138,10 @@ func New(db *sql.DB) (*Storage, error) {
 			return nil, fmt.Errorf("sqlite storage schema: %w", err)
 		}
 	}
+	// The thread's current run, for ThreadTransition's compare-and-set.
+	if err := addMissing(db, "threads", map[string]string{"runId": "TEXT"}); err != nil {
+		return nil, err
+	}
 	if err := addMissing(db, "usage", usageColumns); err != nil {
 		return nil, err
 	}
@@ -233,6 +238,28 @@ func (t threads) ClaimState(ctx context.Context, threadID string, from, to ports
 	// The §3.4 compare-and-set: one conditional UPDATE, so exactly one caller can win.
 	res, err := t.db.ExecContext(ctx, `UPDATE threads SET state = ?, updatedAt = ? WHERE id = ? AND state = ?`,
 		string(to), ms(time.Now()), threadID, string(from))
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+func (t threads) Transition(ctx context.Context, threadID string, tr ports.ThreadTransition, _ ports.StorageContext) (bool, error) {
+	if len(tr.From) == 0 {
+		return false, nil
+	}
+	// One conditional UPDATE, so exactly one caller can win (§3.4). A thread
+	// with no run recorded yet (from before the column) matches any run.
+	args := []any{string(tr.To), ms(time.Now()), tr.NewRunID, threadID, tr.RunID, tr.RunID}
+	marks := make([]string, len(tr.From))
+	for i, s := range tr.From {
+		args = append(args, string(s))
+		marks[i] = "?"
+	}
+	res, err := t.db.ExecContext(ctx,
+		`UPDATE threads SET state = ?, updatedAt = ?, runId = COALESCE(NULLIF(?, ''), runId)
+		 WHERE id = ? AND (? = '' OR runId IS NULL OR runId = ?) AND state IN (`+strings.Join(marks, ", ")+`)`, args...)
 	if err != nil {
 		return false, err
 	}

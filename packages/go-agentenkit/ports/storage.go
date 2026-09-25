@@ -42,6 +42,12 @@ type ThreadStore interface {
 	// transition. Must be atomic: a single conditional UPDATE or equivalent
 	// (§2.5, §2.8).
 	ClaimState(ctx context.Context, threadID string, from, to ExecutionState, sc StorageContext) (bool, error)
+	// Transition is the compare-and-set every run state change goes
+	// through: true iff THIS caller moved the thread (see ThreadTransition).
+	// It must also record the thread's current run, which the adapter
+	// keeps beside the state. Atomic, like ClaimState: one conditional
+	// UPDATE or equivalent.
+	Transition(ctx context.Context, threadID string, t ThreadTransition, sc StorageContext) (bool, error)
 }
 
 // MessageScope decides WHOSE turns List returns (§2.7):

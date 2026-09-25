@@ -65,6 +65,7 @@ const toRun = (r: any): RunRecord => ({
   agent: r.agent, model: r.model, state: r.state as ExecutionState,
   stopReason: r.stopReason ?? null, error: r.error ?? null,
   startedAt: new Date(r.startedAt), endedAt: r.endedAt ? new Date(r.endedAt) : null,
+  enqueuedAt: r.enqueuedAt ? new Date(r.enqueuedAt) : null,
   durationMs: r.durationMs ?? null, queuedMs: r.queuedMs ?? null,
   attempts: r.attempts, steps: r.steps,
   inputTokens: r.inputTokens, cachedInputTokens: r.cachedInputTokens,
@@ -162,13 +163,14 @@ export class PostgresAdminStore implements AdminStore {
       const { rows } = await this.db.query(
         `INSERT INTO agentic_runs
            (id, "threadId", "parentRunId", depth, agent, model, state,
-            prompt, "tokenBudget", "runState", "providerOptions")
-         VALUES ($1, $2, $3, $4, $5, $6, 'RUNNING', $7, $8, $9, $10) RETURNING *`,
+            prompt, "tokenBudget", "runState", "providerOptions", "enqueuedAt")
+         VALUES ($1, $2, $3, $4, $5, $6, $11, $7, $8, $9, $10, $12) RETURNING *`,
         [
           run.id, run.threadId, run.parentRunId ?? null, run.depth ?? 0,
           run.agent, run.model, run.prompt ?? null, run.tokenBudget ?? null,
           run.runState ? JSON.stringify(run.runState) : null,
           run.providerOptions ? JSON.stringify(run.providerOptions) : null,
+          run.state ?? 'RUNNING', run.enqueuedAt ?? null,
         ],
       );
       return toRun(rows[0]);

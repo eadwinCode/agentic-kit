@@ -29,6 +29,7 @@ interface Storage {
     setState(threadId, state, ctx): Promise<void>;
     delete(threadId, ctx): Promise<void>;
     claimState(/* … */): Promise<boolean>;   // must be atomic
+    transition(threadId, t: ThreadTransition, ctx): Promise<boolean>; // must be atomic
   };
   messages: {
     append(threadId, message, ctx): Promise<MessageDTO>;
@@ -65,11 +66,42 @@ correctness bug rather than a display one:
 - `{ agentId: 'sub_1' }` — that nested run's own stream.
 - omitted — every row on the thread, for UI hydration.
 
-### `claimState` must be atomic
+### `claimState` and `transition` must be atomic
 
 One conditional `UPDATE`, one winner. This is the primitive that makes
 concurrent workers safe. Implemented as read-then-write it will pass your tests
 and fail in production.
+
+`transition` is the one every run state change goes through. Besides the
+state, it keeps the thread's current run (a `runId` column beside `state`):
+
+```ts
+interface ThreadTransition {
+  from: ExecutionState[];  // the change lands only from one of these
+  to: ExecutionState;
+  runId?: string;          // …and only while the thread belongs to this run
+  newRunId?: string;       // run admission: the thread now belongs to this run
+}
+```
+
+A row with no run recorded yet (from before the column existed) matches any
+`runId`. With Prisma it is one `updateMany`:
+
+```ts
+transition: async (threadId, t, ctx) => {
+  const { count } = await this.db.thread.updateMany({
+    where: {
+      id: threadId, state: { in: t.from },
+      ...(t.runId ? { OR: [{ runId: t.runId }, { runId: null }] } : {}),
+    },
+    data: { state: t.to, ...(t.newRunId ? { runId: t.newRunId } : {}) },
+  });
+  return count === 1;
+},
+```
+
+A custom storage written before `transition` existed must add it, and a
+`runId` column on its thread table.
 
 ## Queue
 
@@ -149,6 +181,8 @@ interface Kv {
   // compare-and-act: how the run lock is renewed and freed
   setIfValue(key: string, expected: string, value: string, opts?: { exSeconds?: number }): Promise<boolean>;
   delIfValue(key: string, expected: string): Promise<boolean>;
+  // a counter that expires if nobody clears it: the retry counters
+  incrWithExpiry(key: string, exSeconds: number): Promise<number>;
 }
 ```
 
@@ -170,7 +204,8 @@ Break one of these and the failure is subtle rather than loud.
 1. `events.append` receives its `seq` from `kv.incr('agent:seq:{threadId}')` —
    monotonic per thread. Clients use it as a cursor, so a repeated or
    out-of-order value causes replay bugs.
-2. `threads.claimState` is atomic — exactly one caller wins.
+2. `threads.claimState` and `threads.transition` are atomic — exactly one
+   caller wins.
 3. `queue.enqueue` is at-least-once, and never throws for `delaySeconds`.
 4. `bus` is at-most-once; the watchdog compensates.
 5. Durable thread state lives in `storage.threads`; the kv copy is a hot cache.

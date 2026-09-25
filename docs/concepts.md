@@ -128,12 +128,18 @@ IDLE ──► QUEUED ──► RUNNING ──► COMPLETED
                       └────► FAILED              (attempts exhausted, timed out, refused)
 ```
 
-`QUEUED` (Go runtime) is a run the server accepted and put on the queue: no
-worker has it yet. It becomes `RUNNING` the moment a worker picks the job up,
+`QUEUED` is a run the server accepted and put on the queue: no worker has it
+yet. It becomes `RUNNING` the moment a worker picks the job up,
 and goes back to `QUEUED` while a failed run waits for its retry. A client can
 tell a run that is waiting in line from one that is working, and so can an
 operator: the run record keeps `enqueuedAt` and the queue-wait percentiles
 count the runs still waiting.
+
+Every change between these states is one compare-and-set on the thread row,
+on the state **and** the run that owns the thread. So a stop is never
+overwritten by a run that finishes a moment later, and a run that was stopped
+or replaced can never move the thread again: its change simply loses, and it
+publishes nothing.
 
 `WAITING_FOR_INPUT` is the interesting one: it is a durable state, not a blocked
 promise. No worker, no lock, no memory is held while a thread waits for a human.

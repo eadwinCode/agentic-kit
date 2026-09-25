@@ -13,6 +13,10 @@ export interface Kv {
   ): Promise<boolean>;
   del(key: string): Promise<void>;
   incr(key: string): Promise<number>;
+  /** `incr` that stamps a NEW counter (or one that had expired) with an
+   *  expiry, so a counter nobody clears still ages out. A live counter keeps
+   *  the expiry it already has. Atomic, like `incr`. */
+  incrWithExpiry(key: string, exSeconds: number): Promise<number>;
   /** Compare-and-set: writes `value` only while the key still holds
    *  `expected` and has not expired, and returns whether it did. The renewal
    *  half of the run lock (§3.4): a worker that lost its lock to another can

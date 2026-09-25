@@ -135,10 +135,9 @@ func reclaimLost(ctx context.Context, deps ports.RuntimePorts, thread *ports.Thr
 			state = ports.StateFailed
 		}
 		Logger(deps).Warn("thread stuck past its run's end; moved to the run's state", "thread", threadID, "run", runID, "state", state)
-		if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(state), ports.SetOptions{}); err != nil {
-			return false, err
-		}
-		if err := SetThreadState(ctx, deps, threadID, state, thread.Model); err != nil {
+		if won, err := Transition(ctx, deps, threadID, StateChange{
+			From: ActiveStates, To: state, RunID: runID, Model: thread.Model,
+		}); err != nil || !won {
 			return false, err
 		}
 		_, err := Publish(ctx, deps, threadID, "STATE_CHANGE", map[string]any{

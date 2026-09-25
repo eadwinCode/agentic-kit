@@ -1,5 +1,5 @@
 import type { RunFinishInfo, RuntimePorts } from '../ports/runtime.js';
-import type { ExecutionState, ProviderOptions, ResumeInfo, UsageTotals } from './types.js';
+import type { ExecutionState, ProviderOptions, ResumeInfo, RunPatch, UsageTotals } from './types.js';
 import { wireId } from './types.js';
 import { compactContext } from './context.js';
 import type { TokenAttribution } from './usage.js';
@@ -14,9 +14,9 @@ import {
   hitlDeadline,
   type PendingHitl,
 } from './hitl.js';
-import { publish, publishEvent, setThreadState, withPublishEvent } from './publish.js';
+import { ACTIVE_STATES, publish, publishEvent, runStatePayload, transition, withPublishEvent } from './publish.js';
 import { runNestedAgent, spawnSubagentTool, type SubagentCtx } from './subagent.js';
-import { redriveKey, runIdKey } from './keys.js';
+import { attemptsKey, COUNTER_TTL_SECONDS, counterScope, redriveKey, runIdKey } from './keys.js';
 import { withRunState, type AgentRunState } from './state.js';
 import { runLoop, type RunLedger } from './loop.js';
 import { enqueueJob, Lease, parseLockValue, runLockKey, RunLockLostError } from './lease.js';
@@ -168,14 +168,15 @@ async function closeRunRecord(
   deps: RuntimePorts,
   runId: string,
   f: FinalizeInput,
-): Promise<void> {
+): Promise<Date> {
+  let endedAt = new Date();
   try {
     const prior = await deps.admin.runs.get(runId);
-    if (!prior) return; // a run started before §2.9, or a foreign dispatch
+    if (!prior) return endedAt; // a run started before §2.9, or a foreign dispatch
     // stop() already records when the user ended this run. Worker teardown
     // may add usage, but must not move that timestamp or undo cancellation.
     const cancelled = prior.state === 'CANCELLED';
-    const endedAt = cancelled && prior.endedAt ? new Date(prior.endedAt) : new Date();
+    if (cancelled && prior.endedAt) endedAt = new Date(prior.endedAt);
     await deps.admin.runs.patch(runId, {
       state: cancelled ? 'CANCELLED' : f.state,
       stopReason: cancelled ? 'cancelled' : f.stopReason,
@@ -191,6 +192,27 @@ async function closeRunRecord(
   } catch {
     // Observability must never be able to fail a run that otherwise succeeded.
   }
+  return endedAt;
+}
+
+/** Close a run record that can never be worked on again (§2.9): the thread is
+ *  gone, or a newer run replaced this one. Without this the record stays
+ *  open for ever and every "in flight" count carries it. */
+export async function closeIfOpen(
+  deps: RuntimePorts,
+  runId: string | undefined,
+  stopReason: FinalizeInput['stopReason'],
+) {
+  if (!runId) return;
+  const rec = await deps.admin.runs.get(runId).catch(() => null);
+  if (!rec || rec.endedAt) return;
+  await closeRunRecord(deps, runId, {
+    state: 'CANCELLED',
+    stopReason,
+    tokensUsed: 0,
+    attribution: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    runId,
+  });
 }
 
 /** Finalise a run as FAILED on both homes AND keep why (§2.9). The reason used
@@ -202,19 +224,23 @@ async function failRun(
   runId: string | undefined,
   error: string,
 ): Promise<void> {
-  await deps.kv.set(`agent:state:${threadId}`, 'FAILED');
-  await setThreadState(deps, threadId, 'FAILED');
+  // Only while the thread is still this run's and still going: a stop or a
+  // newer run that got there first keeps its own ending (§3.4).
+  if (!(await transition(deps, threadId, { from: ACTIVE_STATES, to: 'FAILED', runId }))) return;
+  let endedAt = new Date();
   if (runId) {
-    await closeRunRecord(deps, runId, {
+    endedAt = await closeRunRecord(deps, runId, {
       state: 'FAILED',
-      stopReason: 'completed',
+      stopReason: 'failed',
       tokensUsed: 0,
       attribution: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 },
       error,
       runId,
     });
   }
-  await publish(deps, threadId, 'STATE_CHANGE', { state: 'FAILED', error });
+  await publish(deps, threadId, 'STATE_CHANGE', {
+    state: 'FAILED', stopReason: 'failed', error, endedAt, ...(runId ? { runId } : {}),
+  });
 }
 
 /** Resolve every parked request at segment start (§2.5, §2.7) and flip the
@@ -229,6 +255,7 @@ async function resumePendingHitl(
   subCtx: SubagentCtx | null,
   signal: AbortSignal,
   state: AgentRunState,
+  runId: string | undefined,
 ): Promise<boolean> {
   // Readiness first, side effects second: the thread resumes only when EVERY
   // open approval has been answered or has expired (§2.7).
@@ -249,9 +276,12 @@ async function resumePendingHitl(
     if (!(await unwindVerdict(deps, threadId, pending, result, subCtx, signal))) return false;
   }
 
-  await deps.kv.set(`agent:state:${threadId}`, 'RUNNING');
-  await setThreadState(deps, threadId, 'RUNNING');
-  await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING' });
+  // A stop that landed while the verdicts were applied wins: the thread stays
+  // CANCELLED and this segment goes no further (§3.4).
+  if (!(await transition(deps, threadId, { from: ['WAITING_FOR_INPUT'], to: 'RUNNING', runId }))) {
+    return false;
+  }
+  await publish(deps, threadId, 'STATE_CHANGE', await runStatePayload(deps, 'RUNNING', runId));
   void expiredAny;
   return true;
 }
@@ -368,11 +398,18 @@ export async function execute(
       // same no-op: it was deleted (§3.2) and must never be resurrected.
       // A newer run already owns this thread: this job has nothing to do, and
       // must not touch state on the live run's behalf (§2.1).
-      if (await stale()) return 'stale';
+      // Its own record is closed, so it does not count as in flight for ever.
+      if (await stale()) {
+        await closeIfOpen(deps, runId, 'replaced');
+        return 'stale';
+      }
 
       const durable = await deps.storage.threads.get(threadId);
+      if (!durable) {
+        await closeIfOpen(deps, runId, 'orphaned');
+        return 'executed';
+      }
       if (
-        !durable ||
         durable.state === 'CANCELLED' ||
         durable.state === 'COMPLETED' ||
         durable.state === 'FAILED'
@@ -398,11 +435,37 @@ export async function execute(
       // same safety cap the main agent is checked against (§2.7).
       const ledger: RunLedger = { tokensUsed: 0 };
 
-      // How long the dispatch sat in the queue before a worker took it (§2.9).
-      if (runId && input.enqueuedAt) {
-        await deps.admin.runs
-          .patch(runId, { queuedMs: Date.now() - input.enqueuedAt })
-          .catch(() => undefined);
+      // Pickup (§2.8): the run has a worker now. A QUEUED thread becomes
+      // RUNNING on every home, its record takes the moment work started, and
+      // the wire says so, so a client's clock measures work rather than
+      // waiting. The wait itself is kept on the record: the latest dispatch's,
+      // so a resume's or a retry's wait shows as its own.
+      const pickedUp = new Date();
+      if (runId) {
+        const patch: RunPatch = {};
+        if (input.enqueuedAt) patch.queuedMs = pickedUp.getTime() - input.enqueuedAt;
+        if (durable.state === 'QUEUED') {
+          // A stop (or a newer run) that landed since the read above wins:
+          // this job has nothing to pick up (§3.4).
+          if (!(await transition(deps, threadId, {
+            from: ['QUEUED'], to: 'RUNNING', runId, model: input.model,
+          }))) {
+            return 'executed';
+          }
+          let startedAt = pickedUp;
+          const rec = await deps.admin.runs.get(runId).catch(() => null);
+          if (rec && rec.queuedMs != null) {
+            startedAt = new Date(rec.startedAt); // a retry: the run started when it first ran
+          } else {
+            patch.startedAt = pickedUp;
+          }
+          patch.state = 'RUNNING';
+          await deps.admin.runs.patch(runId, patch).catch(() => undefined);
+          await publish(deps, threadId, 'STATE_CHANGE', { state: 'RUNNING', runId, startedAt });
+          durable.state = 'RUNNING';
+        } else if (patch.queuedMs !== undefined) {
+          await deps.admin.runs.patch(runId, patch).catch(() => undefined);
+        }
       }
 
       // Platform-owned toolset: HITL (§2.5) over the user's set; spawnSubagent
@@ -463,7 +526,7 @@ export async function execute(
           throw new Error(`Thread ${threadId} is WAITING_FOR_INPUT without a pending INPUT_REQUIRED`);
         }
         const resumed = await resumePendingHitl(
-          deps, threadId, open, rawTools, subCtx, abort.signal, input.state ?? {},
+          deps, threadId, open, rawTools, subCtx, abort.signal, input.state ?? {}, runId,
         );
         if (!resumed) return 'executed'; // still parked — nothing to do yet
       }
@@ -603,7 +666,11 @@ export async function execute(
 
 export interface FinalizeInput {
   state: ExecutionState;
-  stopReason: 'completed' | 'token_budget' | 'cost_budget' | 'max_steps' | 'cancelled';
+  /** Why the run ended. 'failed' for a failure; 'replaced', 'orphaned' and
+   *  'deleted' close a record that can never be worked on again. */
+  stopReason:
+    | 'completed' | 'token_budget' | 'cost_budget' | 'max_steps' | 'cancelled'
+    | 'failed' | 'replaced' | 'orphaned' | 'deleted';
   tokensUsed: number;
   attribution: TokenAttribution;
   /** generate-text flavor only: publish the final text as one TEXT_RESULT. */
@@ -634,34 +701,34 @@ export async function finalize(
   // it happened, inside the loop (§4). Even a run that was replaced part-way
   // through has already had its calls written.
   //
-  // Close the run's durable record (§2.9). Additive: a run that parked and
-  // resumed finalises once, but its steps and tokens accrued over several
-  // segments, so they are summed onto what is already there. The run lock
-  // (§3.4) makes this read-modify-write single-writer.
-  if (f.runId) await closeRunRecord(deps, f.runId, f);
-
-  // Past that, a replaced run stays silent. Its CANCELLED would otherwise land
-  // on top of the next run's RUNNING and wedge the thread: the new worker
-  // would read a terminal state and no-op, and nobody would ever answer the
-  // message the user just sent (§2.1).
-  if (f.runId !== undefined && (await deps.kv.get(runIdKey(threadId))) !== f.runId) return;
-
-  if ((await deps.kv.get(`agent:state:${threadId}`)) === 'CANCELLED') {
-    f = { ...f, state: 'CANCELLED', stopReason: 'cancelled', oneShotText: undefined };
-  }
+  // The thread moves only while it is still this run's and still RUNNING
+  // (§3.4). A stop that got there first has already written CANCELLED and
+  // said so; a newer run owns the thread. Either way this finish loses and
+  // stays silent: publishing it would land on top of the stop, or wedge the
+  // newer run (§2.1).
+  const won = await transition(deps, threadId, { from: ['RUNNING'], to: f.state, runId: f.runId });
+  // The run's record closes either way (§2.9): the segment's steps and tokens
+  // are real. Additive: a run that parked and resumed finalises once, but its
+  // steps and tokens accrued over several segments. A stop already recorded
+  // on it is kept (closeRunRecord never undoes one).
+  const endedAt = f.runId ? await closeRunRecord(deps, f.runId, f) : new Date();
+  if (!won) return;
 
   if (f.oneShotText !== undefined) {
     // One-shot flavor: no CHUNK stream — publish the final text as one event
     await publish(deps, threadId, 'TEXT_RESULT', { text: f.oneShotText });
   }
 
-  await deps.kv.set(`agent:state:${threadId}`, f.state);
-  await setThreadState(deps, threadId, f.state);
+  // The run's identity and end time ride the terminal event, so a client
+  // closes the right timer without reading the run record back.
   await publish(deps, threadId, 'STATE_CHANGE', {
     state: f.state,
     stopReason: f.stopReason,
     tokensUsed: f.tokensUsed,
     usage: f.attribution,
+    endedAt,
+    ...(f.runId ? { runId: f.runId } : {}),
+    ...(f.error ? { error: f.error } : {}),
   });
 }
 
@@ -705,7 +772,8 @@ async function redriveOnLockConflict(
   }
   if ((await deps.kv.get(runIdKey(input.threadId))) !== input.runId) return; // already replaced
 
-  const tries = await deps.kv.incr(redriveKey(input.threadId));
+  const scope = counterScope(input.threadId, input.runId);
+  const tries = await deps.kv.incrWithExpiry(redriveKey(scope), COUNTER_TTL_SECONDS);
   const { delaySeconds, waitedSeconds } = redriveDelay(deps, tries);
   if (tries <= maxAttempts || waitedSeconds < deps.config.runLockLeaseSeconds) {
     return enqueueJob(
@@ -727,7 +795,7 @@ async function redriveOnLockConflict(
     );
   }
 
-  await deps.kv.del(redriveKey(input.threadId));
+  await deps.kv.del(redriveKey(scope));
   await failRun(deps, input.threadId, input.runId, 'the run lock never cleared');
 }
 
@@ -758,14 +826,15 @@ export async function executeWithPolicy(
   exec: typeof execute = execute,
 ): Promise<void> {
   const maxAttempts = policy?.maxAttempts ?? deps.config.runMaxAttempts;
+  const scope = counterScope(input.threadId, input.runId);
   try {
     const outcome = await exec(deps, agent, input);
 
     // Only a run THIS worker executed may reset the retry budget — a
     // lock-conflict no-op must never clear it while the owning worker runs (§2.8)
     if (outcome === 'executed') {
-      await deps.kv.del(`agent:attempts:${input.threadId}`);
-      await deps.kv.del(redriveKey(input.threadId));
+      await deps.kv.del(attemptsKey(scope));
+      await deps.kv.del(redriveKey(scope));
       return;
     }
 
@@ -774,39 +843,95 @@ export async function executeWithPolicy(
 
     await redriveOnLockConflict(deps, agent, input, maxAttempts);
   } catch (err) {
+    const log = deps.log ?? console;
     // A user stop already finalized the thread — never retry a stop
     if ((await deps.kv.get(`agent:state:${input.threadId}`)) === 'CANCELLED') return;
+    // A run that a newer one replaced failed after it stopped mattering: its
+    // error is not the thread's, so it spends no attempt and fails nothing.
+    if (input.runId && (await deps.kv.get(runIdKey(input.threadId))) !== input.runId) return;
 
-    const attempts = await deps.kv.incr(`agent:attempts:${input.threadId}`);
+    const attempts = await deps.kv.incrWithExpiry(attemptsKey(scope), COUNTER_TTL_SECONDS);
     if (attempts < maxAttempts) {
-      return enqueueJob(deps, {
-        threadId: input.threadId,
-        // A retry is the SAME run trying again (§2.1). Dropping the id here
-        // left the retried job unable to notice it had been replaced, and
-        // unable to redrive if it found the lock held.
-        runId: input.runId,
-        enqueuedAt: Date.now(),
-        model: input.model,
-        agent: agent.name,
-        tokenBudget: input.tokenBudget,
-        // A redrive is the SAME run trying again, so it keeps the caps it was
-        // dispatched with — a retry that lost its money cap would be unbounded.
-        costBudgetMicros: input.costBudgetMicros,
-        providerOptions: input.providerOptions,
-        state: input.state,
+      // A retry is the SAME run trying again (§2.1): it keeps the id, so it
+      // can notice it was replaced and redrive if it finds the lock held.
+      const delayMs = retryBackoffMs(deps, attempts);
+      (log as { warn?: (m: string, ...r: unknown[]) => void }).warn?.('run failed; retry scheduled', {
+        threadId: input.threadId, runId: input.runId, err: String(err), attempt: attempts, maxAttempts, delayMs,
       });
+      await requeue(deps, agent, input, delayMs);
+      return;
     }
 
     // Attempts exhausted: finalize FAILED on BOTH the hot cache and durable
     // truth, or subsequent runs would still treat the thread as active (§2.1)
+    log.error('run failed; attempts spent', { threadId: input.threadId, runId: input.runId, err: String(err), attempts });
     await failRun(
       deps,
       input.threadId,
       input.runId,
       err instanceof Error ? err.message : String(err),
     );
-    await deps.kv.del(`agent:attempts:${input.threadId}`);
+    await deps.kv.del(attemptsKey(scope));
   }
+}
+
+/** Put the same run back on the queue as a retry (§2.8). The thread reads
+ *  QUEUED while it waits, so a client sees a run waiting to retry rather than
+ *  one that looks like it is working. */
+async function requeue(
+  deps: RuntimePorts,
+  agent: RegisteredAgent,
+  input: ExecuteInput,
+  delayMs: number,
+): Promise<void> {
+  if (input.runId) await markQueued(deps, input.threadId, input.runId, input.model);
+  await enqueueJob(
+    deps,
+    {
+      threadId: input.threadId,
+      runId: input.runId,
+      enqueuedAt: Date.now(),
+      model: input.model,
+      agent: agent.name,
+      tokenBudget: input.tokenBudget,
+      // A retry is the SAME run trying again, so it keeps the caps it was
+      // dispatched with — a retry that lost its money cap would be unbounded.
+      costBudgetMicros: input.costBudgetMicros,
+      providerOptions: input.providerOptions,
+      state: input.state,
+    },
+    delayMs > 0 ? { delaySeconds: Math.ceil(delayMs / 1000) } : undefined,
+  );
+}
+
+/** Move a RUNNING thread back to QUEUED for a retry, on every home, and say so
+ *  on the wire. A parked thread keeps WAITING_FOR_INPUT: the park machinery
+ *  reads that state. A replaced run leaves the live run's state alone. */
+async function markQueued(deps: RuntimePorts, threadId: string, runId: string, model: string) {
+  if ((await deps.kv.get(runIdKey(threadId))) !== runId) return;
+  // Only a RUNNING thread that is still this run's (§3.4).
+  if (!(await transition(deps, threadId, { from: ['RUNNING'], to: 'QUEUED', runId, model }))) return;
+  await deps.admin.runs.patch(runId, { state: 'QUEUED' }).catch(() => undefined);
+  await publish(deps, threadId, 'STATE_CHANGE', { state: 'QUEUED', runId, enqueuedAt: new Date() });
+}
+
+/** How long the nth retry waits (§2.8): the base doubled per attempt, capped,
+ *  with up to a quarter of jitter so a fleet that failed together does not
+ *  retry together. */
+function retryBackoffMs(deps: RuntimePorts, attempt: number): number {
+  const base = deps.config.runRetryBackoffMs;
+  if (base <= 0) return 0;
+  const max = deps.config.runRetryBackoffMaxMs;
+  let d = base;
+  for (let i = 1; i < attempt; i++) {
+    d *= 2;
+    if (max > 0 && d >= max) {
+      d = max;
+      break;
+    }
+  }
+  if (max > 0 && d > max) d = max;
+  return d + Math.floor(Math.random() * (d / 4 + 1));
 }
 
 

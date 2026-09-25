@@ -59,16 +59,16 @@ async function parkThread(
 }
 
 describe('runtime.run via handle (§5.1)', () => {
-  it('creates a thread, persists the user message, marks RUNNING, enqueues', async () => {
+  it('creates a thread, persists the user message, marks QUEUED, enqueues', async () => {
     const { deps, store, kv, runtime, queue } = await makeDeps();
     const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 
     const res = await chat.run({ prompt: 'hello' });
 
     expect(res.accepted).toBe(true);
-    expect(res.state).toBe('RUNNING');
+    expect(res.state).toBe('QUEUED');
     const thread = await store.threads.get(res.threadId);
-    expect(thread!.state).toBe('RUNNING');
+    expect(thread!.state).toBe('QUEUED');
     expect(thread!.model).toBe('gpt-4o');
     const messages = await store.messages.list(res.threadId, undefined);
     expect(messages).toHaveLength(1);

@@ -1,4 +1,4 @@
-import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewUsage, RunJob, ThreadDTO, UsageFilter, UsageTotals } from '../core/types.js';
+import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewUsage, RunJob, ThreadDTO, ThreadTransition, UsageFilter, UsageTotals } from '../core/types.js';
 import { sumUsage } from '../core/usage.js';
 import type { Storage } from '../ports/storage.js';
 import type { EventBus } from '../ports/bus.js';
@@ -44,6 +44,17 @@ export class MemoryKv implements Kv {
     if ((await this.get(key)) !== expected) return false;
     this.m.delete(key);
     return true;
+  }
+  async incrWithExpiry(key: string, exSeconds: number) {
+    // No awaits between read and write — atomic within the event loop
+    const live = await this.get(key);
+    const n = Number(live ?? 0) + 1;
+    const e = this.m.get(key);
+    this.m.set(key, {
+      value: String(n),
+      expiresAt: live === null ? (exSeconds > 0 ? Date.now() + exSeconds * 1000 : undefined) : e?.expiresAt,
+    });
+    return n;
   }
   async incr(key: string) {
     // No awaits between read and write — atomic within the event loop
@@ -123,6 +134,7 @@ export class MemoryStorage implements Storage {
     delete: async (t: string) => {
       if (!this.threads.store.has(t)) throw new Error(`Unknown thread ${t}`);
       this.threads.store.delete(t);
+      this.threads.runs.delete(t);
       this.messages.store.delete(t);
       this.events.store.delete(t);
       this.usage.recorded = this.usage.recorded.filter((u) => u.threadId !== t);
@@ -131,6 +143,18 @@ export class MemoryStorage implements Storage {
       const thread = this.store.get(t);
       if (!thread || thread.state !== from) return false;
       thread.state = to; thread.updatedAt = new Date();
+      return true;
+    },
+    /** Each thread's current run (ThreadTransition). */
+    runs: new Map<string, string>(),
+    async transition(t: string, tr: ThreadTransition) {
+      // No awaits between the read and the write — atomic within the event loop
+      const thread = this.store.get(t);
+      if (!thread || !tr.from.includes(thread.state)) return false;
+      const current = this.runs.get(t);
+      if (tr.runId && current && current !== tr.runId) return false;
+      thread.state = tr.to; thread.updatedAt = new Date();
+      if (tr.newRunId) this.runs.set(t, tr.newRunId);
       return true;
     },
   };

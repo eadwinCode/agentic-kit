@@ -325,7 +325,7 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
     await runtime.worker.handleJob(queue.items[0]!);
 
     expect(executed).toEqual(['x']);
-    expect(states(bus)).toEqual(['RUNNING', 'COMPLETED']);
+    expect(states(bus)).toEqual(['QUEUED', 'RUNNING', 'COMPLETED']);
     const terminal = lastTerminal(bus).payload as any;
     expect(terminal.stopReason).toBe('completed');
     expect(terminal.tokensUsed).toBe(30); // 15 per step × 2 steps
@@ -391,7 +391,7 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
     // Step 1 (120 tokens) stayed under budget → step 2 RAN and completed; only
     // step 3 was prevented. Nothing aborted mid-generation.
     expect(executed).toEqual(['x']);
-    expect(states(bus)).toEqual(['RUNNING', 'COMPLETED']);
+    expect(states(bus)).toEqual(['QUEUED', 'RUNNING', 'COMPLETED']);
     const terminal = lastTerminal(bus).payload as any;
     expect(terminal.stopReason).toBe('token_budget');
     expect(terminal.tokensUsed).toBe(240);
@@ -437,7 +437,7 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
     const ran = await agent.run({ prompt: 'hi' });
     await runtime.worker.handleJob(queue.items[0]!);
 
-    expect(states(bus)).toEqual(['RUNNING', 'COMPLETED']);
+    expect(states(bus)).toEqual(['QUEUED', 'RUNNING', 'COMPLETED']);
     expect(lastTerminal(bus).payload).toMatchObject({ state: 'COMPLETED', stopReason: 'completed' });
     const textResult = bus.published.find((e) => e.type === 'TEXT_RESULT');
     expect((textResult!.payload as any).text).toBe('answer');
@@ -487,7 +487,7 @@ describe('HITL run-segment park (§2.5)', () => {
     const threadId = await park(r);
 
     expect(r.sent).toEqual([]);
-    expect(states(r.bus)).toEqual(['RUNNING', 'WAITING_FOR_INPUT']);
+    expect(states(r.bus)).toEqual(['QUEUED', 'RUNNING', 'WAITING_FOR_INPUT']);
     expect(await r.kv.get(`agent:state:${threadId}`)).toBe('WAITING_FOR_INPUT');
     // The segment ended: the run lock is released while parked
     expect(await r.kv.get(`agent:lock:${threadId}`)).toBeNull();
@@ -726,7 +726,7 @@ describe('a tool that parks itself (§2.5)', () => {
     await r.runtime.worker.handleJob(r.queue.items[0]!);
 
     expect(started).toEqual(['intro']);
-    expect(states(r.bus)).toEqual(['RUNNING', 'WAITING_FOR_INPUT']);
+    expect(states(r.bus)).toEqual(['QUEUED', 'RUNNING', 'WAITING_FOR_INPUT']);
     expect(await r.kv.get(`agent:lock:${ran.threadId}`)).toBeNull();
     const req = r.storage.events.store.get(ran.threadId)!.find((e) => e.type === 'INPUT_REQUIRED')!;
     expect(req.payload).toMatchObject({ toolCallId: 'c1', toolName: 'render', reason: 'job', arguments: { jobId: 'job-1' } });

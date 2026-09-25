@@ -68,6 +68,9 @@ func (b BoundThreads) Delete(ctx context.Context, threadID string) error {
 func (b BoundThreads) ClaimState(ctx context.Context, threadID string, from, to ExecutionState) (bool, error) {
 	return b.s.ClaimState(ctx, threadID, from, to, b.sc)
 }
+func (b BoundThreads) Transition(ctx context.Context, threadID string, t ThreadTransition) (bool, error) {
+	return b.s.Transition(ctx, threadID, t, b.sc)
+}
 
 // BoundMessages is MessageStore with the StorageContext bound.
 type BoundMessages struct {

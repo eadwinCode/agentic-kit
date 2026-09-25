@@ -5,8 +5,9 @@ import type { AgentRunState } from './state.js';
  *  (`agent:state:{threadId}`) is a hot cache the engine polls (§2.1, §3.4). */
 export type ExecutionState =
   | 'IDLE'
-  /** Accepted and waiting for a worker; written by the Go runtime. It becomes
-   *  RUNNING the moment a worker picks the job up. */
+  /** Accepted and waiting for a worker. It becomes RUNNING the moment a
+   *  worker picks the job up, and goes back to QUEUED while a failed run
+   *  waits for its retry. */
   | 'QUEUED'
   | 'RUNNING'
   | 'WAITING_FOR_INPUT'
@@ -25,6 +26,22 @@ export interface ThreadDTO {
   model: string;
   createdAt: Date;
   updatedAt: Date;
+}
+
+/** One compare-and-set on a thread's state (§3.4). It lands only while the
+ *  thread is in one of `from` AND still belongs to `runId`, so a run that has
+ *  been stopped or replaced can never move the thread again: its write simply
+ *  loses. */
+export interface ThreadTransition {
+  from: ExecutionState[];
+  to: ExecutionState;
+  /** The run the caller acts for. The transition lands only while the
+   *  thread's current run is this one, or the thread has no run recorded yet
+   *  (a thread from before run ids were stored). Omitted means any run. */
+  runId?: string;
+  /** Makes the thread belong to a new run: set by run admission. Omitted
+   *  keeps the current one. */
+  newRunId?: string;
 }
 
 export interface MessageDTO {
@@ -78,8 +95,12 @@ export interface RunRecord {
   stopReason?: string | null;
   /** Why it failed, when it did. Previously dropped on the floor (§2.8). */
   error?: string | null;
-  /** When the run was accepted and enqueued. */
+  /** When a worker first started work on it. Until then (a QUEUED run) the
+   *  time it was accepted. */
   startedAt: Date;
+  /** When the run was accepted and enqueued (§2.8): a queued run's wait
+   *  shows while it lasts. Null on records from before the QUEUED stage. */
+  enqueuedAt?: Date | null;
   endedAt?: Date | null;
   /** endedAt - startedAt, denormalised so a listing never recomputes it. A
    *  parked run legitimately spans however long the human took (§2.5). */
@@ -120,6 +141,11 @@ export interface NewRunRecord {
   /** Defaults to 0 — a dispatched run. */
   depth?: number;
   parentRunId?: string | null;
+  /** A dispatched run opens QUEUED; a nested run starts RUNNING (the
+   *  default). */
+  state?: ExecutionState;
+  /** When a dispatched run was accepted. */
+  enqueuedAt?: Date | null;
 }
 
 export type RunPatch = Partial<Omit<RunRecord, 'id' | 'threadId'>>;
@@ -408,6 +434,12 @@ export interface AgentConfig {
    *  it would strand the user's message — so it comes back once the previous
    *  run has let go. */
   runRedriveDelaySeconds: number;
+  /** A failed run waits this long before its first retry, twice as long each
+   *  time after, up to `runRetryBackoffMaxMs`, with up to a quarter of jitter
+   *  so a fleet that failed together does not retry together (§2.8). 0 retries
+   *  at once. */
+  runRetryBackoffMs: number;
+  runRetryBackoffMaxMs: number;
   /** Default per-run token budget (input + output) when neither the execute
    *  input nor the agent spec declares one. `undefined` = unbounded apart
    *  from `maxSteps` (§2.1 safety cap). */
@@ -460,8 +492,9 @@ export interface AgentConfig {
   /** Per-model native windows below the ceiling (§2.6) — merged over defaults.
    *  A `contextWindow` declared via `resolveModel` wins over this table. */
   nativeWindows?: Record<string, number>;
-  /** Lease (seconds) for the per-thread run lock — must exceed the longest
-   *  possible run segment; parked HITL waits hold NO lock (§2.8, §3.4). */
+  /** Lease (seconds) for the per-thread run lock. The holder renews it every
+   *  sixth of the lease while it holds it, so an expired lock means a dead
+   *  worker; parked HITL waits hold NO lock (§2.8, §3.4). */
   runLockLeaseSeconds: number;
   /** Billing pre-execution check (§4). Return `{ ok: false, error }` to reject
    *  a run. The check can publish on the thread (a credit warning, a reset
@@ -495,6 +528,8 @@ export const DEFAULT_CONFIG: AgentConfig = {
   runMaxAttempts: 3,
   stopPollMs: 500,
   runRedriveDelaySeconds: 2,
+  runRetryBackoffMs: 5_000,
+  runRetryBackoffMaxMs: 120_000,
   subagentMaxDepth: 2,
   subagentMaxConcurrent: 3,
   subagentMaxSteps: 10,
@@ -507,7 +542,7 @@ export const DEFAULT_CONFIG: AgentConfig = {
   contextTailShare: 0.25,
   compactionModel: 'gpt-4o-mini',
   promptCaching: true,
-  runLockLeaseSeconds: 30 * 60,
+  runLockLeaseSeconds: 2 * 60,
 };
 
 export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
@@ -528,6 +563,11 @@ export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
     throw new Error(
       `Invalid config: stopPollMs (${config.stopPollMs}) must be an integer of at least 1`,
     );
+  }
+  for (const key of ['runRetryBackoffMs', 'runRetryBackoffMaxMs'] as const) {
+    if (!Number.isInteger(config[key]) || config[key] < 0) {
+      throw new Error(`Invalid config: ${key} (${config[key]}) must be a non-negative integer`);
+    }
   }
   if (!Number.isInteger(config.runRedriveDelaySeconds) || config.runRedriveDelaySeconds < 0) {
     throw new Error(

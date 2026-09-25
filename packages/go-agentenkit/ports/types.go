@@ -63,6 +63,23 @@ type ThreadDTO struct {
 	UpdatedAt time.Time      `json:"updatedAt"`
 }
 
+// ThreadTransition is one compare-and-set on a thread's state (§3.4). It
+// lands only while the thread is in one of From AND still belongs to RunID,
+// so a run that has been stopped or replaced can never move the thread
+// again: its write simply loses.
+type ThreadTransition struct {
+	From []ExecutionState
+	To   ExecutionState
+	// RunID is the run the caller acts for. The transition lands only while
+	// the thread's current run is this one, or the thread has no run
+	// recorded yet (a thread from before run ids were stored). Empty means
+	// any run.
+	RunID string
+	// NewRunID makes the thread belong to a new run: set by run admission.
+	// Empty keeps the current one.
+	NewRunID string
+}
+
 // MessageDTO is one persisted turn.
 //
 // Content is the message body as JSON, in the same shapes the TypeScript

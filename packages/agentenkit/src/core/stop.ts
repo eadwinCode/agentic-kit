@@ -1,5 +1,5 @@
 import type { RuntimePorts } from '../ports/runtime.js';
-import { publish, setThreadState } from './publish.js';
+import { ACTIVE_STATES, publish, transition } from './publish.js';
 import { loadOpenHitls } from './hitl.js';
 import type { StopResult } from '../ports/runtime.js';
 import { currentRunId } from './keys.js';
@@ -9,7 +9,7 @@ import { currentRunId } from './keys.js';
  *  fires the abort; the durable state is the recovery truth (§3.4). */
 export async function stop(deps: RuntimePorts, threadId: string): Promise<StopResult> {
   const thread = await deps.storage.threads.get(threadId);
-  if (thread?.state !== 'RUNNING' && thread?.state !== 'WAITING_FOR_INPUT') {
+  if (!thread || !ACTIVE_STATES.includes(thread.state)) {
     return { accepted: false, error: `Cannot stop thread in state ${thread?.state ?? 'unknown'}` };
   }
 
@@ -19,8 +19,16 @@ export async function stop(deps: RuntimePorts, threadId: string): Promise<StopRe
   const runId = await currentRunId(deps, threadId);
   const endedAt = new Date();
 
-  await deps.kv.set(`agent:state:${threadId}`, 'CANCELLED');
-  await setThreadState(deps, threadId, 'CANCELLED', thread.model);
+  // A compare-and-set on the state and the run (§3.4): a finish, a failure or
+  // a newer run that got there first keeps its own ending, and this stop is
+  // refused with the state it found.
+  const won = await transition(deps, threadId, {
+    from: ACTIVE_STATES, to: 'CANCELLED', runId, model: thread.model,
+  });
+  if (!won) {
+    const now = await deps.storage.threads.get(threadId);
+    return { accepted: false, error: `Cannot stop thread in state ${now?.state ?? 'unknown'}` };
+  }
   // A queued or parked run may never execute again. Close its record here,
   // without touching usage that a running worker can still be accruing.
   if (runId) await recordStoppedRun(deps, runId, endedAt);

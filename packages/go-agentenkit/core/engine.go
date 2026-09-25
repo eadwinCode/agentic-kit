@@ -349,23 +349,27 @@ func failRun(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			Usage: bill, UsageErr: billErr,
 		})
 	}
-	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateFailed), ports.SetOptions{}); err != nil {
+	// Only while the thread is still this run's and still going: a stop or a
+	// newer run that got there first keeps its own ending (§3.4).
+	won, err := Transition(ctx, deps, threadID, StateChange{From: ActiveStates, To: ports.StateFailed, RunID: runID})
+	if err != nil {
 		return err
 	}
-	if err := SetThreadState(ctx, deps, threadID, ports.StateFailed, ""); err != nil {
-		return err
+	if !won {
+		Logger(deps).Info("run not failed: the thread has moved on", "thread", threadID, "run", runID, "reason", reason)
+		return nil
 	}
 	endedAt := time.Now()
 	if runID != "" {
 		endedAt = closeRunRecord(ctx, deps, runID, FinalizeInput{
-			State: ports.StateFailed, StopReason: "completed", Error: reason, RunID: runID,
+			State: ports.StateFailed, StopReason: "failed", Error: reason, RunID: runID,
 		})
 	}
-	terminal := map[string]any{"state": ports.StateFailed, "error": reason, "endedAt": endedAt}
+	terminal := map[string]any{"state": ports.StateFailed, "stopReason": "failed", "error": reason, "endedAt": endedAt}
 	if runID != "" {
 		terminal["runId"] = runID
 	}
-	_, err := Publish(ctx, deps, threadID, "STATE_CHANGE", terminal)
+	_, err = Publish(ctx, deps, threadID, "STATE_CHANGE", terminal)
 	return err
 }
 
@@ -413,13 +417,15 @@ func resumePendingHitl(ctx, genCtx context.Context, deps ports.RuntimePorts, thr
 			return false, err
 		}
 	}
-	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateRunning), ports.SetOptions{}); err != nil {
+	// A stop that landed while the verdicts were applied wins: the thread
+	// stays CANCELLED and this segment goes no further (§3.4).
+	runID := RunIDFromContext(ctx)
+	if won, err := Transition(ctx, deps, threadID, StateChange{
+		From: []ports.ExecutionState{ports.StateWaitingForInput}, To: ports.StateRunning, RunID: runID,
+	}); err != nil || !won {
 		return false, err
 	}
-	if err := SetThreadState(ctx, deps, threadID, ports.StateRunning, ""); err != nil {
-		return false, err
-	}
-	if _, err := Publish(ctx, deps, threadID, "STATE_CHANGE", runStatePayload(ctx, deps, ports.StateRunning, RunIDFromContext(ctx))); err != nil {
+	if _, err := Publish(ctx, deps, threadID, "STATE_CHANGE", runStatePayload(ctx, deps, ports.StateRunning, runID)); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -723,6 +729,18 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			patch.QueuedMs = ports.Ptr(pickedUp.UnixMilli() - input.EnqueuedAt)
 		}
 		if durable.State == ports.StateQueued {
+			// A stop (or a newer run) that landed since the read above wins:
+			// this job has nothing to pick up (§3.4).
+			won, err := Transition(ctx, deps, threadID, StateChange{
+				From: []ports.ExecutionState{ports.StateQueued}, To: ports.StateRunning, RunID: runID, Model: input.Model,
+			})
+			if err != nil {
+				return "", err
+			}
+			if !won {
+				log.Info("run not picked up: the thread moved on before this worker got to it")
+				return OutcomeExecuted, nil
+			}
 			startedAt := pickedUp
 			if rec, err := deps.Admin.Runs().Get(ctx, runID); err == nil && rec != nil && rec.QueuedMs != nil {
 				startedAt = rec.StartedAt // a retry: the run started when it first ran
@@ -731,12 +749,6 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			}
 			patch.State = ports.Ptr(ports.StateRunning)
 			_ = deps.Admin.Runs().Patch(ctx, runID, patch)
-			if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateRunning), ports.SetOptions{}); err != nil {
-				return "", err
-			}
-			if err := SetThreadState(ctx, deps, threadID, ports.StateRunning, input.Model); err != nil {
-				return "", err
-			}
 			if _, err := Publish(ctx, deps, threadID, "STATE_CHANGE", map[string]any{
 				"state": ports.StateRunning, "runId": runID, "startedAt": startedAt,
 			}); err != nil {
@@ -949,38 +961,33 @@ func Finalize(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAge
 	// as it happened, inside the loop (§4). Even a run that was replaced
 	// part-way through has already had its calls written.
 	//
-	// Close the run's durable record (§2.9). Additive: a run that parked and
-	// resumed finalises once, but its steps and tokens accrued over several
-	// segments. The run lock (§3.4) makes this read-modify-write single-writer.
+	// The thread moves only while it is still this run's and still RUNNING
+	// (§3.4). A stop that got there first has already written CANCELLED and
+	// said so; a newer run owns the thread. Either way this finish loses and
+	// stays silent: publishing it would land on top of the stop, or wedge the
+	// newer run (§2.1).
+	won, err := Transition(ctx, deps, threadID, StateChange{
+		From: []ports.ExecutionState{ports.StateRunning}, To: f.State, RunID: f.RunID,
+	})
+	if err != nil {
+		return err
+	}
+	// Close the run's durable record (§2.9) either way: the segment's steps
+	// and tokens are real. Additive: a run that parked and resumed finalises
+	// once, but its steps and tokens accrued over several segments. A stop
+	// already recorded on it is kept (closeRunRecord never undoes one).
 	endedAt := time.Now()
 	if f.RunID != "" {
 		endedAt = closeRunRecord(ctx, deps, f.RunID, f)
-		// Past that, a replaced run stays silent. Its CANCELLED would otherwise
-		// land on top of the next run's RUNNING and wedge the thread (§2.1).
-		current, _, err := deps.Kv.Get(ctx, RunIDKey(threadID))
-		if err != nil {
-			return err
-		}
-		if current != f.RunID {
-			return nil
-		}
 	}
-	if state, _, err := deps.Kv.Get(ctx, StateKey(threadID)); err != nil {
-		return err
-	} else if state == string(ports.StateCancelled) {
-		f.State, f.StopReason, f.OneShotText = ports.StateCancelled, "cancelled", nil
+	if !won {
+		return nil
 	}
 	if f.OneShotText != nil {
 		// One-shot flavor: no CHUNK stream; publish the final text as one event
 		if _, err := Publish(ctx, deps, threadID, "TEXT_RESULT", map[string]any{"text": *f.OneShotText}); err != nil {
 			return err
 		}
-	}
-	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(f.State), ports.SetOptions{}); err != nil {
-		return err
-	}
-	if err := SetThreadState(ctx, deps, threadID, f.State, ""); err != nil {
-		return err
 	}
 	// The run's identity and end time ride the terminal event, so a client
 	// closes the right timer without reading the run record back.
@@ -994,7 +1001,7 @@ func Finalize(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAge
 	if f.Error != "" {
 		terminal["error"] = f.Error
 	}
-	_, err := Publish(ctx, deps, threadID, "STATE_CHANGE", terminal)
+	_, err = Publish(ctx, deps, threadID, "STATE_CHANGE", terminal)
 	return err
 }
 
@@ -1170,6 +1177,16 @@ func ExecuteWithPolicy(ctx context.Context, deps ports.RuntimePorts, agent *Regi
 	} else if state == string(ports.StateCancelled) {
 		return nil
 	}
+	// A run that a newer one replaced failed after it stopped mattering: its
+	// error is not the thread's, so it spends no attempt and fails nothing.
+	if input.RunID != "" {
+		if current, curErr := CurrentRunID(bg, deps, input.ThreadID); curErr != nil {
+			return errors.Join(err, curErr)
+		} else if current != input.RunID {
+			log.Info("replaced run failed; nothing to retry", "err", err)
+			return nil
+		}
+	}
 	attempts, kvErr := deps.Kv.IncrWithExpiry(bg, AttemptsKey(scope), counterTTL)
 	if kvErr != nil {
 		return errors.Join(err, kvErr)
@@ -1211,14 +1228,11 @@ func markQueued(ctx context.Context, deps ports.RuntimePorts, threadID, runID, m
 	if err != nil || current != runID {
 		return err
 	}
-	durable, err := deps.Storage.Threads.Get(ctx, threadID)
-	if err != nil || durable == nil || durable.State != ports.StateRunning {
-		return err
-	}
-	if _, err := deps.Kv.Set(ctx, StateKey(threadID), string(ports.StateQueued), ports.SetOptions{}); err != nil {
-		return err
-	}
-	if err := SetThreadState(ctx, deps, threadID, ports.StateQueued, model); err != nil {
+	// Only a RUNNING thread that is still this run's (§3.4).
+	won, err := Transition(ctx, deps, threadID, StateChange{
+		From: []ports.ExecutionState{ports.StateRunning}, To: ports.StateQueued, RunID: runID, Model: model,
+	})
+	if err != nil || !won {
 		return err
 	}
 	_ = deps.Admin.Runs().Patch(ctx, runID, ports.RunPatch{State: ports.Ptr(ports.StateQueued)})

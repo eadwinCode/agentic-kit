@@ -27,6 +27,9 @@ model Thread {
   updatedAt DateTime       @updatedAt
   state     ExecutionState @default(IDLE)
   model     String         @default("gpt-4o")
+  /// The run this thread belongs to now: every state change is a
+  /// compare-and-set on it, so a stopped or replaced run cannot move the thread.
+  runId     String?
 
   messages     Message[]
   usage        TokenUsage[]

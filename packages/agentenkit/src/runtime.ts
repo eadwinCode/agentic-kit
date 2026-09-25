@@ -21,7 +21,7 @@ import { openDefaultAdminStore } from './admin/default.js';
 import { reclaimIfOrphaned } from './core/reclaim.js';
 import { respond } from './core/hitl.js';
 import { deleteThread } from './core/deleteThread.js';
-import { publishEvent } from './core/publish.js';
+import { publishEvent, ACTIVE_STATES } from './core/publish.js';
 
 /** Bind the ports to the core behaviors (§3.3). This is the package's public
  *  entry point — the only place where anything is wired together. */
@@ -102,14 +102,15 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
 
       const lastEventSeq = events.at(-1)?.seq ?? -1;
       let activeEvents: AgentEvent[] = [];
-      if (thread.state === 'RUNNING' || thread.state === 'WAITING_FOR_INPUT') {
+      if (ACTIVE_STATES.includes(thread.state)) {
+        // The run's boundary is where it was accepted (QUEUED) or picked up
+        // (RUNNING), whichever came last; a resume after a park publishes
+        // RUNNING too.
         let boundary = -1;
         for (let index = events.length - 1; index >= 0; index -= 1) {
           const event = events[index];
-          if (
-            event.type === 'STATE_CHANGE' &&
-            (event.payload as { state?: string } | null)?.state === 'RUNNING'
-          ) {
+          const state = (event.payload as { state?: string } | null)?.state;
+          if (event.type === 'STATE_CHANGE' && (state === 'RUNNING' || state === 'QUEUED')) {
             boundary = index;
             break;
           }

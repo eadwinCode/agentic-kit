@@ -49,7 +49,7 @@ is assumed.
 | :--- | :--- |
 | `threadId` | the open thread, or `undefined` |
 | `entries` | the conversation — see below |
-| `agentState` | `IDLE` · `QUEUED` · `RUNNING` · `WAITING_FOR_INPUT` · `COMPLETED` · `CANCELLED` · `FAILED` — `QUEUED` is accepted and waiting for a worker (Go runtime) |
+| `agentState` | `IDLE` · `QUEUED` · `RUNNING` · `WAITING_FOR_INPUT` · `COMPLETED` · `CANCELLED` · `FAILED` — `QUEUED` is accepted and waiting for a worker |
 | `activity` | `{ phase, label, detail }` — a live status line |
 | `historyLoading` | hydration in progress |
 | `pendingInputs` | requests the run is parked on: `reason: 'approval'` waits on a human (show a card); any other reason is a tool waiting on work it started (show a status) |

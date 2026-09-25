@@ -236,11 +236,21 @@ type inputRequiredPayload struct {
 // deliveries of one run: whichever resolves the park first wins, and the run
 // lock makes the other a no-op.
 func ParkForApproval(ctx context.Context, deps ports.RuntimePorts, i ParkInput) error {
-	if _, err := deps.Kv.Set(ctx, StateKey(i.ThreadID), string(ports.StateWaitingForInput), ports.SetOptions{}); err != nil {
+	// Only while the run still owns a going thread (§3.4). A step can park
+	// several calls, so the thread may already be WAITING. A run that was
+	// stopped meanwhile parks nothing: the stop has ended it, and a later
+	// prompt repairs the call it left without a result.
+	won, err := Transition(ctx, deps, i.ThreadID, StateChange{
+		From:  []ports.ExecutionState{ports.StateRunning, ports.StateWaitingForInput},
+		To:    ports.StateWaitingForInput,
+		RunID: i.Resume.RunID, Model: i.Resume.Model,
+	})
+	if err != nil {
 		return err
 	}
-	if err := SetThreadState(ctx, deps, i.ThreadID, ports.StateWaitingForInput, i.Resume.Model); err != nil {
-		return err
+	if !won {
+		Logger(deps).Info("park skipped: the run no longer owns the thread", "thread", i.ThreadID, "toolCall", i.ToolCallID)
+		return nil
 	}
 	args := i.Args
 	if len(args) == 0 || !json.Valid(args) {

@@ -48,8 +48,9 @@ be opened should be a startup error.
 | `costBudgetMicros` | `undefined` | Default per-run money cap, in millionths of the pricer's currency. Needs a `pricer`. See [Cost and pricing](./cost-and-pricing.md). |
 | `runMaxAttempts` | `3` | Queue redrive attempts before a run finalizes `FAILED`. |
 | `stopPollMs` | `500` | How often a running worker re-reads the stop signal. Also the window in which it notices a newer run replaced it. |
+| `runRetryBackoffMs` / `runRetryBackoffMaxMs` | `5000` / `120000` | A failed run waits this long before its first retry, twice as long each time after, with jitter. The thread shows `QUEUED` while it waits. |
 | `runRedriveDelaySeconds` | `2` | First delay before re-dispatching a job that found the run lock held. It doubles on each try, up to the lease. |
-| `runLockLeaseSeconds` | `1800` (30 min) | Lease on the per-thread run lock. The worker renews it every sixth of the lease while it holds it, so an expired lock means a dead worker. A job blocked by a held lock gives up only after waiting at least one lease. Parked approvals hold no lock. |
+| `runLockLeaseSeconds` | `120` (2 min) | Lease on the per-thread run lock. The worker renews it every sixth of the lease while it holds it, so an expired lock means a dead worker. A job blocked by a held lock gives up only after waiting at least one lease. Parked approvals hold no lock. |
 
 ### Subagents
 

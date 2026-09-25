@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/core"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
@@ -90,6 +91,8 @@ func (s *Storage) schema() []string {
 		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS "costCurrency" TEXT`,
 		`ALTER TABLE ` + p + `usage ADD COLUMN IF NOT EXISTS "costSource" TEXT`,
 		`CREATE INDEX IF NOT EXISTS ` + p + `usage_run ON ` + p + `usage("runId", "createdAt")`,
+		// The thread's current run, for ThreadTransition's compare-and-set.
+		`ALTER TABLE ` + p + `threads ADD COLUMN IF NOT EXISTS "runId" TEXT`,
 	}
 }
 
@@ -168,6 +171,29 @@ func (t threads) ClaimState(ctx context.Context, threadID string, from, to ports
 	res, err := t.s.db.ExecContext(ctx,
 		`UPDATE `+t.s.t("threads")+` SET state = $1, "updatedAt" = now() WHERE id = $2 AND state = $3`,
 		string(to), threadID, string(from))
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+func (t threads) Transition(ctx context.Context, threadID string, tr ports.ThreadTransition, _ ports.StorageContext) (bool, error) {
+	if len(tr.From) == 0 {
+		return false, nil
+	}
+	// Single conditional UPDATE: the atomicity contract (§3.4). A thread
+	// with no run recorded yet (from before the column) matches any run.
+	args := []any{string(tr.To), threadID, tr.RunID, tr.NewRunID}
+	in := make([]string, len(tr.From))
+	for i, s := range tr.From {
+		args = append(args, string(s))
+		in[i] = fmt.Sprintf("$%d", len(args))
+	}
+	res, err := t.s.db.ExecContext(ctx,
+		`UPDATE `+t.s.t("threads")+` SET state = $1, "updatedAt" = now(), "runId" = COALESCE(NULLIF($4, ''), "runId")
+		 WHERE id = $2 AND state IN (`+strings.Join(in, ", ")+`)
+		   AND ($3 = '' OR "runId" IS NULL OR "runId" = $3)`, args...)
 	if err != nil {
 		return false, err
 	}

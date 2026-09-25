@@ -98,3 +98,7 @@ func NewID() string {
 	hex.Encode(out[24:36], b[10:16])
 	return string(out[:])
 }
+
+// ActiveStates are the states a run is still going in: the ones a stop or a
+// failure can end.
+var ActiveStates = []ports.ExecutionState{ports.StateQueued, ports.StateRunning, ports.StateWaitingForInput}
