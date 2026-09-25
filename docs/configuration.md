@@ -57,7 +57,7 @@ be opened should be a startup error.
 | Setting | Default | Meaning |
 | :--- | ---: | :--- |
 | `subagentMaxDepth` | `2` | Nesting cap. |
-| `subagentMaxConcurrent` | `3` | Children running at once per run. |
+| `subagentMaxConcurrent` | `3` | Children running at once per run, at each depth. |
 | `subagentMaxSteps` | `10` | Model round trips per child. |
 | `subagentResultCapChars` | `8000` | Characters of a child's result handed to the parent. |
 

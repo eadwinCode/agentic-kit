@@ -18,7 +18,7 @@ import {
   ParkBox,
 } from './hitl.js';
 import { ACTIVE_STATES, publish, publishEvent, runStatePayload, transition, withPublishEvent } from './publish.js';
-import { closeNested, runNestedAgent, spawnSubagentTool, type SubagentCtx } from './subagent.js';
+import { closeNested, RunSlots, runNestedAgent, spawnSubagentTool, type SubagentCtx } from './subagent.js';
 import { attemptsKey, COUNTER_TTL_SECONDS, counterScope, redriveKey, runIdKey } from './keys.js';
 import { withRunState, type AgentRunState } from './state.js';
 import { runLoop, type RunLedger } from './loop.js';
@@ -189,6 +189,8 @@ async function unwindVerdict(
       const outcome = await runNestedAgent(subCtx, producer, null, signal, pending.frames.slice(i));
       if (outcome.parked) return false; // parked again, one level down
       if (outcome.aborted) return false; // user stop mid-unwind (§2.1)
+      // A child whose stream ended with no finish did not finish.
+      if (outcome.interrupted) throw new Error(`step ${outcome.steps + 1} ended without a finish`);
 
       const run = await deps.admin.runs.get(producer.agentId).catch(() => null);
       if (run) await closeNested(subCtx, run, outcome, { state: 'COMPLETED', result: { text: outcome.text } });
@@ -547,7 +549,8 @@ export async function execute(
         ? {
             threadId,
             depth: 0,
-            sem: agent.sem,
+            // Made per run: the cap is this run's, never shared with others.
+            slots: new RunSlots(deps.config.subagentMaxConcurrent),
             ports: deps,
             sub,
             agent,
@@ -656,6 +659,9 @@ export async function execute(
       // A lost lock aborts the run the way a stop does, but it is not a stop:
       // another worker may own the thread now, so nothing below may write.
       if (lease.lost) return 'lock-lost';
+      // The stream ended with no finish and no error: the step was not
+      // completed, so it goes to the retry policy rather than finalizing.
+      if (loop.interrupted) throw new Error(`step ${loop.steps + 1} ended without a finish`);
 
       const { attribution, parked } = loop;
       const tokensUsed = ledger.tokensUsed;

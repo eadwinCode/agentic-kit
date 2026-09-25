@@ -181,6 +181,10 @@ func unwindVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadI
 		}
 		var handed any
 		outcome, err := RunNestedAgent(genCtx, subCtx, *producer, nil, pending.Frames[i:])
+		if err == nil && outcome.Interrupted && !outcome.Aborted {
+			// A child whose stream ended with no finish did not finish.
+			err = fmt.Errorf("step %d ended without a finish", outcome.Steps+1)
+		}
 		switch {
 		case err == nil && outcome.Parked:
 			return false, nil // parked again one level down
@@ -850,8 +854,10 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	var subCtx *SubagentCtx
 	if agent.Spec.Subagents != nil {
 		subCtx = &SubagentCtx{
-			IOCtx: ctx, ThreadID: threadID, Depth: 0, Sem: agent.Sem, Ports: deps,
-			Sub: *agent.Spec.Subagents, Agent: agent, Ledger: ledger, Resume: resume,
+			IOCtx: ctx, ThreadID: threadID, Depth: 0, Ports: deps,
+			// Made per run: the cap is this run's, never shared with others.
+			Slots: NewRunSlots(deps.Config.SubagentMaxConcurrent),
+			Sub:   *agent.Spec.Subagents, Agent: agent, Ledger: ledger, Resume: resume,
 			TokenBudget: tokenBudget, CostBudgetMicros: costBudget, BillingRunID: runID,
 			ProviderOptions: providerOptions, Aborted: aborted, Fenced: lease.Lost, Parks: parks, State: input.State,
 		}

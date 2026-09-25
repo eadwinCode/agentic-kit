@@ -38,7 +38,6 @@ type RegisteredAgent struct {
 	Kind ports.AgentKind
 	Spec SpecDefaults
 	Args AgentArgs
-	Sem  *Semaphore
 }
 
 // ScopeFn resolves the ports for one call, binding that call's state to
@@ -109,9 +108,6 @@ func (h *Handle) Stop(ctx context.Context, threadID string, state ports.AgentRun
 }
 
 func newHandle(scope ScopeFn, agent *RegisteredAgent) *Handle {
-	if agent.Sem == nil {
-		agent.Sem = NewSemaphore(scope(nil, "").Config.SubagentMaxConcurrent)
-	}
 	return &Handle{agent: agent, scope: scope}
 }
 

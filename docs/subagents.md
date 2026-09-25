@@ -85,16 +85,25 @@ The result handed back to the parent is capped at
 | Setting | Default | Meaning |
 | :--- | :--- | :--- |
 | `subagentMaxDepth` | 2 | How deep nesting may go |
-| `subagentMaxConcurrent` | 3 | Children running at once per run |
+| `subagentMaxConcurrent` | 3 | Children running at once per run, at each depth |
 | `subagentMaxSteps` | 10 | Model round trips per child |
 | `subagentResultCapChars` | 8000 | Characters returned to the parent |
 
 Depth 2 means a child may spawn a grandchild, and there it stops. Exceeding the
 cap is reported to the caller as a tool result, not raised as a crash.
 
+The concurrency cap belongs to one run: another run's children never take its
+slots. And each depth has slots of its own. A parent keeps its slot while its
+child runs, so a single pool for every depth would let three children each wait
+for a slot only a finished child can free, and the run would never end. Waiting
+for a slot ends at once when the run is stopped.
+
 ## Failure is a result, not a crash
 
-A child that fails reports back to its parent instead of killing the run. The
+A child that fails reports back to its parent instead of killing the run. A
+child whose model stream ended with no finish counts as failed too: its partial
+text is not a result. A child cut off by a user stop is recorded `CANCELLED`, and
+the stop ends the whole run. The
 parent's model sees a failed tool result and decides what to do — retry
 differently, work around it, or tell the user. That is usually what you want; an
 agent whose helper failed is not an agent that should stop existing.

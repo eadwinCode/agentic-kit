@@ -147,7 +147,10 @@ export async function executeStep(
       providerMetadata: meta as any,
       response: { id: (response as any)?.id, headers: (response as any)?.headers },
       streamedText: call.partial?.text || text,
-      finished: true,
+      // The SDK makes up a finish when the provider's stream closes without
+      // one, with reason 'unknown'. A step like that did not finish: the
+      // provider cut it short without saying so.
+      finished: finishReason !== 'unknown',
     };
   }
 
@@ -246,6 +249,9 @@ export interface LoopOutcome {
   parkedToolCallId?: string;
   /** The abort signal fired mid-loop — a user stop (§2.1). */
   aborted: boolean;
+  /** The last model call ended without a finish and without a user stop,
+   *  and no error said why. The run must not be taken as finished. */
+  interrupted: boolean;
   /** Iterations this loop completed (§2.9). */
   steps: number;
   /** The run hit its money cap and stopped between steps (§4). */
@@ -282,6 +288,7 @@ export async function runLoop(
   let stepsLeft = input.maxSteps;
   let stepsRun = 0;
   let costExhausted = false;
+  let interrupted = false;
   // The input count of the last finished call. A call cut off before its
   // finish never reports one, and its prompt was the same size as the
   // previous step's plus a little, so this is the honest floor to bill.
@@ -327,6 +334,26 @@ export async function runLoop(
       }
       if (input.abortSignal.aborted) break; // user stop mid-step
       throw err; // real failure → §2.8 redrive policy
+    }
+    if (!step.finished) {
+      // The stream ended with no finish and no error. Billed like any call cut
+      // short, then handed back unfinished: the caller retries it rather than
+      // taking the partial step as the run's end.
+      const cut = unfinishedUsage(
+        input,
+        stepsRun + 1,
+        partial.text,
+        input.abortSignal.aborted ? 'aborted' : 'error',
+        lastInput || estimateTokens(input.messages),
+      );
+      if (cut.totalTokens > 0) {
+        const priced = await recordCall(deps, threadId, cut);
+        addAttribution(attribution, priced);
+        tokensUsed += priced.totalTokens;
+        ledger.tokensUsed += priced.totalTokens;
+      }
+      if (!input.abortSignal.aborted) interrupted = true;
+      break;
     }
 
     // One priced usage row per model call (§4), recorded below once the step
@@ -493,6 +520,7 @@ export async function runLoop(
     parked,
     parkedToolCallId,
     aborted: input.abortSignal.aborted,
+    interrupted,
     steps: stepsRun,
     costExhausted,
   };

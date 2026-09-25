@@ -25,7 +25,8 @@ import { runLoop, type LoopOutcome, type RunLedger } from './loop.js';
 export interface SubagentCtx {
   threadId: string;
   depth: number; // 0 = called from the main agent
-  sem: Semaphore; // per-run concurrency cap
+  /** This run's subagent cap (§2.7): see RunSlots. */
+  slots: RunSlots;
   ports: RuntimePorts; // the §3.2 ports bundle
   /** Delegation config carried from the parent's spec (§2.7): flavor,
    *  default model, and extra tools for every spawned child. */
@@ -61,23 +62,37 @@ export interface SubagentCtx {
   state?: AgentRunState;
 }
 
-/** Run-scoped semaphore: sibling subagents queue instead of running away (§2.7) */
+/** A concurrency cap: sibling subagents queue instead of running away (§2.7).
+ *  See RunSlots for how a run uses them. */
 export class Semaphore {
   private active = 0;
   private waiters: (() => void)[] = [];
   constructor(private readonly limit: number) {}
 
-  async acquire(): Promise<() => void> {
-    await new Promise<void>((resolve) => {
-      if (this.active < this.limit) {
+  /** Take a slot, waiting for one. A wait the signal aborts gives up with the
+   *  signal's reason instead of waiting on for ever. */
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    await new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(signal.reason ?? new Error('aborted'));
+        return;
+      }
+      if (this.active < Math.max(this.limit, 1)) {
         this.active++;
         resolve();
-      } else {
-        this.waiters.push(() => {
-          this.active++;
-          resolve();
-        });
+        return;
       }
+      const take = () => {
+        signal?.removeEventListener('abort', giveUp);
+        this.active++;
+        resolve();
+      };
+      const giveUp = () => {
+        this.waiters = this.waiters.filter((w) => w !== take);
+        reject(signal?.reason ?? new Error('aborted'));
+      };
+      signal?.addEventListener('abort', giveUp, { once: true });
+      this.waiters.push(take);
     });
     let released = false;
     return () => {
@@ -86,6 +101,26 @@ export class Semaphore {
       this.active--;
       this.waiters.shift()?.();
     };
+  }
+}
+
+/** One run's subagent cap (§2.7): `subagentMaxConcurrent` children at a time at
+ *  each depth. Made per run, so one run's children never wait on another
+ *  run's. And each depth has slots of its own: a parent holds its slot while
+ *  its child runs, so if parent and child shared one pool, a full level of
+ *  parents would each wait for a slot only a finished child can free, and
+ *  never finish. */
+export class RunSlots {
+  private byDepth = new Map<number, Semaphore>();
+  constructor(private readonly limit: number) {}
+
+  acquire(depth: number, signal?: AbortSignal): Promise<() => void> {
+    let sem = this.byDepth.get(depth);
+    if (!sem) {
+      sem = new Semaphore(this.limit);
+      this.byDepth.set(depth, sem);
+    }
+    return sem.acquire(signal);
   }
 }
 
@@ -109,7 +144,7 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
         return { error: `Max subagent depth (${ctx.ports.config.subagentMaxDepth}) reached` };
       }
 
-      const release = await ctx.sem.acquire();
+      const release = await ctx.slots.acquire(depth, opts.abortSignal ?? ctx.abortSignal);
       try {
         // A nested run is a run (§2.9): same table, distinguished by depth and
         // a parent. Its id is also the agentId its messages and events carry.
@@ -161,6 +196,13 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
             ],
           );
 
+          // Stopped or cut short, the child did not finish: its partial text
+          // is not a result. The catch below records which.
+          if (outcome.aborted) throw new RunStoppedError(new Error('stopped'));
+          if (outcome.interrupted) {
+            throw new Error(`step ${outcome.steps + 1} ended without a finish`);
+          }
+
           if (outcome.parked) {
             // The child is suspended, not finished: leave its SubagentRun
             // RUNNING and hand the parent the sentinel so its segment ends
@@ -182,6 +224,7 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
           };
         } catch (err) {
           const cancelled =
+            err instanceof RunStoppedError ||
             (await ctx.ports.kv.get(`agent:state:${ctx.threadId}`)) === 'CANCELLED';
           const state = cancelled ? 'CANCELLED' : 'FAILED';
           const message = err instanceof Error ? err.message : String(err);

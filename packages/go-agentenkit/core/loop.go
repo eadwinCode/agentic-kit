@@ -187,8 +187,11 @@ func ExecuteStep(ctx context.Context, agent *RegisteredAgent, call StepCall) (*S
 			// SAW, not by whether the stream reported an error: a stop that
 			// tears the provider down mid-call does not always surface as one
 			// (§4). The finish chunk arriving is the only reliable "this
-			// completed".
-			if chunk.Type == provider.ChunkFinish {
+			// completed". A finish with no reason is goai's own, made up
+			// when the provider's stream closed without one: the call was
+			// cut short without saying so, which is not a finish either
+			// (the TS runtime reads the SDK's 'unknown' the same way).
+			if chunk.Type == provider.ChunkFinish && chunk.FinishReason != "" {
 				finished = true
 			}
 			if call.OnChunk != nil {

@@ -11,7 +11,6 @@ import type {
   SubagentsConfig,
 } from '../ports/runtime.js';
 import { execute, executeWithPolicy } from './engine.js';
-import { Semaphore } from './subagent.js';
 import { run } from './run.js';
 import { stop } from './stop.js';
 
@@ -33,7 +32,6 @@ export interface RegisteredAgent {
   };
   /** The user's generation args — spread first, platform keys last (§3.1). */
   args: Record<string, any>;
-  sem: Semaphore;
 }
 
 /** Normalize the delegation config: `false`/`undefined` = off; `true` = defaults. */
@@ -70,7 +68,6 @@ export function createStreamTextAgent(
     kind: 'stream-text',
     spec: { model, subagents, tokenBudget, costBudgetMicros, providerOptions },
     args: args as Record<string, any>,
-    sem: new Semaphore(scope().config.subagentMaxConcurrent),
   });
 }
 
@@ -84,6 +81,5 @@ export function createGenerateTextAgent(
     kind: 'generate-text',
     spec: { model, subagents, tokenBudget, costBudgetMicros, providerOptions },
     args: args as Record<string, any>,
-    sem: new Semaphore(scope().config.subagentMaxConcurrent),
   });
 }
