@@ -297,7 +297,7 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 	} else if !active {
 		return refuse("Run was stopped before dispatch")
 	}
-	if err := deps.Queue.Enqueue(ctx, ports.RunJob{
+	if err := EnqueueJob(ctx, deps, ports.RunJob{
 		ThreadID: threadID, RunID: runID, Model: model, Agent: agent.Name,
 		Kind: ports.JobDispatch, PartitionKey: input.PartitionKey,
 		EnqueuedAt: enqueuedAt.UnixMilli(), DispatchedAt: enqueuedAt.UnixMilli(),

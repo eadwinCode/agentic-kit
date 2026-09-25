@@ -53,6 +53,8 @@ export interface SubagentCtx {
   billingRunId?: string;
   providerOptions?: ProviderOptions;
   abortSignal?: AbortSignal;
+  /** True once the run lock is gone (see LoopInput.fenced). */
+  fenced?: () => boolean;
   /** The run's state, handed down unchanged (§2.10). */
   state?: AgentRunState;
 }
@@ -350,6 +352,7 @@ export async function runNestedAgent(
       tools: nestedTools(ctx, d, frames, abortSignal),
       maxSteps: ports.config.subagentMaxSteps,
       abortSignal: abortSignal ?? new AbortController().signal,
+      fenced: ctx.fenced,
       providerOptions: ctx.providerOptions,
       tokenBudget: ctx.tokenBudget,
       // Money is capped and billed at the RUN, not per child (§2.7, §4): the

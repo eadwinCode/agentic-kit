@@ -1,3 +1,4 @@
+import { DEL_IF_VALUE_SCRIPT, SET_IF_VALUE_SCRIPT } from '../src/adapters/upstash.js';
 import { describe, expect, it } from 'bun:test';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
@@ -96,12 +97,28 @@ describe('per-thread run lock (§2.8, §3.4)', () => {
         return n;
       },
       async publish() {},
+      // Acts out the two compare-and-act scripts, in node-redis's call shape.
+      async eval(script: string, a: { keys: string[]; arguments: string[] }) {
+        const [key] = a.keys;
+        const [expected, value] = a.arguments;
+        if (store.get(key) !== expected) return 0;
+        if (script === SET_IF_VALUE_SCRIPT) store.set(key, value);
+        else if (script === DEL_IF_VALUE_SCRIPT) store.delete(key);
+        return 1;
+      },
       duplicate(): never { throw new Error('not used'); },
     };
     const redisKv = new RedisKv(fakeRedis);
     expect(await redisKv.set('k', 'a', { onlyIfNotExists: true })).toBe(true);
     expect(await redisKv.set('k', 'b', { onlyIfNotExists: true })).toBe(false);
     expect(await redisKv.get('k')).toBe('a');
+    // Compare-and-act: only the holder of the value may renew or free it
+    expect(await redisKv.setIfValue('k', 'b', 'b', { exSeconds: 30 })).toBe(false);
+    expect(await redisKv.setIfValue('k', 'a', 'a', { exSeconds: 30 })).toBe(true);
+    expect(await redisKv.delIfValue('k', 'b')).toBe(false);
+    expect(await redisKv.get('k')).toBe('a');
+    expect(await redisKv.delIfValue('k', 'a')).toBe(true);
+    expect(await redisKv.get('k')).toBe(null);
   });
 });
 

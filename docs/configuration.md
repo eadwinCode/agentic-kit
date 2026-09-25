@@ -32,7 +32,7 @@ be opened should be a startup error.
 
 | Key | Default | What it does |
 | :--- | :--- | :--- |
-| `RunLockLease` | `2m` | The per-thread run lock's lease. The worker renews it every third of the lease while its segment runs, so an expired lock means a dead worker. |
+| `RunLockLease` | `2m` | The per-thread run lock's lease. The worker renews it every sixth of the lease while it holds it, so an expired lock means a dead worker. A worker whose renewals have failed for two thirds of the lease stops. A job blocked by a held lock is redriven with a growing delay and gives up only after waiting at least one lease. |
 | `RunRetryBackoff` / `RunRetryBackoffMax` | `5s` / `2m` | A failed run waits this long before its first retry, twice as long each time after, with jitter. |
 | `StepTimeout` | off | Bounds one model round trip; a step past it fails and the run takes the retry policy. |
 | `SegmentTimeout` | off | Bounds one worker segment; a segment past it settles the run `FAILED` with a reason. |
@@ -48,8 +48,8 @@ be opened should be a startup error.
 | `costBudgetMicros` | `undefined` | Default per-run money cap, in millionths of the pricer's currency. Needs a `pricer`. See [Cost and pricing](./cost-and-pricing.md). |
 | `runMaxAttempts` | `3` | Queue redrive attempts before a run finalizes `FAILED`. |
 | `stopPollMs` | `500` | How often a running worker re-reads the stop signal. Also the window in which it notices a newer run replaced it. |
-| `runRedriveDelaySeconds` | `2` | Delay before re-dispatching a job that found the run lock held by an older run. |
-| `runLockLeaseSeconds` | `1800` (30 min) | Lease on the per-thread run lock. **Must exceed your longest run segment.** Parked approvals hold no lock. |
+| `runRedriveDelaySeconds` | `2` | First delay before re-dispatching a job that found the run lock held. It doubles on each try, up to the lease. |
+| `runLockLeaseSeconds` | `1800` (30 min) | Lease on the per-thread run lock. The worker renews it every sixth of the lease while it holds it, so an expired lock means a dead worker. A job blocked by a held lock gives up only after waiting at least one lease. Parked approvals hold no lock. |
 
 ### Subagents
 

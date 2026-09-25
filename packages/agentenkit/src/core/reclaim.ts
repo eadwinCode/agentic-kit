@@ -2,6 +2,7 @@ import type { RuntimePorts } from '../ports/runtime.js';
 import type { ResumeInfo } from './types.js';
 import { currentRunId } from './keys.js';
 import { hitlDeadline, loadOpenHitls } from './hitl.js';
+import { enqueueJob } from './lease.js';
 
 // Small grace so an in-flight /respond delivery always lands first —
 // reclamation only ever sees true orphans.
@@ -44,7 +45,7 @@ export async function reclaimIfOrphaned(deps: RuntimePorts, threadId: string): P
   const requested = await deps.storage.events.listByType(threadId, 'INPUT_REQUIRED');
   const resume = (requested.at(-1)?.payload as { resume?: ResumeInfo } | null)?.resume;
 
-  await deps.queue.enqueue({
+  await enqueueJob(deps, {
     threadId,
     // Resuming a parked run REUSES its id — it is the same run continuing,
     // and the park's own expiry job must stay a duplicate of this one (§2.1).

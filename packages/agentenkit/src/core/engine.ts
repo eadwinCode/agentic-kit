@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import type { RunFinishInfo, RuntimePorts } from '../ports/runtime.js';
 import type { ExecutionState, ProviderOptions, ResumeInfo, UsageTotals } from './types.js';
 import { wireId } from './types.js';
@@ -20,13 +19,13 @@ import { runNestedAgent, spawnSubagentTool, type SubagentCtx } from './subagent.
 import { redriveKey, runIdKey } from './keys.js';
 import { withRunState, type AgentRunState } from './state.js';
 import { runLoop, type RunLedger } from './loop.js';
+import { enqueueJob, Lease, parseLockValue, runLockKey, RunLockLostError } from './lease.js';
 
 export { countTokens } from './usage.js';
 // executeStep and the loop live in ./loop.js so a nested run can share them
 // without engine ↔ subagent becoming a cycle (§2.7).
 export { executeStep, isParked, runLoop, type LoopInput, type LoopOutcome, type RunLedger, type StepResult } from './loop.js';
 
-const runLockKey = (threadId: string) => `agent:lock:${threadId}`;
 
 /** The safety cap (§2.1) must be either absent (unbounded apart from
  *  maxSteps) or a positive number — `0`/negative/NaN would silently disable
@@ -273,16 +272,20 @@ interface HitlAnswer {
  *  the SDK.
  *
  *  Concurrency: acquires the per-thread run lock (`agent:lock:{threadId}`,
- *  SET NX + lease) before any work — two workers can never run one thread,
- *  and a crashed worker's lock expires instead of blocking forever (§3.4).
- *  Returns 'lock-conflict' when the lock is held, so callers can tell a
- *  genuine no-op apart from a completed run. */
+ *  SET NX + lease) before any work, and renews it while it works — two
+ *  workers can never run one thread, and a crashed worker's lock expires
+ *  instead of blocking forever (§3.4). Returns 'lock-conflict' when the lock
+ *  is held, so callers can tell a genuine no-op apart from a completed run,
+ *  and 'lock-lost' when the lock could not be kept. */
 export interface ExecuteInput {
   threadId: string;
   model: string;
   /** This dispatch's run id (§2.1). A job without one keeps the old
    *  behavior: no staleness check, and no redrive on a lock conflict. */
   runId?: string;
+  /** The job's delivery id (see `RunJob.dispatchId`). Absent on a call that
+   *  did not come off the queue; the lock then makes one up. */
+  dispatchId?: string;
   /** Epoch ms at enqueue, for the queue-wait measurement (§2.9). */
   enqueuedAt?: number;
   /** The run's state (§2.10) — carried so a redrive keeps it. */
@@ -296,8 +299,11 @@ export interface ExecuteInput {
 
 /** 'executed'      — this worker ran the segment (or it was a legitimate no-op).
  *  'lock-conflict' — someone else holds the thread's run lock; nothing ran.
- *  'stale'         — a NEWER run owns the thread; this job must do nothing. */
-export type ExecuteOutcome = 'executed' | 'lock-conflict' | 'stale';
+ *  'stale'         — a NEWER run owns the thread; this job must do nothing.
+ *  'lock-lost'     — this worker held the lock and could not keep it; the
+ *                    segment ended early and the job should come back once
+ *                    the lock is free. Every step it finished is persisted. */
+export type ExecuteOutcome = 'executed' | 'lock-conflict' | 'stale' | 'lock-lost';
 
 export async function execute(
   deps: RuntimePorts,
@@ -313,13 +319,15 @@ export async function execute(
   const stale = async () =>
     runId !== undefined && (await deps.kv.get(runIdKey(threadId))) !== runId;
 
-  // The lock carries the run id, so a later conflict can tell a duplicate
-  // delivery of THIS run apart from an older run that is still finishing.
-  const locked = await deps.kv.set(runLockKey(threadId), runId ?? randomUUID(), {
-    onlyIfNotExists: true,
-    exSeconds: deps.config.runLockLeaseSeconds,
-  });
-  if (!locked) return 'lock-conflict'; // another worker owns this thread (§2.8)
+  // The lock names this run and this delivery of it (§3.4), so a later
+  // conflict can tell a duplicate of THIS job apart from another delivery of
+  // the same run and from an older run that is still finishing.
+  const lease = await Lease.acquire(deps, threadId, runId, input.dispatchId);
+  if (!lease) return 'lock-conflict'; // another worker owns this thread (§2.8)
+  // Renewed until released, not only while the model runs: finalize is a
+  // write too. A lease that cannot be kept ends the segment at once — and is
+  // told apart from a user stop, which ends it the same way.
+  lease.keep(() => abort.abort());
 
   // Token budget (§2.1 safety cap) — precedence: execute input → spec →
   // config. Checked BETWEEN steps: the finished step is always kept in full,
@@ -354,226 +362,242 @@ export async function execute(
   }, deps.config.stopPollMs);
 
   try {
-    // At-least-once idempotency (§2.8): a job whose run already ended — or
-    // was stopped — must be a no-op on redelivery. A MISSING thread is the
-    // same no-op: it was deleted (§3.2) and must never be resurrected.
-    // A newer run already owns this thread: this job has nothing to do, and
-    // must not touch state on the live run's behalf (§2.1).
-    if (await stale()) return 'stale';
+    try {
+      // At-least-once idempotency (§2.8): a job whose run already ended — or
+      // was stopped — must be a no-op on redelivery. A MISSING thread is the
+      // same no-op: it was deleted (§3.2) and must never be resurrected.
+      // A newer run already owns this thread: this job has nothing to do, and
+      // must not touch state on the live run's behalf (§2.1).
+      if (await stale()) return 'stale';
 
-    const durable = await deps.storage.threads.get(threadId);
-    if (
-      !durable ||
-      durable.state === 'CANCELLED' ||
-      durable.state === 'COMPLETED' ||
-      durable.state === 'FAILED'
-    ) {
-      return 'executed';
-    }
+      const durable = await deps.storage.threads.get(threadId);
+      if (
+        !durable ||
+        durable.state === 'CANCELLED' ||
+        durable.state === 'COMPLETED' ||
+        durable.state === 'FAILED'
+      ) {
+        return 'executed';
+      }
 
-    const resume: ResumeInfo = {
-      agent: agent.name,
-      model: input.model,
-      ...(runId ? { runId } : {}),
-      ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
-      ...(input.costBudgetMicros !== undefined
-        ? { costBudgetMicros: input.costBudgetMicros }
-        : {}),
-      ...(providerOptions ? { providerOptions } : {}),
-      // Carried so the resumed segment scopes its storage the same way this
-      // one does (§2.10).
-      ...(input.state ? { state: input.state } : {}),
-    };
+      const resume: ResumeInfo = {
+        agent: agent.name,
+        model: input.model,
+        ...(runId ? { runId } : {}),
+        ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
+        ...(input.costBudgetMicros !== undefined
+          ? { costBudgetMicros: input.costBudgetMicros }
+          : {}),
+        ...(providerOptions ? { providerOptions } : {}),
+        // Carried so the resumed segment scopes its storage the same way this
+        // one does (§2.10).
+        ...(input.state ? { state: input.state } : {}),
+      };
 
-    // One ledger for the whole run: a nested run's spend counts against the
-    // same safety cap the main agent is checked against (§2.7).
-    const ledger: RunLedger = { tokensUsed: 0 };
+      // One ledger for the whole run: a nested run's spend counts against the
+      // same safety cap the main agent is checked against (§2.7).
+      const ledger: RunLedger = { tokensUsed: 0 };
 
-    // How long the dispatch sat in the queue before a worker took it (§2.9).
-    if (runId && input.enqueuedAt) {
-      await deps.admin.runs
-        .patch(runId, { queuedMs: Date.now() - input.enqueuedAt })
-        .catch(() => undefined);
-    }
+      // How long the dispatch sat in the queue before a worker took it (§2.9).
+      if (runId && input.enqueuedAt) {
+        await deps.admin.runs
+          .patch(runId, { queuedMs: Date.now() - input.enqueuedAt })
+          .catch(() => undefined);
+      }
 
-    // Platform-owned toolset: HITL (§2.5) over the user's set; spawnSubagent
-    // added ONLY when the spec opts in (§2.7). rawTools keeps the real
-    // implementations — the resolved park executes the approved tool.
-    const sub = agent.spec.subagents
-      ? agent.spec.subagents === true
-        ? {}
-        : agent.spec.subagents
-      : null;
-    const subCtx: SubagentCtx | null = sub
-      ? {
+      // Platform-owned toolset: HITL (§2.5) over the user's set; spawnSubagent
+      // added ONLY when the spec opts in (§2.7). rawTools keeps the real
+      // implementations — the resolved park executes the approved tool.
+      const sub = agent.spec.subagents
+        ? agent.spec.subagents === true
+          ? {}
+          : agent.spec.subagents
+        : null;
+      const subCtx: SubagentCtx | null = sub
+        ? {
+            threadId,
+            depth: 0,
+            sem: agent.sem,
+            ports: deps,
+            sub,
+            agent,
+            ledger,
+            resume,
+            agentId: null, // spawned by the main agent
+            frames: [],
+            tokenBudget,
+            costBudgetMicros: costBudget,
+            billingRunId: runId,
+            providerOptions,
+            abortSignal: abort.signal,
+            fenced: () => lease.lost,
+            state: input.state,
+          }
+        : null;
+      const rawTools: Record<string, any> = {
+        ...(agent.args.tools ?? {}),
+        ...(subCtx ? { spawnSubagent: spawnSubagentTool(subCtx) } : {}),
+      };
+      // The main agent's own toolset: nothing is waiting on its parks (§2.7).
+      // Every tool also sees the run's state (§2.10).
+      // Every tool also sees the run's state (§2.10) and can publish its own
+      // events on the thread.
+      const tools = withRunState(
+        withPublishEvent(
+          deps,
           threadId,
-          depth: 0,
-          sem: agent.sem,
-          ports: deps,
-          sub,
-          agent,
-          ledger,
-          resume,
-          agentId: null, // spawned by the main agent
-          frames: [],
+          withHitl(deps, threadId, rawTools, { resume, agentId: null, frames: [] }),
+        ),
+        input.state ?? {},
+      );
+
+      // §2.5 resume: a WAITING thread at segment start is either the /respond
+      // continuation or a redelivery of the original job while still parked.
+      if (durable?.state === 'WAITING_FOR_INPUT') {
+        // Every approval still open, not just the latest: one parent step can
+        // park several nested runs at once (§2.7).
+        const open = await loadOpenHitls(deps, threadId);
+        if (open.length === 0) {
+          // WAITING without a pending request cannot be continued — fail into
+          // the §2.8 policy rather than corrupting the conversation.
+          throw new Error(`Thread ${threadId} is WAITING_FOR_INPUT without a pending INPUT_REQUIRED`);
+        }
+        const resumed = await resumePendingHitl(
+          deps, threadId, open, rawTools, subCtx, abort.signal, input.state ?? {},
+        );
+        if (!resumed) return 'executed'; // still parked — nothing to do yet
+      }
+
+      // Durable compaction pass — history always fits the model budget (§2.6);
+      // the budget uses the resolved model's contextWindow (§3.3)
+      const history = await compactContext(deps, threadId, input.model);
+      const model = deps.resolveModel(input.model);
+
+      // Prompt caching (§2.6): stamp the stable prefix once — appended step
+      // messages extend the prompt without invalidating the breakpoints.
+      let messages = repairDanglingToolCalls(promptMessages(history) as any[]);
+      if (deps.config.promptCaching) {
+        messages = markPromptCaching(messages);
+      }
+
+      const userArgs = agent.args as Record<string, any>;
+
+      const loop = await runLoop(
+        deps,
+        agent,
+        threadId,
+        {
+          agentId: null, // the main agent's stream (§2.7)
+          runId,
+          kind: agent.kind,
+          model: model.instance(),
+          messages,
+          tools,
+          maxSteps: deps.config.maxSteps,
+          abortSignal: abort.signal,
+          providerOptions,
           tokenBudget,
           costBudgetMicros: costBudget,
           billingRunId: runId,
-          providerOptions,
-          abortSignal: abort.signal,
-          state: input.state,
-        }
-      : null;
-    const rawTools: Record<string, any> = {
-      ...(agent.args.tools ?? {}),
-      ...(subCtx ? { spawnSubagent: spawnSubagentTool(subCtx) } : {}),
-    };
-    // The main agent's own toolset: nothing is waiting on its parks (§2.7).
-    // Every tool also sees the run's state (§2.10).
-    // Every tool also sees the run's state (§2.10) and can publish its own
-    // events on the thread.
-    const tools = withRunState(
-      withPublishEvent(
-        deps,
-        threadId,
-        withHitl(deps, threadId, rawTools, { resume, agentId: null, frames: [] }),
-      ),
-      input.state ?? {},
-    );
-
-    // §2.5 resume: a WAITING thread at segment start is either the /respond
-    // continuation or a redelivery of the original job while still parked.
-    if (durable?.state === 'WAITING_FOR_INPUT') {
-      // Every approval still open, not just the latest: one parent step can
-      // park several nested runs at once (§2.7).
-      const open = await loadOpenHitls(deps, threadId);
-      if (open.length === 0) {
-        // WAITING without a pending request cannot be continued — fail into
-        // the §2.8 policy rather than corrupting the conversation.
-        throw new Error(`Thread ${threadId} is WAITING_FOR_INPUT without a pending INPUT_REQUIRED`);
-      }
-      const resumed = await resumePendingHitl(
-        deps, threadId, open, rawTools, subCtx, abort.signal, input.state ?? {},
-      );
-      if (!resumed) return 'executed'; // still parked — nothing to do yet
-    }
-
-    // Durable compaction pass — history always fits the model budget (§2.6);
-    // the budget uses the resolved model's contextWindow (§3.3)
-    const history = await compactContext(deps, threadId, input.model);
-    const model = deps.resolveModel(input.model);
-
-    // Prompt caching (§2.6): stamp the stable prefix once — appended step
-    // messages extend the prompt without invalidating the breakpoints.
-    let messages = repairDanglingToolCalls(promptMessages(history) as any[]);
-    if (deps.config.promptCaching) {
-      messages = markPromptCaching(messages);
-    }
-
-    const userArgs = agent.args as Record<string, any>;
-
-    const loop = await runLoop(
-      deps,
-      agent,
-      threadId,
-      {
-        agentId: null, // the main agent's stream (§2.7)
-        runId,
-        kind: agent.kind,
-        model: model.instance(),
-        messages,
-        tools,
-        maxSteps: deps.config.maxSteps,
-        abortSignal: abort.signal,
-        providerOptions,
-        tokenBudget,
-        costBudgetMicros: costBudget,
-        billingRunId: runId,
-        modelKey: input.model,
-        modelId: wireId(model, input.model),
-        agentName: agent.name,
-        cacheSystemPrompt: deps.config.promptCaching,
-        onChunk: async (chunk) => {
-          // One canonical path for every client: durable log + live Pub/Sub (§2.1, §2.2)
-          await publish(deps, threadId, 'CHUNK', chunk);
-          userArgs.onChunk?.({ chunk }); // user callback still fires
+          modelKey: input.model,
+          modelId: wireId(model, input.model),
+          agentName: agent.name,
+          cacheSystemPrompt: deps.config.promptCaching,
+          fenced: () => lease.lost,
+          onChunk: async (chunk) => {
+            // One canonical path for every client: durable log + live Pub/Sub (§2.1, §2.2)
+            await publish(deps, threadId, 'CHUNK', chunk);
+            userArgs.onChunk?.({ chunk }); // user callback still fires
+          },
         },
-      },
-      ledger,
-    );
+        ledger,
+      );
 
-    const { attribution, parked } = loop;
-    const tokensUsed = ledger.tokensUsed;
-    const lastText = loop.text;
-    const lastFinishReason = loop.finishReason;
+      // A lost lock aborts the run the way a stop does, but it is not a stop:
+      // another worker may own the thread now, so nothing below may write.
+      if (lease.lost) return 'lock-lost';
 
-    if (parked) {
-      // The segment ends holding the park. Every call it made was already
-      // recorded and priced as it happened (§4), so there is nothing left to
-      // bill here. NO state flip: WAITING_FOR_INPUT (or CANCELLED if the user
-      // stopped meanwhile) stands.
-      if (runId) {
+      const { attribution, parked } = loop;
+      const tokensUsed = ledger.tokensUsed;
+      const lastText = loop.text;
+      const lastFinishReason = loop.finishReason;
+
+      if (parked) {
+        // The segment ends holding the park. Every call it made was already
+        // recorded and priced as it happened (§4), so there is nothing left to
+        // bill here. NO state flip: WAITING_FOR_INPUT (or CANCELLED if the user
+        // stopped meanwhile) stands.
+        if (runId) {
+          try {
+            const prior = await deps.admin.runs.get(runId);
+            if (prior) await deps.admin.runs.patch(runId, {
+              steps: prior.steps + loop.steps,
+              inputTokens: prior.inputTokens + attribution.inputTokens,
+              cachedInputTokens: prior.cachedInputTokens + attribution.cachedInputTokens,
+              outputTokens: prior.outputTokens + attribution.outputTokens,
+              totalTokens: prior.totalTokens + attribution.totalTokens,
+            });
+          } catch { /* Operational history must not fail a parked run. */ }
+        }
+        return 'executed';
+      }
+
+      const stopReason = abort.signal.aborted
+        ? 'cancelled'
+        : loop.costExhausted
+          ? 'cost_budget' // the money cap (§4)
+          : tokenBudget && tokensUsed >= tokenBudget
+            ? 'token_budget'
+            : lastFinishReason === 'tool-calls'
+              ? 'max_steps' // step ceiling hit (§2.1)
+              : 'completed';
+
+      const state = abort.signal.aborted ? 'CANCELLED' : 'COMPLETED';
+      await finalize(deps, agent, threadId, {
+        state,
+        stopReason,
+        tokensUsed,
+        attribution,
+        oneShotText: agent.kind === 'generate-text' ? lastText : undefined,
+        runId,
+        steps: loop.steps,
+      });
+
+      if (typeof userArgs.onFinish === 'function') {
+        // The whole run's bill, read back from the rows the loop wrote (§4):
+        // every segment and every nested run, priced and grouped into lines, so
+        // a settle hook charges in one pass without keeping its own tally.
+        // The run is already finalized: a callback that throws is the
+        // caller's bug to see in the log, not a reason to fail a finished run.
         try {
-          const prior = await deps.admin.runs.get(runId);
-          if (prior) await deps.admin.runs.patch(runId, {
-            steps: prior.steps + loop.steps,
-            inputTokens: prior.inputTokens + attribution.inputTokens,
-            cachedInputTokens: prior.cachedInputTokens + attribution.cachedInputTokens,
-            outputTokens: prior.outputTokens + attribution.outputTokens,
-            totalTokens: prior.totalTokens + attribution.totalTokens,
-          });
-        } catch { /* Operational history must not fail a parked run. */ }
+          await userArgs.onFinish({
+            threadId,
+            runId,
+            state,
+            stopReason,
+            tokensUsed,
+            attribution,
+            steps: loop.steps,
+            usage: await runBill(deps, threadId, runId),
+          } satisfies RunFinishInfo);
+        } catch (err) {
+          (deps.log ?? console).error('onFinish threw', { runId, err: String(err) });
+        }
       }
+
       return 'executed';
+    } catch (err) {
+      // Whatever failed after the lease was lost is that loss showing through
+      // (an aborted call, a fenced write): the job comes back, it is not a
+      // failed attempt.
+      if (lease.lost || err instanceof RunLockLostError) return 'lock-lost';
+      throw err;
     }
-
-    const stopReason = abort.signal.aborted
-      ? 'cancelled'
-      : loop.costExhausted
-        ? 'cost_budget' // the money cap (§4)
-        : tokenBudget && tokensUsed >= tokenBudget
-          ? 'token_budget'
-          : lastFinishReason === 'tool-calls'
-            ? 'max_steps' // step ceiling hit (§2.1)
-            : 'completed';
-
-    const state = abort.signal.aborted ? 'CANCELLED' : 'COMPLETED';
-    await finalize(deps, agent, threadId, {
-      state,
-      stopReason,
-      tokensUsed,
-      attribution,
-      oneShotText: agent.kind === 'generate-text' ? lastText : undefined,
-      runId,
-      steps: loop.steps,
-    });
-
-    if (typeof userArgs.onFinish === 'function') {
-      // The whole run's bill, read back from the rows the loop wrote (§4):
-      // every segment and every nested run, priced and grouped into lines, so
-      // a settle hook charges in one pass without keeping its own tally.
-      // The run is already finalized: a callback that throws is the
-      // caller's bug to see in the log, not a reason to fail a finished run.
-      try {
-        await userArgs.onFinish({
-          threadId,
-          runId,
-          state,
-          stopReason,
-          tokensUsed,
-          attribution,
-          steps: loop.steps,
-          usage: await runBill(deps, threadId, runId),
-        } satisfies RunFinishInfo);
-      } catch (err) {
-        (deps.log ?? console).error('onFinish threw', { runId, err: String(err) });
-      }
-    }
-
-    return 'executed';
   } finally {
     clearInterval(controlPoll);
-    await deps.kv.del(runLockKey(threadId)); // release — success, failure, or stop
+    // Release — success, failure, or stop — only while the lock is still this
+    // worker's. One another worker took after this one's lapsed is theirs.
+    await lease.release();
   }
 }
 
@@ -641,15 +665,22 @@ export async function finalize(
   });
 }
 
-/** A lock conflict has two very different causes (§2.8), and only one of them
- *  is a no-op:
+/** A lock conflict (§2.8). The lock names the run and the delivery that hold
+ *  it (§3.4), so a conflict can say which of these it is:
  *
- *  - the lock carries THIS run's id → an at-least-once duplicate of a job that
- *    is already executing. Drop it.
- *  - the lock belongs to an OLDER run that has not finished tearing down →
- *    this job never ran. Dropping it strands the message the user just sent,
- *    so come back once the lock clears. Bounded by maxAttempts, then FAILED,
- *    so a wedged lock reports itself instead of spinning forever. */
+ *  - the same job, delivered twice by the queue (same run, same dispatch): a
+ *    duplicate of work already running. Drop it.
+ *  - another delivery of the same run — a retry, an approval's answer or its
+ *    expiry (§2.5) — arriving while the current holder winds down. It has
+ *    work to do once the lock clears, so it comes back. Dropping it would
+ *    leave the thread waiting (or RUNNING) with nobody working on it.
+ *  - an OLDER run that has not finished tearing down: this job never ran.
+ *    Dropping it strands the message the user just sent, so it comes back.
+ *
+ *  Because the lock is renewed while its holder runs, a held lock means a
+ *  live worker, and waiting for it is right. The job comes back with a
+ *  growing delay until it has waited at least one lease and used its
+ *  attempts; only then is the lock taken to be wedged and the run FAILED. */
 async function redriveOnLockConflict(
   deps: RuntimePorts,
   agent: RegisteredAgent,
@@ -657,12 +688,28 @@ async function redriveOnLockConflict(
   maxAttempts: number,
 ): Promise<void> {
   if (!input.runId) return; // legacy dispatch, no identity — old drop behavior
-  if ((await deps.kv.get(runLockKey(input.threadId))) === input.runId) return; // own duplicate
+  // A thread that has ended has nothing left for this job, whoever holds the
+  // lock: redriving it would only fail the ended run again.
+  const durable = await deps.storage.threads.get(input.threadId);
+  const state = durable?.state;
+  if (!durable || state === 'CANCELLED' || state === 'COMPLETED' || state === 'FAILED') return;
+  const holder = parseLockValue(await deps.kv.get(runLockKey(input.threadId)));
+  if (holder.runId === input.runId) {
+    if (holder.dispatchId !== null && holder.dispatchId === input.dispatchId) return; // the same job, twice
+    if (state !== 'WAITING_FOR_INPUT' && (holder.dispatchId === null || !input.dispatchId)) {
+      // A lock or a job from before dispatch ids: the two deliveries cannot be
+      // told apart, so the old rule stands — a duplicate of a running segment.
+      return;
+    }
+    // Otherwise: another delivery of this run, waiting on the current holder.
+  }
   if ((await deps.kv.get(runIdKey(input.threadId))) !== input.runId) return; // already replaced
 
   const tries = await deps.kv.incr(redriveKey(input.threadId));
-  if (tries <= maxAttempts) {
-    return deps.queue.enqueue(
+  const { delaySeconds, waitedSeconds } = redriveDelay(deps, tries);
+  if (tries <= maxAttempts || waitedSeconds < deps.config.runLockLeaseSeconds) {
+    return enqueueJob(
+      deps,
       {
         threadId: input.threadId,
         runId: input.runId,
@@ -676,12 +723,26 @@ async function redriveOnLockConflict(
         providerOptions: input.providerOptions,
         state: input.state,
       },
-      { delaySeconds: deps.config.runRedriveDelaySeconds },
+      { delaySeconds },
     );
   }
 
   await deps.kv.del(redriveKey(input.threadId));
   await failRun(deps, input.threadId, input.runId, 'the run lock never cleared');
+}
+
+/** How long the given try waits (`runRedriveDelaySeconds`, doubled on each
+ *  try, capped at the lease), and how long the tries before it waited in all. */
+function redriveDelay(deps: RuntimePorts, tries: number) {
+  const lease = deps.config.runLockLeaseSeconds;
+  // A zero base would never grow, and never give up.
+  let delaySeconds = deps.config.runRedriveDelaySeconds || 1;
+  let waitedSeconds = 0;
+  for (let i = 1; i < tries; i++) {
+    waitedSeconds += delaySeconds;
+    delaySeconds = Math.min(delaySeconds * 2, lease);
+  }
+  return { delaySeconds, waitedSeconds };
 }
 
 /** §2.8 failure policy: transient errors redrive through the queue; exhausted
@@ -718,7 +779,7 @@ export async function executeWithPolicy(
 
     const attempts = await deps.kv.incr(`agent:attempts:${input.threadId}`);
     if (attempts < maxAttempts) {
-      return deps.queue.enqueue({
+      return enqueueJob(deps, {
         threadId: input.threadId,
         // A retry is the SAME run trying again (§2.1). Dropping the id here
         // left the retried job unable to notice it had been replaced, and

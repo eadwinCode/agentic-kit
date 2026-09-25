@@ -15,6 +15,7 @@ import type { NewUsage } from './types.js';
 import { drainOrThrow } from './stream.js';
 import { publish, publishNotice } from './publish.js';
 import { HITL_PARKED } from './hitl.js';
+import { RunLockLostError } from './lease.js';
 
 /** True for the sentinel a parked `requiresConfirmation` tool returns (§2.5).
  *  It is never a real tool result and is never persisted. */
@@ -200,6 +201,9 @@ export interface LoopInput {
   tools: Record<string, any>;
   maxSteps: number;
   abortSignal: AbortSignal;
+  /** True once the run lock is gone (§3.4): another worker may own the
+   *  thread, so this loop must not write another step to it. */
+  fenced?: () => boolean;
   providerOptions?: ProviderOptions;
   /** Cumulative cap for the whole run, checked against the shared ledger. */
   tokenBudget?: number;
@@ -321,6 +325,30 @@ export async function runLoop(
       throw err; // real failure → §2.8 redrive policy
     }
 
+    // One priced usage row per model call (§4), recorded below once the step
+    // is committed.
+    const stepUsage: NewUsage = {
+      runId: input.billingRunId,
+      agentId: input.agentId,
+      agentName: input.agentName,
+      kind: 'step',
+      step: stepsRun + 1,
+      model: input.modelKey,
+      modelId: input.modelId,
+      outcome: 'finished',
+      providerMetadata: providerMeta(step.providerMetadata, step.response),
+      ...fillTokens(step.usage as any, step.providerMetadata),
+    };
+
+    // The step is done, and its messages are the first thing it writes. A
+    // worker that lost the lock meanwhile must not write them: the next
+    // holder may already be writing its own. The call itself did happen and
+    // the provider billed it, so its usage is still recorded.
+    if (input.fenced?.()) {
+      await recordCall(deps, threadId, stepUsage);
+      throw new RunLockLostError();
+    }
+
     // Per-step durability (§5.6): append this step's turns BEFORE the next
     // step. A parked HITL tool result (the sentinel) is NOT a real result —
     // it is skipped here; the resumed segment appends the user's verdict.
@@ -351,18 +379,7 @@ export async function runLoop(
     // One priced usage row per model call (§4), then the same counters
     // accumulated across the segment's steps and into the run-wide ledger the
     // safety caps are checked against (§2.7).
-    const priced = await recordCall(deps, threadId, {
-      runId: input.billingRunId,
-      agentId: input.agentId,
-      agentName: input.agentName,
-      kind: 'step',
-      step: stepsRun + 1,
-      model: input.modelKey,
-      modelId: input.modelId,
-      outcome: 'finished',
-      providerMetadata: providerMeta(step.providerMetadata, step.response),
-      ...fillTokens(step.usage as any, step.providerMetadata),
-    });
+    const priced = await recordCall(deps, threadId, stepUsage);
     lastInput = priced.inputTokens;
     addAttribution(attribution, priced);
     tokensUsed += priced.totalTokens;

@@ -94,7 +94,9 @@ func (k *Kv) Get(ctx context.Context, key string) (string, bool, error) {
 func (k *Kv) Set(ctx context.Context, key, value string, opts ports.SetOptions) (bool, error) {
 	cmd := []any{"SET", key, value}
 	if opts.Expiry > 0 {
-		cmd = append(cmd, "EX", int64(opts.Expiry.Seconds()))
+		// PX, not EX: seconds would cut 1.9s to 1s, and anything under a
+		// second to EX 0, which Redis refuses.
+		cmd = append(cmd, "PX", max(opts.Expiry.Milliseconds(), 1))
 	}
 	if opts.OnlyIfNotExists {
 		cmd = append(cmd, "NX")

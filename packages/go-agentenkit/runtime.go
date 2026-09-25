@@ -405,7 +405,7 @@ func (w *WorkerAPI) HandleJob(ctx context.Context, job RunJob) (HandleJobResult,
 		ThreadID: job.ThreadID,
 		// The dispatch's identity (§2.1): without it the worker cannot tell it
 		// has been replaced by a newer run, and a blocked job is dropped.
-		RunID: job.RunID,
+		RunID: job.RunID, DispatchID: job.DispatchID,
 		// Carries the queue wait through to the run record (§2.9), and the
 		// run's place in line onto any retry (§2.8).
 		EnqueuedAt: job.EnqueuedAt, DispatchedAt: job.DispatchedAt,

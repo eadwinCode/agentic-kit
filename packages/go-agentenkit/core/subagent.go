@@ -48,6 +48,8 @@ type SubagentCtx struct {
 	ProviderOptions ports.ProviderOptions
 	// Aborted reports a user stop (§2.1).
 	Aborted func() bool
+	// Fenced reports that the run lock is gone (see LoopInput.Fenced).
+	Fenced func() bool
 	// State is the run's state, handed down unchanged (§2.10).
 	State ports.AgentRunState
 }
@@ -409,7 +411,7 @@ func RunNestedAgent(genCtx context.Context, sctx *SubagentCtx, d ports.NestedDes
 		Messages: messages,
 		Tools:    nestedTools(sctx, d, frames),
 		MaxSteps: maxSteps,
-		GenCtx:   genCtx, Aborted: sctx.Aborted,
+		GenCtx:   genCtx, Aborted: sctx.Aborted, Fenced: sctx.Fenced,
 		ProviderOptions: sctx.ProviderOptions,
 		TokenBudget:     sctx.TokenBudget,
 		// Money is capped and billed at the RUN, not per child (§2.7, §4):

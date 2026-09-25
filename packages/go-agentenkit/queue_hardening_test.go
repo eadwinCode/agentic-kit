@@ -219,7 +219,8 @@ func TestLock_IsRenewedWhileTheSegmentRuns(t *testing.T) {
 		_, _ = h.rt.Worker.HandleJob(h.ctx, job)
 	}()
 	time.Sleep(1200 * time.Millisecond) // past the lease: only a renewal keeps it
-	mustEqual(t, h.kvGet(agentenkit.RunLockKey(ran.ThreadID)), ran.RunID, "the lock is still this worker's")
+	holder, _ := agentenkit.ParseLockValue(h.kvGet(agentenkit.RunLockKey(ran.ThreadID)))
+	mustEqual(t, holder, ran.RunID, "the lock is still this worker's")
 	<-done
 	mustEqual(t, h.kvGet(agentenkit.RunLockKey(ran.ThreadID)), "", "released at the end")
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "completed")

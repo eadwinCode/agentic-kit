@@ -173,7 +173,7 @@ func reclaimLost(ctx context.Context, deps ports.RuntimePorts, thread *ports.Thr
 }
 
 func enqueueReclaim(ctx context.Context, deps ports.RuntimePorts, job ports.RunJob) (bool, error) {
-	err := deps.Queue.Enqueue(ctx, job, &ports.EnqueueOptions{Key: reclaimJobKey(job.RunID), Priority: ports.PriorityLow})
+	err := EnqueueJob(ctx, deps, job, &ports.EnqueueOptions{Key: reclaimJobKey(job.RunID), Priority: ports.PriorityLow})
 	if errors.Is(err, ports.ErrDuplicateJob) {
 		return false, nil // someone else got there first
 	}

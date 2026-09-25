@@ -432,6 +432,9 @@ type ExecuteInput struct {
 	// RunID is this dispatch's run id (§2.1). A job without one keeps the
 	// old behavior: no staleness check, and no redrive on a lock conflict.
 	RunID string
+	// DispatchID is the job's delivery id (see ports.RunJob). Empty means a
+	// call that did not come off the queue; the lock then makes one up.
+	DispatchID string
 	// EnqueuedAt is epoch ms at enqueue, for the queue-wait measurement (§2.9).
 	EnqueuedAt int64
 	// DispatchedAt is epoch ms of the run's first dispatch (§2.8), carried
@@ -452,8 +455,19 @@ type ExecuteInput struct {
 	MaxSteps int
 }
 
+// EnqueueJob is the one way the platform puts a job on the queue: it stamps
+// the job with a fresh DispatchID, so every enqueue is a delivery of its own
+// and only the queue's own redelivery repeats one (§3.4).
+func EnqueueJob(ctx context.Context, deps ports.RuntimePorts, job ports.RunJob, opts *ports.EnqueueOptions) error {
+	if job.DispatchID == "" {
+		job.DispatchID = NewID()
+	}
+	return deps.Queue.Enqueue(ctx, job, opts)
+}
+
 // job rebuilds the dispatch ticket for a job that goes back on the queue: a
-// retry, a redrive. Same run, same caps, same place in line.
+// retry, a redrive. Same run, same caps, same place in line; a new
+// delivery, so no DispatchID (EnqueueJob stamps a fresh one).
 func (input ExecuteInput) job(agent string, kind ports.JobKind) ports.RunJob {
 	return ports.RunJob{
 		ThreadID: input.ThreadID, RunID: input.RunID, Model: input.Model, Agent: agent,
@@ -518,25 +532,21 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		return current != runID, err
 	}
 
-	// The lock carries the run id, so a later conflict can tell a duplicate
-	// delivery of THIS run apart from an older run that is still finishing.
-	lockValue := runID
-	if lockValue == "" {
-		lockValue = NewID()
-	}
-	locked, err := deps.Kv.Set(ctx, RunLockKey(threadID), lockValue, ports.SetOptions{
-		OnlyIfNotExists: true, Expiry: deps.Config.RunLockLease,
-	})
+	// The lock names this run and this delivery of it (§3.4), so a later
+	// conflict can tell a duplicate of THIS job apart from another delivery
+	// of the same run and from an older run that is still finishing.
+	lease, err := AcquireRunLock(ctx, deps, threadID, runID, input.DispatchID)
 	if err != nil {
 		return "", err
 	}
-	if !locked {
+	if lease == nil {
 		return OutcomeLockConflict, nil // another worker owns this thread (§2.8)
 	}
 	// Release on success, failure, or stop: only while the lock is still
 	// this worker's. A lock another worker took after this one lapsed is
-	// theirs to free (§3.4).
-	defer func() { _, _ = deps.Kv.DelIfValue(context.WithoutCancel(ctx), RunLockKey(threadID), lockValue) }()
+	// theirs to free (§3.4). Registered first, so it runs last: the lease
+	// is held through the settle and the finalize below.
+	defer lease.Release()
 
 	// Token budget (§2.1 safety cap): execute input → spec → config. Checked
 	// BETWEEN steps: the finished step is always kept in full.
@@ -604,43 +614,16 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			}
 		}
 	}()
-	// The lock is renewed every third of its lease while the segment runs,
-	// the way a queue renews a job lease, so an expired lock means a dead
-	// worker and nothing else. A renewal that finds the key gone or holding
-	// another value, or that fails three times running, ends the segment.
-	renewDone := make(chan struct{})
-	go func() {
-		defer close(renewDone)
-		ticker := time.NewTicker(deps.Config.RunLockLease / 3)
-		defer ticker.Stop()
-		failures := 0
-		for {
-			select {
-			case <-genCtx.Done():
-				return
-			case <-ticker.C:
-				ok, err := deps.Kv.SetIfValue(ctx, RunLockKey(threadID), lockValue, lockValue, deps.Config.RunLockLease)
-				if err != nil {
-					failures++
-					log.Warn("run lock renewal failed", "err", err, "consecutive", failures)
-					if failures < 3 {
-						continue
-					}
-				} else if ok {
-					failures = 0
-					continue
-				}
-				log.Error("run lock lost; ending the segment", "err", err)
-				lockLost.Store(true)
-				cancel()
-				return
-			}
-		}
-	}()
+	// The lease is renewed until it is released, not only while the model
+	// runs: the settle and the finalize after the loop are writes too. A
+	// lease that cannot be kept ends the segment (§3.4).
+	lease.Keep(func() {
+		lockLost.Store(true)
+		cancel()
+	})
 	defer func() {
 		cancel()
 		<-pollDone
-		<-renewDone
 	}()
 
 	// A newer run already owns this thread: this job has nothing to do, and
@@ -774,7 +757,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			IOCtx: ctx, ThreadID: threadID, Depth: 0, Sem: agent.Sem, Ports: deps,
 			Sub: *agent.Spec.Subagents, Agent: agent, Ledger: ledger, Resume: resume,
 			TokenBudget: tokenBudget, CostBudgetMicros: costBudget, BillingRunID: runID,
-			ProviderOptions: providerOptions, Aborted: aborted, State: input.State,
+			ProviderOptions: providerOptions, Aborted: aborted, Fenced: lease.Lost, State: input.State,
 		}
 	}
 	rawTools := slices.Clone(agent.Args.Tools)
@@ -826,7 +809,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	loop, err := RunLoop(ctx, deps, agent, threadID, LoopInput{
 		AgentID: "", RunID: runID, Kind: agent.Kind, Model: model.Instance(),
 		Messages: messages, Tools: tools, MaxSteps: maxSteps,
-		GenCtx: genCtx, Aborted: aborted,
+		GenCtx: genCtx, Aborted: aborted, Fenced: lease.Lost,
 		ProviderOptions: providerOptions, TokenBudget: tokenBudget,
 		SystemFn: agent.Args.SystemFn, PrepareStep: agent.Args.PrepareStep, State: input.State,
 		CostBudgetMicros: costBudget, BillingRunID: runID,
@@ -1015,39 +998,50 @@ func Finalize(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAge
 	return err
 }
 
-// redriveOnLockConflict: a lock conflict has two very different causes
-// (§2.8), and only one of them is a no-op:
+// redriveOnLockConflict: the lock names the run and the delivery that hold
+// it (§3.4), so a conflict can say which of these it is:
 //
-//   - the lock carries THIS run's id → an at-least-once duplicate of a job
-//     that is already executing. Drop it, and say so.
-//   - the lock belongs to an OLDER run that has not finished tearing down →
-//     this job never ran. Dropping it strands the message the user just sent,
-//     so come back once the lock clears. Bounded by maxAttempts, then FAILED.
+//   - the same job, delivered twice by the queue (same run, same dispatch):
+//     a duplicate of work already running. Drop it, and say so.
+//   - another delivery of the same run: a retry, an approval's answer or its
+//     expiry (§2.5), arriving while the current holder winds down. It has
+//     work to do once the lock clears, so it comes back.
+//   - an OLDER run that has not finished tearing down: this job never ran.
+//     Dropping it strands the message the user just sent, so it comes back.
 //
-// Because the lock is renewed while its worker runs (§3.4), a held lock
-// means a live worker. One case is neither: the thread already ended under
-// the held lock and its settle never ran. That job is the last chance to
-// settle, so it comes back once the lock has surely cleared.
+// Because the lock is renewed while its holder runs, a held lock means a
+// live worker, and waiting for it is always right. The job comes back with
+// a growing delay until it has waited at least one lease and used its
+// attempts; only then is the lock taken to be wedged and the run FAILED.
+//
+// One case is none of these: the thread already ended under the held lock
+// and its settle never ran. That job is the last chance to settle, so it
+// comes back once the lock has surely cleared.
 func redriveOnLockConflict(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, input ExecuteInput, maxAttempts int) error {
 	if input.RunID == "" {
 		return nil // legacy dispatch, no identity: old drop behavior
 	}
 	log := Logger(deps).With("thread", input.ThreadID, "run", input.RunID, "kind", string(input.Kind))
 	scope := CounterScope(input.ThreadID, input.RunID)
-	if holder, _, err := deps.Kv.Get(ctx, RunLockKey(input.ThreadID)); err != nil {
+	holder, held, err := deps.Kv.Get(ctx, RunLockKey(input.ThreadID))
+	if err != nil {
 		return err
-	} else if holder == input.RunID {
-		// The lock is held by THIS run. While its segment is running that is
-		// a duplicate delivery, and a no-op. But a park hands the same run id
-		// to two later deliveries, the approval's answer and its expiry
-		// (§2.5), and either can arrive while the parking segment is still
-		// winding down and holding the lock. Dropping that one would leave
-		// the thread waiting forever: nobody re-sends an expiry. The thread's
-		// durable state tells the two cases apart, because ParkForApproval
-		// writes WAITING_FOR_INPUT before the segment ends.
-		durable, err := deps.Storage.Threads.Get(ctx, input.ThreadID)
-		if err != nil {
-			return err
+	}
+	durable, err := deps.Storage.Threads.Get(ctx, input.ThreadID)
+	if err != nil {
+		return err
+	}
+	holderRun, holderDispatch := ParseLockValue(holder)
+	if held && holderRun != input.RunID && durable != nil && isTerminal(durable.State) {
+		// The thread has ended: this job has nothing left to do, whoever
+		// holds the lock. Redriving it would only fail the ended run again.
+		log.Info("delivery dropped: the thread has already ended")
+		return nil
+	}
+	if held && holderRun == input.RunID {
+		if holderDispatch != "" && holderDispatch == input.DispatchID {
+			log.Info("duplicate delivery dropped: this job is already running")
+			return nil
 		}
 		switch {
 		case durable == nil || durable.State == ports.StateWaitingForInput:
@@ -1056,7 +1050,7 @@ func redriveOnLockConflict(ctx context.Context, deps ports.RuntimePorts, agent *
 			rec, err := deps.Admin.Runs().Get(ctx, input.RunID)
 			if err == nil && rec != nil && rec.SettledAt == nil {
 				log.Info("run ended under a held lock and is not settled; settle retried once the lock clears")
-				err := deps.Queue.Enqueue(ctx, input.job(agent.Name, ports.JobRedrive),
+				err := EnqueueJob(ctx, deps, input.job(agent.Name, ports.JobRedrive),
 					&ports.EnqueueOptions{Delay: deps.Config.RunLockLease, Key: "settle:" + input.RunID, Priority: ports.PriorityLow})
 				if errors.Is(err, ports.ErrDuplicateJob) {
 					return nil
@@ -1064,9 +1058,14 @@ func redriveOnLockConflict(ctx context.Context, deps ports.RuntimePorts, agent *
 				return err
 			}
 			return nil
-		default:
+		case holderDispatch == "" || input.DispatchID == "":
+			// A lock or a job from before dispatch ids: the two deliveries
+			// cannot be told apart, so the old rule stands.
 			log.Info("duplicate delivery dropped: this run already holds the lock")
-			return nil // own duplicate
+			return nil
+		default:
+			// Another delivery of this run, while it runs: a retry its own
+			// holder queued before letting go. Come back once it has.
 		}
 	}
 	if current, _, err := deps.Kv.Get(ctx, RunIDKey(input.ThreadID)); err != nil {
@@ -1079,14 +1078,30 @@ func redriveOnLockConflict(ctx context.Context, deps ports.RuntimePorts, agent *
 	if err != nil {
 		return err
 	}
-	if tries <= int64(maxAttempts) {
-		log.Info("run lock held by an older run; redriven", "try", tries, "in", deps.Config.RunRedriveDelay)
-		return deps.Queue.Enqueue(ctx, input.job(agent.Name, ports.JobRedrive), &ports.EnqueueOptions{Delay: deps.Config.RunRedriveDelay})
+	delay, waited := redriveDelay(deps.Config, tries)
+	if tries <= int64(maxAttempts) || waited < deps.Config.RunLockLease {
+		log.Info("run lock held; redriven", "try", tries, "in", delay)
+		return EnqueueJob(ctx, deps, input.job(agent.Name, ports.JobRedrive), &ports.EnqueueOptions{Delay: delay})
 	}
 	if err := deps.Kv.Del(ctx, RedriveKey(scope)); err != nil {
 		return err
 	}
 	return failRun(ctx, deps, agent, input.ThreadID, input.RunID, "the run lock never cleared")
+}
+
+// redriveDelay is how long the given try waits (RunRedriveDelay, doubled on
+// each try, capped at the lease), and how long the tries before it waited in
+// all.
+func redriveDelay(cfg ports.AgentConfig, tries int64) (delay, waited time.Duration) {
+	delay = cfg.RunRedriveDelay
+	if delay <= 0 {
+		delay = time.Second // a zero base would never grow, and never give up
+	}
+	for i := int64(1); i < tries; i++ {
+		waited += delay
+		delay = min(delay*2, cfg.RunLockLease)
+	}
+	return delay, waited
 }
 
 // ExecuteFunc is the signature of Execute, an injection seam for tests.
@@ -1184,7 +1199,7 @@ func requeue(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			return err
 		}
 	}
-	return deps.Queue.Enqueue(ctx, input.job(agent.Name, ports.JobRetry), &ports.EnqueueOptions{Delay: delay})
+	return EnqueueJob(ctx, deps, input.job(agent.Name, ports.JobRetry), &ports.EnqueueOptions{Delay: delay})
 }
 
 // markQueued moves a RUNNING thread back to QUEUED for a retry, on every
@@ -1267,11 +1282,12 @@ func FailLostRun(ctx context.Context, deps ports.RuntimePorts, agent *Registered
 	if err != nil || thread == nil || !IsActive(thread.State) {
 		return false, err
 	}
-	locked, err := deps.Kv.Set(ctx, RunLockKey(threadID), runID, ports.SetOptions{OnlyIfNotExists: true, Expiry: deps.Config.RunLockLease})
-	if err != nil || !locked {
+	lease, err := AcquireRunLock(ctx, deps, threadID, runID, "")
+	if err != nil || lease == nil {
 		return false, err // a worker still holds it; the run is not lost
 	}
-	defer func() { _, _ = deps.Kv.DelIfValue(context.WithoutCancel(ctx), RunLockKey(threadID), runID) }()
+	lease.Keep(nil) // the settle hook in failRun can be slow
+	defer lease.Release()
 	if thread.State == ports.StateWaitingForInput {
 		_ = closeOpenParks(ctx, deps, threadID)
 	}
@@ -1285,10 +1301,11 @@ func SettleLate(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredA
 	if runID == "" {
 		return false, nil
 	}
-	locked, err := deps.Kv.Set(ctx, RunLockKey(threadID), runID, ports.SetOptions{OnlyIfNotExists: true, Expiry: deps.Config.RunLockLease})
-	if err != nil || !locked {
+	lease, err := AcquireRunLock(ctx, deps, threadID, runID, "")
+	if err != nil || lease == nil {
 		return false, err
 	}
-	defer func() { _, _ = deps.Kv.DelIfValue(context.WithoutCancel(ctx), RunLockKey(threadID), runID) }()
+	lease.Keep(nil) // renewed while the settle hook runs
+	defer lease.Release()
 	return settleEndedRun(ctx, deps, agent, threadID, runID), nil
 }

@@ -5,6 +5,7 @@ import type { AgentEvent, NestedDescriptor, ResumeInfo } from './types.js';
 import { publish, setThreadState } from './publish.js';
 import { currentRunId } from './keys.js';
 import { reclaimIfOrphaned } from './reclaim.js';
+import { enqueueJob } from './lease.js';
 
 export const HITL_TTL_MS = 15 * 60_000;
 
@@ -213,7 +214,8 @@ export async function parkForApproval(deps: RuntimePorts, i: ParkInput): Promise
   // Arriving early is equally harmless: an unexpired, unanswered request
   // resolves to nothing and the job is a no-op (see resumePendingHitl).
   try {
-    await deps.queue.enqueue(
+    await enqueueJob(
+      deps,
       {
         threadId: i.threadId,
         runId: await currentRunId(deps, i.threadId),
@@ -383,7 +385,7 @@ export async function respond(deps: RuntimePorts, input: RespondInput): Promise<
   // park's expiry job are the same run, and the lock must be able to tell
   // that. Bumping here would let both run and reply twice (§2.5).
   const runId = await currentRunId(deps, input.threadId);
-  await deps.queue.enqueue({
+  await enqueueJob(deps, {
     threadId: input.threadId,
     runId,
     model: resume?.model ?? thread.model,

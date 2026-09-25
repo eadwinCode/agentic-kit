@@ -312,6 +312,12 @@ export interface RunJob {
    *  been replaced by a newer run and must not execute. Omitted on legacy
    *  dispatches, which keep the old no-identity behavior. */
   runId?: string;
+  /** Names THIS enqueue of the run: a fresh dispatch, a retry, a resume each
+   *  get their own. A queue that delivers one job twice delivers the same
+   *  id, which is how the run lock tells a duplicate apart from another
+   *  delivery of the same run (§3.4). Stamped by `enqueueJob`; absent on
+   *  jobs written before it. */
+  dispatchId?: string;
   /** Epoch ms at enqueue. The worker subtracts it on pickup to record how long
    *  the job waited — the number that says whether workers keep up (§2.9). */
   enqueuedAt?: number;

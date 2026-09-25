@@ -280,8 +280,9 @@ export interface AgentHandle {
 
   /** Worker-side only (§5.6). Throws on failure — see executeWithPolicy.
    *  Returns 'lock-conflict' when another worker owns the thread's run lock
-   *  (nothing was executed) and 'stale' when a newer run has replaced this
-   *  one (§2.1, §2.8). */
+   *  (nothing was executed), 'stale' when a newer run has replaced this
+   *  one (§2.1, §2.8), and 'lock-lost' when this worker could not keep the
+   *  lock and stopped early (§3.4). */
   execute(input: ExecuteInput): Promise<ExecuteOutcome>;
 
   /** execute + §2.8 failure policy: redrive < maxAttempts, else finalize FAILED */

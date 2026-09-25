@@ -9,6 +9,7 @@ import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters
 import { runIdKey } from '../src/core/keys.js';
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
 import type { RuntimeOptions } from '../src/ports/runtime.js';
+import { parseLockValue } from '../src/core/lease.js';
 
 /** Pull the newest user message out of the SDK-level prompt so the mock can
  *  answer the message it was actually given — that is how these tests tell
@@ -85,7 +86,7 @@ describe('stop, then send another message right away (§2.1)', () => {
     const threadId = first.threadId;
     const workerA = runtime.worker.handleJob(queue.items[0]!);
     await sleep(30);
-    expect(await kv.get(`agent:lock:${threadId}`)).toBe(first.runId!);
+    expect(parseLockValue(await kv.get(`agent:lock:${threadId}`)).runId).toBe(first.runId!);
 
     // 2. Stop.
     expect((await chat.stop(threadId)).accepted).toBe(true);
@@ -226,9 +227,11 @@ describe('lock conflicts (§2.8)', () => {
   });
 
   it('gives up with FAILED when the lock never clears', async () => {
+    // A held lock is waited out for at least one lease: redrives of 2s then
+    // 3s (capped at the 3s lease) have waited 5s, so the third arrival gives up.
     const { runtime, storage, queue, kv } = await makeRuntime(
       slowModel({ aborted: false }),
-      { runMaxAttempts: 2 },
+      { runMaxAttempts: 2, runLockLeaseSeconds: 3 },
     );
     const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
 

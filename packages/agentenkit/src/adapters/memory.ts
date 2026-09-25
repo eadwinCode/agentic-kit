@@ -31,6 +31,20 @@ export class MemoryKv implements Kv {
     return true;
   }
   async del(key: string) { this.m.delete(key); }
+  async setIfValue(key: string, expected: string, value: string, opts?: { exSeconds?: number }) {
+    // No awaits between the read and the write — atomic within the event loop
+    if ((await this.get(key)) !== expected) return false;
+    this.m.set(key, {
+      value,
+      expiresAt: opts?.exSeconds ? Date.now() + opts.exSeconds * 1000 : undefined,
+    });
+    return true;
+  }
+  async delIfValue(key: string, expected: string) {
+    if ((await this.get(key)) !== expected) return false;
+    this.m.delete(key);
+    return true;
+  }
   async incr(key: string) {
     // No awaits between read and write — atomic within the event loop
     const e = this.m.get(key);

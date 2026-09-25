@@ -318,6 +318,9 @@ func (l *RunLedger) TokensUsed() int {
 }
 
 // LoopInput seeds a loop.
+// ErrRunLockLost ends a loop whose run lock was lost between steps (§3.4).
+var ErrRunLockLost = errors.New("agentenkit: run lock lost")
+
 type LoopInput struct {
 	// AgentID is whose stream this loop persists to (§2.7). Empty is the
 	// main agent.
@@ -336,7 +339,11 @@ type LoopInput struct {
 	// can still be finalized.
 	GenCtx context.Context
 	// Aborted reports whether the platform cancelled GenCtx on purpose.
-	Aborted         func() bool
+	Aborted func() bool
+	// Fenced reports that the run lock is gone (§3.4): another worker may
+	// own the thread, so this loop must not write another step to it. Nil
+	// means never.
+	Fenced          func() bool
 	ProviderOptions ports.ProviderOptions
 	// TokenBudget is the cumulative cap for the whole run, checked against
 	// the shared ledger.
@@ -518,6 +525,15 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 				break
 			}
 			return out, err // real failure → §2.8 redrive policy
+		}
+
+		// The step is done, and its messages are the first thing it writes.
+		// A worker that lost the lock meanwhile must not write them: the
+		// next holder may already be writing its own. The call itself did
+		// happen and the provider billed it, so its usage is still recorded.
+		if input.Fenced != nil && input.Fenced() {
+			RecordCall(ctx, deps, threadID, usageOf(input, out.Steps+1, ports.KindStep, step, ports.UsageFinished))
+			return out, ErrRunLockLost
 		}
 
 		// Per-step durability (§5.6): append this step's turns BEFORE the next

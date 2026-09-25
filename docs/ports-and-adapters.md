@@ -142,16 +142,26 @@ guarantees — which is what lets it be Redis pub/sub, Ably, or Postgres
 ```ts
 interface Kv {
   get(key: string): Promise<string | null>;
-  set(key: string, value: string, opts?: { ttlSeconds?: number }): Promise<void>;
+  // onlyIfNotExists is SET NX: how the run lock is taken
+  set(key: string, value: string, opts?: { exSeconds?: number; onlyIfNotExists?: boolean }): Promise<boolean>;
   del(key: string): Promise<void>;
   incr(key: string): Promise<number>;
-  // plus the conditional set used for locks
+  // compare-and-act: how the run lock is renewed and freed
+  setIfValue(key: string, expected: string, value: string, opts?: { exSeconds?: number }): Promise<boolean>;
+  delIfValue(key: string, expected: string): Promise<boolean>;
 }
 ```
 
 Hot cache and coordination: thread state, run identity, HITL handoff keys, and
 the per-thread `seq` counter. Everything here is reconstructible except while a
 run is in flight.
+
+`setIfValue` and `delIfValue` act only while the key still holds `expected`,
+and each must be **one atomic step**: a Lua script on Redis, a conditional
+`UPDATE`/`DELETE` in SQL. A `get` followed by a `set` is not enough. Together
+they are what stop a worker from renewing or freeing a run lock that another
+worker took after its own lapsed. A custom `Kv` written before these existed
+must add them.
 
 ## The invariants
 

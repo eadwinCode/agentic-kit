@@ -596,6 +596,12 @@ type RunJob struct {
 	// time and `agent:run:{threadId}` holds its id; a job whose id no longer
 	// matches has been replaced and must not execute.
 	RunID string `json:"runId,omitempty"`
+	// DispatchID names THIS enqueue of the run: a fresh dispatch, a retry, a
+	// resume each get their own. A queue that delivers one job twice
+	// delivers the same DispatchID, which is how the run lock tells a
+	// duplicate apart from another delivery of the same run (§3.4). Stamped
+	// by the platform when it enqueues; empty on jobs written before it.
+	DispatchID string `json:"dispatchId,omitempty"`
 	// EnqueuedAt is epoch milliseconds at THIS enqueue (§2.9): the queue
 	// wait a worker measures on pickup.
 	EnqueuedAt int64 `json:"enqueuedAt,omitempty"`

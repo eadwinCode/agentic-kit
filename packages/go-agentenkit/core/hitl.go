@@ -281,7 +281,7 @@ func ParkForApproval(ctx context.Context, deps ports.RuntimePorts, i ParkInput) 
 	// resolves to nothing and the job is a no-op (see resumePendingHitl).
 	// The row is keyed so an answer can withdraw it, and it queues behind
 	// every user message: an expiry that came due is never urgent.
-	if err := deps.Queue.Enqueue(ctx, ports.RunJob{
+	if err := EnqueueJob(ctx, deps, ports.RunJob{
 		ThreadID: i.ThreadID, RunID: runID, Model: i.Resume.Model, Agent: i.Resume.Agent,
 		Kind: ports.JobExpiry, DispatchedAt: i.Resume.DispatchedAt,
 		TokenBudget: i.Resume.TokenBudget, CostBudgetMicros: i.Resume.CostBudgetMicros,
@@ -487,7 +487,7 @@ func Respond(ctx context.Context, deps ports.RuntimePorts, input ports.RespondIn
 	}
 	// One resume row per answer, keyed on the call: a second enqueue for
 	// the same answer is refused by the queue itself.
-	if err := deps.Queue.Enqueue(ctx, job, &ports.EnqueueOptions{Key: resumeJobKey(input.ToolCallID)}); err != nil {
+	if err := EnqueueJob(ctx, deps, job, &ports.EnqueueOptions{Key: resumeJobKey(input.ToolCallID)}); err != nil {
 		if errors.Is(err, ports.ErrDuplicateJob) {
 			return ports.RespondResult{Delivered: false, Error: "This request was already answered"}, nil
 		}

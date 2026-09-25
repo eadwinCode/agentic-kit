@@ -103,14 +103,15 @@ func settleAfterStop(ctx context.Context, deps ports.RuntimePorts, lookup func(s
 	if agent == nil {
 		return
 	}
-	locked, err := deps.Kv.Set(ctx, RunLockKey(threadID), runID, ports.SetOptions{
-		OnlyIfNotExists: true, Expiry: deps.Config.RunLockLease,
-	})
-	if err != nil || !locked {
+	lease, err := AcquireRunLock(ctx, deps, threadID, runID, "")
+	if err != nil || lease == nil {
 		Logger(deps).Info("stop: a worker holds the run; it settles the run itself", "thread", threadID, "run", runID)
 		return
 	}
-	defer func() { _, _ = deps.Kv.DelIfValue(context.WithoutCancel(ctx), RunLockKey(threadID), runID) }()
+	// Renewed while the hook runs: a slow settle must not let a queued job
+	// take the lock and settle the same run beside it.
+	lease.Keep(nil)
+	defer lease.Release()
 	settleEndedRun(ctx, deps, agent, threadID, runID)
 }
 

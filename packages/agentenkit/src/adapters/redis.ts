@@ -1,7 +1,7 @@
 import type { AgentEvent } from '../core/types.js';
 import type { Kv } from '../ports/kv.js';
 import type { EventBus } from '../ports/bus.js';
-import { THREAD_CHANNEL } from './upstash.js';
+import { DEL_IF_VALUE_SCRIPT, SET_IF_VALUE_SCRIPT, THREAD_CHANNEL } from './upstash.js';
 
 /** Minimal structural type of a node-redis (v4) client — the real client
  *  satisfies it without importing the SDK here. Works against any Redis:
@@ -15,6 +15,8 @@ export interface RedisClientLike {
   del: any;
   incr: any;
   publish: any;
+  /** node-redis v4: `eval(script, { keys, arguments })`. */
+  eval: any;
   duplicate(): any;
 }
 
@@ -51,6 +53,18 @@ export class RedisKv implements Kv {
   }
   del(key: string) { return this.redis.del(key).then(() => undefined); }
   incr(key: string) { return this.redis.incr(key); }
+  async setIfValue(key: string, expected: string, value: string, opts?: { exSeconds?: number }) {
+    const ms = Math.round((opts?.exSeconds ?? 0) * 1000);
+    const n = await this.redis.eval(SET_IF_VALUE_SCRIPT, {
+      keys: [key],
+      arguments: [expected, value, String(ms)],
+    });
+    return Number(n) === 1;
+  }
+  async delIfValue(key: string, expected: string) {
+    const n = await this.redis.eval(DEL_IF_VALUE_SCRIPT, { keys: [key], arguments: [expected] });
+    return Number(n) === 1;
+  }
 }
 
 /** Reference EventBus adapter over plain Redis Pub/Sub (node-redis).

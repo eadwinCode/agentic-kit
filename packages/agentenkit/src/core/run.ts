@@ -6,6 +6,7 @@ import { recordStoppedRun } from './stop.js';
 import { randomUUID } from 'node:crypto';
 import { publish, setThreadState, publishEvent } from './publish.js';
 import { mergeProviderOptions } from './types.js';
+import { enqueueJob } from './lease.js';
 
 /** The §5.1 behavior: heal orphans → billing pre-check (§4) → persist the user
  *  message → state RUNNING (hot + durable) → enqueue on the dispatch queue
@@ -163,7 +164,7 @@ export async function run(
     if (!await dispatchActive(deps, threadId, runId)) {
       return { accepted: false, threadId, runId, error: 'Run was stopped before dispatch' };
     }
-    await deps.queue.enqueue({
+    await enqueueJob(deps, {
       threadId, runId, model, agent: agent.name,
       enqueuedAt: Date.now(),
       // Persisted on the ticket so a worker — or a resume after an approval,

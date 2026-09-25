@@ -221,6 +221,7 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
           // The dispatch's identity (§2.1) — without it the worker cannot tell
           // it has been replaced by a newer run, and a blocked job is dropped.
           runId: job.runId,
+          dispatchId: job.dispatchId,
           // Carries the queue wait through to the run record (§2.9).
           enqueuedAt: job.enqueuedAt,
           // Rehydrated from the ticket: this worker never saw the caller (§2.10).

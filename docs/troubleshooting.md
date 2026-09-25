@@ -33,9 +33,9 @@ Either the thread has an active run — stop it first, or wait — or your
 ### A thread is stuck in `RUNNING` with no worker
 
 The worker died holding the run lock. It clears when the lease expires
-(`runLockLeaseSeconds`). If that is routinely too long, shorten it — but keep it
-above your longest run segment, or a second worker will start on a thread that is
-still being advanced.
+(`runLockLeaseSeconds`). A live worker renews its lock while it runs, so a
+shorter lease only makes a dead worker's lock clear sooner; it does not cut a
+long run short.
 
 ### A stopped run wedges the thread
 

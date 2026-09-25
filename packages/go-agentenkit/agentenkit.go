@@ -278,8 +278,9 @@ var (
 	StateKey         = core.StateKey
 	SeqKey           = core.SeqKey
 
-	RunLockKey = core.RunLockKey
-	NewID      = core.NewID
+	RunLockKey     = core.RunLockKey
+	ParseLockValue = core.ParseLockValue
+	NewID          = core.NewID
 
 	CountTokens     = core.CountTokens
 	AttributeTokens = core.AttributeTokens
