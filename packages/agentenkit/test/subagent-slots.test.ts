@@ -19,6 +19,8 @@ interface Step {
   calls?: Array<{ id: string; instructions: string }>;
   delayMs?: number;
   noFinish?: boolean;
+  /** The provider's finish says no reason: the SDK reads it as 'unknown'. */
+  finishNoReason?: boolean;
 }
 
 /** Answers by who is asking rather than by call order: nested runs call it in
@@ -52,7 +54,7 @@ function routedModel(route: (brief: string, answered: boolean) => Step) {
       if (!s.noFinish) {
         chunks.push({
           type: 'finish',
-          finishReason: s.calls?.length ? 'tool-calls' : 'stop',
+          finishReason: s.finishNoReason ? 'unknown' : s.calls?.length ? 'tool-calls' : 'stop',
           usage: { promptTokens: 10, completionTokens: 5 },
         });
       }
@@ -167,6 +169,26 @@ describe('the main agent (§2.8)', () => {
     const ran = await r.chat.run({ prompt: 'hi' });
     await r.runtime.worker.handleJob(r.queue.items.shift()!);
     expect(await r.state(ran.threadId)).not.toBe('COMPLETED'); // a step that never finished
+    await r.runtime.worker.handleJob(r.queue.items.shift()!);
+    expect(await r.state(ran.threadId)).toBe('COMPLETED'); // the retry completes it
+  });
+
+  // The Go runtime's twin covers goai's OpenAI stream, which gives the reason
+  // on step_finish; the AI SDK always hands it over on the finish part.
+  it('a finish reason on step finish completes the run', async () => {
+    const r = await routedRuntime(() => ({ text: 'Hello!' }));
+    const ran = await r.chat.run({ prompt: 'hi' });
+    await r.runtime.worker.handleJob(r.queue.items.shift()!);
+    expect(await r.state(ran.threadId)).toBe('COMPLETED'); // on the first try
+    expect(r.queue.items).toHaveLength(0); // no retry
+  });
+
+  it('a finish with no reason anywhere is not completed', async () => {
+    let calls = 0;
+    const r = await routedRuntime(() => (calls++ === 0 ? { text: 'part', finishNoReason: true } : { text: 'whole' }));
+    const ran = await r.chat.run({ prompt: 'hi' });
+    await r.runtime.worker.handleJob(r.queue.items.shift()!);
+    expect(await r.state(ran.threadId)).not.toBe('COMPLETED');
     await r.runtime.worker.handleJob(r.queue.items.shift()!);
     expect(await r.state(ran.threadId)).toBe('COMPLETED'); // the retry completes it
   });

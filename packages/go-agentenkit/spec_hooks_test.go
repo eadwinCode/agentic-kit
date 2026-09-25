@@ -211,6 +211,32 @@ func TestExecute_AStreamCutWithoutAFinishIsNotCompleted(t *testing.T) {
 	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "the retry completes it")
 }
 
+// goai's OpenAI provider sends the finish reason on step_finish and then a
+// finish chunk with only the usage. That is a finished step: an answer that
+// came back whole must complete the run on the first try.
+func TestExecute_AFinishReasonOnStepFinishCompletesTheRun(t *testing.T) {
+	h := makeRuntime(t, scripted(step{text: "Hello!", reasonOnStepFinish: true}))
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
+	h.handleNext(t)
+	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "completed on the first try")
+	mustEqual(t, h.queue.Len(), 0, "no retry")
+}
+
+// A finish chunk with no reason, and nothing before it that gave one, is a
+// stream cut short.
+func TestExecute_AFinishWithNoReasonAnywhereIsNotCompleted(t *testing.T) {
+	h := makeRuntime(t, scripted(step{text: "part", finishNoReason: true}, step{text: "whole"}))
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
+	h.handleNext(t)
+	if st := h.thread(t, ran.ThreadID).State; st == agentenkit.StateCompleted {
+		t.Fatal("a step that never gave a finish reason must not complete the run")
+	}
+	h.handleNext(t) // the retry
+	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "the retry completes it")
+}
+
 func TestOnSettle_RunsWhenAttemptsAreExhausted(t *testing.T) {
 	h := makeRuntime(t, scripted(step{err: errBoom}), func(c *agentenkit.AgentConfig) { c.RunMaxAttempts = 1 })
 	var seen agentenkit.RunFinishInfo
