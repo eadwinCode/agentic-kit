@@ -20,14 +20,20 @@ import type { TokenAttribution } from '../core/usage.js';
 import type { Storage } from './storage.js';
 import type { AdminStore, RunFilter, StepRecord } from './admin.js';
 import type { AgentRunState, BoundStorage } from '../core/state.js';
-import type { FollowOptions, SseOptions, SseStream } from '../core/follow.js';
+import type { FollowFrame, FollowOptions, FollowThreadOptions, SseStream, ThreadCursor } from '../core/follow.js';
+import type { StreamItem } from '../core/stream-events.js';
+import type { StreamSnapshot } from './streams.js';
 import type { PublishEventOptions } from '../core/publish.js';
+import type { SnapshotStream } from '../core/snapshot.js';
+import type { PruneOptions, PruneReport } from '../core/prune.js';
+import type { WireFormat } from '../core/agui.js';
 
 export type { AdminStore, NewStepRecord, RunFilter, StepRecord } from './admin.js';
 export type { AgentRunState, BoundStorage, StorageContext } from '../core/state.js';
 import type { EventBus } from './bus.js';
 import type { Queue } from './queue.js';
 import type { Kv } from './kv.js';
+import type { RunStreams } from './streams.js';
 import type { ExecuteInput, ExecuteOutcome } from '../core/engine.js';
 import type {
   AdminOverview,
@@ -59,6 +65,8 @@ export interface RuntimePorts {
   bus: EventBus;
   queue: Queue;
   kv: Kv;
+  /** Run streams, one per segment; absent, none are written. */
+  streams?: RunStreams;
   /** User-provided model resolution (§3.3): models can live in any shape on
    *  the consumer side — the platform only ever sees `ResolvedModel`. */
   resolveModel(modelName: string): ResolvedModel;
@@ -99,6 +107,10 @@ export interface RuntimeOptions {
   bus: EventBus;
   queue: Queue;
   kv: Kv;
+  /** Short-lived logs, one per run segment: where a run's live events go.
+   *  Omitted, they are kept in memory, which only this process can read —
+   *  fine for one process, not for web servers and workers that run apart. */
+  streams?: RunStreams;
   /** Models can come in any shape — config files, a database, provider SDKs.
    *  The platform only ever sees the resolved `ResolvedModel`. */
   resolveModel(modelName: string): ResolvedModel;
@@ -281,6 +293,13 @@ export type PrepareStepFn = (
 ) => Array<any> | Promise<Array<any>>;
 
 /** Durable state used to hydrate a client before it starts live event replay. */
+/** Where a follow starts: `cursor` (a ThreadCursor, or its wire string as an
+ *  SSE Last-Event-ID carries it), or a bare record seq `since`. */
+export interface FollowStartOptions extends Omit<FollowThreadOptions, 'cursor'> {
+  cursor?: ThreadCursor | string | null;
+  since?: number;
+}
+
 export interface ThreadSnapshot {
   thread: ThreadDTO;
   messages: MessageDTO[];
@@ -288,10 +307,13 @@ export interface ThreadSnapshot {
    *  reconnecting client rebuilds its subagent panel without depending on
    *  events that only replay while a run is unfinished. */
   runs: RunRecord[];
-  /** Cursor for starting live replay without duplicating snapshot state. */
+  /** The thread record's last seq. */
   lastEventSeq: number;
-  /** Only the unfinished run's events, used to restore transient activity. */
+  /** The unfinished run's record entries: its open park, a refusal. */
   activeEvents: AgentEvent[];
+  /** The run stream in flight, or one that just ended: what the messages
+   *  do not have yet, and where a live read picks up. */
+  stream: SnapshotStream | null;
 }
 
 /** Everything streamText accepts except the platform-owned keys (§3.1).
@@ -430,31 +452,59 @@ export interface AgentCore {
   events: {
     since(threadId: string, sinceSeq: number, state?: AgentRunState): Promise<AgentEvent[]>;
     subscribe(threadId: string, handler: (event: AgentEvent) => void): Promise<() => void>;
-    /** Replay then live, as one sequence, with the cursor discipline already
-     *  applied (§2.2): subscribe before replaying, never emit at or below the
-     *  cursor, forward a seq-0 notice without moving it.
+    /** A thread live, as one sequence of frames (§2.2): its record entries
+     *  and notices, and its run streams — the stream the cursor names read on
+     *  from its offset, the next segment's from its RUN_STARTED, and one
+     *  SNAPSHOT frame when the stream the client was reading is gone.
      *
-     *  Framework-neutral — an async iterable is something Express, Nest, Hono,
-     *  Next or a plain worker can each consume in their own way. Pass a signal,
-     *  or the subscription outlives the client. */
+     *  `cursor` is where the client is: the SSE `id:` it last saw
+     *  (Last-Event-ID), as a string or parsed. `since` is a bare record seq,
+     *  as older clients send. Framework-neutral — an async iterable is
+     *  something Express, Nest, Hono, Next or a plain worker can each consume
+     *  in their own way. Pass a signal, or the follow outlives the client. */
     follow(
+      threadId: string,
+      options?: FollowStartOptions & { state?: AgentRunState },
+    ): AsyncGenerator<FollowFrame>;
+    /** `follow`, encoded as Server-Sent Events. Each frame that moves the
+     *  cursor carries it as its `id:`. `wireFormat: 'ag-ui'` sends AG-UI
+     *  events instead of our frames (opt-in). Returns the stream and the
+     *  headers rather than a Response, because half the ecosystem has none. */
+    sse(
+      threadId: string,
+      options?: FollowStartOptions & { retryMs?: number; wireFormat?: WireFormat; state?: AgentRunState },
+    ): SseStream;
+    /** The thread record and its notices alone, as before run streams: no
+     *  stream frames. */
+    followRecord(
       threadId: string,
       options?: FollowOptions & { state?: AgentRunState },
     ): AsyncGenerator<AgentEvent>;
-    /** `follow`, encoded as Server-Sent Events. Returns the stream and the
-     *  headers rather than a Response, because half the ecosystem has none. */
-    sse(threadId: string, options?: SseOptions & { state?: AgentRunState }): SseStream;
     /** Publish an event of your own on a thread, from anywhere on the server
      *  — a webhook, a cron job, a route. Tools get the same thing bound to
-     *  their thread as `publishEvent` on their options. Durable by default;
-     *  `{ durable: false }` is a bus-only notice. Platform event types are
-     *  refused. */
+     *  their thread as `publishEvent` on their options. Live only by default;
+     *  `{ durable: true }` also keeps it in the thread record. Platform event
+     *  types are refused. */
     publishEvent(
       threadId: string,
       type: string,
       payload: unknown,
       options?: PublishEventOptions & { state?: AgentRunState },
     ): Promise<AgentEvent>;
+  };
+
+  /** Delete the stream-only rows (chunks, step markers, state changes…)
+   *  releases before run streams left in the event table, a batch at a
+   *  time. Nothing reads them any more; an app's own types are kept. Run it
+   *  when it suits you, after upgrading: `{ dryRun: true }` counts first. */
+  pruneEvents(options?: PruneOptions): Promise<PruneReport>;
+
+  /** A run stream by id, for a caller that only cares about one run: its
+   *  items after `after`, live until it closes. Throws StreamGoneError once
+   *  the stream is past its grace window. */
+  streams: {
+    read(streamId: string, after: string | null, signal?: AbortSignal): AsyncIterable<StreamItem>;
+    snapshot(streamId: string, after?: string | null): Promise<StreamSnapshot | null>;
   };
 
   /** Agent factories — see §4. Each call registers a handle under `spec.name`. */

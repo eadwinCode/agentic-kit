@@ -211,25 +211,27 @@ func TestBudget_ARunThatParksThreeTimesCountsEverySegment(t *testing.T) {
 	mustEqual(t, term["tokensUsed"], float64(60), "the whole run's tokens")
 }
 
-// failStepCommitOnce fails the first STEP_COMMITTED write: the worker dies
-// right after the step's messages and usage are saved.
-type failStepCommitOnce struct {
+// failFinishOnce fails the first move to COMPLETED: the worker dies after
+// the step's messages and usage are saved, before the run ends.
+type failFinishOnce struct {
 	ports.Storage
 	failed atomic.Bool
 }
 
-type failingEvents struct {
-	ports.EventStore
-	s *failStepCommitOnce
+type failFinishThreads struct {
+	ports.ThreadStore
+	s *failFinishOnce
 }
 
-func (s *failStepCommitOnce) Events() ports.EventStore { return failingEvents{s.Storage.Events(), s} }
+func (s *failFinishOnce) Threads() ports.ThreadStore {
+	return failFinishThreads{s.Storage.Threads(), s}
+}
 
-func (e failingEvents) Append(ctx context.Context, threadID string, ev ports.AgentEvent, sc ports.StorageContext) error {
-	if ev.Type == "STEP_COMMITTED" && e.s.failed.CompareAndSwap(false, true) {
-		return errors.New("worker died")
+func (t failFinishThreads) Transition(ctx context.Context, threadID string, tr ports.ThreadTransition, sc ports.StorageContext) (bool, error) {
+	if tr.To == ports.StateCompleted && t.s.failed.CompareAndSwap(false, true) {
+		return false, errors.New("worker died")
 	}
-	return e.EventStore.Append(ctx, threadID, ev, sc)
+	return t.ThreadStore.Transition(ctx, threadID, tr, sc)
 }
 
 // A retry after the run's last step was saved finalizes from the saved
@@ -237,7 +239,7 @@ func (e failingEvents) Append(ctx context.Context, threadID string, ev ports.Age
 func TestRetry_ARunWhoseLastStepWasSavedIsNotAskedAgain(t *testing.T) {
 	var settles atomic.Int32
 	h := makeRuntimeOpts(t, scripted(step{text: "the answer"}, step{text: "a second answer"}), func(o *agentenkit.RuntimeOptions) {
-		o.Storage = &failStepCommitOnce{Storage: o.Storage}
+		o.Storage = &failFinishOnce{Storage: o.Storage}
 	}, func(c *agentenkit.AgentConfig) { c.RunRetryBackoff = 0 })
 	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
 		Name:     "chat",

@@ -133,9 +133,12 @@ you can see the split — but the cap is enforced across the whole tree.
 
 ## Watching them
 
-Four event types describe a child's life: `SUBAGENT_STARTED`, `SUBAGENT_CHUNK`,
-`SUBAGENT_COMPLETED`, `SUBAGENT_FAILED`. `use-agentenkit` turns them into a
-`subagents` array:
+Three run stream events describe a child's life: `SUBAGENT_STARTED`
+(`subagentId`, `name`, `depth`), `SUBAGENT_EVENT` (one of the child's own
+stream events, wrapped, with its `subagentId`) and `SUBAGENT_FINISHED`
+(`status` is `completed`, `failed` or `cancelled`, with an `error` when it
+has one). They travel on the parent run's stream. `use-agentenkit` turns them
+into a `subagents` array:
 
 ```tsx
 {subagents.map((s) => (
@@ -147,6 +150,7 @@ Four event types describe a child's life: `SUBAGENT_STARTED`, `SUBAGENT_CHUNK`,
 ))}
 ```
 
-Those events only replay while a run is unfinished. On a completed thread the
-hook rebuilds each card from the durable run rows and the child's persisted
-turns instead, so a reload does not lose a subagent's output.
+Those events live only as long as the run stream (`streamGraceMs` after the
+segment ends). On a finished thread the hook rebuilds each card from the
+durable run rows and the child's persisted turns instead, so a reload does not
+lose a subagent's output.

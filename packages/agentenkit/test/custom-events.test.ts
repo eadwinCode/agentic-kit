@@ -12,6 +12,7 @@ import { publishEvent, RESERVED_EVENT_TYPES } from '../src/core/publish.js';
 import { resolveConfig } from '../src/core/types.js';
 import { bindStorage } from '../src/core/state.js';
 import type { RuntimeOptions } from '../src/ports/runtime.js';
+import { ofType as streamOfType, runItems, threadItems } from './stream-helpers.js';
 
 interface ScriptedStep {
   text?: string;
@@ -70,7 +71,7 @@ describe('custom events', () => {
         render: agentTool({
           parameters: z.object({}),
           execute: async (_args, { publishEvent, state }) => {
-            const event = await publishEvent('DESIGN_PREVIEW', { url: 'https://x/1.png', org: state.orgId });
+            const event = await publishEvent('DESIGN_PREVIEW', { url: 'https://x/1.png', org: state.orgId }, { durable: true });
             expect(event.seq).toBeGreaterThan(0);
             return { ok: true };
           },
@@ -92,7 +93,7 @@ describe('custom events', () => {
     expect(snap!.lastEventSeq).toBeGreaterThanOrEqual(preview.seq);
   });
 
-  it('a notice reaches the bus only, with seq 0', async () => {
+  it('by default an event is live only: on the run stream during a run, never stored', async () => {
     const r = await makeRuntime(
       scriptedModel([{ toolCalls: [{ toolCallId: 'c1', toolName: 'slow', args: {} }] }, { text: 'done' }]),
     );
@@ -102,7 +103,7 @@ describe('custom events', () => {
         slow: agentTool({
           parameters: z.object({}),
           execute: async (_args, { publishEvent }) => {
-            await publishEvent('PROGRESS', { label: 'Rendering…' }, { durable: false });
+            await publishEvent('PROGRESS', { label: 'Rendering…' });
             return 'ok';
           },
         }),
@@ -110,9 +111,10 @@ describe('custom events', () => {
     });
     const ran = await chat.run({ prompt: 'hi' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
-    const notices = ofType(r.bus, 'PROGRESS');
-    expect(notices).toHaveLength(1);
-    expect(notices[0]!.seq).toBe(0);
+    // During a run it goes to the run's stream alone, as CUSTOM.
+    expect(ofType(r.bus, 'PROGRESS')).toHaveLength(0);
+    const custom = streamOfType(await runItems(r.runtime.ports(), ran.runId!), 'CUSTOM');
+    expect(custom).toMatchObject([{ name: 'PROGRESS', value: { label: 'Rendering…' } }]);
     const logged = await r.runtime.events.since(ran.threadId, -1);
     expect(logged.some((e) => e.type === 'PROGRESS')).toBe(false);
   });
@@ -131,8 +133,11 @@ describe('custom events', () => {
     const r = await makeRuntime(scriptedModel([{ text: 'ok' }]));
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
     const ran = await chat.run({ prompt: 'hi' });
-    const event = await r.runtime.events.publishEvent(ran.threadId, 'BILLING', { credits: 0 }, { state: { orgId: 'acme' } });
+    const event = await r.runtime.events.publishEvent(
+      ran.threadId, 'BILLING', { credits: 0 }, { state: { orgId: 'acme' }, durable: true },
+    );
     expect(event.type).toBe('BILLING');
+    expect(event.seq).toBeGreaterThan(0);
     expect(ofType(r.bus, 'BILLING')).toHaveLength(1);
     const logged = await r.runtime.events.since(ran.threadId, -1);
     expect(logged.at(-1)!.type).toBe('BILLING');
@@ -170,7 +175,8 @@ describe('custom events', () => {
     await r.runtime.hitl.respond({ threadId: ran.threadId, toolCallId: 'd1', approved: true });
     await r.queue.drain((job) => r.runtime.worker.handleJob(job).then(() => undefined));
     expect(seen).toEqual(['wipe:acme']);
-    expect(ofType(r.bus, 'WIPED')).toHaveLength(1);
+    const custom = streamOfType(await threadItems(r.runtime.ports(), ran.threadId), 'CUSTOM');
+    expect(custom.filter((e) => e.name === 'WIPED')).toHaveLength(1);
     expect(ofType(r.bus, 'STATE_CHANGE').at(-1)!.payload).toMatchObject({ state: 'COMPLETED' });
   });
 });

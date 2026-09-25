@@ -45,12 +45,9 @@ async function parkThread(
 ) {
   const { store, kv } = r;
   const thread = await store.threads.create(undefined);
-  const seq = await kv.incr(`agent:seq:${thread.id}`);
   await store.threads.setState(thread.id, 'WAITING_FOR_INPUT');
   await kv.set(`agent:state:${thread.id}`, 'WAITING_FOR_INPUT');
   await store.events.append(thread.id, {
-    threadId: thread.id,
-    seq,
     type: 'INPUT_REQUIRED',
     payload: { toolCallId, toolName: 'sendEmail', arguments: { to: 'a@b.c' } },
     createdAt: new Date(),
@@ -188,10 +185,9 @@ describe('reclaimIfOrphaned (§2.5)', () => {
   it('does nothing for a young pending request', async () => {
     const { deps, store, kv, runtime } = await makeDeps({ hitlTtlMs: 5, reclaimGraceMs: 1 });
     const thread = await store.threads.create(undefined);
-    const seq = await kv.incr(`agent:seq:${thread.id}`);
     await store.threads.setState(thread.id, 'WAITING_FOR_INPUT');
     await store.events.append(thread.id, {
-      threadId: thread.id, seq, type: 'INPUT_REQUIRED', payload: { toolCallId: 'c1' }, createdAt: new Date(),
+      type: 'INPUT_REQUIRED', payload: { toolCallId: 'c1' }, createdAt: new Date(),
     });
 
     expect(await runtime.hitl.reclaimIfOrphaned(thread.id)).toBe(false);
@@ -200,12 +196,11 @@ describe('reclaimIfOrphaned (§2.5)', () => {
   it('re-dispatches a true orphan instead of healing it inline (§2.7)', async () => {
     const { deps, store, kv, runtime, queue } = await makeDeps({ hitlTtlMs: 5, reclaimGraceMs: 1 });
     const thread = await store.threads.create(undefined);
-    const seq = await kv.incr(`agent:seq:${thread.id}`);
     await store.threads.setState(thread.id, 'WAITING_FOR_INPUT');
     await kv.set(`agent:state:${thread.id}`, 'WAITING_FOR_INPUT');
     await kv.set(`agent:run:${thread.id}`, 'run-1');
     await store.events.append(thread.id, {
-      threadId: thread.id, seq, type: 'INPUT_REQUIRED', payload: { toolCallId: 'c1' },
+      type: 'INPUT_REQUIRED', payload: { toolCallId: 'c1' },
       createdAt: new Date(Date.now() - 60_000), // far older than TTL + grace
     });
 
@@ -232,8 +227,6 @@ describe('reclaimIfOrphaned (§2.5)', () => {
     await store.threads.setState(thread.id, 'WAITING_FOR_INPUT');
     for (const [id, ageMs] of [['old', 60_000], ['fresh', 0]] as const) {
       await store.events.append(thread.id, {
-        threadId: thread.id,
-        seq: await kv.incr(`agent:seq:${thread.id}`),
         type: 'INPUT_REQUIRED',
         payload: { toolCallId: id },
         createdAt: new Date(Date.now() - ageMs),
@@ -251,7 +244,7 @@ describe('runtime.deleteThread (§3.2)', () => {
     const thread = await store.threads.create(undefined);
     await store.messages.append(thread.id, { role: 'user', content: 'hi' });
     await store.events.append(thread.id, {
-      threadId: thread.id, seq: 1, type: 'CHUNK', payload: {}, createdAt: new Date(),
+      type: 'CONTEXT_COMPACTED', payload: {}, createdAt: new Date(),
     });
     await store.usage.record(thread.id, {
       agentId: null, kind: 'step', step: 1, outcome: 'finished',
@@ -308,7 +301,7 @@ describe('runtime.deleteThread (§3.2)', () => {
     const thread = await store.threads.create(undefined);
     await store.threads.setState(thread.id, 'WAITING_FOR_INPUT');
     await store.events.append(thread.id, {
-      threadId: thread.id, seq: 1, type: 'INPUT_REQUIRED',
+      type: 'INPUT_REQUIRED',
       payload: { toolCallId: 'c1', toolName: 'sendEmail', resume: { agent: 'chat', model: 'gpt-4o' } },
       createdAt: new Date(),
     });
@@ -327,7 +320,7 @@ describe('runtime.events (§2.2)', () => {
     const thread = await store.threads.create(undefined);
     for (let i = 1; i <= 3; i++) {
       await store.events.append(thread.id, {
-        threadId: thread.id, seq: i, type: 'CHUNK', payload: { i }, createdAt: new Date(),
+        type: 'CONTEXT_COMPACTED', payload: { i }, createdAt: new Date(),
       });
     }
 

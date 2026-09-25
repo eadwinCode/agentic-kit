@@ -12,6 +12,7 @@ import { publish } from '../src/core/publish.js';
 import { resolveConfig } from '../src/core/types.js';
 import type { AgentEvent } from '../src/core/types.js';
 import type { RuntimePorts } from '../src/ports/runtime.js';
+import { ofType, runItems } from './stream-helpers.js';
 
 // Workstream G: a follower never skips a seq, a lost seq counter carries on
 // from the log, token deltas go out merged, and the platform's own event
@@ -73,22 +74,27 @@ describe('events (§2.2)', () => {
     await stream.return(undefined);
   });
 
-  it('a lost seq counter carries on from the log', async () => {
+  it('the store mints the seq, so a lost kv changes nothing', async () => {
     const r = await makeRuntime(model([[say('x'), finish()]]));
     const th = await r.storage.threads.create({});
-    for (let i = 0; i < 3; i++) await publish(r.ports, th.id, 'X', null);
-    await r.kv.del(`agent:seq:${th.id}`); // flushed, evicted, restarted
-    expect((await publish(r.ports, th.id, 'X', null)).seq).toBe(4); // past what the log holds
+    for (let i = 0; i < 3; i++) await publish(r.ports, th.id, 'CONTEXT_COMPACTED', null);
+    await r.kv.del(`agent:seq:${th.id}`); // there is no counter to lose any more
+    expect((await publish(r.ports, th.id, 'CONTEXT_COMPACTED', null)).seq).toBe(4);
+  });
+
+  it('a live-only event is a notice and is never stored', async () => {
+    const r = await makeRuntime(model([[say('x'), finish()]]));
+    const th = await r.storage.threads.create({});
+    const sent = await publish(r.ports, th.id, 'STATE_CHANGE', { state: 'RUNNING' });
+    expect(sent.seq).toBe(0);
+    expect(await r.storage.events.listSince(th.id, -1)).toEqual([]);
   });
 
   it('consecutive deltas go out as one event', async () => {
     const r = await makeRuntime(model([[say('one '), say('two '), say('three'), finish()]]));
     const ran = await r.chat.run({ prompt: 'go' });
     await r.runtime.worker.handleJob(r.queue.items.shift()!);
-    const deltas = r.events(ran.threadId, 'CHUNK')
-      .map((e) => e.payload as any)
-      .filter((p) => p.type === 'text-delta')
-      .map((p) => p.textDelta);
+    const deltas = ofType(await runItems(r.runtime.ports(), ran.runId!), 'TEXT_MESSAGE_CONTENT').map((e) => e.delta);
     expect(deltas.join('')).toBe('one two three'); // the text arrives whole
     expect(deltas).toHaveLength(1); // as one event
   });
@@ -119,12 +125,9 @@ describe('events (§2.2)', () => {
     const ran = await r.chat.run({ prompt: 'go' });
     await r.runtime.worker.handleJob(r.queue.items.shift()!);
     const results = new Map(
-      r.events(ran.threadId, 'CHUNK')
-        .map((e) => e.payload as any)
-        .filter((p) => p.type === 'tool-result')
-        .map((p) => [p.toolCallId, p]),
+      ofType(await runItems(r.runtime.ports(), ran.runId!), 'TOOL_CALL_RESULT').map((e) => [e.toolCallId, e]),
     );
-    expect(results.get('c1')).toEqual({ type: 'tool-result', toolCallId: 'c1', toolName: 'lookup', result: { found: true } });
-    expect(results.get('c2').result).toEqual({ error: 'boom' }); // a failed tool names its error
+    expect(results.get('c1')).toEqual({ type: 'TOOL_CALL_RESULT', toolCallId: 'c1', toolName: 'lookup', result: { found: true }, offset: expect.any(String) } as any);
+    expect(results.get('c2')!.result).toEqual({ error: 'boom' }); // a failed tool names its error
   });
 });

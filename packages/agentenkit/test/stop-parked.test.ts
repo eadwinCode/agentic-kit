@@ -11,6 +11,7 @@ import { agentTool } from '../src/core/tools.js';
 import { repairDanglingToolCalls } from '../src/core/messages.js';
 import { resolveConfig } from '../src/core/types.js';
 import type { RuntimeOptions } from '../src/ports/runtime.js';
+import { subagents } from './stream-helpers.js';
 
 interface ScriptedStep {
   text?: string;
@@ -91,7 +92,7 @@ describe('stop while parked (§2.5)', () => {
     expect(stopped).toMatchObject({ state: 'CANCELLED', stopReason: 'cancelled', totalTokens: 0 });
     expect(stopped.endedAt).toBeInstanceOf(Date);
     expect(stopped.durationMs).toBeGreaterThanOrEqual(0);
-    const events = await r.storage.events.listSince(ran.threadId, 0);
+    const events = r.bus.published.filter((e) => e.threadId === ran.threadId && e.type === 'STATE_CHANGE');
     expect(events.at(-1)!.payload).toMatchObject({
       state: 'CANCELLED', stopReason: 'cancelled', runId: ran.runId, endedAt: stopped.endedAt,
     });
@@ -162,7 +163,7 @@ describe('stop while parked (§2.5)', () => {
     });
     const ran = await chat.run({ prompt: 'go' });
     await r.runtime.worker.handleJob(r.queue.items[0]!);
-    const childId = (r.bus.published.find((e) => e.type === 'SUBAGENT_STARTED')!.payload as any).agentId as string;
+    const childId = (await subagents(r.runtime.ports(), ran.threadId)).started[0]!.subagentId;
 
     await chat.stop(ran.threadId);
     expect(roles(r.storage, ran.threadId)).toEqual(['user', 'assistant', 'tool']);

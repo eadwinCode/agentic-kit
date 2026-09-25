@@ -325,6 +325,44 @@ func TestReclaim_AThreadWithNoLockAndNoJobIsRedispatched(t *testing.T) {
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "the run finished")
 }
 
+// findlessQueue cannot look a job up, like QStash.
+type findlessQueue struct{ ports.Queue }
+
+func (findlessQueue) Find(context.Context, string) (*ports.QueuedJob, error) {
+	return nil, ports.ErrUnsupported
+}
+
+// With a queue that cannot find jobs, only time says a job is lost: past the
+// lock lease AND past the queue wait limit, whichever is longer.
+func TestReclaim_AQueueThatCannotFindJobsRedispatchesAfterTheLongestWait(t *testing.T) {
+	h := makeRuntimeOpts(t, scripted(step{text: "ok"}),
+		func(o *agentenkit.RuntimeOptions) { o.Queue = findlessQueue{o.Queue} },
+		func(c *agentenkit.AgentConfig) {
+			c.RunLockLease = time.Second
+			c.MaxQueueWait = 2 * time.Second
+			c.RunRetryBackoff = 0
+		})
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
+	h.queue.Shift() // the queue lost the job
+
+	time.Sleep(1050 * time.Millisecond)
+	report, err := h.rt.ReclaimStuckRuns(h.ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustEqual(t, report.Redispatched, 0, "past the lease, but a job may still wait up to 2s")
+	time.Sleep(time.Second)
+	report, err = h.rt.ReclaimStuckRuns(h.ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustEqual(t, report.Redispatched, 1, "re-dispatched")
+	mustEqual(t, h.queue.Items()[0].Kind, agentenkit.JobReclaim, "as a reclaim")
+	h.drain(t)
+	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "the run finished")
+}
+
 // A settle hook that fails leaves the run unsettled; the sweep runs it again.
 func TestSettle_AFailedHookLeavesTheRunUnsettledAndTheSweepRetriesIt(t *testing.T) {
 	calls := 0
@@ -563,8 +601,9 @@ func TestSnapshot_AQueuedThreadIsActiveFromItsAcceptance(t *testing.T) {
 	mustEqual(t, snap.Thread.State, agentenkit.StateQueued, "state")
 	mustEqual(t, len(snap.Runs), 1, "the run is on the snapshot")
 	mustEqual(t, snap.Runs[0].State, agentenkit.StateQueued, "as queued")
-	if len(snap.ActiveEvents) == 0 || payload(snap.ActiveEvents[0])["state"] != "QUEUED" {
-		t.Fatalf("the active window starts at the acceptance: %+v", snap.ActiveEvents)
+	// Not picked up yet: no segment has started, so there is no stream.
+	if snap.Stream != nil {
+		t.Fatalf("a queued run has no stream yet: %+v", snap.Stream)
 	}
 }
 

@@ -1,6 +1,7 @@
 package agentenkit_test
 
 import (
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 	"testing"
 
 	"github.com/zendev-sh/goai/provider"
@@ -42,11 +43,18 @@ func TestReasoning_StreamsAndPersists(t *testing.T) {
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "q"})
 	h.handleNext(t)
 	var kinds []string
-	for _, e := range h.events(ran.ThreadID, "CHUNK") {
-		kinds = append(kinds, payload(e)["type"].(string))
+	var reasoning string
+	for _, i := range runItems(t, h, ran.RunID) {
+		switch e := i.Event.(type) {
+		case *ports.ReasoningContentEvent:
+			kinds = append(kinds, "reasoning")
+			reasoning += e.Delta
+		case *ports.TextMessageContentEvent:
+			kinds = append(kinds, "text")
+		}
 	}
-	mustStrings(t, kinds[:2], []string{"reasoning", "text-delta"}, "chunk order")
-	mustEqual(t, payload(h.events(ran.ThreadID, "CHUNK")[0])["textDelta"], "thinking hard", "reasoning delta")
+	mustStrings(t, kinds, []string{"reasoning", "text"}, "stream order")
+	mustEqual(t, reasoning, "thinking hard", "reasoning delta")
 	parts := agentenkit.ParseContent(h.storage.MessageRows(ran.ThreadID)[1].Content)
 	mustEqual(t, parts[0].Type, "reasoning", "persisted reasoning")
 	mustEqual(t, parts[0].Text, "thinking hard", "persisted text")

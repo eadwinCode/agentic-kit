@@ -55,11 +55,11 @@ describe('event order (J1)', () => {
 
   it('hands a custom transport the cursor to resume from', async () => {
     const { streams, emit } = await mount();
-    expect(streams[0]!.handlers.getCursor()).toBe(7); // the snapshot's
+    expect(streams[0]!.handlers.getCursor()).toBe('7 - -'); // the snapshot's
     await act(async () => {
       emit({ seq: 9, type: 'STATE_CHANGE', payload: { state: 'RUNNING' } });
     });
-    expect(streams[0]!.handlers.getCursor()).toBe(9);
+    expect(streams[0]!.handlers.getCursor()).toBe('9 - -');
   });
 });
 

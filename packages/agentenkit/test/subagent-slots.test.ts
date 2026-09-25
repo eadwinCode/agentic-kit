@@ -7,6 +7,7 @@ import { MemoryAdminStore } from '../src/admin/memory.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import { RunSlots } from '../src/core/subagent.js';
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
+import { subagents } from './stream-helpers.js';
 
 // Workstream F: the subagent cap is per run and per depth, a wait for a slot
 // ends on a stop, and a child that was stopped or cut short is never taken
@@ -101,7 +102,7 @@ describe('the subagent cap (§2.7)', () => {
     ]);
     expect(outcome).toBe('done');
     expect(await r.state(ran.threadId)).toBe('COMPLETED');
-    expect(r.events(ran.threadId, 'SUBAGENT_COMPLETED')).toHaveLength(6); // 3 children, 3 grandchildren
+    expect((await subagents(r.runtime.ports(), ran.threadId)).completed).toHaveLength(6); // 3 children, 3 grandchildren
   }, 10_000);
 
   it('slots are per depth', async () => {
@@ -139,8 +140,9 @@ describe('a child that did not finish (§2.7)', () => {
     while (!childStarted) await new Promise((resolve) => setTimeout(resolve, 5));
     await r.chat.stop(ran.threadId);
     await running;
-    expect(r.events(ran.threadId, 'SUBAGENT_COMPLETED')).toHaveLength(0);
-    const childId = (r.events(ran.threadId, 'SUBAGENT_STARTED')[0]!.payload as any).agentId;
+    const subs = await subagents(r.runtime.ports(), ran.threadId);
+    expect(subs.completed).toHaveLength(0);
+    const childId = subs.started[0]!.subagentId;
     expect((await r.admin.runs.get(childId))!.state).toBe('CANCELLED');
   });
 
@@ -153,10 +155,10 @@ describe('a child that did not finish (§2.7)', () => {
     const ran = await r.chat.run({ prompt: 'go' });
     await r.runtime.worker.handleJob(r.queue.items.shift()!);
     expect(await r.state(ran.threadId)).toBe('COMPLETED'); // the parent goes on
-    const failed = r.events(ran.threadId, 'SUBAGENT_FAILED');
-    expect(failed).toHaveLength(1);
-    expect((failed[0]!.payload as any).error).toContain('without a finish');
-    expect(r.events(ran.threadId, 'SUBAGENT_COMPLETED')).toHaveLength(0); // partial text is not a result
+    const subs = await subagents(r.runtime.ports(), ran.threadId);
+    expect(subs.failed).toHaveLength(1);
+    expect(subs.failed[0]!.error).toContain('without a finish');
+    expect(subs.completed).toHaveLength(0); // partial text is not a result
   });
 });
 

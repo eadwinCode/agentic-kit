@@ -470,9 +470,17 @@ export async function runLoop(
     // would render the same text twice, once from the message and once from
     // the stream that produced it. Persisted (not a bus notice) because the
     // snapshot needs its seq to know where durable ends and live begins.
+    // It carries the step's finish and usage: a run stream turns it into
+    // its STEP_FINISHED, at the moment the step is saved.
     await publish(deps, threadId, 'STEP_COMMITTED', {
       index: stepsRun,
       agentId: input.agentId,
+      step: stepsRun + 1,
+      finishReason: step.finishReason,
+      inputTokens: priced.inputTokens,
+      cachedInputTokens: priced.cacheReadInputTokens,
+      outputTokens: priced.outputTokens,
+      totalTokens: priced.totalTokens,
     });
     // The step is durable now, tool calls included, so the parks it raised
     // can be written: WAITING_FOR_INPUT and the approval requests.

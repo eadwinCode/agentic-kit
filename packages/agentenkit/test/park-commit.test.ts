@@ -13,6 +13,7 @@ import { repairDanglingToolCalls } from '../src/core/messages.js';
 import { runIdKey } from '../src/core/keys.js';
 import { resolveConfig } from '../src/core/types.js';
 import type { RuntimePorts } from '../src/ports/runtime.js';
+import { runItems, subagents } from './stream-helpers.js';
 
 // Workstream D: a park is written only once its step is saved, an answer
 // survives until its result is saved, and a failure on the way back up never
@@ -110,12 +111,15 @@ async function setup(
     resolveModel: () => ({ instance: () => model, contextWindow: 128_000 }),
   };
   const state = async (threadId: string) => (await storage.threads.get(threadId))!.state;
+  // Everything the thread saw, in the order it was sent: record entries and
+  // live notices alike.
   const events = (threadId: string, type: string) =>
-    (storage.events.store.get(threadId) ?? []).filter((e) => e.type === type);
+    bus.published.filter((e) => e.threadId === threadId && e.type === type);
+  const order = (e: unknown) => bus.published.indexOf(e as any);
   const rows = (threadId: string, agentId: string | null = null) =>
     storage.messages.store.get(threadId)!.filter((m) => m.agentId === agentId);
   const next = () => runtime.worker.handleJob(queue.items.shift()!);
-  return { runtime, chat, storage, queue, kv, ports, prompts, sent, wiped, state, events, rows, next };
+  return { runtime, chat, storage, queue, kv, ports, prompts, sent, wiped, state, events, order, rows, next };
 }
 
 describe('a park waits for its step (§2.5)', () => {
@@ -123,8 +127,11 @@ describe('a park waits for its step (§2.5)', () => {
     const r = await setup([[call('a1', 'send', {}), finish('tool-calls')]]);
     const ran = await r.chat.run({ prompt: 'go' });
     await r.next();
-    const committed = r.events(ran.threadId, 'STEP_COMMITTED')[0]!.seq;
-    const requested = r.events(ran.threadId, 'INPUT_REQUIRED')[0]!.seq;
+    // On the run's stream, in the order they happened.
+    const types = (await runItems(r.runtime.ports(), ran.runId!)).map((i) => i.type);
+    const committed = types.indexOf('STEP_FINISHED');
+    const requested = types.indexOf('INPUT_REQUIRED');
+    expect(committed).toBeGreaterThan(-1);
     expect(requested).toBeGreaterThan(committed);
     expect(await r.state(ran.threadId)).toBe('WAITING_FOR_INPUT');
     expect(r.rows(ran.threadId).map((m) => m.role)).toEqual(['user', 'assistant']);
@@ -211,7 +218,7 @@ describe('unwinding a nested park (§2.7)', () => {
     await r.next();
     expect(r.wiped).toEqual(['prod']);
     expect(await r.state(ran.threadId)).toBe('COMPLETED'); // not stuck
-    expect(r.events(ran.threadId, 'SUBAGENT_FAILED')).toHaveLength(1);
+    expect((await subagents(r.runtime.ports(), ran.threadId)).failed).toHaveLength(1);
     const spawn = (r.rows(ran.threadId)[2]!.content as any[])[0];
     expect(spawn.toolCallId).toBe('s1');
     expect(spawn.result.error).toBeTruthy();
@@ -224,7 +231,7 @@ describe('unwinding a nested park (§2.7)', () => {
     );
     const ran = await r.chat.run({ prompt: 'go' });
     await r.next();
-    const childId = (r.events(ran.threadId, 'SUBAGENT_STARTED')[0]!.payload as any).agentId;
+    const childId = (await subagents(r.runtime.ports(), ran.threadId)).started[0]!.subagentId;
     // A worker landed the child's verdict, then died before the level above.
     await r.storage.messages.append(ran.threadId, {
       role: 'tool',

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -160,6 +161,10 @@ func New(db *sql.DB) (*Storage, error) {
 		}
 	}
 	// The thread's current run, for ThreadTransition's compare-and-set.
+	// The run a record entry belongs to.
+	if err := addMissing(db, "events", map[string]string{"runId": "TEXT"}); err != nil {
+		return nil, err
+	}
 	if err := addMissing(db, "threads", map[string]string{"runId": "TEXT"}); err != nil {
 		return nil, err
 	}
@@ -391,9 +396,11 @@ func scanEvent(row interface{ Scan(...any) error }) (*ports.AgentEvent, error) {
 	var e ports.AgentEvent
 	var payload sql.NullString
 	var created int64
-	if err := row.Scan(&e.ThreadID, &e.Seq, &e.Type, &payload, &created); err != nil {
+	var runID sql.NullString
+	if err := row.Scan(&e.ThreadID, &e.Seq, &e.Type, &payload, &created, &runID); err != nil {
 		return nil, err
 	}
+	e.RunID = runID.String
 	if payload.Valid {
 		e.Payload = json.RawMessage(payload.String)
 	} else {
@@ -420,12 +427,55 @@ func (e events) query(ctx context.Context, q string, args ...any) ([]ports.Agent
 	return out, rows.Err()
 }
 
-const eventCols = `threadId, seq, type, payload, createdAt`
+const eventCols = `threadId, seq, type, payload, createdAt, runId`
 
-func (e events) Append(ctx context.Context, threadID string, ev ports.AgentEvent, _ ports.StorageContext) error {
-	_, err := e.db.ExecContext(ctx, `INSERT INTO events (id,threadId,seq,type,payload,createdAt) VALUES (?,?,?,?,?,?)`,
-		core.NewID(), threadID, ev.Seq, ev.Type, string(core.MarshalPayload(ev.Payload)), ms(ev.CreatedAt))
-	return err
+// Append mints the seq in the insert itself: SQLite runs one writer at a
+// time, so no two appends on a thread read the same MAX.
+func (e events) Append(ctx context.Context, threadID string, in ports.NewThreadEvent, _ ports.StorageContext) (ports.AgentEvent, error) {
+	at := in.CreatedAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+	payload := core.MarshalPayload(in.Payload)
+	var runID any
+	if in.RunID != "" {
+		runID = in.RunID
+	}
+	ev := ports.AgentEvent{ThreadID: threadID, Type: in.Type, Payload: payload, CreatedAt: fromMs(ms(at)), RunID: in.RunID}
+	err := e.db.QueryRowContext(ctx,
+		`INSERT INTO events (id,threadId,seq,type,payload,createdAt,runId)
+		 SELECT ?,?,COALESCE(MAX(seq),0)+1,?,?,?,? FROM events WHERE threadId = ?
+		 RETURNING seq`,
+		core.NewID(), threadID, in.Type, string(payload), ms(at), runID, threadID).Scan(&ev.Seq)
+	return ev, err
+}
+
+func (e events) List(ctx context.Context, threadID string, f ports.ThreadEventFilter, _ ports.StorageContext) ([]ports.AgentEvent, error) {
+	where := []string{"threadId = ?"}
+	args := []any{threadID}
+	if f.Types != nil {
+		marks := strings.TrimSuffix(strings.Repeat("?,", len(f.Types)), ",")
+		if marks == "" {
+			marks = "NULL"
+		}
+		where = append(where, "type IN ("+marks+")")
+		for _, t := range f.Types {
+			args = append(args, t)
+		}
+	}
+	if f.RunID != "" {
+		where = append(where, "runId = ?")
+		args = append(args, f.RunID)
+	}
+	if f.After != nil {
+		where = append(where, "seq > ?")
+		args = append(args, *f.After)
+	}
+	q := `SELECT ` + eventCols + ` FROM events WHERE ` + strings.Join(where, " AND ") + ` ORDER BY seq`
+	if f.Limit > 0 {
+		q += " LIMIT " + strconv.Itoa(f.Limit)
+	}
+	return e.query(ctx, q, args...)
 }
 
 func (e events) ListSince(ctx context.Context, threadID string, sinceSeq int64, _ ports.StorageContext) ([]ports.AgentEvent, error) {
@@ -442,6 +492,54 @@ func (e events) Latest(ctx context.Context, threadID, typ string, _ ports.Storag
 
 func (e events) ListByType(ctx context.Context, threadID, typ string, _ ports.StorageContext) ([]ports.AgentEvent, error) {
 	return e.query(ctx, `SELECT `+eventCols+` FROM events WHERE threadId = ? AND type = ? ORDER BY seq`, threadID, typ)
+}
+
+func (e events) Prune(ctx context.Context, types []string, limit int, dryRun bool) (map[string]int64, error) {
+	counts := map[string]int64{}
+	marks := strings.TrimSuffix(strings.Repeat("?,", len(types)), ",")
+	if marks == "" {
+		return counts, nil
+	}
+	args := make([]any, len(types))
+	for i, t := range types {
+		args[i] = t
+	}
+	if dryRun {
+		rows, err := e.db.QueryContext(ctx, `SELECT type, COUNT(*) FROM events WHERE type IN (`+marks+`) GROUP BY type`, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var typ string
+			var n int64
+			if err := rows.Scan(&typ, &n); err != nil {
+				return nil, err
+			}
+			counts[typ] = n
+		}
+		return counts, rows.Err()
+	}
+	rows, err := e.db.QueryContext(ctx, `SELECT id, type FROM events WHERE type IN (`+marks+`) LIMIT ?`, append(args, limit)...)
+	if err != nil {
+		return nil, err
+	}
+	var ids []any
+	for rows.Next() {
+		var id, typ string
+		if err := rows.Scan(&id, &typ); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+		counts[typ]++
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return counts, nil
+	}
+	_, err = e.db.ExecContext(ctx, `DELETE FROM events WHERE id IN (`+strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")+`)`, ids...)
+	return counts, err
 }
 
 type usage struct{ db *sql.DB }

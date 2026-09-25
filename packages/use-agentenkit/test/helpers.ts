@@ -1,5 +1,5 @@
 import type { AgentRunConfig, StreamHandlers } from '../src/config.js';
-import type { StreamEvent, ThreadSnapshot } from '../src/types.js';
+import type { FollowFrame, StreamEvent, ThreadSnapshot } from '../src/types.js';
 
 export type AgentRunConfigLike = Partial<AgentRunConfig> & {
   /** What the history route returns. */
@@ -78,7 +78,7 @@ export function harness(over: AgentRunConfigLike = {}) {
   };
 
   /** Push an event as the server would. */
-  const emit = (event: StreamEvent) => {
+  const emit = (event: StreamEvent | FollowFrame | Record<string, unknown>) => {
     const live = streams.find((s) => !s.closed);
     if (!live) throw new Error('emit() called with no open stream');
     live.handlers.onMessage(JSON.stringify(event));

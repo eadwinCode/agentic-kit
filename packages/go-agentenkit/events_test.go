@@ -23,10 +23,11 @@ func TestFollow_AnEventTheBusSkippedIsReadBackFromTheLog(t *testing.T) {
 	deps := h.rt.Ports(nil)
 	th, _ := h.storage.Threads().Create(h.ctx, ports.ThreadInit{}, agentenkit.StorageContext{})
 	store := func(seq int64) ports.AgentEvent {
-		e := ports.AgentEvent{ThreadID: th.ID, Seq: seq, Type: "X", Payload: json.RawMessage("null"), CreatedAt: time.Now()}
-		if err := h.storage.Events().Append(h.ctx, th.ID, e, agentenkit.StorageContext{}); err != nil {
+		e, err := h.storage.Events().Append(h.ctx, th.ID, ports.NewThreadEvent{Type: "X", Payload: json.RawMessage("null")}, agentenkit.StorageContext{})
+		if err != nil {
 			t.Fatal(err)
 		}
+		mustEqual(t, e.Seq, seq, "the store minted the next seq")
 		return e
 	}
 	store(1)
@@ -54,21 +55,36 @@ func TestFollow_AnEventTheBusSkippedIsReadBackFromTheLog(t *testing.T) {
 	mustEqual(t, next(), int64(3), "then the live event")
 }
 
+// The store mints the seq, so a lost kv changes nothing.
 func TestPublish_ALostSeqCounterCarriesOnFromTheLog(t *testing.T) {
 	h := makeRuntime(t, scripted(step{text: "ok"}))
 	deps := h.rt.Ports(nil)
 	th, _ := h.storage.Threads().Create(h.ctx, ports.ThreadInit{}, agentenkit.StorageContext{})
 	for i := 0; i < 3; i++ {
-		if _, err := core.Publish(h.ctx, deps, th.ID, "X", nil); err != nil {
+		if _, err := core.Publish(h.ctx, deps, th.ID, "CONTEXT_COMPACTED", nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	_ = h.kv.Del(h.ctx, core.SeqKey(th.ID)) // flushed, evicted, restarted
-	e, err := core.Publish(h.ctx, deps, th.ID, "X", nil)
+	_ = h.kv.Del(h.ctx, core.SeqKey(th.ID)) // there is no counter to lose any more
+	e, err := core.Publish(h.ctx, deps, th.ID, "CONTEXT_COMPACTED", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustEqual(t, e.Seq, int64(4), "past what the log holds, never back at 1")
+	mustEqual(t, e.Seq, int64(4), "the thread's next")
+}
+
+// A live-only event is a notice and is never stored.
+func TestPublish_ALiveOnlyEventIsANotice(t *testing.T) {
+	h := makeRuntime(t, scripted(step{text: "ok"}))
+	deps := h.rt.Ports(nil)
+	th, _ := h.storage.Threads().Create(h.ctx, ports.ThreadInit{}, agentenkit.StorageContext{})
+	sent, err := core.Publish(h.ctx, deps, th.ID, "STATE_CHANGE", map[string]any{"state": "RUNNING"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustEqual(t, sent.Seq, int64(0), "a notice")
+	stored, _ := h.storage.Events().ListSince(h.ctx, th.ID, -1, agentenkit.StorageContext{})
+	mustEqual(t, len(stored), 0, "never stored")
 }
 
 func TestChunks_ConsecutiveDeltasGoOutAsOneEvent(t *testing.T) {
@@ -78,9 +94,9 @@ func TestChunks_ConsecutiveDeltasGoOutAsOneEvent(t *testing.T) {
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
 	h.handleNext(t)
 	var deltas []string
-	for _, e := range h.events(ran.ThreadID, "CHUNK") {
-		if p := payload(e); p["type"] == "text-delta" {
-			deltas = append(deltas, p["textDelta"].(string))
+	for _, i := range runItems(t, h, ran.RunID) {
+		if c, ok := i.Event.(*ports.TextMessageContentEvent); ok {
+			deltas = append(deltas, c.Delta)
 		}
 	}
 	mustEqual(t, strings.Join(deltas, ""), "one two three", "the text arrives whole")

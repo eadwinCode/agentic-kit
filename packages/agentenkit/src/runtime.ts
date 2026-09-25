@@ -21,7 +21,12 @@ import { contextUsage } from './core/context.js';
 import { createGenerateTextAgent, createStreamTextAgent } from './core/agent.js';
 import * as adminReads from './core/admin.js';
 import { bindStorage, type AgentRunState } from './core/state.js';
-import { followEvents, toSseStream } from './core/follow.js';
+import { threadSnapshot } from './core/snapshot.js';
+import { pruneEvents } from './core/prune.js';
+import { MemoryRunStreams } from './adapters/memory.js';
+import type { Logger } from './ports/runtime.js';
+import { currentRunId } from './core/keys.js';
+import { followEvents, followThread, parseCursor, toFollowSse, type ThreadCursor } from './core/follow.js';
 import { openDefaultAdminStore } from './admin/default.js';
 import { reclaimIfOrphaned } from './core/reclaim.js';
 import { respond } from './core/hitl.js';
@@ -35,6 +40,30 @@ export class UnknownAgentError extends Error {
     super(`no agent registered for this job: ${JSON.stringify(agent ?? '')}`);
     this.name = 'UnknownAgentError';
   }
+}
+
+/** The cursor a follow starts from: a ThreadCursor or its wire string, or a
+ *  bare record seq (`since`) as older clients send. */
+function cursorOf(options: { cursor?: ThreadCursor | string | null; since?: number }): ThreadCursor | null {
+  if (typeof options.cursor === 'string') return parseCursor(options.cursor);
+  if (options.cursor) return options.cursor;
+  return options.since !== undefined ? { seq: options.since } : null;
+}
+
+let warnedInMemory = false;
+
+/** The run streams when none were passed: in memory, which only this
+ *  process can read. Said once, loudly, since a web server and a worker in
+ *  separate processes would each see only their own. */
+function inMemoryStreams(log?: Logger): MemoryRunStreams {
+  if (!warnedInMemory) {
+    warnedInMemory = true;
+    ((log ?? console) as { warn?: (m: string) => void }).warn?.(
+      'agentenkit: no `streams` port was passed, so run streams are kept in memory and only this process can ' +
+        'read them. Pass one (RedisRunStreams, a Postgres or SQL store) when web servers and workers run apart.',
+    );
+  }
+  return new MemoryRunStreams();
 }
 
 /** Bind the ports to the core behaviors (§3.3). This is the package's public
@@ -55,6 +84,7 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
     bus: opts.bus,
     queue: opts.queue,
     kv: opts.kv,
+    streams: opts.streams ?? inMemoryStreams(opts.log),
     resolveModel: (modelName: string) => opts.resolveModel(modelName),
     pricer: opts.pricer,
     log: opts.log,
@@ -121,53 +151,7 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
     getThreadSnapshot: async (
       threadId: string,
       state?: AgentRunState,
-    ): Promise<ThreadSnapshot | null> => {
-      const deps = scope(state);
-      const thread = await deps.storage.threads.get(threadId);
-      if (!thread) return null;
-
-      const messages = await deps.storage.messages.list(threadId, undefined);
-      const runs = await deps.admin.runs.listByThread(threadId);
-      const events = await deps.storage.events.listSince(threadId, -1);
-
-      const lastEventSeq = events.at(-1)?.seq ?? -1;
-      let activeEvents: AgentEvent[] = [];
-      if (ACTIVE_STATES.includes(thread.state)) {
-        // The run's boundary is where it was accepted (QUEUED) or picked up
-        // (RUNNING), whichever came last; a resume after a park publishes
-        // RUNNING too.
-        let boundary = -1;
-        for (let index = events.length - 1; index >= 0; index -= 1) {
-          const event = events[index];
-          const state = (event.payload as { state?: string } | null)?.state;
-          if (event.type === 'STATE_CHANGE' && (state === 'RUNNING' || state === 'QUEUED')) {
-            boundary = index;
-            break;
-          }
-        }
-        const active = events.slice(Math.max(0, boundary));
-
-        // Everything up to the last committed step is ALREADY in `messages`
-        // (§2.2). Replaying those chunks too would render each finished step's
-        // text twice — once from the durable message, once from the stream
-        // that produced it. Only the in-flight step's chunks are missing from
-        // durable history, so only those are transient.
-        //
-        // Chunks alone: a park (INPUT_REQUIRED) is published right after its
-        // step commits, so slicing the whole window by this boundary would
-        // drop the very approval a reconnecting client needs.
-        const lastCommitted = active.reduce(
-          (seq, e) => (e.type === 'STEP_COMMITTED' ? e.seq : seq),
-          -1,
-        );
-        const isStream = (type: string) => type === 'CHUNK' || type === 'SUBAGENT_CHUNK';
-        activeEvents = active.filter(
-          (e) => !(isStream(e.type) && e.seq !== 0 && e.seq <= lastCommitted),
-        );
-      }
-
-      return { thread, messages, runs, lastEventSeq, activeEvents };
-    },
+    ): Promise<ThreadSnapshot | null> => threadSnapshot(scope(state), threadId),
 
     admin: {
       overview: (range) => adminReads.overview(deps, range),
@@ -216,14 +200,28 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
       subscribe: async (threadId: string, handler: (event: AgentEvent) => void) =>
         deps.bus.subscribe(threadId, handler),
       // The replay-then-tail dance lives here rather than in every route
-      // handler: subscribe first, never emit at or below the cursor, and let a
-      // seq-0 notice through without moving it (§2.2).
+      // handler (§2.2): the record from the cursor, the run stream from its
+      // offset, one SNAPSHOT when that stream is gone.
       follow: (threadId, options = {}) =>
+        followThread(scope(options.state), threadId, { ...options, cursor: cursorOf(options) }),
+      sse: (threadId, options = {}) => {
+        const cursor = cursorOf(options);
+        return toFollowSse(followThread(scope(options.state), threadId, { ...options, cursor }), cursor, { ...options, threadId });
+      },
+      followRecord: (threadId, options = {}) =>
         followEvents(scope(options.state), threadId, options),
-      sse: (threadId, options = {}) =>
-        toSseStream(followEvents(scope(options.state), threadId, options), options),
       publishEvent: (threadId, type, payload, options = {}) =>
         publishEvent(scope(options.state), threadId, type, payload, options),
+    },
+
+    pruneEvents: (options) => pruneEvents(deps, options),
+
+    streams: {
+      read: (streamId, after, signal) => {
+        if (!deps.streams) throw new Error('this runtime has no run streams');
+        return deps.streams.read(streamId, after, signal);
+      },
+      snapshot: async (streamId, after) => (deps.streams ? deps.streams.snapshot(streamId, after) : null),
     },
 
     createStreamTextAgent: (spec) => {

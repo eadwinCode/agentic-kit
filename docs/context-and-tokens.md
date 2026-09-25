@@ -47,8 +47,8 @@ platform's own housekeeping costs is visible on its own (see
 so it is on that run's bill and counts toward its cost cap, and a stop cancels
 it like any other call of the run.
 
-The summary is persisted as a `system` message and a `CONTEXT_COMPACTED` event
-is published. Reading current load:
+The summary is persisted as a `system` message and a `CONTEXT_COMPACTED` entry
+is added to the thread record. Reading current load:
 
 ```ts
 const usage = await runtime.getThreadUsage(threadId);
@@ -143,7 +143,7 @@ config: {
   billingPreCheck: async ({ threadId, state, publishEvent }) => {
     const org = await orgById(state.orgId);
     if (org.credits > 0) return { ok: true };
-    await publishEvent('CREDIT_LIMIT', { resetAt: org.periodEndsAt });
+    await publishEvent('CREDIT_LIMIT', { resetAt: org.periodEndsAt }, { durable: true });
     return { ok: false, error: 'Out of credits' };
   },
 }
@@ -152,7 +152,9 @@ config: {
 A rejected run writes no message and returns `accepted: false` with your
 error. It does publish: your own event, if the check sent one, and the
 platform's `RUN_REFUSED` with the error, so the chat can show the refusal
-where the user is looking rather than only in an HTTP response.
+where the user is looking rather than only in an HTTP response. `RUN_REFUSED`
+is kept in the thread record; your own event is kept only with
+`{ durable: true }`, as above.
 
 Mid-run, the budget is the credit check. When the run's cumulative spend
 crosses `tokenBudget` between steps, the platform publishes

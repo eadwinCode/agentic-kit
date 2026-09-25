@@ -98,7 +98,9 @@ func reclaimParked(ctx context.Context, deps ports.RuntimePorts, thread *ports.T
 
 // reclaimLost re-dispatches a QUEUED or RUNNING thread that nothing is
 // working on: no run lock, no job on the queue, and a run record that has
-// sat untouched for longer than a lock lease.
+// sat untouched for longer than a lock lease. With a queue that cannot look
+// a job up, the run must also have been quiet for longer than any of its
+// jobs could wait.
 func reclaimLost(ctx context.Context, deps ports.RuntimePorts, thread *ports.ThreadDTO) (bool, error) {
 	threadID := thread.ID
 	runID, err := CurrentRunID(ctx, deps, threadID)
@@ -110,14 +112,16 @@ func reclaimLost(ctx context.Context, deps ports.RuntimePorts, thread *ports.Thr
 	} else if held {
 		return false, nil // a live worker: the lock is renewed while one runs (§3.4)
 	}
+	// A queue that cannot look a job up (QStash) cannot say whether it still
+	// holds this one. Then only time can: see the wait below.
+	queueCannotSay := false
 	job, err := deps.Queue.Find(ctx, runID)
-	if err != nil {
-		if errors.Is(err, ports.ErrUnsupported) {
-			return false, nil // this queue cannot say; nothing to do safely
-		}
+	switch {
+	case errors.Is(err, ports.ErrUnsupported):
+		queueCannotSay = true
+	case err != nil:
 		return false, err
-	}
-	if job != nil {
+	case job != nil:
 		return false, nil // still queued, or leased: the queue has it
 	}
 	rec, err := deps.Admin.Runs().Get(ctx, runID)
@@ -143,6 +147,7 @@ func reclaimLost(ctx context.Context, deps ports.RuntimePorts, thread *ports.Thr
 		_, err := Publish(ctx, deps, threadID, "STATE_CHANGE", map[string]any{
 			"state": state, "stopReason": rec.StopReason, "runId": runID, "endedAt": *rec.EndedAt,
 		})
+		CloseLostSegment(ctx, deps, threadID, runID, "the run ended but its worker never closed its stream")
 		return true, err
 	}
 	// A run just accepted has no lock and no row for a moment between its
@@ -152,10 +157,25 @@ func reclaimLost(ctx context.Context, deps ports.RuntimePorts, thread *ports.Thr
 	if rec.EnqueuedAt != nil && rec.EnqueuedAt.After(last) {
 		last = *rec.EnqueuedAt
 	}
-	if time.Since(last) < deps.Config.RunLockLease {
+	wait := deps.Config.RunLockLease
+	if queueCannotSay {
+		// Without the queue's word, the run is lost only once it has been
+		// quiet for longer than any job of it could fairly wait: a retry sent
+		// back with a delay, or a queue with a wait limit. The thread's own
+		// last change counts too, since a retry moves it back to QUEUED.
+		// Should the job turn up after all, it finds the run taken and does
+		// nothing.
+		if thread.UpdatedAt.After(last) {
+			last = thread.UpdatedAt
+		}
+		wait = max(wait, deps.Config.MaxQueueWait, longestRetryDelay(deps.Config))
+	}
+	if time.Since(last) < wait {
 		return false, nil
 	}
 	Logger(deps).Warn("run lost by the queue; re-dispatched", "thread", threadID, "run", runID, "state", thread.State)
+	// A worker that took it and died may have left its segment's stream open.
+	CloseLostSegment(ctx, deps, threadID, runID, "the worker was lost; the run was dispatched again")
 	job2 := ports.RunJob{
 		ThreadID: threadID, RunID: runID, Model: rec.Model, Agent: rec.Agent,
 		Kind: ports.JobReclaim, EnqueuedAt: time.Now().UnixMilli(),
@@ -180,4 +200,24 @@ func enqueueReclaim(ctx context.Context, deps ports.RuntimePorts, job ports.RunJ
 		return false, err
 	}
 	return true, nil
+}
+
+// longestRetryDelay is the longest a failed run's retry is held back (§2.8):
+// the base doubled per attempt, capped, plus the most jitter a delay can get.
+func longestRetryDelay(c ports.AgentConfig) time.Duration {
+	base, limit := c.RunRetryBackoff, c.RunRetryBackoffMax
+	if base <= 0 {
+		return 0
+	}
+	d := base
+	for i := 1; i < c.RunMaxAttempts; i++ {
+		d *= 2
+		if limit > 0 && d >= limit {
+			break
+		}
+	}
+	if limit > 0 && d > limit {
+		d = limit
+	}
+	return d + d/4
 }

@@ -388,7 +388,7 @@ func TestSubagents_AProfileGivesTheChildItsOwnPersonaToolsAndModel(t *testing.T)
 			t.Fatalf("spawn description %q lacks %q", spawnDesc, want)
 		}
 	}
-	childID := payload(h.events(ran.ThreadID, "SUBAGENT_STARTED")[0])["agentId"].(string)
+	childID := subagentsOf(t, h, ran.ThreadID).started[0].SubagentID
 	rec, _ := h.admin.Runs().Get(h.ctx, childID)
 	mustEqual(t, rec.Model, "gpt-4o-mini", "the profile's model")
 	mustEqual(t, rec.Agent, "researcher", "the profile's name")
@@ -408,7 +408,7 @@ func TestSubagents_AnUnknownProfileIsReportedToTheModel(t *testing.T) {
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
 	h.handleNext(t)
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "state")
-	mustEqual(t, len(h.events(ran.ThreadID, "SUBAGENT_STARTED")), 0, "nothing was spawned")
+	mustEqual(t, len(subagentsOf(t, h, ran.ThreadID).started), 0, "nothing was spawned")
 	parent, _ := h.storage.Messages().List(h.ctx, ran.ThreadID, agentenkit.MainAgent, agentenkit.StorageContext{})
 	result := string(agentenkit.ParseContent(parent[2].Content)[0].Result)
 	if !strings.Contains(result, `Unknown subagent \"nobody\"`) || !strings.Contains(result, "researcher") {
@@ -481,6 +481,7 @@ func TestModelCalls_CarryTheRunIDAndStateOnTheirContext(t *testing.T) {
 	model := &ctxModel{scriptedModel: inner}
 	rt, err := agentenkit.SetupAgentCore(h.ctx, agentenkit.RuntimeOptions{
 		Storage: h.storage, Admin: h.admin, Bus: h.bus, Kv: h.kv, Queue: h.queue,
+		Streams: h.rt.Ports(nil).Streams, // the harness reads them back
 		ResolveModel: func(string) (agentenkit.ResolvedModel, error) {
 			return agentenkit.ResolvedModel{Instance: func() provider.LanguageModel { return model }, ContextWindow: 128_000}, nil
 		},
@@ -497,7 +498,7 @@ func TestModelCalls_CarryTheRunIDAndStateOnTheirContext(t *testing.T) {
 	if _, err := rt.Worker.HandleJob(h.ctx, job); err != nil {
 		t.Fatal(err)
 	}
-	childID := payload(h.events(ran.ThreadID, "SUBAGENT_STARTED")[0])["agentId"].(string)
+	childID := subagentsOf(t, h, ran.ThreadID).started[0].SubagentID
 	mustStrings(t, model.seen, []string{"run-x|acme", childID + "|acme", "run-x|acme"}, "run id and state per model call")
 }
 

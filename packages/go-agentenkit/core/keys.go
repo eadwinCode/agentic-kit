@@ -17,7 +17,9 @@ func StateKey(threadID string) string { return "agent:state:" + threadID }
 // RunLockKey is the per-thread run lock (§3.4).
 func RunLockKey(threadID string) string { return "agent:lock:" + threadID }
 
-// SeqKey is the per-thread event sequence counter (§3.4).
+// SeqKey is the per-thread event counter older releases kept in the kv.
+// The thread record now mints its own seq; only a thread delete still
+// clears it.
 func SeqKey(threadID string) string { return "agent:seq:" + threadID }
 
 // AttemptsKey counts §2.8 failure retries of ONE run. Keyed by the run, so

@@ -139,7 +139,7 @@ export class TenantStorage implements Storage {
         orderBy: { createdAt: 'asc' },
       }),
 
-    // …events and usage follow the same shape.
+    // …the thread record (events) and usage follow the same shape.
   };
 }
 ```
@@ -185,7 +185,14 @@ await runtime.getThreadUsage(threadId, { orgId });
 await runtime.deleteThread(threadId, { orgId });
 await runtime.hitl.respond({ threadId, toolCallId, approved, state: { orgId } });
 await chat.stop(threadId, { orgId });
+runtime.events.sse(threadId, { cursor, lastMessageId, signal, state: { orgId } });
 ```
+
+The state scopes the thread record and the snapshot. A run stream is keyed by
+stream id alone, but the follow reads a stream only when it belongs to the
+thread being followed: a cursor that names another thread's stream gets a
+SNAPSHOT of the right thread instead. So the one check left to you is the
+usual one: that the user may see the thread before you open its follow.
 
 Forget one and that call reaches your storage with an empty context. Write your
 storage so an absent `orgId` returns nothing rather than everything:
@@ -302,7 +309,7 @@ config: {
     if (!org) return { ok: false, error: 'Unknown organisation' };
     if (org.creditsRemaining <= 0) {
       // Every client on the thread sees why, now and after a reload
-      await publishEvent('CREDIT_LIMIT', { resetAt: org.periodEndsAt });
+      await publishEvent('CREDIT_LIMIT', { resetAt: org.periodEndsAt }, { durable: true });
       return { ok: false, error: `Out of credits until ${org.periodEndsAt}` };
     }
     return { ok: true };
@@ -343,7 +350,8 @@ connections, and that multiplies by your customer count.
 - [ ] Storage **throws** when the tenant is absent
 - [ ] `claimState` is one atomic conditional update, scoped by tenant
 - [ ] Tenant read from the session at the edge, never from the request body
-- [ ] State passed to `listThreads`, `getThreadSnapshot`, `getThreadUsage`, `deleteThread`, `stop`, `hitl.respond`
+- [ ] State passed to `listThreads`, `getThreadSnapshot`, `getThreadUsage`, `deleteThread`, `stop`, `hitl.respond`, `events.sse` / `follow`
+- [ ] The stream route checks the user may see the thread before it opens
 - [ ] Tools scope their own queries by `state.orgId`
 - [ ] `runtime.admin.*` behind operator authorization only
 - [ ] `recordPayloads` decided deliberately

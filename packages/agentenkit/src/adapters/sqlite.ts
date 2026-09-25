@@ -1,9 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import type {
-  AgentEvent, ExecutionState, MessageDTO, NewMessage, NewUsage, ThreadDTO, UsageFilter, UsageTotals, ThreadTransition,
+  AgentEvent, ExecutionState, MessageDTO, NewMessage, NewThreadEvent, NewUsage, ThreadDTO, ThreadEventFilter,
+  UsageFilter, UsageTotals, ThreadTransition,
 } from '../core/types.js';
 import { UsageMerger } from '../core/usage.js';
 import type { Storage } from '../ports/storage.js';
+import { StreamClosedError, StreamGoneError, type RunStreams, type StreamMeta, type StreamSnapshot } from '../ports/streams.js';
+import { isStreamEnd, type StreamEnd, type StreamEvent, type StreamItem } from '../core/stream-events.js';
+import { sleep } from './stream-scripts.js';
 
 /** Minimal structural type over a synchronous SQLite handle — `bun:sqlite`'s
  *  `Database` satisfies it. Kept structural for the same reason every other
@@ -154,6 +158,8 @@ export class SqliteStorage implements Storage {
     this.db.prepare('CREATE INDEX IF NOT EXISTS usage_run ON usage(runId, createdAt)').run();
     // The thread's current run, for ThreadTransition's compare-and-set.
     this.addMissing('threads', { runId: 'TEXT' });
+    // The run a record entry belongs to.
+    this.addMissing('events', { runId: 'TEXT' });
     // One event per seq on a thread: a counter that restarted must fail its
     // write, never land a second event under a seq clients already have. A log
     // from before this check may already hold duplicates; the index is then
@@ -221,7 +227,7 @@ export class SqliteStorage implements Storage {
   });
   private toEvent = (r: any): AgentEvent => ({
     threadId: r.threadId, seq: r.seq, type: r.type,
-    payload: parse(r.payload), createdAt: new Date(r.createdAt),
+    payload: parse(r.payload), createdAt: new Date(r.createdAt), ...(r.runId ? { runId: r.runId } : {}),
   }) as AgentEvent;
   threads = {
     get: async (threadId: string) => {
@@ -324,9 +330,33 @@ export class SqliteStorage implements Storage {
   };
 
   events = {
-    append: async (threadId: string, e: AgentEvent) => {
-      this.write('INSERT INTO events (id,threadId,seq,type,payload,createdAt) VALUES (?,?,?,?,?,?)',
-        randomUUID(), threadId, e.seq, e.type, json(e.payload), new Date(e.createdAt).getTime());
+    // The seq is minted in the insert itself: SQLite runs one writer at a
+    // time, so no two appends on a thread read the same MAX.
+    append: async (threadId: string, e: NewThreadEvent): Promise<AgentEvent> => {
+      const createdAt = e.createdAt ? new Date(e.createdAt).getTime() : Date.now();
+      const row = this.all(
+        `INSERT INTO events (id,threadId,seq,type,payload,createdAt,runId)
+         SELECT ?,?,COALESCE(MAX(seq),0)+1,?,?,?,? FROM events WHERE threadId = ?
+         RETURNING seq`,
+        randomUUID(), threadId, e.type, json(e.payload), createdAt, e.runId ?? null, threadId,
+      )[0] as { seq: number };
+      return {
+        threadId, seq: Number(row.seq), type: e.type, payload: e.payload,
+        createdAt: new Date(createdAt), ...(e.runId ? { runId: e.runId } : {}),
+      };
+    },
+    list: async (threadId: string, f: ThreadEventFilter = {}) => {
+      const where = ['threadId = ?'];
+      const args: unknown[] = [threadId];
+      if (f.types) {
+        where.push(`type IN (${f.types.map(() => '?').join(',') || 'NULL'})`);
+        args.push(...f.types);
+      }
+      if (f.runId !== undefined) { where.push('runId = ?'); args.push(f.runId); }
+      if (f.after !== undefined) { where.push('seq > ?'); args.push(f.after); }
+      const limit = f.limit ? ` LIMIT ${Math.floor(f.limit)}` : '';
+      return this.all(`SELECT * FROM events WHERE ${where.join(' AND ')} ORDER BY seq${limit}`, ...args)
+        .map(this.toEvent);
     },
     listSince: async (threadId: string, sinceSeq: number) =>
       this.all('SELECT * FROM events WHERE threadId = ? AND seq > ? ORDER BY seq',
@@ -340,6 +370,21 @@ export class SqliteStorage implements Storage {
     listByType: async (threadId: string, type: string) =>
       this.all('SELECT * FROM events WHERE threadId = ? AND type = ? ORDER BY seq',
         threadId, type).map(this.toEvent),
+    prune: async (types: string[], opts: { limit: number; dryRun?: boolean }) => {
+      const counts: Record<string, number> = {};
+      const marks = types.map(() => '?').join(',') || 'NULL';
+      if (opts.dryRun) {
+        for (const r of this.all(`SELECT type, COUNT(*) AS n FROM events WHERE type IN (${marks}) GROUP BY type`, ...types) as Array<{ type: string; n: number }>) {
+          counts[r.type] = Number(r.n);
+        }
+        return counts;
+      }
+      const rows = this.all(`SELECT id, type FROM events WHERE type IN (${marks}) LIMIT ?`, ...types, opts.limit) as Array<{ id: string; type: string }>;
+      if (rows.length === 0) return counts;
+      this.write(`DELETE FROM events WHERE id IN (${rows.map(() => '?').join(',')})`, ...rows.map((r) => r.id));
+      for (const r of rows) counts[r.type] = (counts[r.type] ?? 0) + 1;
+      return counts;
+    },
   };
 
   usage = {
@@ -400,4 +445,189 @@ export class SqliteStorage implements Storage {
 
 
 
+}
+
+/** The current time in epoch milliseconds, the form expiresAt is kept in. */
+const NOW_MS = `CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`;
+
+const STREAMS_SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS run_streams (
+     id TEXT PRIMARY KEY, "threadId" TEXT NOT NULL, "runId" TEXT NOT NULL,
+     closed INTEGER NOT NULL, "endEvent" TEXT, "expiresAt" INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS run_streams_expires ON run_streams("expiresAt")`,
+  `CREATE INDEX IF NOT EXISTS run_streams_thread ON run_streams("threadId")`,
+  `CREATE TABLE IF NOT EXISTS run_stream_events (
+     pos INTEGER PRIMARY KEY AUTOINCREMENT, "streamId" TEXT NOT NULL, event TEXT NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS run_stream_events_stream ON run_stream_events("streamId", pos)`,
+];
+
+/** RunStreams over SQLite: the run_streams and run_stream_events tables, the
+ *  same ones the Go adapter uses. The offset is the event row's key, which
+ *  AUTOINCREMENT never reuses. Readers in this process wake on its own
+ *  appends; one in another process sees them on its next poll. Expired
+ *  streams are deleted as new ones open, 500 a pass, at most once a minute. */
+export class SqliteRunStreams implements RunStreams {
+  private readonly waiters = new Map<string, Set<() => void>>();
+  private swept = 0;
+
+  constructor(
+    private readonly db: SqliteLike,
+    private readonly opts: { pollMs?: number } = {},
+  ) {
+    for (const sql of STREAMS_SCHEMA) this.db.prepare(sql).run();
+  }
+
+  private tx<T>(work: () => T): T {
+    this.db.prepare('BEGIN IMMEDIATE').run();
+    try {
+      const out = work();
+      this.db.prepare('COMMIT').run();
+      return out;
+    } catch (err) {
+      this.db.prepare('ROLLBACK').run();
+      throw err;
+    }
+  }
+
+  private wake(streamId: string) {
+    const set = this.waiters.get(streamId);
+    this.waiters.delete(streamId);
+    for (const wake of set ?? []) wake();
+  }
+
+  /** Registers a wake-up before the reader reads, so an append that lands
+   *  between the read and the wait still wakes it. */
+  private arm(streamId: string) {
+    let wake!: () => void;
+    const woken = new Promise<void>((resolve) => { wake = resolve; });
+    let set = this.waiters.get(streamId);
+    if (!set) { set = new Set(); this.waiters.set(streamId, set); }
+    set.add(wake);
+    const disarm = () => {
+      const s = this.waiters.get(streamId);
+      s?.delete(wake);
+      if (s && s.size === 0) this.waiters.delete(streamId);
+    };
+    return { woken, disarm };
+  }
+
+  private sweep() {
+    if (Date.now() - this.swept < 60_000) return;
+    this.swept = Date.now();
+    const ids = this.db
+      .prepare(`SELECT id FROM run_streams WHERE "expiresAt" <= ${NOW_MS} LIMIT 500`)
+      .all() as Array<{ id: string }>;
+    for (const { id } of ids) this.remove(id);
+  }
+
+  private remove(streamId: string) {
+    this.tx(() => {
+      this.db.prepare('DELETE FROM run_stream_events WHERE "streamId" = ?').run(streamId);
+      this.db.prepare('DELETE FROM run_streams WHERE id = ?').run(streamId);
+    });
+  }
+
+  async open(streamId: string, meta: StreamMeta, ttlMs: number) {
+    this.sweep();
+    // A row past its expiry is gone: replace it rather than reopen it.
+    this.db.prepare(`DELETE FROM run_streams WHERE id = ? AND "expiresAt" <= ${NOW_MS}`).run(streamId);
+    this.db
+      .prepare(`INSERT INTO run_streams (id, "threadId", "runId", closed, "expiresAt") VALUES (?, ?, ?, 0, ?)
+                ON CONFLICT (id) DO NOTHING`)
+      .run(streamId, meta.threadId, meta.runId, Date.now() + ttlMs);
+  }
+
+  /** Inside a transaction: whether the stream is live and closed. */
+  private state(streamId: string) {
+    const row = this.db
+      .prepare(`SELECT closed, "expiresAt" > ${NOW_MS} AS live FROM run_streams WHERE id = ?`)
+      .all(streamId)[0] as { closed: number; live: number } | undefined;
+    return { live: !!row?.live, closed: !!row?.closed };
+  }
+
+  private insert(streamId: string, events: StreamEvent[]): string[] {
+    const stmt = this.db.prepare('INSERT INTO run_stream_events ("streamId", event) VALUES (?, ?) RETURNING pos');
+    return events.map((e) => String((stmt.all(streamId, JSON.stringify(e))[0] as { pos: number }).pos));
+  }
+
+  async append(streamId: string, events: StreamEvent[]) {
+    if (events.length === 0) return [];
+    const offsets = this.tx(() => {
+      const { live, closed } = this.state(streamId);
+      if (!live) throw new StreamGoneError(streamId);
+      if (closed) throw new StreamClosedError(streamId);
+      return this.insert(streamId, events);
+    });
+    this.wake(streamId);
+    return offsets;
+  }
+
+  async close(streamId: string, end: StreamEnd, graceMs: number) {
+    this.tx(() => {
+      const { live, closed } = this.state(streamId);
+      if (!live) throw new StreamGoneError(streamId);
+      if (closed) return;
+      this.insert(streamId, [end]);
+      this.db
+        .prepare('UPDATE run_streams SET closed = 1, "endEvent" = ?, "expiresAt" = ? WHERE id = ?')
+        .run(JSON.stringify(end), Date.now() + graceMs, streamId);
+    });
+    this.wake(streamId);
+  }
+
+  async delete(streamId: string) {
+    this.remove(streamId);
+    this.wake(streamId);
+  }
+
+  private page(streamId: string, after: string | null) {
+    const row = this.db
+      .prepare(`SELECT "threadId", "runId", closed, "endEvent", "expiresAt" > ${NOW_MS} AS live
+                FROM run_streams WHERE id = ?`)
+      .all(streamId)[0] as
+      | { threadId: string; runId: string; closed: number; endEvent: string | null; live: number }
+      | undefined;
+    if (!row || !row.live) return null;
+    const rows = this.db
+      .prepare('SELECT pos, event FROM run_stream_events WHERE "streamId" = ? AND pos > ? ORDER BY pos')
+      .all(streamId, after ? Number(after) : 0) as Array<{ pos: number; event: string }>;
+    return {
+      meta: { threadId: row.threadId, runId: row.runId },
+      closed: !!row.closed,
+      end: row.closed && row.endEvent ? (JSON.parse(row.endEvent) as StreamEnd) : null,
+      items: rows.map((r) => ({ ...JSON.parse(r.event), offset: String(r.pos) }) as StreamItem),
+    };
+  }
+
+  async *read(streamId: string, after: string | null, signal?: AbortSignal): AsyncIterable<StreamItem> {
+    let cursor = after;
+    for (;;) {
+      if (signal?.aborted) return;
+      const { woken, disarm } = this.arm(streamId);
+      const page = this.page(streamId, cursor);
+      if (!page) {
+        disarm();
+        throw new StreamGoneError(streamId);
+      }
+      if (page.items.length > 0) disarm();
+      for (const item of page.items) {
+        yield item;
+        cursor = item.offset;
+        if (isStreamEnd(item)) return;
+      }
+      if (page.items.length > 0) continue;
+      // Read from past the end item: nothing more will ever come.
+      if (page.closed) {
+        disarm();
+        return;
+      }
+      await Promise.race([woken, sleep(this.opts.pollMs ?? 250, signal)]);
+      disarm();
+    }
+  }
+
+  async snapshot(streamId: string, after?: string | null): Promise<StreamSnapshot | null> {
+    const page = this.page(streamId, after ?? null);
+    return page && { meta: page.meta, items: page.items, end: page.end };
+  }
 }

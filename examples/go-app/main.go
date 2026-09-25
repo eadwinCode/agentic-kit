@@ -67,6 +67,7 @@ func main() {
 	// memory, which is right for one process.
 	var kv agentenkit.Kv
 	var bus agentenkit.EventBus
+	var streams agentenkit.RunStreams
 	if url := os.Getenv("REDIS_URL"); url != "" {
 		opts, err := goredis.ParseURL(url)
 		if err != nil {
@@ -77,13 +78,22 @@ func main() {
 			log.Fatalf("redis at %s: %v", url, err)
 		}
 		kv, bus = redis.NewKv(client), redis.NewBus(client, 0)
-		log.Printf("kv and bus on redis (%s)", opts.Addr)
+		// A run's live events: one short-lived Redis Stream per run segment,
+		// which any process can read.
+		streams = redis.NewRunStreams(client, redis.StreamsOptions{})
+		log.Printf("kv, bus and run streams on redis (%s)", opts.Addr)
 	} else {
 		kv, err = sqlite.NewKv(db)
 		if err != nil {
 			log.Fatal(err)
 		}
 		bus = memory.NewBus()
+		// Run streams in the SQLite file, so a tab that reconnects mid-run,
+		// even across a restart, picks up where it left off.
+		streams, err = sqlite.NewRunStreams(ctx, db, 0)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	// The queue and the worker each need the other, so the queue is bound
@@ -100,6 +110,7 @@ func main() {
 		Admin:   adminStore,
 		Bus:     bus,
 		Kv:      kv,
+		Streams: streams,
 		Queue:   queue,
 		Config:  &cfg,
 		// Money (§4): every model call is priced before its usage row is

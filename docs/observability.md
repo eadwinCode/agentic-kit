@@ -213,10 +213,11 @@ They answer different questions:
 
 | Question | Look at |
 | :--- | :--- |
-| What is this conversation showing right now? | the event log |
+| What is this conversation showing right now? | the thread record and its run stream |
 | How long did runs take last week? | the admin store |
 | What did step 3 of that failed run produce? | the admin store |
-| What should this client render next? | the event log |
+| What should this client render next? | the run stream |
 
-The event log is per-thread, replayable and client-facing. The admin store is
+The thread record and run streams are per-thread and client-facing; a run
+stream lives only a short while after its run. The admin store is
 cross-thread, aggregated and operator-facing.

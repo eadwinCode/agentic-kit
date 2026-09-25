@@ -1,63 +1,90 @@
 import type { RuntimePorts } from '../ports/runtime.js';
 import { THREAD_KEY_TTL_SECONDS } from './keys.js';
+import { activeSegment } from './segment.js';
 import type { ExecutionState, ThreadTransition } from './types.js';
 import type { AgentEvent } from './types.js';
 
-/** Per-thread chains that serialise taking a seq and storing the event in
- *  this process, so the log is written in seq order and a counter reseed (see
- *  nextSeq) cannot race another publisher here. The bus send is left outside:
- *  a subscriber may publish from inside it, and a follower fills any gap the
- *  bus leaves from storage (see followEvents). */
-const publishChains = new Map<string, Promise<unknown>>();
+/** The platform's types that go in the thread record: what must outlive a
+ *  run (see Storage.events). Every other platform type is live only: a
+ *  notice on the bus, and an event on the run stream when one is open. */
+export const RECORD_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'INPUT_REQUIRED',
+  'INPUT_EXPIRED',
+  'HITL_RESPONSE',
+  'RUN_REFUSED',
+  'TOKEN_BUDGET_EXHAUSTED',
+  'COST_BUDGET_EXHAUSTED',
+  'CONTEXT_COMPACTED',
+  'MESSAGES_DROPPED',
+  'RUN_STARTED',
+  'RUN_ENDED',
+]);
 
-function serialise<T>(threadId: string, work: () => Promise<T>): Promise<T> {
-  const before = publishChains.get(threadId) ?? Promise.resolve();
-  const mine = before.then(work, work);
-  const tail = mine.catch(() => undefined);
-  publishChains.set(threadId, tail);
-  // Dropped once nothing queues behind it, so the map does not grow per thread.
-  void tail.then(() => {
-    if (publishChains.get(threadId) === tail) publishChains.delete(threadId);
-  });
-  return mine;
+/** The run an entry belongs to: the one given, else the one its payload
+ *  names. */
+function runOf(payload: unknown, runId?: string): string | null {
+  if (runId) return runId;
+  const p = payload as { runId?: unknown; resume?: { runId?: unknown } } | null;
+  if (typeof p?.runId === 'string') return p.runId;
+  if (typeof p?.resume?.runId === 'string') return p.resume.runId;
+  return null;
 }
 
-/** The thread's next event seq. A counter that restarts at 1 on a thread that
- *  already has events means the kv lost the key (a flush, an eviction, a
- *  restart without persistence). Carrying on from 1 would repeat seqs the log
- *  already holds, and every client would drop the new events as already seen,
- *  so the counter is moved past the stored ones first. The move is a
- *  compare-and-set, so a publisher that took 2 meanwhile is not undone. */
-async function nextSeq(deps: RuntimePorts, threadId: string): Promise<number> {
-  const key = `agent:seq:${threadId}`;
-  const seq = await deps.kv.incrWithExpiry(key, THREAD_KEY_TTL_SECONDS);
-  if (seq !== 1) return seq;
-  const stored = await deps.storage.events.listSince(threadId, 0);
-  const top = stored.at(-1)?.seq ?? 0;
-  if (top < 1) return seq;
-  await deps.kv.setIfValue(key, '1', String(top));
-  return deps.kv.incr(key);
-}
-
-/** Persist to the replayable event log, then fan out live to all subscribers
- *  (§2.2). Seq comes from Kv.incr — monotonic per thread (§3.4). */
+/** Publish a platform event (§2.2). A record type is stored first (the
+ *  store mints its seq) and then sent; any other type is sent as a notice.
+ *  Either way it reaches the run stream this process has open on the
+ *  thread. */
 export async function publish(
   deps: RuntimePorts,
   threadId: string,
   type: string,
   payload: unknown,
+  runId?: string,
 ): Promise<AgentEvent> {
-  const event = await serialise(threadId, async () => {
-    const seq = await nextSeq(deps, threadId);
-    const e: AgentEvent = { threadId, seq, type, payload, createdAt: new Date() };
-    await deps.storage.events.append(threadId, e);
-    return e;
-  });
+  if (!RECORD_EVENT_TYPES.has(type)) return publishNotice(deps, threadId, type, payload);
+  return record(deps, threadId, type, payload, runOf(payload, runId));
+}
+
+/** Store an entry in the thread record, then send it. */
+async function record(
+  deps: RuntimePorts,
+  threadId: string,
+  type: string,
+  payload: unknown,
+  runId: string | null,
+): Promise<AgentEvent> {
+  const event = await deps.storage.events.append(threadId, { type, payload, runId });
   await deps.bus.publish(threadId, event);
+  // A platform entry the stream shows too (a park). An app's durable event
+  // is delivered as this entry alone, so a tab never sees it twice.
+  if (RESERVED_EVENT_TYPES.has(type)) await toSegment(deps, threadId, type, payload);
   return event;
 }
 
-/** Publish a bus-only notice (never persisted) — e.g. HITL death notices (§2.5). */
+/** What a run stream carries in place of the bus while a segment is open:
+ *  a tab reads these from the stream, so the bus sending them too would
+ *  show them twice. */
+const STREAM_CONTENT: ReadonlySet<string> = new Set([
+  'CHUNK',
+  'SUBAGENT_CHUNK',
+  'TEXT_RESULT',
+  'STEP_COMMITTED',
+  'SUBAGENT_STARTED',
+  'SUBAGENT_COMPLETED',
+  'SUBAGENT_FAILED',
+]);
+
+/** Hands an event to the run stream this process has open on the thread,
+ *  if any; the segment keeps what belongs in a stream (see SegmentStream). */
+async function toSegment(deps: RuntimePorts, threadId: string, type: string, payload: unknown) {
+  const seg = activeSegment(deps, threadId);
+  if (seg) await seg.forward(type, payload, RESERVED_EVENT_TYPES.has(type));
+}
+
+/** Publish a live-only event (never stored). While this process has a
+ *  segment open on the thread, stream content and an app's own events go to
+ *  the run stream alone; everything else goes on the bus, and to the stream
+ *  when the stream has a shape for it (a step's end). */
 export async function publishNotice(
   deps: RuntimePorts,
   threadId: string,
@@ -65,7 +92,14 @@ export async function publishNotice(
   payload: unknown,
 ): Promise<AgentEvent> {
   const event: AgentEvent = { threadId, seq: 0, type, payload, createdAt: new Date() };
+  const seg = activeSegment(deps, threadId);
+  const custom = !RESERVED_EVENT_TYPES.has(type);
+  if (seg && (custom || STREAM_CONTENT.has(type))) {
+    await seg.forward(type, payload, !custom);
+    return event;
+  }
   await deps.bus.publish(threadId, event);
+  if (seg) await seg.forward(type, payload, true);
   return event;
 }
 
@@ -92,18 +126,24 @@ export const RESERVED_EVENT_TYPES: ReadonlySet<string> = new Set([
   'RUN_REFUSED',
   'TOKEN_BUDGET_EXHAUSTED',
   'COST_BUDGET_EXHAUSTED',
+  'RUN_STARTED',
+  'RUN_ENDED',
+  'RECORD_CHANGED',
+  'SNAPSHOT',
 ]);
 
 export interface PublishEventOptions {
-  /** `true` (the default) writes the event to the thread's log, so it is
-   *  replayed to a client that reconnects. `false` sends it over the bus only:
-   *  a progress tick, a typing indicator — anything nobody needs to see twice. */
+  /** `true` also keeps the event in the thread record, so a tab that opens
+   *  the thread next week still sees it. Otherwise (the default) it is live
+   *  only: it goes out on the bus and, during a run, on the run's stream,
+   *  which a tab that reconnects within the grace window replays. */
   durable?: boolean;
 }
 
 /** Publish an event of your own on a thread, through the same pipeline the
- *  platform's events take: the durable log and the live bus (§2.2). A client
- *  sees it in `onEvent`, exactly like a built-in one. */
+ *  platform's events take (§2.2): the live bus, the run stream during a run
+ *  (as CUSTOM), and the thread record when it is durable. A client sees it
+ *  in `onEvent`, exactly like a built-in one. */
 export async function publishEvent(
   deps: RuntimePorts,
   threadId: string,
@@ -117,9 +157,9 @@ export async function publishEvent(
   if (RESERVED_EVENT_TYPES.has(type)) {
     throw new Error(`publishEvent: ${type} is a platform event type — pick your own`);
   }
-  return options.durable === false
-    ? publishNotice(deps, threadId, type, payload)
-    : publish(deps, threadId, type, payload);
+  return options.durable
+    ? record(deps, threadId, type, payload, runOf(payload))
+    : publishNotice(deps, threadId, type, payload);
 }
 
 /** What a tool calls to publish: `publishEvent(type, payload, options?)`,

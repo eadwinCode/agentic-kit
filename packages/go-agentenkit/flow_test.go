@@ -3,6 +3,7 @@ package agentenkit_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -243,6 +244,12 @@ func TestEvents_ReplaysSinceACursorAndSubscribesLive(t *testing.T) {
 	h := makeRuntime(t, scripted(step{text: "ok"}))
 	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "x"})
+	for _, typ := range []string{"NOTE_ONE", "NOTE_TWO"} {
+		if _, err := h.rt.Events.PublishEvent(h.ctx, ran.ThreadID, typ, nil,
+			agentenkit.PublishStateOptions{PublishOptions: agentenkit.PublishOptions{Durable: true}}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	all, err := h.rt.Events.Since(h.ctx, ran.ThreadID, -1, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -257,7 +264,7 @@ func TestEvents_ReplaysSinceACursorAndSubscribesLive(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.handleNext(t)
-	if len(live) == 0 || live[len(live)-1] != "STATE_CHANGE" {
+	if !slices.Contains(live, "STATE_CHANGE") || live[len(live)-1] != "RUN_ENDED" {
 		t.Fatalf("live tail missing, got %v", live)
 	}
 	_ = unsub()

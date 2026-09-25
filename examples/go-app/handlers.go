@@ -146,34 +146,41 @@ func (a *app) respond(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, res)
 }
 
-// stream is the SSE distributor. Replay-then-tail lives in the runtime; this
-// handler is a cursor and a writer. EventSource sends Last-Event-ID on its own
-// reconnects, so a client never replays what it has seen.
+// stream is the SSE distributor. The follow (the thread record from the
+// cursor, the run stream from its offset, one SNAPSHOT when that stream is
+// gone) lives in the runtime; this handler is a cursor and a writer.
+// EventSource sends Last-Event-ID on its own reconnects; the hook puts the
+// cursor in the query when it opens the stream.
 func (a *app) stream(w http.ResponseWriter, r *http.Request) {
 	threadID := r.URL.Query().Get("threadId")
 	if threadID == "" {
 		http.Error(w, "threadId is required", http.StatusBadRequest)
 		return
 	}
-	raw := r.Header.Get("Last-Event-ID")
-	if raw == "" {
-		raw = r.URL.Query().Get("since")
+	cursor := r.Header.Get("Last-Event-ID")
+	if cursor == "" {
+		cursor = r.URL.Query().Get("cursor")
 	}
-	since, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		since = -1
+	if cursor == "" {
+		cursor = r.URL.Query().Get("since") // a bare record seq, from an older client
 	}
 	// The §2.5 fallback: one call per connection rather than a poll per viewer.
 	_, _ = a.rt.HITL.ReclaimIfOrphaned(r.Context(), threadID, nil)
 
 	stream, err := a.rt.Events.SSE(r.Context(), threadID, agentenkit.SSEStateOptions{
-		SSEOptions: agentenkit.SSEOptions{FollowOptions: agentenkit.FollowOptions{Since: since}, RetryMs: 2000},
+		FollowStateOptions: agentenkit.FollowStateOptions{
+			Cursor: cursor,
+			// So a catch-up after a long gap carries only the messages the
+			// tab lacks.
+			LastMessageID: r.URL.Query().Get("lastMessageId"),
+		},
+		RetryMs: 2000,
 	})
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	stream.ServeHTTP(w, r) // returns when the client hangs up, and unsubscribes
+	stream.ServeHTTP(w, r) // returns when the client hangs up, and stops the follow
 }
 
 func (a *app) history(w http.ResponseWriter, r *http.Request) {

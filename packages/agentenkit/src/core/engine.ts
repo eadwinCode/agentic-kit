@@ -24,6 +24,8 @@ import { attemptsKey, COUNTER_TTL_SECONDS, counterScope, redriveKey, runIdKey } 
 import { withRunState, type AgentRunState } from './state.js';
 import { runLoop, seedRunLedger, type LoopOutcome } from './loop.js';
 import { enqueueJob, Lease, parseLockValue, runLockKey, RunLockLostError } from './lease.js';
+import { activeSegment, closeLostSegment, openSegment, type SegmentStream } from './segment.js';
+import type { StreamEnd } from './stream-events.js';
 import { closeOpenParks } from './stop.js';
 import { callOnFinish, isTerminal, runBill, settleEndedRun, settleRun } from './settle.js';
 import { DuplicateJobError, PRIORITY_LOW } from '../ports/queue.js';
@@ -145,6 +147,24 @@ async function landVerdict(
   await deps.kv.del(hitlDoneKey(pending.toolCallId));
 }
 
+/** A result the resume saved, on the resume's run stream: a live tool's
+ *  result goes out as its chunk, but a verdict's is only ever saved. */
+async function streamToolResult(
+  deps: RuntimePorts,
+  threadId: string,
+  agentId: string | null | undefined,
+  toolCallId: string,
+  toolName: string,
+  result: unknown,
+): Promise<void> {
+  const seg = activeSegment(deps, threadId);
+  if (!seg) return;
+  const chunk = { type: 'tool-result', toolCallId, toolName, result: result ?? null };
+  await (agentId
+    ? seg.forward('SUBAGENT_CHUNK', { agentId, chunk }, true)
+    : seg.forward('CHUNK', chunk, true));
+}
+
 /** Land a settled verdict and unwind whatever was waiting on it (§2.7).
  *
  *  The verdict belongs to the stream that asked — the main agent's, or a
@@ -188,6 +208,7 @@ async function unwindVerdict(
         },
       ],
     });
+    await streamToolResult(deps, threadId, pending.agentId, pending.toolCallId, pending.toolName, settled?.result);
     await landVerdict(deps, threadId, pending, settled?.expired ?? false);
   }
 
@@ -233,6 +254,7 @@ async function unwindVerdict(
         { type: 'tool-result', toolCallId: frame.toolCallId, toolName: 'spawnSubagent', result: handed },
       ],
     });
+    await streamToolResult(deps, threadId, frame.agentId, frame.toolCallId, 'spawnSubagent', handed);
     producer = frame.nested;
   }
   return true;
@@ -539,6 +561,13 @@ export async function execute(
   //   2. the run id has moved on: the user pressed stop and then sent another
   //      message, which put RUNNING back over CANCELLED before this poll could
   //      read it. The state key lies in that window; the run id never does.
+  // The segment's run stream, open from pickup (see SegmentStream), and how
+  // it ends: set where the segment's outcome is known, or worked out in the
+  // finally below from how it stopped.
+  let seg: SegmentStream | null = null;
+  let segEnd: StreamEnd | undefined;
+  let failure: unknown;
+
   const controlPoll = setInterval(async () => {
     try {
       if ((await deps.kv.get(`agent:state:${threadId}`)) === 'CANCELLED' || (await stale())) {
@@ -675,6 +704,9 @@ export async function execute(
         }
       }
 
+      // From here on the segment does work, and says so on its own stream.
+      seg = await openSegment(deps, threadId, runId);
+
       // Platform-owned toolset: HITL (§2.5) over the user's set; spawnSubagent
       // added ONLY when the spec opts in (§2.7). rawTools keeps the real
       // implementations — the resolved park executes the approved tool.
@@ -747,6 +779,7 @@ export async function execute(
           // Still parked, or parked again one level down while unwinding: the
           // new park's step is saved by now, so it is written here.
           await commitParks(deps, parks);
+          segEnd = { type: 'RUN_FINISHED', status: 'parked' };
           return 'executed';
         }
       }
@@ -851,6 +884,7 @@ export async function execute(
             .increment(runId, deltasOf(loop.steps, attribution))
             .catch(() => undefined); // operational history must not fail a parked run
         }
+        segEnd = { type: 'RUN_FINISHED', status: 'parked' };
         return 'executed';
       }
 
@@ -905,10 +939,28 @@ export async function execute(
         steps: loop.steps,
         ...(error ? { error } : {}),
       });
+      segEnd = state === 'FAILED'
+        ? { type: 'RUN_ERROR', status: 'error', error: error ?? 'the run failed' }
+        : {
+            type: 'RUN_FINISHED',
+            status: state === 'CANCELLED' ? 'stopped' : 'finished',
+            usage: {
+              inputTokens: bill.usage.inputTokens,
+              cachedInputTokens: bill.usage.cachedInputTokens,
+              outputTokens: bill.usage.outputTokens,
+              totalTokens: bill.usage.totalTokens,
+            },
+            ...(bill.usage.costs?.length
+              ? { costs: bill.usage.costs.map((c) => ({ currency: c.currency, micros: c.costMicros })) }
+              : {}),
+            ...(lastFinishReason ? { finishReason: lastFinishReason } : {}),
+            ...(seg?.oneShotText !== undefined ? { text: seg.oneShotText } : {}),
+          };
       await callOnFinish(deps, agent, info());
 
       return 'executed';
     } catch (err) {
+      failure = err;
       // Whatever failed after the lease was lost is that loss showing through
       // (an aborted call, a fenced write): the job comes back, it is not a
       // failed attempt.
@@ -919,6 +971,22 @@ export async function execute(
     clearInterval(controlPoll);
     clearTimeout(segmentTimer);
     input.signal?.removeEventListener('abort', onShutdown);
+    // The stream closes before the lock goes, so the next segment's stream
+    // never starts while this one is still open.
+    if (seg && !seg.closed) {
+      await seg.close(
+        segEnd ??
+          (lease.lost || failure instanceof RunLockLostError
+            ? { type: 'RUN_ERROR', status: 'lost', error: 'the worker lost the run lock' }
+            : shutdown
+              ? { type: 'RUN_ERROR', status: 'lost', error: 'the worker shut down mid-run' }
+              : {
+                  type: 'RUN_ERROR',
+                  status: 'error',
+                  error: failure instanceof Error ? failure.message : failure !== undefined ? String(failure) : 'the segment ended',
+                }),
+      );
+    }
     // Release — success, failure, or stop — only while the lock is still this
     // worker's. One another worker took after this one's lapsed is theirs.
     await lease.release();
@@ -1013,6 +1081,9 @@ export async function failLostRun(
   try {
     if (thread.state === 'WAITING_FOR_INPUT') await closeOpenParks(deps, threadId).catch(() => undefined);
     await failRun(deps, agent, threadId, runId, reason);
+    // The dead worker never closed its segment's stream: a reader waiting
+    // on it stops here.
+    await closeLostSegment(deps, threadId, runId, reason);
     return true;
   } finally {
     await lease.release();

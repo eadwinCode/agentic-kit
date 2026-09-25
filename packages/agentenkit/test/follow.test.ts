@@ -3,7 +3,7 @@ import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import { bindStorage } from '../src/core/state.js';
-import { sseFrame, SSE_HEADERS } from '../src/core/follow.js';
+import { sseFrame, SSE_HEADERS, type FollowFrame } from '../src/core/follow.js';
 import { resolveConfig } from '../src/core/types.js';
 import type { AgentEvent } from '../src/core/types.js';
 
@@ -21,11 +21,9 @@ async function harness() {
   const store = bindStorage(storage, { state: {} });
   const threadId = (await store.threads.create({ model: 'gpt-4o' })).id;
 
-  /** Append to the durable log AND fan out, exactly as publish() does. */
+  /** Store in the thread record AND fan out, exactly as publish() does. */
   const publish = async (type: string, payload: unknown = null) => {
-    const seq = await kv.incr(`agent:seq:${threadId}`);
-    const event: AgentEvent = { threadId, seq, type, payload, createdAt: new Date() };
-    await store.events.append(threadId, event);
+    const event = await store.events.append(threadId, { type, payload });
     await bus.publish(threadId, event);
     return event;
   };
@@ -36,12 +34,15 @@ async function harness() {
   return { runtime, threadId, publish, notice, bus };
 }
 
-/** Take n events, then stop — which also closes the generator. */
-async function take(gen: AsyncGenerator<AgentEvent>, n: number) {
+/** The thread event a frame carries. */
+const eventOf = (frame: FollowFrame | undefined) => (frame as { event: AgentEvent }).event;
+
+/** Take n thread events, then stop — which also closes the generator. */
+async function take(gen: AsyncGenerator<FollowFrame>, n: number) {
   const out: AgentEvent[] = [];
   if (n === 0) return out;
-  for await (const e of gen) {
-    out.push(e);
+  for await (const frame of gen) {
+    if (frame.kind === 'thread') out.push(frame.event);
     if (out.length >= n) break;
   }
   return out;
@@ -77,11 +78,11 @@ describe('events.follow (§2.2)', () => {
     const gen = h.runtime.events.follow(h.threadId);
     // Start the generator: it subscribes, then reads the durable log.
     const first = await gen.next();
-    expect((first.value as AgentEvent).type).toBe('A');
+    expect(eventOf(first.value).type).toBe('A');
 
     await h.publish('B');
     const second = await gen.next();
-    expect((second.value as AgentEvent).type).toBe('B');
+    expect(eventOf(second.value).type).toBe('B');
     await gen.return(undefined as never);
   });
 
@@ -90,8 +91,8 @@ describe('events.follow (§2.2)', () => {
     const gen = h.runtime.events.follow(h.threadId);
     const collected: AgentEvent[] = [];
     const reader = (async () => {
-      for await (const e of gen) {
-        collected.push(e);
+      for await (const frame of gen) {
+        collected.push(eventOf(frame));
         if (collected.length >= 2) break;
       }
     })();
@@ -134,7 +135,7 @@ describe('events.follow (§2.2)', () => {
 describe('events.sse (§2.2)', () => {
   const decode = (chunk: Uint8Array) => new TextDecoder().decode(chunk);
 
-  it('encodes frames with the seq as the id', async () => {
+  it('encodes frames with the cursor as the id', async () => {
     const h = await harness();
     await h.publish('A', { x: 1 });
 
@@ -143,7 +144,7 @@ describe('events.sse (§2.2)', () => {
 
     const reader = stream.getReader();
     const first = decode((await reader.read()).value!);
-    expect(first).toMatch(/^id: \d+\ndata: \{/);
+    expect(first).toMatch(/^id: 1 - -\ndata: \{"kind":"thread"/);
     expect(first.endsWith('\n\n')).toBe(true);
     await reader.cancel();
   });

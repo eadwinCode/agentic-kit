@@ -11,6 +11,7 @@ import { QStashQueue } from '../src/adapters/qstash.js';
 import { markRequiresConfirmation } from '../src/core/engine.js';
 import { resolveConfig, type AgentConfig, type RunJob } from '../src/core/types.js';
 import type { RuntimeOptions } from '../src/ports/runtime.js';
+import { subagents } from './stream-helpers.js';
 
 /** Records which QStash API each dispatch actually used. The live server
  *  rejects Upstash-Delay on enqueue outright, so the two paths must differ. */
@@ -173,6 +174,6 @@ describe('a subagent whose model call fails (§2.7)', () => {
     // It came back at all, and let go of the lock.
     expect(await r.kv.get(`agent:lock:${ran.threadId}`)).toBeNull();
     // The child was recorded as failed rather than silently completing.
-    expect(r.bus.published.some((e) => e.type === 'SUBAGENT_FAILED')).toBe(true);
+    expect((await subagents(r.runtime.ports(), ran.threadId)).failed).toHaveLength(1);
   }, 10_000);
 });

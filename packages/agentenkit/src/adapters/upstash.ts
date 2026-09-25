@@ -1,6 +1,7 @@
 import type { AgentEvent } from '../core/types.js';
 import type { Kv } from '../ports/kv.js';
 import type { EventBus } from '../ports/bus.js';
+import { ScriptedRunStreams, sleep } from './stream-scripts.js';
 
 /** The compare-and-act scripts behind `setIfValue` / `delIfValue`, the same
  *  ones the Go adapters run: one round trip, atomic on the server. */
@@ -99,5 +100,18 @@ export class UpstashBus implements EventBus {
         // malformed frame — never kill the subscription
       }
     });
+  }
+}
+
+/** RunStreams over Upstash Redis Streams: the same keys and scripts as
+ *  RedisRunStreams (see stream-scripts.ts). Upstash's REST API has no
+ *  blocking read, so a live reader polls every `pollMs`. */
+export class UpstashRunStreams extends ScriptedRunStreams {
+  constructor(redis: UpstashRedisLike, opts: { pollMs?: number } = {}) {
+    super(
+      (script, keys, args) => redis.eval(script, keys, args),
+      (_key, _after, maxMs, signal) => sleep(maxMs, signal),
+      opts.pollMs ?? 250,
+    );
   }
 }

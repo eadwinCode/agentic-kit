@@ -22,8 +22,10 @@ export interface AgentRoutes {
   stop: string;
   /** POST { threadId, toolCallId, approved, payload? } — answer an approval */
   respond: string;
-  /** GET, server-sent events. Resumes from `since`. */
-  stream: Route<{ threadId: string; since: number }>;
+  /** GET, server-sent events. Resumes from `cursor` ("<seq> <streamId>
+   *  <offset>"); `since` is the record seq alone, for an older server.
+   *  `lastMessageId` lets a catch-up carry only the messages after it. */
+  stream: Route<{ threadId: string; since: number; cursor: string; lastMessageId?: string }>;
   /** GET → ThreadSnapshot */
   history: Route<{ threadId: string }>;
   /** GET → ThreadUsage */
@@ -200,9 +202,10 @@ export interface StreamHandlers {
   /** The stream is closed for good: the transport gave up (a 401, a 404).
    *  The hook re-reads the thread and opens a new stream, with a backoff. */
   onClose?: () => void;
-  /** The seq of the last event the hook applied. A transport that reconnects
-   *  on its own resumes after it, so nothing is shown twice or missed. */
-  getCursor: () => number;
+  /** Where the hook is: "<seq> <streamId> <offset>", the id of the last
+   *  frame it applied. A transport that reconnects on its own resumes after
+   *  it, so nothing is shown twice or missed. */
+  getCursor: () => string;
 }
 
 export interface StreamSubscription {
@@ -252,6 +255,9 @@ export interface AgentRunConfig {
    *  event is handled and stop the built-in reducer — that is how an app adds
    *  its own event types, or overrides one. */
   onEvent?: (event: StreamEvent) => boolean | void;
+  /** An app's own event, by name: one a tool sent with `publishEvent`, from
+   *  the run stream or, when durable, from the thread record. */
+  onCustom?: (name: string, value: unknown) => void;
   /** Background refresh for the thread list, in ms. `false` disables it —
    *  other tabs and the worker can change thread state without this tab
    *  seeing an event, which is the only reason it exists. */
@@ -271,6 +277,7 @@ export interface ResolvedConfig {
   labels: ActivityLabels;
   format: EntryFormat;
   onEvent: ((event: StreamEvent) => boolean | void) | undefined;
+  onCustom: ((name: string, value: unknown) => void) | undefined;
   threadsRefreshMs: number | false;
   loadThreadsOnMount: boolean;
 }
@@ -292,6 +299,7 @@ export function resolveConfig(config: AgentRunConfig = {}): ResolvedConfig {
     labels: { ...defaultLabels, ...config.labels },
     format: { ...defaultFormat, ...config.format },
     onEvent: config.onEvent,
+    onCustom: config.onCustom,
     threadsRefreshMs: config.threadsRefreshMs ?? 30_000,
     loadThreadsOnMount: config.loadThreadsOnMount ?? true,
   };

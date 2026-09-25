@@ -42,6 +42,12 @@ type (
 	QueuedJob      = ports.QueuedJob
 	JobKind        = ports.JobKind
 	Kv             = ports.Kv
+	RunStreams     = ports.RunStreams
+	StreamItem     = ports.StreamItem
+	StreamEvent    = ports.StreamEvent
+	StreamEnd      = ports.StreamEnd
+	StreamMeta     = ports.StreamMeta
+	SnapshotStream = ports.SnapshotStream
 	SetOptions     = ports.SetOptions
 
 	AdminStore        = ports.AdminStore
@@ -206,6 +212,12 @@ type (
 
 	FollowOptions = core.FollowOptions
 	EventStream   = core.EventStream
+	FrameStream   = core.FrameStream
+	FollowFrame   = core.FollowFrame
+	FollowSSE     = core.FollowSSE
+	ThreadCursor  = core.ThreadCursor
+	PruneOptions  = core.PruneOptions
+	PruneReport   = core.PruneReport
 	SSEOptions    = core.SSEOptions
 	SSEStream     = core.SSEStream
 
@@ -266,6 +278,8 @@ var (
 	FollowEvents = core.FollowEvents
 	ToSSEStream  = core.ToSSEStream
 	SSEFrame     = core.SSEFrame
+	ParseCursor  = core.ParseCursor
+	FormatCursor = core.FormatCursor
 	SSEHeaders   = core.SSEHeaders
 
 	ContextWithRunID = core.ContextWithRunID

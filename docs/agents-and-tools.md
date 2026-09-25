@@ -192,19 +192,20 @@ The model cannot reach outside the tenant even if it asks to, because the tool
 ### Tools can publish events
 
 The same second argument carries `publishEvent`, bound to the thread the tool
-runs on. Anything the tool learns can reach the UI through the event log, live
-and on reconnect:
+runs on. Anything the tool learns can reach the UI through the same follow the
+text comes through:
 
 ```ts
 execute: async ({ brief }, { publishEvent }) => {
   const url = await render(brief);
-  await publishEvent('DESIGN_PREVIEW', { url });
+  await publishEvent('DESIGN_PREVIEW', { url }, { durable: true });
   return { url };
 },
 ```
 
-See [Custom events](./custom-events.md) for the durable/notice choice and the
-client side.
+An event is live only by default: it goes to the run's stream. Pass
+`{ durable: true }` to keep it in the thread record, so it survives a reload.
+See [Custom events](./custom-events.md) for the choice and the client side.
 
 ## Budgets and ceilings
 
@@ -362,7 +363,7 @@ not the handle. One durable write; the worker notices within `stopPollMs`.
 
 `onChunk`, `onFinish` and `onStepFinish` from the AI SDK still fire. The
 platform chains its own handlers around yours rather than replacing them, so
-your callback runs *and* the event still reaches the log and the bus.
+your callback runs *and* the event still reaches the run stream.
 
 Platform-owned keys — `model`, `messages`, `tools`, `maxSteps`, `abortSignal` —
 are set by the engine and cannot be overridden from the spec.

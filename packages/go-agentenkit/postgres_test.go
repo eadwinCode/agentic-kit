@@ -101,8 +101,11 @@ func TestPostgresStorage_BehavesLikeTheOthers(t *testing.T) {
 	got, _ := s.Threads().Get(ctx, th.ID, sc)
 	mustEqual(t, got.State, ports.StateCompleted, "state")
 
-	_ = s.Events().Append(ctx, th.ID, ports.AgentEvent{ThreadID: th.ID, Seq: 1, Type: "X", Payload: []byte(`{"a":1}`), CreatedAt: got.UpdatedAt}, sc)
-	_ = s.Events().Append(ctx, th.ID, ports.AgentEvent{ThreadID: th.ID, Seq: 2, Type: "X", CreatedAt: got.UpdatedAt}, sc)
+	_, _ = s.Events().Append(ctx, th.ID, ports.NewThreadEvent{Type: "X", Payload: []byte(`{"a":1}`), RunID: "r1"}, sc)
+	_, _ = s.Events().Append(ctx, th.ID, ports.NewThreadEvent{Type: "X"}, sc)
+	ofRun, _ := s.Events().List(ctx, th.ID, ports.ThreadEventFilter{RunID: "r1"}, sc)
+	mustEqual(t, len(ofRun), 1, "by run")
+	mustEqual(t, ofRun[0].RunID, "r1", "runId kept")
 	latest, _ := s.Events().Latest(ctx, th.ID, "X", sc)
 	mustEqual(t, latest.Seq, int64(2), "latest")
 	since, _ := s.Events().ListSince(ctx, th.ID, 1, sc)

@@ -15,8 +15,9 @@ watch it at once. That is what this library is.
 
 | | What it is | Lifetime |
 | :--- | :--- | :--- |
-| **Thread** | A conversation. Holds messages, events and usage. | Until deleted |
+| **Thread** | A conversation. Holds messages, its record and usage. | Until deleted |
 | **Run** | One dispatched attempt to advance a thread. | Minutes |
+| **Segment** | One pickup of a run by a worker. A resume or a retry is a new one. It has its own run stream. | Minutes, plus `streamGraceMs` for its stream |
 | **Step** | One model round trip inside a run. | Seconds |
 
 A thread has many runs. A run has many steps. `Thread.state` only ever describes
@@ -70,53 +71,73 @@ which one wins depends on timing.
 
 ## Ports
 
-The engine imports no database driver. Four interfaces stand between it and your
+The engine imports no database driver. Five interfaces stand between it and your
 stack:
 
 | Port | Role | Delivery |
 | :--- | :--- | :--- |
-| `Storage` | threads, messages, events, usage | your database |
+| `Storage` | threads, messages, the thread record, usage | your database |
 | `Queue` | durable run dispatch | at-least-once |
 | `EventBus` | live fan-out to watching clients | at-most-once |
 | `Kv` | hot state, handoff keys, counters | fast, expendable |
+| `RunStreams` | one short-lived stream per run segment | kept for a grace window |
 
 The split between the queue and the bus matters. The queue must not lose a job,
 so it is at-least-once and the engine is idempotent under redelivery. The bus may
-lose a frame, because a client that misses one recovers by replaying the durable
-event log from its cursor.
+lose a frame, because a client that misses one recovers by reading the thread
+record and the run stream again from its cursor.
 
 See [Ports and adapters](./ports-and-adapters.md).
 
-## The event log
+## The thread record and run streams
 
-Everything a run does is appended to a per-thread event log with a monotonic
-`seq`, then fanned out on the bus. A client hydrates from the durable log and
-then tails the bus from its cursor, so a reload, a reconnect, or a second tab all
-converge on the same conversation.
+What a run says goes to two places.
 
-`runtime.events.follow()` and `runtime.events.sse()` do that sequencing for you,
-in any framework — see [HTTP API](./http-api.md#live-stream).
+- **The run stream.** Each run segment gets its own short-lived stream: text
+  deltas, reasoning, tool calls and results, step ends, nested run activity,
+  your own live events. A segment is one pickup by a worker; a resume after a
+  park, or a retry, starts a new segment and a new stream. The stream is
+  closed when the segment ends and deleted a little later (`streamGraceMs`).
+- **The thread record.** A small, per-thread log with a monotonic `seq`. It
+  keeps only what must outlive a run: parks and their answers, refusals,
+  budget stops, compaction, each segment's start and end, and your own events
+  published with `durable: true`.
 
-Common event types:
+The finished text is not lost when a stream goes: it is in the messages. So a
+client loads the snapshot (messages, the record, and the stream in flight),
+then follows the record and the stream from its cursor. A reload, a reconnect,
+or a second tab all end up with the same conversation.
+
+`runtime.events.follow()` and `runtime.events.sse()` do that for you, in any
+framework — see [HTTP API](./http-api.md#live-stream) and
+[Run streams](./run-streams.md).
+
+Common stream events (the shapes follow [AG-UI](https://docs.ag-ui.com)):
 
 | Type | Meaning |
 | :--- | :--- |
-| `STATE_CHANGE` | The thread moved to a new state |
-| `MESSAGE_APPENDED` | A user turn was persisted |
-| `MESSAGES_DROPPED` | An edit removed a turn and everything after it |
-| `CHUNK` | A piece of model output — text, reasoning, tool activity |
-| `STEP_COMMITTED` | A step's messages are now durable |
+| `RUN_STARTED` | A segment began |
+| `TEXT_MESSAGE_START` / `_CONTENT` / `_END` | Model text, as deltas |
+| `REASONING_START` / `_CONTENT` / `_END` | Model reasoning, as deltas |
+| `TOOL_CALL_START` / `_ARGS` / `_END`, `TOOL_CALL_RESULT` | Tool activity |
+| `STEP_FINISHED` | A step's messages are saved |
+| `MESSAGE_APPENDED` | A message was saved |
 | `INPUT_REQUIRED` | A tool is waiting for a human |
-| `INPUT_EXPIRED` | That wait timed out |
-| `SUBAGENT_STARTED` / `_CHUNK` / `_COMPLETED` / `_FAILED` | Nested run activity |
-| `CONTEXT_COMPACTED` | History was summarized |
+| `SUBAGENT_STARTED` / `SUBAGENT_EVENT` / `SUBAGENT_FINISHED` | Nested run activity |
+| `CUSTOM` | Your own event, `{ name, value }` |
+| `RUN_FINISHED` / `RUN_ERROR` | The segment ended; always the last item |
+
+Common record entries: `INPUT_REQUIRED`, `INPUT_EXPIRED`, `HITL_RESPONSE`,
+`RUN_REFUSED`, `TOKEN_BUDGET_EXHAUSTED`, `COST_BUDGET_EXHAUSTED`,
+`CONTEXT_COMPACTED`, `MESSAGES_DROPPED`, `RUN_STARTED`, `RUN_ENDED`.
+`STATE_CHANGE` is still sent live on the bus, but it is not stored.
 
 ### Your own events
 
-The log is not only the platform's. A tool, or any server code, can
+The pipe is not only the platform's. A tool, or any server code, can
 [publish an event](./custom-events.md) on a thread, and a client reads it
-through the same stream. Durable by default; a notice when nobody needs to see
-it twice.
+through the same follow. Live only by default; `durable: true` keeps it in the
+thread record.
 
 ## Thread states
 
@@ -150,8 +171,8 @@ watching.
 
 - It does not own your prompts, models or tools. The AI SDK does.
 - It does not own your database schema. You implement `Storage`.
-- It does not render anything. `use-agentenkit` is one option; the event log is a
-  public contract you can build any client over.
+- It does not render anything. `use-agentenkit` is one option; the follow's frames
+  are a public contract you can build any client over.
 
 ## Next
 

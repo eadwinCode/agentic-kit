@@ -26,7 +26,7 @@ bun add @prisma/client redis @upstash/qstash @upstash/redis pg
 
 ## A runtime you can run right now
 
-There is no `createDevRuntime`. Assembling the platform is four adapters and one
+There is no `createDevRuntime`. Assembling the platform is five adapters and one
 wire, and seeing them is the point — swapping any one of them for its durable
 equivalent later is then obvious rather than magic.
 
@@ -34,7 +34,7 @@ equivalent later is then obvious rather than magic.
 // lib/runtime.ts
 import { Database } from 'bun:sqlite';
 import { setupAgentCore } from 'agentenkit';
-import { SqliteStorage } from 'agentenkit/adapters/sqlite';
+import { SqliteRunStreams, SqliteStorage } from 'agentenkit/adapters/sqlite';
 import { InlineQueue } from 'agentenkit/adapters/inline';
 import { MemoryBus, MemoryKv } from 'agentenkit/adapters/memory';
 import { SqliteAdminStore } from 'agentenkit/admin/sqlite';
@@ -47,6 +47,7 @@ const queue = new InlineQueue();
 
 export const runtime = await setupAgentCore({
   storage: new SqliteStorage(db),
+  streams: new SqliteRunStreams(db),   // each run's live output
   admin: SqliteAdminStore.open(db),
   bus: new MemoryBus(),
   kv: new MemoryKv(),
@@ -95,16 +96,19 @@ queue. What it does not do is survive a restart. Use it in development.
 
 ## Watching a run
 
-Nothing above prints anything, because a run's output goes to the event log and
-the bus, not to the caller. The shortest way to see it:
+Nothing above prints anything, because a run's output goes to its run stream,
+not to the caller. The shortest way to see it:
 
 ```ts
-const unsubscribe = await runtime.events.subscribe(threadId, (event) => {
-  if (event.type === 'CHUNK' && event.payload?.type === 'text-delta') {
-    process.stdout.write(event.payload.textDelta);
-  }
-});
+for await (const frame of runtime.events.follow(threadId)) {
+  if (frame.kind !== 'stream') continue;
+  if (frame.item.type === 'TEXT_MESSAGE_CONTENT') process.stdout.write(frame.item.delta);
+  if (frame.item.type === 'RUN_FINISHED' || frame.item.type === 'RUN_ERROR') break;
+}
 ```
+
+`follow` reads the thread record and the run streams as one. Breaking out of
+the loop stops it. See [Run streams](./run-streams.md).
 
 For a browser, expose the [HTTP endpoints](./http-api.md) and use
 [`use-agentenkit`](./react.md), which does the hydrate-then-tail dance for you.
@@ -113,4 +117,4 @@ For a browser, expose the [HTTP endpoints](./http-api.md) and use
 
 - [Core concepts](./concepts.md) — what a thread, a run and a step actually are.
 - [HTTP API](./http-api.md) — the endpoints to expose.
-- [Production](./production.md) — swapping the four adapters for durable ones.
+- [Production](./production.md) — swapping the adapters for durable ones.

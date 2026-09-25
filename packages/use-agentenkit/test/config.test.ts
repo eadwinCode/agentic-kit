@@ -9,8 +9,8 @@ import {
 
 describe('routes', () => {
   it('appends the hook query to a plain path', () => {
-    expect(routeUrl(defaultRoutes.stream, { threadId: 't1', since: 7 }, '')).toBe(
-      '/api/agent/stream?threadId=t1&since=7',
+    expect(routeUrl(defaultRoutes.stream, { threadId: 't1', since: 7, cursor: '7 r:1 3' }, '')).toBe(
+      '/api/agent/stream?threadId=t1&since=7&cursor=7%20r%3A1%203',
     );
   });
 
