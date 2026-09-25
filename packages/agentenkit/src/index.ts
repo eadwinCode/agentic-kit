@@ -21,6 +21,7 @@ export {
   type StreamSnapshot,
 } from './ports/streams.js';
 export * from './core/stream-events.js';
+export type { SnapshotStream } from './core/snapshot.js';
 export type {
   AgentCore,
   AgentHandle,

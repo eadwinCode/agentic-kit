@@ -616,12 +616,45 @@ func (m messages) DeleteFrom(_ context.Context, threadID, messageID string, sc p
 
 type events struct{ s *Storage }
 
-func (e events) Append(_ context.Context, threadID string, ev ports.AgentEvent, sc ports.StorageContext) error {
+func (e events) Append(_ context.Context, threadID string, in ports.NewThreadEvent, sc ports.StorageContext) (ports.AgentEvent, error) {
 	e.s.mu.Lock()
 	defer e.s.mu.Unlock()
 	e.s.saw(sc)
+	// The thread's next seq, minted here: one higher than any it holds.
+	var top int64
+	for _, ev := range e.s.events[threadID] {
+		top = max(top, ev.Seq)
+	}
+	at := in.CreatedAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+	payload := in.Payload
+	if len(payload) == 0 {
+		payload = json.RawMessage("null")
+	}
+	ev := ports.AgentEvent{ThreadID: threadID, Seq: top + 1, Type: in.Type, Payload: payload, CreatedAt: at, RunID: in.RunID}
 	e.s.events[threadID] = append(e.s.events[threadID], ev)
-	return nil
+	return ev, nil
+}
+
+func (e events) List(_ context.Context, threadID string, f ports.ThreadEventFilter, sc ports.StorageContext) ([]ports.AgentEvent, error) {
+	e.s.mu.Lock()
+	defer e.s.mu.Unlock()
+	e.s.saw(sc)
+	var out []ports.AgentEvent
+	for _, ev := range e.s.events[threadID] {
+		if (f.Types == nil || slices.Contains(f.Types, ev.Type)) &&
+			(f.RunID == "" || ev.RunID == f.RunID) &&
+			(f.After == nil || ev.Seq > *f.After) {
+			out = append(out, ev)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	if f.Limit > 0 && len(out) > f.Limit {
+		out = out[:f.Limit]
+	}
+	return out, nil
 }
 
 func (e events) ListSince(_ context.Context, threadID string, sinceSeq int64, sc ports.StorageContext) ([]ports.AgentEvent, error) {

@@ -118,7 +118,8 @@ func (c *AgentCore) DeleteThread(ctx context.Context, threadID string, state Age
 }
 
 // GetThreadSnapshot is one call for UIs: thread + messages + runs + the
-// unfinished run's events. Nil when the thread is gone.
+// unfinished run's record entries + its run stream. Nil when the thread is
+// gone.
 func (c *AgentCore) GetThreadSnapshot(ctx context.Context, threadID string, state AgentRunState) (*ThreadSnapshot, error) {
 	deps := c.scope(state, "")
 	thread, err := deps.Storage.Threads.Get(ctx, threadID)
@@ -147,43 +148,24 @@ func (c *AgentCore) GetThreadSnapshot(ctx context.Context, threadID string, stat
 	if len(events) > 0 {
 		snap.LastEventSeq = events[len(events)-1].Seq
 	}
+	// The unfinished run's record entries: its open park, a refusal. The
+	// run's live events come from its stream, not from here.
 	if core.IsActive(thread.State) {
-		// The run's boundary is where it was accepted (QUEUED) or picked up
-		// (RUNNING), whichever came last; a resume after a park publishes
-		// RUNNING too.
-		boundary := 0
-		for i := len(events) - 1; i >= 0; i-- {
-			if events[i].Type != "STATE_CHANGE" {
-				continue
-			}
-			var p struct {
-				State string `json:"state"`
-			}
-			if events[i].PayloadInto(&p) == nil && (p.State == string(StateRunning) || p.State == string(StateQueued)) {
-				boundary = i
-				break
-			}
+		runID, err := core.CurrentRunID(ctx, deps, threadID)
+		if err != nil {
+			return nil, err
 		}
-		active := events[boundary:]
-		// Everything up to the last committed step is ALREADY in messages
-		// (§2.2). Only the in-flight step's chunks are missing from durable
-		// history, so only those are transient. Chunks alone: a park is
-		// published right after its step commits, so slicing the whole
-		// window would drop the very approval a reconnecting client needs.
-		var lastCommitted int64 = -1
-		for _, e := range active {
-			if e.Type == "STEP_COMMITTED" {
-				lastCommitted = e.Seq
+		for _, e := range events {
+			if runID != "" && e.RunID == runID {
+				snap.ActiveEvents = append(snap.ActiveEvents, e)
 			}
-		}
-		for _, e := range active {
-			isStream := e.Type == "CHUNK" || e.Type == "SUBAGENT_CHUNK"
-			if isStream && e.Seq != 0 && e.Seq <= lastCommitted {
-				continue
-			}
-			snap.ActiveEvents = append(snap.ActiveEvents, e)
 		}
 	}
+	stream, err := core.SnapshotStreamOf(ctx, deps, threadID)
+	if err != nil {
+		return nil, err
+	}
+	snap.Stream = stream
 	return snap, nil
 }
 
@@ -317,8 +299,9 @@ type PublishStateOptions struct {
 
 // PublishEvent publishes an event of your own on a thread, from anywhere on
 // the server: a webhook, a cron job, a route. Tools get the same thing bound
-// to their thread through ToolContext.PublishEvent. Durable by default;
-// Notice sends a bus-only notice. Platform event types are refused.
+// to their thread through ToolContext.PublishEvent. Live only by default;
+// Durable also keeps it in the thread record. Platform event types are
+// refused.
 func (e *EventsAPI) PublishEvent(ctx context.Context, threadID, typ string, payload any, opts PublishStateOptions) (AgentEvent, error) {
 	return core.PublishEvent(ctx, e.c.scope(opts.State, ""), threadID, typ, payload, opts.PublishOptions)
 }

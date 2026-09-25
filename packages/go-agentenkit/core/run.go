@@ -103,8 +103,8 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 	if deps.Config.BillingPreCheck != nil {
 		check := ports.BillingCheck{
 			ThreadID: threadID, State: input.State, Stage: ports.BillingAtDispatch,
-			PublishEvent: func(ctx context.Context, typ string, payload any, notice bool) (ports.AgentEvent, error) {
-				return PublishEvent(ctx, deps, threadID, typ, payload, PublishOptions{Notice: notice})
+			PublishEvent: func(ctx context.Context, typ string, payload any, durable bool) (ports.AgentEvent, error) {
+				return PublishEvent(ctx, deps, threadID, typ, payload, PublishOptions{Durable: durable})
 			},
 		}
 		if err := deps.Config.BillingPreCheck(ctx, check); err != nil {

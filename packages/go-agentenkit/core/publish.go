@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
-	"sync"
 	"time"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
@@ -27,28 +25,59 @@ func MarshalPayload(payload any) json.RawMessage {
 	return b
 }
 
-// publishLocks serialises taking a seq and storing the event, per thread in
-// this process, so the log is written in seq order and a counter reseed (see
-// nextSeq) cannot race another publisher here. The bus send is left outside:
-// a subscriber may publish from inside it, and a follower fills any gap the
-// bus leaves from storage (see FollowEvents).
-var publishLocks = newKeyedMutex()
+// RecordEventTypes are the platform's types that go in the thread record:
+// what must outlive a run (see ports.EventStore). Every other platform type
+// is live only: a notice on the bus, and an event on the run stream when
+// one is open. The TS runtime has the same set.
+var RecordEventTypes = map[string]bool{
+	"INPUT_REQUIRED": true, "INPUT_EXPIRED": true, "HITL_RESPONSE": true,
+	"RUN_REFUSED": true, "TOKEN_BUDGET_EXHAUSTED": true, "COST_BUDGET_EXHAUSTED": true,
+	"CONTEXT_COMPACTED": true, "MESSAGES_DROPPED": true,
+	"RUN_STARTED": true, "RUN_ENDED": true,
+}
 
-// Publish persists to the replayable event log, then fans out live to all
-// subscribers (§2.2). Seq comes from Kv.Incr, monotonic per thread (§3.4).
+// runOf is the run an entry belongs to: the one its payload names, as
+// runId or as resume.runId.
+func runOf(payload json.RawMessage) string {
+	var p struct {
+		RunID  string `json:"runId"`
+		Resume *struct {
+			RunID string `json:"runId"`
+		} `json:"resume"`
+	}
+	_ = json.Unmarshal(payload, &p)
+	if p.RunID != "" {
+		return p.RunID
+	}
+	if p.Resume != nil {
+		return p.Resume.RunID
+	}
+	return ""
+}
+
+// Publish publishes a platform event (§2.2). A record type is stored first
+// (the store mints its seq) and then sent; any other type is sent as a
+// notice. Either way it reaches the run stream this process has open on the
+// thread.
 func Publish(ctx context.Context, deps ports.RuntimePorts, threadID, typ string, payload any) (ports.AgentEvent, error) {
-	unlock := publishLocks.lock(threadID)
-	seq, err := nextSeq(ctx, deps, threadID)
-	if err != nil {
-		unlock()
-		return ports.AgentEvent{}, err
+	return PublishFor(ctx, deps, threadID, "", typ, payload)
+}
+
+// PublishFor is Publish for an entry that belongs to runID; empty takes the
+// run the payload names.
+func PublishFor(ctx context.Context, deps ports.RuntimePorts, threadID, runID, typ string, payload any) (ports.AgentEvent, error) {
+	if !RecordEventTypes[typ] {
+		return publishNotice(ctx, deps, threadID, typ, payload)
 	}
-	event := ports.AgentEvent{
-		ThreadID: threadID, Seq: seq, Type: typ,
-		Payload: MarshalPayload(payload), CreatedAt: time.Now(),
+	return record(ctx, deps, threadID, runID, typ, MarshalPayload(payload))
+}
+
+// record stores an entry in the thread record, then sends it.
+func record(ctx context.Context, deps ports.RuntimePorts, threadID, runID, typ string, payload json.RawMessage) (ports.AgentEvent, error) {
+	if runID == "" {
+		runID = runOf(payload)
 	}
-	err = deps.Storage.Events.Append(ctx, threadID, event)
-	unlock()
+	event, err := deps.Storage.Events.Append(ctx, threadID, ports.NewThreadEvent{Type: typ, Payload: payload, RunID: runID})
 	if err != nil {
 		return event, err
 	}
@@ -63,65 +92,6 @@ func Publish(ctx context.Context, deps ports.RuntimePorts, threadID, typ string,
 func toSegment(ctx context.Context, deps ports.RuntimePorts, event ports.AgentEvent) {
 	if seg := ActiveSegment(deps, event.ThreadID); seg != nil {
 		seg.Forward(ctx, event.Type, event.Payload, ReservedEventTypes[event.Type])
-	}
-}
-
-// nextSeq takes the thread's next event seq. A counter that restarts at 1 on
-// a thread that already has events means the kv lost the key (a flush, an
-// eviction, a restart without persistence). Carrying on from 1 would repeat
-// seqs the log already holds, and every client would drop the new events as
-// already seen, so the counter is moved past the stored ones first. The move
-// is a compare-and-set, so a publisher that took 2 meanwhile is not undone.
-func nextSeq(ctx context.Context, deps ports.RuntimePorts, threadID string) (int64, error) {
-	seq, err := deps.Kv.IncrWithExpiry(ctx, SeqKey(threadID), ThreadKeyTTL)
-	if err != nil || seq != 1 {
-		return seq, err
-	}
-	stored, err := deps.Storage.Events.ListSince(ctx, threadID, 0)
-	if err != nil || len(stored) == 0 {
-		return seq, err
-	}
-	top := stored[len(stored)-1].Seq
-	if top < 1 {
-		return seq, nil
-	}
-	if _, err := deps.Kv.SetIfValue(ctx, SeqKey(threadID), "1", strconv.FormatInt(top, 10), 0); err != nil {
-		return 0, err
-	}
-	return deps.Kv.Incr(ctx, SeqKey(threadID))
-}
-
-// keyedMutex is a mutex per key, dropped once nobody holds or waits on it.
-type keyedMutex struct {
-	mu    sync.Mutex
-	locks map[string]*keyedEntry
-}
-
-type keyedEntry struct {
-	mu   sync.Mutex
-	refs int
-}
-
-func newKeyedMutex() *keyedMutex { return &keyedMutex{locks: map[string]*keyedEntry{}} }
-
-func (k *keyedMutex) lock(key string) (unlock func()) {
-	k.mu.Lock()
-	e := k.locks[key]
-	if e == nil {
-		e = &keyedEntry{}
-		k.locks[key] = e
-	}
-	e.refs++
-	k.mu.Unlock()
-	e.mu.Lock()
-	return func() {
-		e.mu.Unlock()
-		k.mu.Lock()
-		e.refs--
-		if e.refs == 0 {
-			delete(k.locks, key)
-		}
-		k.mu.Unlock()
 	}
 }
 
@@ -152,21 +122,23 @@ var ReservedEventTypes = map[string]bool{
 	"SUBAGENT_STARTED": true, "SUBAGENT_CHUNK": true, "SUBAGENT_COMPLETED": true, "SUBAGENT_FAILED": true,
 	"TEXT_RESULT": true, "THREAD_DELETED": true, "HEARTBEAT": true,
 	"RUN_REFUSED": true, "TOKEN_BUDGET_EXHAUSTED": true, "COST_BUDGET_EXHAUSTED": true,
+	"RUN_STARTED": true, "RUN_ENDED": true, "RECORD_CHANGED": true, "SNAPSHOT": true,
 }
 
 // PublishOptions tunes PublishEvent.
 type PublishOptions struct {
-	// Notice sends the event over the bus only (seq 0), never to the log: a
-	// progress tick, a typing indicator, anything nobody needs to see twice.
-	// The default writes it to the thread's log, so a reconnecting client
-	// replays it.
-	Notice bool
+	// Durable also keeps the event in the thread record, so a tab that
+	// opens the thread next week still sees it. Otherwise (the default) it
+	// is live only: it goes out on the bus and, during a run, on the run's
+	// stream, which a tab that reconnects within the grace window replays.
+	Durable bool
 }
 
 // PublishEvent publishes an event of your own on a thread, through the same
-// pipeline the platform's events take: the durable log and the live bus
-// (§2.2). A client sees it in its event stream exactly like a built-in one.
-// Platform event types are refused.
+// pipeline the platform's events take (§2.2): the live bus, the run stream
+// during a run (as CUSTOM), and the thread record when it is durable. A
+// client sees it in its event stream exactly like a built-in one. Platform
+// event types are refused.
 func PublishEvent(ctx context.Context, deps ports.RuntimePorts, threadID, typ string, payload any, opts PublishOptions) (ports.AgentEvent, error) {
 	if typ == "" {
 		return ports.AgentEvent{}, errors.New("PublishEvent: an event type is required")
@@ -174,10 +146,10 @@ func PublishEvent(ctx context.Context, deps ports.RuntimePorts, threadID, typ st
 	if ReservedEventTypes[typ] {
 		return ports.AgentEvent{}, fmt.Errorf("PublishEvent: %s is a platform event type; pick your own", typ)
 	}
-	if opts.Notice {
-		return publishNotice(ctx, deps, threadID, typ, payload)
+	if opts.Durable {
+		return record(ctx, deps, threadID, "", typ, MarshalPayload(payload))
 	}
-	return Publish(ctx, deps, threadID, typ, payload)
+	return publishNotice(ctx, deps, threadID, typ, payload)
 }
 
 // EventPublisher is what a tool calls to publish, already bound to the

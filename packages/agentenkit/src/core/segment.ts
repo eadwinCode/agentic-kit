@@ -1,6 +1,7 @@
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { RunStreams } from '../ports/streams.js';
 import { THREAD_KEY_TTL_SECONDS } from './keys.js';
+import { publish } from './publish.js';
 import { streamIdOf, type StreamEnd, type StreamEvent } from './stream-events.js';
 
 /** The worker's side of a run stream: one per segment, open from pickup to
@@ -54,7 +55,7 @@ export async function openSegment(
     const segment = await deps.kv.incrWithExpiry(segmentKey(runId), THREAD_KEY_TTL_SECONDS);
     const streamId = streamIdOf(runId, segment);
     await deps.streams.open(streamId, { threadId, runId }, deps.config.streamTtlMs);
-    const seg = new SegmentStream(deps, deps.streams, threadId, streamId);
+    const seg = new SegmentStream(deps, deps.streams, threadId, runId, segment, streamId);
     let byThread = open.get(deps.streams);
     if (!byThread) {
       byThread = new Map();
@@ -62,6 +63,9 @@ export async function openSegment(
     }
     byThread.set(threadId, seg);
     await seg.push([{ type: 'RUN_STARTED', threadId, runId, streamId, segment }]);
+    // The thread record says which stream is open, so a tab that opens the
+    // thread finds it.
+    await publish(deps, threadId, 'RUN_STARTED', { runId, streamId, segment }, runId);
     return seg;
   } catch (err) {
     (deps.log ?? console).error('run stream not opened', { threadId, runId, err });
@@ -72,13 +76,22 @@ export async function openSegment(
 /** Closes a segment's stream that its worker could not: the sweep's end for
  *  a run whose worker died. A stream that is already closed or gone is left
  *  as it is. */
-export async function closeLostSegment(deps: RuntimePorts, runId: string, error: string): Promise<void> {
+export async function closeLostSegment(
+  deps: RuntimePorts,
+  threadId: string,
+  runId: string,
+  error: string,
+): Promise<void> {
   if (!deps.streams) return;
-  const current = Number(await deps.kv.get(segmentKey(runId)));
-  if (!current) return;
+  const segment = Number(await deps.kv.get(segmentKey(runId)));
+  if (!segment) return;
+  const streamId = streamIdOf(runId, segment);
+  const snap = await deps.streams.snapshot(streamId).catch(() => null);
+  if (!snap || snap.end) return; // gone, or its worker closed it after all
   await deps.streams
-    .close(streamIdOf(runId, current), { type: 'RUN_ERROR', status: 'lost', error }, deps.config.streamGraceMs)
+    .close(streamId, { type: 'RUN_ERROR', status: 'lost', error }, deps.config.streamGraceMs)
     .catch(() => undefined);
+  await publish(deps, threadId, 'RUN_ENDED', { runId, streamId, segment, status: 'lost', error }, runId);
 }
 
 export class SegmentStream {
@@ -95,6 +108,8 @@ export class SegmentStream {
     private readonly deps: RuntimePorts,
     private readonly streams: RunStreams,
     readonly threadId: string,
+    readonly runId: string,
+    readonly segment: number,
     readonly streamId: string,
   ) {}
 
@@ -146,6 +161,13 @@ export class SegmentStream {
     if (byThread?.get(this.threadId) === this) byThread.delete(this.threadId);
     await this.streams.close(this.streamId, end, this.deps.config.streamGraceMs).catch((err) => {
       (this.deps.log ?? console).error('run stream not closed', { streamId: this.streamId, err });
+    });
+    // The thread record says how the segment ended.
+    await publish(this.deps, this.threadId, 'RUN_ENDED', {
+      runId: this.runId, streamId: this.streamId, segment: this.segment, status: end.status,
+      ...(end.type === 'RUN_ERROR' ? { error: end.error } : {}),
+    }, this.runId).catch((err) => {
+      (this.deps.log ?? console).error('run end not recorded', { streamId: this.streamId, err });
     });
   }
 

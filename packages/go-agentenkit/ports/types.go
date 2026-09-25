@@ -135,16 +135,38 @@ type NewMessage struct {
 	Content json.RawMessage
 }
 
-// AgentEvent is an append-only event log entry: the replay source for SSE
-// (re)connects and the durable record of INPUT_REQUIRED (HITL) requests. Seq
-// is assigned by the engine via Kv.Incr before append (§3.4). Seq 0 marks a
-// bus-only notice that is never persisted.
+// AgentEvent is an event on a thread: an entry in the thread record, or a
+// live notice. Seq is the record's order, minted by the store on insert
+// (EventStore.Append). Seq 0 marks a notice, which is never stored.
 type AgentEvent struct {
 	ThreadID  string          `json:"threadId"`
 	Seq       int64           `json:"seq"`
 	Type      string          `json:"type"`
 	Payload   json.RawMessage `json:"payload"`
 	CreatedAt time.Time       `json:"createdAt"`
+	// RunID is the run the entry belongs to, when it belongs to one.
+	RunID string `json:"runId,omitempty"`
+}
+
+// NewThreadEvent is an entry for the thread record, before the store gives
+// it its seq.
+type NewThreadEvent struct {
+	Type    string
+	Payload json.RawMessage
+	RunID   string
+	// CreatedAt is when it happened; now when zero.
+	CreatedAt time.Time
+}
+
+// ThreadEventFilter picks record entries: all of them by default, oldest
+// first.
+type ThreadEventFilter struct {
+	Types []string
+	RunID string
+	// After, when set, keeps only entries after this seq.
+	After *int64
+	// Limit, when above zero, caps how many come back.
+	Limit int
 }
 
 // PayloadInto decodes the event payload into v.
@@ -808,9 +830,9 @@ type BillingCheck struct {
 	// either field and the segment runs with the lowered cap; raising is
 	// ignored. Nil at dispatch.
 	Budget *RunBudget
-	// PublishEvent publishes a durable event on the thread; Notice for a
-	// bus-only one.
-	PublishEvent func(ctx context.Context, typ string, payload any, notice bool) (AgentEvent, error)
+	// PublishEvent publishes an event on the thread: live only, or also
+	// kept in the thread record when durable.
+	PublishEvent func(ctx context.Context, typ string, payload any, durable bool) (AgentEvent, error)
 }
 
 // AgentConfig tunes the platform. Build one with DefaultConfig and change

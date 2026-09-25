@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/admin/migrate"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/core"
@@ -50,6 +52,9 @@ func New(ctx context.Context, db *sql.DB, opts ...Option) (*Storage, error) {
 		// both land (Append retries the loser).
 		optional(migrate.NewMigration("storage_0003_messages_seq_unique",
 			`CREATE UNIQUE INDEX IF NOT EXISTS `+s.t("messages_thread_seq_unique")+` ON `+s.t("messages")+`("threadId", seq)`)),
+		// The run a record entry belongs to.
+		migrate.NewMigration("storage_0004_events_run",
+			`ALTER TABLE `+s.t("events")+` ADD COLUMN IF NOT EXISTS "runId" TEXT`),
 	}); err != nil {
 		return nil, err
 	}
@@ -315,7 +320,7 @@ func (m messages) DeleteFrom(ctx context.Context, threadID, messageID string, _ 
 
 type events struct{ s *Storage }
 
-const eventCols = `"threadId", seq, type, payload, "createdAt"`
+const eventCols = `"threadId", seq, type, payload, "createdAt", COALESCE("runId", '')`
 
 func (e events) query(ctx context.Context, q string, vals ...any) ([]ports.AgentEvent, error) {
 	rows, err := e.s.db.QueryContext(ctx, q, vals...)
@@ -327,7 +332,7 @@ func (e events) query(ctx context.Context, q string, vals ...any) ([]ports.Agent
 	for rows.Next() {
 		var ev ports.AgentEvent
 		var payload []byte
-		if err := rows.Scan(&ev.ThreadID, &ev.Seq, &ev.Type, &payload, &ev.CreatedAt); err != nil {
+		if err := rows.Scan(&ev.ThreadID, &ev.Seq, &ev.Type, &payload, &ev.CreatedAt, &ev.RunID); err != nil {
 			return nil, err
 		}
 		ev.Payload = json.RawMessage(payload)
@@ -339,11 +344,65 @@ func (e events) query(ctx context.Context, q string, vals ...any) ([]ports.Agent
 	return out, rows.Err()
 }
 
-func (e events) Append(ctx context.Context, threadID string, ev ports.AgentEvent, _ ports.StorageContext) error {
-	_, err := e.s.db.ExecContext(ctx,
-		`INSERT INTO `+e.s.t("events")+` (id, "threadId", seq, type, payload, "createdAt") VALUES ($1,$2,$3,$4,$5,$6)`,
-		core.NewID(), threadID, ev.Seq, ev.Type, string(core.MarshalPayload(ev.Payload)), ev.CreatedAt)
-	return err
+// Append mints the seq as messages do: it locks the thread's row, so two
+// appends on one thread take turns and never read the same MAX.
+func (e events) Append(ctx context.Context, threadID string, in ports.NewThreadEvent, _ ports.StorageContext) (ports.AgentEvent, error) {
+	at := in.CreatedAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+	payload := core.MarshalPayload(in.Payload)
+	ev := ports.AgentEvent{ThreadID: threadID, Type: in.Type, Payload: payload, CreatedAt: at, RunID: in.RunID}
+	tx, err := e.s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ev, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SELECT 1 FROM `+e.s.t("threads")+` WHERE id = $1 FOR UPDATE`, threadID); err != nil {
+		return ev, err
+	}
+	var runID any
+	if in.RunID != "" {
+		runID = in.RunID
+	}
+	if err := tx.QueryRowContext(ctx,
+		`INSERT INTO `+e.s.t("events")+` (id, "threadId", seq, type, payload, "createdAt", "runId")
+		 SELECT $1, $2, COALESCE(MAX(seq), 0) + 1, $3, $4, $5, $6 FROM `+e.s.t("events")+` WHERE "threadId" = $2
+		 RETURNING seq`,
+		core.NewID(), threadID, in.Type, string(payload), at, runID).Scan(&ev.Seq); err != nil {
+		return ev, err
+	}
+	return ev, tx.Commit()
+}
+
+func (e events) List(ctx context.Context, threadID string, f ports.ThreadEventFilter, _ ports.StorageContext) ([]ports.AgentEvent, error) {
+	where := []string{`"threadId" = $1`}
+	args := []any{threadID}
+	arg := func(v any) string {
+		args = append(args, v)
+		return "$" + strconv.Itoa(len(args))
+	}
+	if f.Types != nil {
+		marks := make([]string, len(f.Types))
+		for i, t := range f.Types {
+			marks[i] = arg(t)
+		}
+		if len(marks) == 0 {
+			marks = []string{"NULL"}
+		}
+		where = append(where, "type IN ("+strings.Join(marks, ", ")+")")
+	}
+	if f.RunID != "" {
+		where = append(where, `"runId" = `+arg(f.RunID))
+	}
+	if f.After != nil {
+		where = append(where, "seq > "+arg(*f.After))
+	}
+	q := `SELECT ` + eventCols + ` FROM ` + e.s.t("events") + ` WHERE ` + strings.Join(where, " AND ") + ` ORDER BY seq`
+	if f.Limit > 0 {
+		q += " LIMIT " + strconv.Itoa(f.Limit)
+	}
+	return e.query(ctx, q, args...)
 }
 
 func (e events) ListSince(ctx context.Context, threadID string, sinceSeq int64, _ ports.StorageContext) ([]ports.AgentEvent, error) {

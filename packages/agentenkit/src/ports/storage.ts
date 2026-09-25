@@ -4,6 +4,8 @@ import type {
   ExecutionState,
   MessageDTO,
   NewMessage,
+  NewThreadEvent,
+  ThreadEventFilter,
   NewUsage,
   UsageFilter,
   UsageTotals,
@@ -72,15 +74,23 @@ export interface Storage {
      *  provider accepts. `run()` enforces that; adapters just delete. */
     deleteFrom(threadId: string, messageId: string, ctx: StorageContext): Promise<number>;
   };
+  /** The thread record: the few events that must outlive a run — parks and
+   *  their answers, refusals, budget stops, compaction, each segment's start
+   *  and end, and an app's own events published durable. A run's live
+   *  events go to its run stream, never here, so this grows with runs, not
+   *  with tokens. */
   events: {
-    append(threadId: string, event: AgentEvent, ctx: StorageContext): Promise<void>;
-    /** All events after the cursor, ascending by seq — SSE replay (§2.2) */
+    /** Store an entry and mint its seq: the thread's next, one higher than
+     *  any it holds. Two appends on one thread never get the same seq. */
+    append(threadId: string, event: NewThreadEvent, ctx: StorageContext): Promise<AgentEvent>;
+    /** Entries by filter, ascending by seq. */
+    list(threadId: string, filter: ThreadEventFilter, ctx: StorageContext): Promise<AgentEvent[]>;
+    /** All events after the cursor, ascending by seq. */
     listSince(threadId: string, sinceSeq: number, ctx: StorageContext): Promise<AgentEvent[]>;
     /** Most recent event of a type — the HITL pending check (§2.5) */
     latest(threadId: string, type: string, ctx: StorageContext): Promise<AgentEvent | null>;
     /** Every event of a type, ascending by seq. The open-approval set (§2.7)
-     *  is derived from these; scanning `listSince` instead would drag every
-     *  CHUNK on the thread through memory. */
+     *  is derived from these. */
     listByType(threadId: string, type: string, ctx: StorageContext): Promise<AgentEvent[]>;
   };
   /** One row per model call (§4).

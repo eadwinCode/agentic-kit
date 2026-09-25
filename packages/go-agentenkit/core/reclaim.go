@@ -143,7 +143,7 @@ func reclaimLost(ctx context.Context, deps ports.RuntimePorts, thread *ports.Thr
 		_, err := Publish(ctx, deps, threadID, "STATE_CHANGE", map[string]any{
 			"state": state, "stopReason": rec.StopReason, "runId": runID, "endedAt": *rec.EndedAt,
 		})
-		CloseLostSegment(ctx, deps, runID, "the run ended but its worker never closed its stream")
+		CloseLostSegment(ctx, deps, threadID, runID, "the run ended but its worker never closed its stream")
 		return true, err
 	}
 	// A run just accepted has no lock and no row for a moment between its
@@ -158,7 +158,7 @@ func reclaimLost(ctx context.Context, deps ports.RuntimePorts, thread *ports.Thr
 	}
 	Logger(deps).Warn("run lost by the queue; re-dispatched", "thread", threadID, "run", runID, "state", thread.State)
 	// A worker that took it and died may have left its segment's stream open.
-	CloseLostSegment(ctx, deps, runID, "the worker was lost; the run was dispatched again")
+	CloseLostSegment(ctx, deps, threadID, runID, "the worker was lost; the run was dispatched again")
 	job2 := ports.RunJob{
 		ThreadID: threadID, RunID: runID, Model: rec.Model, Agent: rec.Agent,
 		Kind: ports.JobReclaim, EnqueuedAt: time.Now().UnixMilli(),

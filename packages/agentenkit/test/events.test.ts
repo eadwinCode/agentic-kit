@@ -73,12 +73,20 @@ describe('events (§2.2)', () => {
     await stream.return(undefined);
   });
 
-  it('a lost seq counter carries on from the log', async () => {
+  it('the store mints the seq, so a lost kv changes nothing', async () => {
     const r = await makeRuntime(model([[say('x'), finish()]]));
     const th = await r.storage.threads.create({});
-    for (let i = 0; i < 3; i++) await publish(r.ports, th.id, 'X', null);
-    await r.kv.del(`agent:seq:${th.id}`); // flushed, evicted, restarted
-    expect((await publish(r.ports, th.id, 'X', null)).seq).toBe(4); // past what the log holds
+    for (let i = 0; i < 3; i++) await publish(r.ports, th.id, 'CONTEXT_COMPACTED', null);
+    await r.kv.del(`agent:seq:${th.id}`); // there is no counter to lose any more
+    expect((await publish(r.ports, th.id, 'CONTEXT_COMPACTED', null)).seq).toBe(4);
+  });
+
+  it('a live-only event is a notice and is never stored', async () => {
+    const r = await makeRuntime(model([[say('x'), finish()]]));
+    const th = await r.storage.threads.create({});
+    const sent = await publish(r.ports, th.id, 'STATE_CHANGE', { state: 'RUNNING' });
+    expect(sent.seq).toBe(0);
+    expect(await r.storage.events.listSince(th.id, -1)).toEqual([]);
   });
 
   it('consecutive deltas go out as one event', async () => {

@@ -66,10 +66,32 @@ export interface NewMessage {
  *  engine via Kv.incr before append (§3.4). */
 export interface AgentEvent {
   threadId: string;
+  /** The thread record's order, minted by the store on insert. 0 for a
+   *  notice, which is never stored. */
   seq: number;
   type: string;
   payload: unknown;
   createdAt: Date;
+  /** The run the entry belongs to, when it belongs to one. */
+  runId?: string | null;
+}
+
+/** An entry for the thread record, before the store gives it its seq. */
+export interface NewThreadEvent {
+  type: string;
+  payload: unknown;
+  runId?: string | null;
+  /** When it happened; now when omitted. */
+  createdAt?: Date;
+}
+
+/** Which record entries to read back: all of them by default, oldest first. */
+export interface ThreadEventFilter {
+  types?: string[];
+  runId?: string;
+  /** Only entries after this seq. */
+  after?: number;
+  limit?: number;
 }
 
 /** The durable record of ONE agent run (§2.9): when it started, how it ended,

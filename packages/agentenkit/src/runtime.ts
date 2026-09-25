@@ -21,6 +21,8 @@ import { contextUsage } from './core/context.js';
 import { createGenerateTextAgent, createStreamTextAgent } from './core/agent.js';
 import * as adminReads from './core/admin.js';
 import { bindStorage, type AgentRunState } from './core/state.js';
+import { snapshotStream } from './core/snapshot.js';
+import { currentRunId } from './core/keys.js';
 import { followEvents, toSseStream } from './core/follow.js';
 import { openDefaultAdminStore } from './admin/default.js';
 import { reclaimIfOrphaned } from './core/reclaim.js';
@@ -129,45 +131,19 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
 
       const messages = await deps.storage.messages.list(threadId, undefined);
       const runs = await deps.admin.runs.listByThread(threadId);
+      // The record is small (parks, refusals, each segment's start and
+      // end), and the run's live events come from its stream, not from here.
       const events = await deps.storage.events.listSince(threadId, -1);
-
       const lastEventSeq = events.at(-1)?.seq ?? -1;
+      // The unfinished run's record entries: its open park, a refusal.
       let activeEvents: AgentEvent[] = [];
       if (ACTIVE_STATES.includes(thread.state)) {
-        // The run's boundary is where it was accepted (QUEUED) or picked up
-        // (RUNNING), whichever came last; a resume after a park publishes
-        // RUNNING too.
-        let boundary = -1;
-        for (let index = events.length - 1; index >= 0; index -= 1) {
-          const event = events[index];
-          const state = (event.payload as { state?: string } | null)?.state;
-          if (event.type === 'STATE_CHANGE' && (state === 'RUNNING' || state === 'QUEUED')) {
-            boundary = index;
-            break;
-          }
-        }
-        const active = events.slice(Math.max(0, boundary));
-
-        // Everything up to the last committed step is ALREADY in `messages`
-        // (§2.2). Replaying those chunks too would render each finished step's
-        // text twice — once from the durable message, once from the stream
-        // that produced it. Only the in-flight step's chunks are missing from
-        // durable history, so only those are transient.
-        //
-        // Chunks alone: a park (INPUT_REQUIRED) is published right after its
-        // step commits, so slicing the whole window by this boundary would
-        // drop the very approval a reconnecting client needs.
-        const lastCommitted = active.reduce(
-          (seq, e) => (e.type === 'STEP_COMMITTED' ? e.seq : seq),
-          -1,
-        );
-        const isStream = (type: string) => type === 'CHUNK' || type === 'SUBAGENT_CHUNK';
-        activeEvents = active.filter(
-          (e) => !(isStream(e.type) && e.seq !== 0 && e.seq <= lastCommitted),
-        );
+        const runId = await currentRunId(deps, threadId);
+        activeEvents = runId ? events.filter((e) => e.runId === runId) : [];
       }
+      const stream = await snapshotStream(deps, threadId);
 
-      return { thread, messages, runs, lastEventSeq, activeEvents };
+      return { thread, messages, runs, lastEventSeq, activeEvents, stream };
     },
 
     admin: {

@@ -1,4 +1,4 @@
-import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewUsage, ThreadDTO, ThreadTransition, UsageFilter, UsageTotals } from '../core/types.js';
+import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewThreadEvent, NewUsage, ThreadDTO, ThreadEventFilter, ThreadTransition, UsageFilter, UsageTotals } from '../core/types.js';
 import { UsageMerger } from '../core/usage.js';
 import type { Storage } from '../ports/storage.js';
 import { StreamClosedError, StreamGoneError, type RunStreams, type StreamMeta, type StreamSnapshot } from '../ports/streams.js';
@@ -36,14 +36,15 @@ export interface PrismaLike {
     deleteMany(a: { where: { threadId: string; seq: { gte: bigint | number } } }): Promise<{ count: number }>;
   };
   agentEvent: {
-    create(a: { data: { threadId: string; seq: number; type: string; payload: any } }): Promise<unknown>;
+    create(a: { data: { threadId: string; seq: number; type: string; payload: any; runId?: string | null; createdAt?: Date } }): Promise<AgentEvent>;
     findMany(a: {
-      // One signature covering both reads — listSince (by seq) and listByType.
-      // Two overloads here would be a shape the real PrismaClient cannot satisfy.
-      where: { threadId: string; seq?: { gt: number }; type?: string };
+      // One signature for every read: by seq, by type, by run. Several
+      // overloads would be a shape the real PrismaClient cannot satisfy.
+      where: { threadId: string; seq?: { gt: number }; type?: string | { in: string[] }; runId?: string };
       orderBy: { seq: 'asc' };
+      take?: number;
     }): Promise<AgentEvent[]>;
-    findFirst(a: { where: { threadId: string; type: string }; orderBy: { seq: 'desc' } }): Promise<AgentEvent | null>;
+    findFirst(a: { where: { threadId: string; type?: string }; orderBy: { seq: 'desc' } }): Promise<AgentEvent | null>;
   };
   tokenUsage: {
     create(a: { data: TokenUsageRow }): Promise<unknown>;
@@ -187,23 +188,48 @@ export class PrismaStorage implements Storage {
   };
 
   events = {
-    append: async (threadId: string, event: AgentEvent) => {
-      await this.prisma.agentEvent.create({
-        data: { threadId, seq: event.seq, type: event.type, payload: event.payload },
-      });
+    // The seq is the thread's next: read the top one and insert above it.
+    // Two appends that read the same top collide on the (threadId, seq)
+    // unique index, and the loser tries again.
+    append: async (threadId: string, event: NewThreadEvent): Promise<AgentEvent> => {
+      for (let attempt = 0; ; attempt++) {
+        const top = await this.prisma.agentEvent.findFirst({ where: { threadId }, orderBy: { seq: 'desc' } });
+        try {
+          const row = await this.prisma.agentEvent.create({
+            data: {
+              threadId, seq: (top?.seq ?? 0) + 1, type: event.type, payload: event.payload ?? null,
+              runId: event.runId ?? null,
+              ...(event.createdAt ? { createdAt: event.createdAt } : {}),
+            },
+          });
+          return withRun(row);
+        } catch (err: any) {
+          if (err?.code !== 'P2002' || attempt >= 9) throw err;
+        }
+      }
     },
-    listSince: (threadId: string, sinceSeq: number) =>
-      this.prisma.agentEvent.findMany({
+    list: async (threadId: string, f: ThreadEventFilter = {}) =>
+      (await this.prisma.agentEvent.findMany({
+        where: {
+          threadId,
+          ...(f.types ? { type: { in: f.types } } : {}),
+          ...(f.runId !== undefined ? { runId: f.runId } : {}),
+          ...(f.after !== undefined ? { seq: { gt: f.after } } : {}),
+        },
+        orderBy: { seq: 'asc' },
+        ...(f.limit ? { take: f.limit } : {}),
+      })).map(withRun),
+    listSince: async (threadId: string, sinceSeq: number) =>
+      (await this.prisma.agentEvent.findMany({
         where: { threadId, seq: { gt: sinceSeq } },
         orderBy: { seq: 'asc' },
-      }),
-    latest: (threadId: string, type: string) =>
-      this.prisma.agentEvent.findFirst({
-        where: { threadId, type },
-        orderBy: { seq: 'desc' },
-      }),
-    listByType: (threadId: string, type: string) =>
-      this.prisma.agentEvent.findMany({ where: { threadId, type }, orderBy: { seq: 'asc' } }),
+      })).map(withRun),
+    latest: async (threadId: string, type: string) => {
+      const row = await this.prisma.agentEvent.findFirst({ where: { threadId, type }, orderBy: { seq: 'desc' } });
+      return row && withRun(row);
+    },
+    listByType: async (threadId: string, type: string) =>
+      (await this.prisma.agentEvent.findMany({ where: { threadId, type }, orderBy: { seq: 'asc' } })).map(withRun),
   };
 
   usage = {
@@ -283,6 +309,14 @@ export class PrismaStorage implements Storage {
 
 
 
+}
+
+/** A record row as an event: `runId` only when the entry has one, as the
+ *  other stores and the Go runtime send it. */
+function withRun(row: AgentEvent): AgentEvent {
+  const { runId, ...rest } = row as AgentEvent & { id?: string };
+  delete (rest as { id?: string }).id;
+  return runId ? { ...rest, runId } : rest;
 }
 
 /** The Prisma surface PrismaRunStreams uses: the RunStream and

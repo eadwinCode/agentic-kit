@@ -94,8 +94,11 @@ type BoundEvents struct {
 	sc StorageContext
 }
 
-func (b BoundEvents) Append(ctx context.Context, threadID string, e AgentEvent) error {
+func (b BoundEvents) Append(ctx context.Context, threadID string, e NewThreadEvent) (AgentEvent, error) {
 	return b.s.Append(ctx, threadID, e, b.sc)
+}
+func (b BoundEvents) List(ctx context.Context, threadID string, f ThreadEventFilter) ([]AgentEvent, error) {
+	return b.s.List(ctx, threadID, f, b.sc)
 }
 func (b BoundEvents) ListSince(ctx context.Context, threadID string, sinceSeq int64) ([]AgentEvent, error) {
 	return b.s.ListSince(ctx, threadID, sinceSeq, b.sc)

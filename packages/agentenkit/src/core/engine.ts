@@ -1083,7 +1083,7 @@ export async function failLostRun(
     await failRun(deps, agent, threadId, runId, reason);
     // The dead worker never closed its segment's stream: a reader waiting
     // on it stops here.
-    await closeLostSegment(deps, runId, reason);
+    await closeLostSegment(deps, threadId, runId, reason);
     return true;
   } finally {
     await lease.release();

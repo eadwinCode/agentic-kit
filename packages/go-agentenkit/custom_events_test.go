@@ -16,7 +16,7 @@ func TestCustomEvents_AToolPublishesADurableEvent(t *testing.T) {
 		Name: "chat", Model: "gpt-4o",
 		Tools: []agentenkit.Tool{agentenkit.AgentTool("render", "r",
 			func(ctx context.Context, _ struct{}, tc agentenkit.ToolContext) (string, error) {
-				e, err := tc.PublishEvent(ctx, "DESIGN_PREVIEW", map[string]any{"url": "https://x/1.png", "org": tc.State["orgId"]}, agentenkit.PublishOptions{})
+				e, err := tc.PublishEvent(ctx, "DESIGN_PREVIEW", map[string]any{"url": "https://x/1.png", "org": tc.State["orgId"]}, agentenkit.PublishOptions{Durable: true})
 				if err != nil {
 					return "", err
 				}
@@ -45,6 +45,7 @@ func TestCustomEvents_AToolPublishesADurableEvent(t *testing.T) {
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "run completed")
 }
 
+// By default an event is live only: a notice with seq 0, never stored.
 func TestCustomEvents_ANoticeReachesTheBusOnly(t *testing.T) {
 	h := makeRuntime(t, scripted(step{calls: []call{{"c1", "slow", `{}`}}}, step{text: "done"}))
 	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
@@ -53,7 +54,7 @@ func TestCustomEvents_ANoticeReachesTheBusOnly(t *testing.T) {
 			// A hand-built goai tool reads the context off ctx
 			tc := agentenkit.ToolContextFrom(ctx)
 			mustEqual(t, tc.ToolCallID, "c1", "tool call id")
-			_, err := tc.PublishEvent(ctx, "PROGRESS", map[string]any{"label": "Rendering…"}, agentenkit.PublishOptions{Notice: true})
+			_, err := tc.PublishEvent(ctx, "PROGRESS", map[string]any{"label": "Rendering…"}, agentenkit.PublishOptions{})
 			return "ok", err
 		}))},
 	})
@@ -91,11 +92,12 @@ func TestCustomEvents_TheRuntimePublishesFromOutsideARun(t *testing.T) {
 	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
 	e, err := h.rt.Events.PublishEvent(h.ctx, ran.ThreadID, "CREDIT_LIMIT", map[string]any{"kind": "monthly"},
-		agentenkit.PublishStateOptions{State: agentenkit.AgentRunState{"orgId": "acme"}})
+		agentenkit.PublishStateOptions{State: agentenkit.AgentRunState{"orgId": "acme"}, PublishOptions: agentenkit.PublishOptions{Durable: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	mustEqual(t, e.Type, "CREDIT_LIMIT", "type")
+	mustEqual(t, e.Seq > 0, true, "a durable event carries a seq")
 	mustEqual(t, h.storage.LastContext.State["orgId"], "acme", "scoped write")
 	logged, _ := h.rt.Events.Since(h.ctx, ran.ThreadID, -1, nil)
 	mustEqual(t, logged[len(logged)-1].Type, "CREDIT_LIMIT", "logged last")

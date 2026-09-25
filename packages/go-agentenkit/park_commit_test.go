@@ -42,30 +42,22 @@ func approvalSetup(t *testing.T, steps ...step) (*harness, *agentenkit.AgentHand
 	return h, chat, &sent
 }
 
-func allEvents(t *testing.T, h *harness, threadID string) []agentenkit.AgentEvent {
-	t.Helper()
-	out, err := h.storage.Events().ListSince(h.ctx, threadID, -1, agentenkit.StorageContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return out
-}
-
-func seqOf(events []agentenkit.AgentEvent, typ string) int64 {
-	for _, e := range events {
-		if e.Type == typ {
-			return e.Seq
-		}
-	}
-	return -1
-}
-
 func TestPark_IsWrittenOnlyAfterItsStepIsSaved(t *testing.T) {
 	h, chat, _ := approvalSetup(t, step{calls: []call{{"a1", "send", `{}`}}})
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
 	h.handleNext(t)
-	events := allEvents(t, h, ran.ThreadID)
-	committed, requested := seqOf(events, "STEP_COMMITTED"), seqOf(events, "INPUT_REQUIRED")
+	// In the order they were sent: the commit is live only, the park is in
+	// the record too.
+	sent := h.events(ran.ThreadID, "")
+	committed, requested := -1, -1
+	for i, e := range sent {
+		if e.Type == "STEP_COMMITTED" && committed < 0 {
+			committed = i
+		}
+		if e.Type == "INPUT_REQUIRED" && requested < 0 {
+			requested = i
+		}
+	}
 	if committed < 0 || requested < 0 || requested < committed {
 		t.Fatalf("INPUT_REQUIRED (%d) must follow STEP_COMMITTED (%d)", requested, committed)
 	}

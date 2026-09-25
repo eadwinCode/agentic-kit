@@ -91,7 +91,7 @@ describe('stop while parked (§2.5)', () => {
     expect(stopped).toMatchObject({ state: 'CANCELLED', stopReason: 'cancelled', totalTokens: 0 });
     expect(stopped.endedAt).toBeInstanceOf(Date);
     expect(stopped.durationMs).toBeGreaterThanOrEqual(0);
-    const events = await r.storage.events.listSince(ran.threadId, 0);
+    const events = r.bus.published.filter((e) => e.threadId === ran.threadId && e.type === 'STATE_CHANGE');
     expect(events.at(-1)!.payload).toMatchObject({
       state: 'CANCELLED', stopReason: 'cancelled', runId: ran.runId, endedAt: stopped.endedAt,
     });

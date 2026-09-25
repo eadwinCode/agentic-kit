@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type {
-  AgentEvent, ExecutionState, MessageDTO, NewMessage, NewUsage, ThreadDTO, UsageFilter, UsageTotals, ThreadTransition,
+  AgentEvent, ExecutionState, MessageDTO, NewMessage, NewThreadEvent, NewUsage, ThreadDTO, ThreadEventFilter,
+  UsageFilter, UsageTotals, ThreadTransition,
 } from '../core/types.js';
 import { UsageMerger } from '../core/usage.js';
 import type { Storage } from '../ports/storage.js';
@@ -157,6 +158,8 @@ export class SqliteStorage implements Storage {
     this.db.prepare('CREATE INDEX IF NOT EXISTS usage_run ON usage(runId, createdAt)').run();
     // The thread's current run, for ThreadTransition's compare-and-set.
     this.addMissing('threads', { runId: 'TEXT' });
+    // The run a record entry belongs to.
+    this.addMissing('events', { runId: 'TEXT' });
     // One event per seq on a thread: a counter that restarted must fail its
     // write, never land a second event under a seq clients already have. A log
     // from before this check may already hold duplicates; the index is then
@@ -224,7 +227,7 @@ export class SqliteStorage implements Storage {
   });
   private toEvent = (r: any): AgentEvent => ({
     threadId: r.threadId, seq: r.seq, type: r.type,
-    payload: parse(r.payload), createdAt: new Date(r.createdAt),
+    payload: parse(r.payload), createdAt: new Date(r.createdAt), ...(r.runId ? { runId: r.runId } : {}),
   }) as AgentEvent;
   threads = {
     get: async (threadId: string) => {
@@ -327,9 +330,33 @@ export class SqliteStorage implements Storage {
   };
 
   events = {
-    append: async (threadId: string, e: AgentEvent) => {
-      this.write('INSERT INTO events (id,threadId,seq,type,payload,createdAt) VALUES (?,?,?,?,?,?)',
-        randomUUID(), threadId, e.seq, e.type, json(e.payload), new Date(e.createdAt).getTime());
+    // The seq is minted in the insert itself: SQLite runs one writer at a
+    // time, so no two appends on a thread read the same MAX.
+    append: async (threadId: string, e: NewThreadEvent): Promise<AgentEvent> => {
+      const createdAt = e.createdAt ? new Date(e.createdAt).getTime() : Date.now();
+      const row = this.all(
+        `INSERT INTO events (id,threadId,seq,type,payload,createdAt,runId)
+         SELECT ?,?,COALESCE(MAX(seq),0)+1,?,?,?,? FROM events WHERE threadId = ?
+         RETURNING seq`,
+        randomUUID(), threadId, e.type, json(e.payload), createdAt, e.runId ?? null, threadId,
+      )[0] as { seq: number };
+      return {
+        threadId, seq: Number(row.seq), type: e.type, payload: e.payload,
+        createdAt: new Date(createdAt), ...(e.runId ? { runId: e.runId } : {}),
+      };
+    },
+    list: async (threadId: string, f: ThreadEventFilter = {}) => {
+      const where = ['threadId = ?'];
+      const args: unknown[] = [threadId];
+      if (f.types) {
+        where.push(`type IN (${f.types.map(() => '?').join(',') || 'NULL'})`);
+        args.push(...f.types);
+      }
+      if (f.runId !== undefined) { where.push('runId = ?'); args.push(f.runId); }
+      if (f.after !== undefined) { where.push('seq > ?'); args.push(f.after); }
+      const limit = f.limit ? ` LIMIT ${Math.floor(f.limit)}` : '';
+      return this.all(`SELECT * FROM events WHERE ${where.join(' AND ')} ORDER BY seq${limit}`, ...args)
+        .map(this.toEvent);
     },
     listSince: async (threadId: string, sinceSeq: number) =>
       this.all('SELECT * FROM events WHERE threadId = ? AND seq > ? ORDER BY seq',

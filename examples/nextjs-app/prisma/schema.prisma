@@ -76,12 +76,16 @@ model RunStreamEvent {
   @@index([streamId, pos])
 }
 
+/// The thread record: parks, refusals, budget stops, compaction, each run
+/// segment's start and end, and an app's durable events. A run's live
+/// events go to its RunStream, never here.
 model AgentEvent {
   id        String   @id @default(cuid())
   threadId  String
   seq       Int
   type      String
   payload   Json
+  runId     String?
   createdAt DateTime @default(now())
 
   thread Thread @relation(fields: [threadId], references: [id], onDelete: Cascade)

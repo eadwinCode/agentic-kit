@@ -119,7 +119,7 @@ func TestSegmentStreams(t *testing.T) {
 		chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
 			Name: "chat", Model: "gpt-4o",
 			Tools: []agentenkit.Tool{agentenkit.AgentTool("render", "render", func(ctx context.Context, _ map[string]any, tc agentenkit.ToolContext) (string, error) {
-				_, err := tc.PublishEvent(ctx, "SEARCH_PROGRESS", map[string]any{"done": 3, "of": 10}, agentenkit.PublishOptions{Notice: true})
+				_, err := tc.PublishEvent(ctx, "SEARCH_PROGRESS", map[string]any{"done": 3, "of": 10}, agentenkit.PublishOptions{})
 				return "ok", err
 			})},
 		})

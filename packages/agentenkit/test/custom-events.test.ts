@@ -70,7 +70,7 @@ describe('custom events', () => {
         render: agentTool({
           parameters: z.object({}),
           execute: async (_args, { publishEvent, state }) => {
-            const event = await publishEvent('DESIGN_PREVIEW', { url: 'https://x/1.png', org: state.orgId });
+            const event = await publishEvent('DESIGN_PREVIEW', { url: 'https://x/1.png', org: state.orgId }, { durable: true });
             expect(event.seq).toBeGreaterThan(0);
             return { ok: true };
           },
@@ -92,7 +92,7 @@ describe('custom events', () => {
     expect(snap!.lastEventSeq).toBeGreaterThanOrEqual(preview.seq);
   });
 
-  it('a notice reaches the bus only, with seq 0', async () => {
+  it('by default an event is live only: a notice with seq 0, never stored', async () => {
     const r = await makeRuntime(
       scriptedModel([{ toolCalls: [{ toolCallId: 'c1', toolName: 'slow', args: {} }] }, { text: 'done' }]),
     );
@@ -102,7 +102,7 @@ describe('custom events', () => {
         slow: agentTool({
           parameters: z.object({}),
           execute: async (_args, { publishEvent }) => {
-            await publishEvent('PROGRESS', { label: 'Rendering…' }, { durable: false });
+            await publishEvent('PROGRESS', { label: 'Rendering…' });
             return 'ok';
           },
         }),
@@ -131,8 +131,11 @@ describe('custom events', () => {
     const r = await makeRuntime(scriptedModel([{ text: 'ok' }]));
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
     const ran = await chat.run({ prompt: 'hi' });
-    const event = await r.runtime.events.publishEvent(ran.threadId, 'BILLING', { credits: 0 }, { state: { orgId: 'acme' } });
+    const event = await r.runtime.events.publishEvent(
+      ran.threadId, 'BILLING', { credits: 0 }, { state: { orgId: 'acme' }, durable: true },
+    );
     expect(event.type).toBe('BILLING');
+    expect(event.seq).toBeGreaterThan(0);
     expect(ofType(r.bus, 'BILLING')).toHaveLength(1);
     const logged = await r.runtime.events.since(ran.threadId, -1);
     expect(logged.at(-1)!.type).toBe('BILLING');

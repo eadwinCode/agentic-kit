@@ -123,7 +123,7 @@ async function reclaimLost(deps: RuntimePorts, thread: ThreadDTO): Promise<boole
     await publish(deps, threadId, 'STATE_CHANGE', {
       state, stopReason: rec.stopReason, runId, endedAt: rec.endedAt,
     });
-    await closeLostSegment(deps, runId, 'the run ended but its worker never closed its stream');
+    await closeLostSegment(deps, threadId, runId, 'the run ended but its worker never closed its stream');
     return true;
   }
   // A run just accepted has no lock and no job for a moment between its state
@@ -134,7 +134,7 @@ async function reclaimLost(deps: RuntimePorts, thread: ThreadDTO): Promise<boole
   if (Date.now() - last < deps.config.runLockLeaseSeconds * 1000) return false;
   log.warn?.('run lost by the queue; re-dispatched', { threadId, runId, state: thread.state });
   // A worker that took it and died may have left its segment's stream open.
-  await closeLostSegment(deps, runId, 'the worker was lost; the run was dispatched again');
+  await closeLostSegment(deps, threadId, runId, 'the worker was lost; the run was dispatched again');
   try {
     await enqueueJob(
       deps,

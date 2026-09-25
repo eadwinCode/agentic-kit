@@ -852,8 +852,8 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		budget := &ports.RunBudget{CostBudgetMicros: costBudget, MaxSteps: input.MaxSteps}
 		check := ports.BillingCheck{
 			ThreadID: threadID, RunID: runID, State: input.State, Stage: ports.BillingAtPickup, Budget: budget,
-			PublishEvent: func(ctx context.Context, typ string, payload any, notice bool) (ports.AgentEvent, error) {
-				return PublishEvent(ctx, deps, threadID, typ, payload, PublishOptions{Notice: notice})
+			PublishEvent: func(ctx context.Context, typ string, payload any, durable bool) (ports.AgentEvent, error) {
+				return PublishEvent(ctx, deps, threadID, typ, payload, PublishOptions{Durable: durable})
 			},
 		}
 		if err := deps.Config.BillingPreCheck(ctx, check); err != nil {
@@ -1540,7 +1540,7 @@ func FailLostRun(ctx context.Context, deps ports.RuntimePorts, agent *Registered
 	err = failRun(ctx, deps, agent, threadID, runID, reason)
 	// The dead worker never closed its segment's stream: a reader waiting on
 	// it stops here.
-	CloseLostSegment(ctx, deps, runID, reason)
+	CloseLostSegment(ctx, deps, threadID, runID, reason)
 	return true, err
 }
 

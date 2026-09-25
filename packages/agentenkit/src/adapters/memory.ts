@@ -1,4 +1,4 @@
-import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewUsage, RunJob, ThreadDTO, ThreadTransition, UsageFilter, UsageTotals } from '../core/types.js';
+import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewThreadEvent, ThreadEventFilter, NewUsage, RunJob, ThreadDTO, ThreadTransition, UsageFilter, UsageTotals } from '../core/types.js';
 import { sumUsage } from '../core/usage.js';
 import type { Storage } from '../ports/storage.js';
 import type { EventBus } from '../ports/bus.js';
@@ -267,10 +267,25 @@ export class MemoryStorage implements Storage {
 
   events = {
     store: new Map<string, AgentEvent[]>(),
-    async append(t: string, e: AgentEvent) {
+    async append(t: string, e: NewThreadEvent): Promise<AgentEvent> {
       let list = this.store.get(t);
       if (!list) { list = []; this.store.set(t, list); }
-      list.push(e);
+      // The thread's next seq, minted here: one higher than any it holds.
+      const seq = list.reduce((top, x) => Math.max(top, x.seq), 0) + 1;
+      const event: AgentEvent = {
+        threadId: t, seq, type: e.type, payload: e.payload, createdAt: e.createdAt ?? new Date(),
+        ...(e.runId ? { runId: e.runId } : {}),
+      };
+      list.push(event);
+      return event;
+    },
+    async list(t: string, f: ThreadEventFilter = {}) {
+      const rows = (this.store.get(t) ?? [])
+        .filter((e) => (!f.types || f.types.includes(e.type))
+          && (f.runId === undefined || e.runId === f.runId)
+          && (f.after === undefined || e.seq > f.after))
+        .sort((a, b) => a.seq - b.seq);
+      return f.limit ? rows.slice(0, f.limit) : rows;
     },
     async listSince(t: string, sinceSeq: number) {
       return (this.store.get(t) ?? []).filter((e) => e.seq > sinceSeq)

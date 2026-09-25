@@ -67,11 +67,11 @@ function scriptedModel(steps: Step[]) {
 
 async function makeRuntime(
   steps: Step[],
-  opts: { config?: Partial<AgentConfig>; pricer?: Pricer; storage?: MemoryStorage } = {},
+  opts: { config?: Partial<AgentConfig>; pricer?: Pricer; storage?: MemoryStorage; bus?: MemoryBus } = {},
 ) {
   const { model, calls } = scriptedModel(steps);
   const storage = opts.storage ?? new MemoryStorage();
-  const bus = new MemoryBus();
+  const bus = opts.bus ?? new MemoryBus();
   const queue = new MemoryQueue();
   const kv = new MemoryKv();
   const admin = new MemoryAdminStore();
@@ -423,18 +423,19 @@ describe('budgets and retries (§2.1, §2.8)', () => {
   });
 
   it('a run whose last step was saved is not asked again', async () => {
-    // The worker dies right after the step's messages and usage are saved.
-    const storage = new MemoryStorage();
-    const append = storage.events.append.bind(storage.events);
+    // The worker dies right after the step's messages and usage are saved:
+    // sending the step's commit is the first thing after that.
+    const bus = new MemoryBus();
+    const send = bus.publish.bind(bus);
     let failed = false;
-    storage.events.append = async (t, e) => {
+    bus.publish = async (t, e) => {
       if (e.type === 'STEP_COMMITTED' && !failed) {
         failed = true;
         throw new Error('worker died');
       }
-      return append(t, e);
+      return send(t, e);
     };
-    const r = await makeRuntime([{ text: 'the answer' }, { text: 'a second answer' }], { storage });
+    const r = await makeRuntime([{ text: 'the answer' }, { text: 'a second answer' }], { bus });
     const { spy, onSettle } = settleSpy();
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', onSettle });
     const ran = await chat.run({ prompt: 'hi' });
@@ -443,9 +444,9 @@ describe('budgets and retries (§2.1, §2.8)', () => {
     await r.handleNext(); // the retry
     expect(r.calls()).toBe(1); // the model was asked once
     expect(await r.state(ran.threadId)).toBe('COMPLETED');
-    const roles = (await storage.messages.list(ran.threadId, { agentId: null })).map((m) => m.role);
+    const roles = (await r.storage.messages.list(ran.threadId, { agentId: null })).map((m) => m.role);
     expect(roles).toEqual(['user', 'assistant']); // one answer
-    expect(storage.usage.recorded).toHaveLength(1); // the call billed once
+    expect(r.storage.usage.recorded).toHaveLength(1); // the call billed once
     expect(spy.n).toBe(1);
   });
 });

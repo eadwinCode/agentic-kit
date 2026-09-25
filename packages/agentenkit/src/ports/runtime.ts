@@ -22,6 +22,7 @@ import type { AdminStore, RunFilter, StepRecord } from './admin.js';
 import type { AgentRunState, BoundStorage } from '../core/state.js';
 import type { FollowOptions, SseOptions, SseStream } from '../core/follow.js';
 import type { PublishEventOptions } from '../core/publish.js';
+import type { SnapshotStream } from '../core/snapshot.js';
 
 export type { AdminStore, NewStepRecord, RunFilter, StepRecord } from './admin.js';
 export type { AgentRunState, BoundStorage, StorageContext } from '../core/state.js';
@@ -294,10 +295,13 @@ export interface ThreadSnapshot {
    *  reconnecting client rebuilds its subagent panel without depending on
    *  events that only replay while a run is unfinished. */
   runs: RunRecord[];
-  /** Cursor for starting live replay without duplicating snapshot state. */
+  /** The thread record's last seq. */
   lastEventSeq: number;
-  /** Only the unfinished run's events, used to restore transient activity. */
+  /** The unfinished run's record entries: its open park, a refusal. */
   activeEvents: AgentEvent[];
+  /** The run stream in flight, or one that just ended: what the messages
+   *  do not have yet, and where a live read picks up. */
+  stream: SnapshotStream | null;
 }
 
 /** Everything streamText accepts except the platform-owned keys (§3.1).

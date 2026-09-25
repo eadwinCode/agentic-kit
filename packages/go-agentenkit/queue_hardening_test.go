@@ -563,8 +563,9 @@ func TestSnapshot_AQueuedThreadIsActiveFromItsAcceptance(t *testing.T) {
 	mustEqual(t, snap.Thread.State, agentenkit.StateQueued, "state")
 	mustEqual(t, len(snap.Runs), 1, "the run is on the snapshot")
 	mustEqual(t, snap.Runs[0].State, agentenkit.StateQueued, "as queued")
-	if len(snap.ActiveEvents) == 0 || payload(snap.ActiveEvents[0])["state"] != "QUEUED" {
-		t.Fatalf("the active window starts at the acceptance: %+v", snap.ActiveEvents)
+	// Not picked up yet: no segment has started, so there is no stream.
+	if snap.Stream != nil {
+		t.Fatalf("a queued run has no stream yet: %+v", snap.Stream)
 	}
 }
 

@@ -110,12 +110,15 @@ async function setup(
     resolveModel: () => ({ instance: () => model, contextWindow: 128_000 }),
   };
   const state = async (threadId: string) => (await storage.threads.get(threadId))!.state;
+  // Everything the thread saw, in the order it was sent: record entries and
+  // live notices alike.
   const events = (threadId: string, type: string) =>
-    (storage.events.store.get(threadId) ?? []).filter((e) => e.type === type);
+    bus.published.filter((e) => e.threadId === threadId && e.type === type);
+  const order = (e: unknown) => bus.published.indexOf(e as any);
   const rows = (threadId: string, agentId: string | null = null) =>
     storage.messages.store.get(threadId)!.filter((m) => m.agentId === agentId);
   const next = () => runtime.worker.handleJob(queue.items.shift()!);
-  return { runtime, chat, storage, queue, kv, ports, prompts, sent, wiped, state, events, rows, next };
+  return { runtime, chat, storage, queue, kv, ports, prompts, sent, wiped, state, events, order, rows, next };
 }
 
 describe('a park waits for its step (§2.5)', () => {
@@ -123,8 +126,9 @@ describe('a park waits for its step (§2.5)', () => {
     const r = await setup([[call('a1', 'send', {}), finish('tool-calls')]]);
     const ran = await r.chat.run({ prompt: 'go' });
     await r.next();
-    const committed = r.events(ran.threadId, 'STEP_COMMITTED')[0]!.seq;
-    const requested = r.events(ran.threadId, 'INPUT_REQUIRED')[0]!.seq;
+    const committed = r.order(r.events(ran.threadId, 'STEP_COMMITTED')[0]);
+    const requested = r.order(r.events(ran.threadId, 'INPUT_REQUIRED')[0]);
+    expect(committed).toBeGreaterThan(-1);
     expect(requested).toBeGreaterThan(committed);
     expect(await r.state(ran.threadId)).toBe('WAITING_FOR_INPUT');
     expect(r.rows(ran.threadId).map((m) => m.role)).toEqual(['user', 'assistant']);

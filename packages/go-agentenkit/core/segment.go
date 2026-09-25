@@ -75,7 +75,10 @@ func OpenSegment(ctx context.Context, deps ports.RuntimePorts, threadID, runID s
 		streamID := ports.StreamIDOf(runID, int(n))
 		err = deps.Streams.Open(ctx, streamID, ports.StreamMeta{ThreadID: threadID, RunID: runID}, deps.Config.StreamTTL)
 		if err == nil {
-			seg := &SegmentStream{deps: deps, streams: deps.Streams, ThreadID: threadID, StreamID: streamID, agents: map[string]*blocks{}}
+			seg := &SegmentStream{
+				deps: deps, streams: deps.Streams, ThreadID: threadID, RunID: runID, Segment: int(n), StreamID: streamID,
+				agents: map[string]*blocks{},
+			}
 			openSegments.Lock()
 			if openSegments.m[deps.Streams] == nil {
 				openSegments.m[deps.Streams] = map[string]*SegmentStream{}
@@ -83,6 +86,13 @@ func OpenSegment(ctx context.Context, deps ports.RuntimePorts, threadID, runID s
 			openSegments.m[deps.Streams][threadID] = seg
 			openSegments.Unlock()
 			seg.Push(ctx, &ports.RunStartedEvent{ThreadID: threadID, RunID: runID, StreamID: streamID, Segment: int(n)})
+			// The thread record says which stream is open, so a tab that
+			// opens the thread finds it.
+			if _, err := PublishFor(ctx, deps, threadID, runID, "RUN_STARTED", map[string]any{
+				"runId": runID, "streamId": streamID, "segment": n,
+			}); err != nil {
+				Logger(deps).Error("run start not recorded", "stream", streamID, "err", err)
+			}
 			return seg
 		}
 	}
@@ -93,7 +103,7 @@ func OpenSegment(ctx context.Context, deps ports.RuntimePorts, threadID, runID s
 // CloseLostSegment closes a segment's stream that its worker could not: the
 // sweep's end for a run whose worker died. A stream already closed or gone
 // is left as it is.
-func CloseLostSegment(ctx context.Context, deps ports.RuntimePorts, runID, reason string) {
+func CloseLostSegment(ctx context.Context, deps ports.RuntimePorts, threadID, runID, reason string) {
 	if deps.Streams == nil {
 		return
 	}
@@ -102,13 +112,23 @@ func CloseLostSegment(ctx context.Context, deps ports.RuntimePorts, runID, reaso
 	if err != nil || !ok || n < 1 {
 		return
 	}
-	_ = deps.Streams.Close(ctx, ports.StreamIDOf(runID, n), &ports.RunErrorEvent{Status: "lost", Error: reason}, deps.Config.StreamGrace)
+	streamID := ports.StreamIDOf(runID, n)
+	snap, err := deps.Streams.Snapshot(ctx, streamID, "")
+	if err != nil || snap == nil || snap.End != nil {
+		return // gone, or its worker closed it after all
+	}
+	_ = deps.Streams.Close(ctx, streamID, &ports.RunErrorEvent{Status: "lost", Error: reason}, deps.Config.StreamGrace)
+	_, _ = PublishFor(ctx, deps, threadID, runID, "RUN_ENDED", map[string]any{
+		"runId": runID, "streamId": streamID, "segment": n, "status": "lost", "error": reason,
+	})
 }
 
 type SegmentStream struct {
 	deps     ports.RuntimePorts
 	streams  ports.RunStreams
 	ThreadID string
+	RunID    string
+	Segment  int
 	StreamID string
 
 	// appendMu keeps appends in the order their batches were taken.
@@ -208,8 +228,20 @@ func (s *SegmentStream) Close(ctx context.Context, end ports.StreamEnd) {
 		delete(openSegments.m[s.streams], s.ThreadID)
 	}
 	openSegments.Unlock()
-	if err := s.streams.Close(context.WithoutCancel(ctx), s.StreamID, end, s.deps.Config.StreamGrace); err != nil {
+	bg := context.WithoutCancel(ctx)
+	if err := s.streams.Close(bg, s.StreamID, end, s.deps.Config.StreamGrace); err != nil {
 		Logger(s.deps).Error("run stream not closed", "stream", s.StreamID, "err", err)
+	}
+	// The thread record says how the segment ended.
+	ended := map[string]any{"runId": s.RunID, "streamId": s.StreamID, "segment": s.Segment}
+	switch e := end.(type) {
+	case *ports.RunFinishedEvent:
+		ended["status"] = e.Status
+	case *ports.RunErrorEvent:
+		ended["status"], ended["error"] = e.Status, e.Error
+	}
+	if _, err := PublishFor(bg, s.deps, s.ThreadID, s.RunID, "RUN_ENDED", ended); err != nil {
+		Logger(s.deps).Error("run end not recorded", "stream", s.StreamID, "err", err)
 	}
 }
 

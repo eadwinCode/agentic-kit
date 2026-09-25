@@ -243,6 +243,12 @@ func TestEvents_ReplaysSinceACursorAndSubscribesLive(t *testing.T) {
 	h := makeRuntime(t, scripted(step{text: "ok"}))
 	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "x"})
+	for _, typ := range []string{"NOTE_ONE", "NOTE_TWO"} {
+		if _, err := h.rt.Events.PublishEvent(h.ctx, ran.ThreadID, typ, nil,
+			agentenkit.PublishStateOptions{PublishOptions: agentenkit.PublishOptions{Durable: true}}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	all, err := h.rt.Events.Since(h.ctx, ran.ThreadID, -1, nil)
 	if err != nil {
 		t.Fatal(err)

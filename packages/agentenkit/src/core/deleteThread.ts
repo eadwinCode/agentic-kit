@@ -1,6 +1,7 @@
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { DeleteThreadResult } from '../ports/runtime.js';
 import { publishNotice } from './publish.js';
+import { segmentKey } from './segment.js';
 import { attemptsKey, redriveKey, runIdKey } from './keys.js';
 import { closeIfOpen } from './engine.js';
 
@@ -31,8 +32,17 @@ export async function deleteThread(
     if (!run.endedAt) await closeIfOpen(deps, run.id, 'deleted');
   }
 
+  // Its run streams go now rather than at their grace window's end. The
+  // record says which it had, so it is read before the cascade takes it.
+  const segments = await deps.storage.events.list(threadId, { types: ['RUN_STARTED'] }).catch(() => []);
+
   // Cascade: messages, events, usage, runs follow the thread (§3.2)
   await deps.storage.threads.delete(threadId);
+
+  for (const e of segments) {
+    const { streamId } = e.payload as { streamId?: string };
+    if (streamId) await deps.streams?.delete(streamId).catch(() => undefined);
+  }
 
   // The platform's own history of the thread goes with it: a deleted thread
   // must not live on in operational views. Best effort, like every admin
@@ -48,7 +58,7 @@ export async function deleteThread(
   // Hot cache cleanup — a deleted thread must not resurrect from kv
   await deps.kv.del(`agent:state:${threadId}`);
   await deps.kv.del(`agent:lock:${threadId}`);
-  await deps.kv.del(`agent:seq:${threadId}`);
+  await deps.kv.del(`agent:seq:${threadId}`); // the counter older releases kept
   await deps.kv.del(attemptsKey(threadId));
   await deps.kv.del(runIdKey(threadId));
   await deps.kv.del(redriveKey(threadId));
@@ -56,6 +66,7 @@ export async function deleteThread(
   for (const run of runs) {
     await deps.kv.del(attemptsKey(run.id));
     await deps.kv.del(redriveKey(run.id));
+    await deps.kv.del(segmentKey(run.id));
   }
 
   return { accepted: true };

@@ -17,7 +17,8 @@ func publishN(t *testing.T, h *harness, threadID string, types ...string) []agen
 	t.Helper()
 	var out []agentenkit.AgentEvent
 	for _, typ := range types {
-		e, err := core.Publish(h.ctx, h.rt.Ports(nil), threadID, typ, map[string]any{"t": typ})
+		// An app's own durable events: stored in the thread record, then sent.
+		e, err := core.PublishEvent(h.ctx, h.rt.Ports(nil), threadID, typ, map[string]any{"t": typ}, core.PublishOptions{Durable: true})
 		if err != nil {
 			t.Fatal(err)
 		}
