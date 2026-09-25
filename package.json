@@ -15,6 +15,9 @@
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs"
   },
+  "trustedDependencies": [
+    "@upstash/qstash-cli"
+  ],
   "devDependencies": {
     "typescript": "^5.6.3",
     "vitepress": "^1.6.4"
