@@ -18,7 +18,7 @@ bun run --cwd examples/go-app/web build
 
 # 2. start the server
 cd examples/go-app
-go run .                       # http://localhost:8080, mock model
+go run .                       # http://localhost:8090, mock model
 OPENAI_API_KEY=sk-… go run .   # gpt-4o-mini (MODEL=… to change)
 ```
 
@@ -29,7 +29,8 @@ go run .                                   # terminal 1
 bun run --cwd examples/go-app/web dev      # terminal 2, http://localhost:5173
 ```
 
-Flags and env: `-addr` / `ADDR`, `-db` / `DB_FILE` (SQLite file, default
+Port 8090, so it runs next to the Next.js example, whose local QStash
+takes 8080. Flags and env: `-addr` / `ADDR`, `-db` / `DB_FILE` (SQLite file, default
 `go-app.sqlite`), `-static` / `STATIC_DIR` (built SPA, default `web/dist`).
 
 Web tools: set `BRAVE_API_KEY` (or `JINA_API_KEY`) in `.env` and the agent
