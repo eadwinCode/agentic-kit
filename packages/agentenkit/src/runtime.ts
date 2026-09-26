@@ -19,6 +19,7 @@ import { settleLate } from './core/settle.js';
 import { failLostRun } from './core/engine.js';
 import { contextUsage } from './core/context.js';
 import { createGenerateTextAgent, createStreamTextAgent } from './core/agent.js';
+import { buildBuiltinTools } from './core/builtin/index.js';
 import * as adminReads from './core/admin.js';
 import { bindStorage, type AgentRunState } from './core/state.js';
 import { threadSnapshot } from './core/snapshot.js';
@@ -233,6 +234,8 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
     createGenerateTextAgent: (spec) => register(spec.name, 'generate-text', spec),
 
     getAgent: (name: string) => registry.get(name) ?? null,
+
+    builtinTools: (names, options) => buildBuiltinTools(opts.tools ?? {}, names, options),
 
     reclaimStuckRuns: async (olderThanMs: number): Promise<ReclaimReport> => {
       const report: ReclaimReport = { checked: 0, redispatched: 0, settled: 0, errors: 0 };

@@ -130,6 +130,16 @@ func (c *AgentCore) ResolveModel(modelName string) (ResolvedModel, error) {
 	return c.opts.ResolveModel(modelName)
 }
 
+// BuiltinTools returns the built-in tools, ready to put in an agent's
+// Tools: one name and one input shape in every runtime, so any model that
+// can call tools can use them. An error when a tool's adapter was not given
+// in RuntimeOptions.Tools.
+//
+//	tools, err := rt.BuiltinTools([]string{"web_search", "web_fetch"}, agentenkit.BuiltinToolOptions{})
+func (c *AgentCore) BuiltinTools(names []string, opts BuiltinToolOptions) ([]Tool, error) {
+	return core.BuildBuiltinTools(c.opts.Tools, names, opts)
+}
+
 // ListThreads lists threads most recent first. Takes the run state (§2.10)
 // so a tenant-scoped Storage can filter; a read has no dispatch ticket.
 func (c *AgentCore) ListThreads(ctx context.Context, state AgentRunState) ([]ThreadDTO, error) {

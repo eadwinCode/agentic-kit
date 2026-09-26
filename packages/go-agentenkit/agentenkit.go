@@ -120,11 +120,21 @@ type (
 	BillingCheck     = ports.BillingCheck
 	BillingStage     = ports.BillingStage
 	RunBudget        = ports.RunBudget
+
+	Search           = ports.Search
+	SearchOptions    = ports.SearchOptions
+	SearchHit        = ports.SearchHit
+	SearchRecency    = ports.SearchRecency
+	Fetcher          = ports.Fetcher
+	FetchOptions     = ports.FetchOptions
+	FetchedPage      = ports.FetchedPage
+	BuiltinToolPorts = ports.BuiltinToolPorts
 )
 
 const (
 	KindStep       = ports.KindStep
 	KindCompaction = ports.KindCompaction
+	KindTool       = ports.KindTool
 
 	UsageFinished = ports.UsageFinished
 	UsageAborted  = ports.UsageAborted
@@ -233,11 +243,17 @@ type (
 	ContentPart      = core.ContentPart
 	TokenAttribution = core.TokenAttribution
 
-	ToolContext    = core.ToolContext
-	Approval       = core.Approval
-	ParkRequest    = core.ParkRequest
-	PublishOptions = core.PublishOptions
-	EventPublisher = core.EventPublisher
+	ToolContext = core.ToolContext
+	ToolRun     = core.ToolRun
+
+	BuiltinToolOptions    = core.BuiltinToolOptions
+	BuiltinToolDefinition = core.BuiltinToolDefinition
+	WebSearchOptions      = core.WebSearchOptions
+	WebFetchOptions       = core.WebFetchOptions
+	Approval              = core.Approval
+	ParkRequest           = core.ParkRequest
+	PublishOptions        = core.PublishOptions
+	EventPublisher        = core.EventPublisher
 
 	AdminOverview = core.AdminOverview
 	RunStats      = core.RunStats
@@ -346,6 +362,10 @@ var (
 	PublishEvent         = core.PublishEvent
 	WithPublishEvent     = core.WithPublishEvent
 	ToolContextFrom      = core.ToolContextFrom
+	ToolRunFromContext   = core.ToolRunFromContext
+	BuiltinToolNames     = core.BuiltinToolNames
+	DecodeEntities       = core.DecodeEntities
+	HTMLToText           = core.HTMLToText
 	ApprovalFromContext  = core.ApprovalFromContext
 	PublisherFromContext = core.PublisherFromContext
 	ReservedEventTypes   = core.ReservedEventTypes

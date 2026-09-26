@@ -27,6 +27,8 @@ import type { PublishEventOptions } from '../core/publish.js';
 import type { SnapshotStream } from '../core/snapshot.js';
 import type { PruneOptions, PruneReport } from '../core/prune.js';
 import type { WireFormat } from '../core/agui.js';
+import type { BuiltinToolPorts } from './tools.js';
+import type { BuiltinToolName, BuiltinToolOptions } from '../core/builtin/index.js';
 
 export type { AdminStore, NewStepRecord, RunFilter, StepRecord } from './admin.js';
 export type { AgentRunState, BoundStorage, StorageContext } from '../core/state.js';
@@ -123,6 +125,10 @@ export interface RuntimeOptions {
    *  run. Defaults to `console`. */
   log?: Logger;
   config?: Partial<AgentConfig>;
+  /** The adapters behind the built-in tools: a search engine for
+   *  `web_search`, a page reader for `web_fetch`. Only the tools you ask
+   *  `builtinTools` for need theirs. */
+  tools?: BuiltinToolPorts;
 }
 
 export interface RunInput {
@@ -513,6 +519,15 @@ export interface AgentCore {
 
   /** Worker-side resolution of a registered handle from the queue job. */
   getAgent(name: string): AgentHandle | null;
+
+  /** The built-in tools, ready to put in an agent's `tools`: one name and one
+   *  input shape in every runtime, so any model that can call tools can use
+   *  them. Throws when a tool's adapter was not given to `setupAgentCore`.
+   *
+   * ```ts
+   * tools: { ...runtime.builtinTools(['web_search', 'web_fetch']), lookupInvoice }
+   * ``` */
+  builtinTools(names: BuiltinToolName[], options?: BuiltinToolOptions): Record<string, any>;
 
   /** Operational reads (§2.9). The platform records what runs did; building a
    *  view over it is the caller's business. Everything here comes from the

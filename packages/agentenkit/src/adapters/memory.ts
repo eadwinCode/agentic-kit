@@ -1,3 +1,4 @@
+import type { FetchedPage, Fetcher, FetchOptions, Search, SearchHit, SearchOptions } from '../ports/tools.js';
 import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewThreadEvent, ThreadEventFilter, NewUsage, RunJob, ThreadDTO, ThreadTransition, UsageFilter, UsageTotals } from '../core/types.js';
 import { sumUsage } from '../core/usage.js';
 import type { Storage } from '../ports/storage.js';
@@ -444,5 +445,48 @@ export class MemoryRunStreams implements RunStreams {
    *  test prove a stream was deleted. */
   get size(): number {
     return this.streams.size;
+  }
+}
+
+/** A search engine for tests: answers from a fixed list, or from a function
+ *  of the query, and keeps every query it was asked. */
+export class MemorySearch implements Search {
+  readonly name: string;
+  readonly queries: Array<{ query: string; options: SearchOptions }> = [];
+  constructor(
+    private readonly answer: SearchHit[] | ((query: string, options: SearchOptions) => SearchHit[] | Promise<SearchHit[]>),
+    name = 'memory-search',
+  ) {
+    this.name = name;
+  }
+  async search(query: string, options: SearchOptions): Promise<SearchHit[]> {
+    this.queries.push({ query, options });
+    const hits = typeof this.answer === 'function' ? await this.answer(query, options) : this.answer;
+    return hits.slice(0, options.maxResults);
+  }
+}
+
+/** A page reader for tests: serves pages from a map by URL, and keeps every
+ *  URL it was asked for. An unknown URL fails like a 404. */
+export class MemoryFetcher implements Fetcher {
+  readonly name: string;
+  readonly fetched: string[] = [];
+  constructor(
+    private readonly pages: Record<string, { title?: string; content: string }>,
+    name = 'memory-fetcher',
+  ) {
+    this.name = name;
+  }
+  async fetch(url: string, options: FetchOptions): Promise<FetchedPage> {
+    this.fetched.push(url);
+    const page = this.pages[url];
+    if (!page) throw new Error(`memory-fetcher: ${url} answered 404`);
+    const truncated = page.content.length > options.maxBytes;
+    return {
+      url,
+      title: page.title ?? '',
+      content: truncated ? page.content.slice(0, options.maxBytes) : page.content,
+      truncated,
+    };
   }
 }
