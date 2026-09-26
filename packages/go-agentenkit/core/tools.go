@@ -18,9 +18,9 @@ type ToolContext struct {
 	ToolCallID string
 	// PublishEvent publishes an event of your own on the thread the tool is
 	// acting on: a progress label, a preview URL, anything a client should
-	// react to. Durable by default, so a reconnecting client replays it;
-	// PublishOptions{Notice: true} sends a bus-only notice. See the
-	// "Custom events" guide.
+	// react to. Live only by default: a tab that reconnects soon replays it,
+	// but it is not saved. PublishOptions{Durable: true} also keeps it in the
+	// thread record. See the "Custom events" guide.
 	PublishEvent EventPublisher
 	// Approval is present only when this call is the resumption of an
 	// approved park (§2.5): whatever the human sent back with the approval.

@@ -15,9 +15,10 @@ export interface ToolContext extends ToolExecutionOptions {
    *  run, including a nested one and a segment resumed after an approval. */
   state: AgentRunState;
   /** Publish an event of your own on this thread — a progress label, a
-   *  preview URL, anything a client should react to. Durable by default, so a
-   *  reconnecting client replays it; pass `{ durable: false }` for a notice.
-   *  See the "Custom events" guide. */
+   *  preview URL, anything a client should react to. Live only by default: a
+   *  tab that reconnects soon replays it, but it is not saved. Pass
+   *  `{ durable: true }` to also keep it in the thread record. See the
+   *  "Custom events" guide. */
   publishEvent: ToolPublishEvent;
   /** Present only when this call is the resumption of an approved park
    *  (§2.5): whatever the human sent back with the approval — answers to
