@@ -206,6 +206,15 @@ func TestSandboxTools_BashKeepsTheWorkingFolderBetweenCommands(t *testing.T) {
 	mustEqual(t, h.resultMap(t, threadID, "b3")["stdout"], "work\n", "b3")
 }
 
+func TestSandboxTools_BashKeepsTheFolderWhenTheCommandSetsItsOwnExitTrapAndKeepsItsExitCode(t *testing.T) {
+	h := toolsRuntime(t, [][]toolCall{
+		{bashCall("b1", "mkdir -p sub && cd sub && trap 'true' EXIT")},
+		{bashCall("b2", `basename "$PWD"; false`)},
+	}, []string{"bash"}, noApproval, nil)
+	threadID := h.runIn(t, "")
+	mustJSON(t, h.result(t, threadID, "b2"), map[string]any{"stdout": "sub\n", "stderr": "", "exitCode": 1}, "b2")
+}
+
 func TestSandboxTools_BashOutputIsCutInTheMiddlePastTheResultCap(t *testing.T) {
 	h := toolsRuntime(t, [][]toolCall{{bashCall("b1", `printf 'start'; head -c 500 /dev/zero | tr '\0' x; printf 'end'`)}}, []string{"bash"}, noApproval, nil,
 		func(c *agentenkit.AgentConfig) { c.BuiltinToolResultCapChars = 100 })
@@ -251,6 +260,15 @@ func TestSandboxTools_CodeExecutionRunsPythonWithoutApprovalAndListsTheFilesItMa
 		"stdout": "2\n", "stderr": "", "exitCode": 0,
 		"files": []any{map[string]any{"path": "chart.png", "mediaType": "image/png"}, map[string]any{"path": "data/out.csv", "mediaType": "text/csv"}},
 	}, "c1")
+}
+
+func TestSandboxTools_CodeExecutionCanImportAModuleFromTheWorkFolder(t *testing.T) {
+	h := toolsRuntime(t, [][]toolCall{
+		{bashCall("b0", `printf 'X = 41\n' > helper.py`)},
+		{{id: "c1", name: "code_execution", args: map[string]any{"code": "import helper\nprint(helper.X + 1)"}}},
+	}, []string{"bash", "code_execution"}, noApproval, nil)
+	threadID := h.runIn(t, "")
+	mustJSON(t, h.result(t, threadID, "c1"), map[string]any{"stdout": "42\n", "stderr": "", "exitCode": 0, "files": []any{}}, "c1")
 }
 
 func TestSandboxTools_CodeExecutionReportsAFailingProgram(t *testing.T) {

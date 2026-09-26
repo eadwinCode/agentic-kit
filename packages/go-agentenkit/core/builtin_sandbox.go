@@ -215,7 +215,12 @@ func bashScript(command string, restart bool) string {
 	lines = append(lines,
 		`if [ -f "$__ak/bash-cwd" ]; then cd -- "$(cat "$__ak/bash-cwd")" 2>/dev/null; fi`,
 		`trap 'pwd > "$__ak/bash-cwd"' EXIT`,
-		command)
+		command,
+		// Saved again here, for a command that set its own EXIT trap in
+		// place of ours; the trap still covers one that calls exit.
+		`__ec=$?`,
+		`pwd > "$__ak/bash-cwd"`,
+		`exit $__ec`)
 	return strings.Join(lines, "\n")
 }
 
@@ -271,7 +276,9 @@ func RunBash(ctx context.Context, opts BashOptions, args map[string]any, run Too
 
 type codeRunner struct{ ext, run string }
 
-var codeRunners = map[string]codeRunner{"python": {"py", "python3"}, "javascript": {"js", "node"}}
+// Python writes no __pycache__, which would show up among the files the
+// program made.
+var codeRunners = map[string]codeRunner{"python": {"py", "PYTHONDONTWRITEBYTECODE=1 python3"}, "javascript": {"js", "node"}}
 
 // MediaTypeOf is the media type of a file a program made, from its name.
 func MediaTypeOf(path string) string {
@@ -334,9 +341,12 @@ func RunCodeExecution(ctx context.Context, opts CodeExecutionOptions, args map[s
 		}
 		// A marker made just before the run: the files newer than it are the
 		// ones the program made or changed.
+		// The program is read from stdin, so its imports (Python) and
+		// relative requires (Node) resolve from the work folder, not the
+		// hidden one.
 		script := strings.Join([]string{
 			`touch "` + base + `.start"`,
-			runner.run + ` "` + file + `"`,
+			runner.run + ` - < "` + file + `"`,
 			`__ec=$?`,
 			`find . -path "./` + stateDir + `" -prune -o -type f -newer "` + base + `.start" -print > "` + base + `.files" 2>/dev/null`,
 			`exit $__ec`,

@@ -153,6 +153,11 @@ function bashScript(command: string, restart: boolean): string {
     `if [ -f "$__ak/bash-cwd" ]; then cd -- "$(cat "$__ak/bash-cwd")" 2>/dev/null; fi`,
     `trap 'pwd > "$__ak/bash-cwd"' EXIT`,
     command,
+    // Saved again here, for a command that set its own EXIT trap in place
+    // of ours; the trap still covers one that calls exit.
+    '__ec=$?',
+    'pwd > "$__ak/bash-cwd"',
+    'exit $__ec',
   ].join('\n');
 }
 
@@ -195,7 +200,8 @@ export async function runBash(
 // --- code_execution -------------------------------------------------------
 
 const RUNNERS = {
-  python: { ext: 'py', run: 'python3' },
+  // No __pycache__, which would show up among the files the program made.
+  python: { ext: 'py', run: 'PYTHONDONTWRITEBYTECODE=1 python3' },
   javascript: { ext: 'js', run: 'node' },
 } as const;
 
@@ -235,9 +241,11 @@ export async function runCodeExecution(
       await sandbox.filesystem.writeFile(file, code);
       // A marker made just before the run: the files newer than it are the
       // ones the program made or changed.
+      // The program is read from stdin, so its imports (Python) and relative
+      // requires (Node) resolve from the work folder, not the hidden one.
       const script = [
         `touch "${STATE_DIR}/code/${name}.start"`,
-        `${runner.run} "${file}"`,
+        `${runner.run} - < "${file}"`,
         '__ec=$?',
         `find . -path "./${STATE_DIR}" -prune -o -type f -newer "${STATE_DIR}/code/${name}.start" -print > "${STATE_DIR}/code/${name}.files" 2>/dev/null`,
         'exit $__ec',

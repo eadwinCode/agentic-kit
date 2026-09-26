@@ -135,6 +135,16 @@ describe('sandbox tools (T4)', () => {
     expect(h.result(threadId, 'b3').stdout).toBe('work\n');
   });
 
+  it('bash keeps the folder when the command sets its own exit trap, and keeps its exit code', async () => {
+    const h = await harness(
+      [[bash('b1', "mkdir -p sub && cd sub && trap 'true' EXIT")], [bash('b2', 'basename "$PWD"; false')]],
+      ['bash'],
+      noApproval,
+    );
+    const threadId = await h.run();
+    expect(h.result(threadId, 'b2')).toEqual({ stdout: 'sub\n', stderr: '', exitCode: 1 });
+  });
+
   it('bash output is cut in the middle past the result cap', async () => {
     const h = await harness([[bash('b1', "printf 'start'; head -c 500 /dev/zero | tr '\\0' x; printf 'end'")]], ['bash'], noApproval, {
       config: { builtinToolResultCapChars: 100 },
@@ -181,6 +191,16 @@ describe('sandbox tools (T4)', () => {
       stdout: '2\n', stderr: '', exitCode: 0,
       files: [{ path: 'chart.png', mediaType: 'image/png' }, { path: 'data/out.csv', mediaType: 'text/csv' }],
     });
+  });
+
+  it('code_execution can import a module from the work folder', async () => {
+    const h = await harness(
+      [[bash('b0', "printf 'X = 41\\n' > helper.py")], [{ id: 'c1', name: 'code_execution', args: { code: 'import helper\nprint(helper.X + 1)' } }]],
+      ['bash', 'code_execution'],
+      noApproval,
+    );
+    const threadId = await h.run();
+    expect(h.result(threadId, 'c1')).toEqual({ stdout: '42\n', stderr: '', exitCode: 0, files: [] });
   });
 
   it('code_execution reports a failing program', async () => {
