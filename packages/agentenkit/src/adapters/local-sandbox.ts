@@ -156,7 +156,8 @@ class LocalBox implements Sandbox {
     const [file, ...args] = runArgv(command);
     return new Promise((resolve, reject) => {
       // Its own process group, so the time limit stops what it started too.
-      const child = spawn(file!, args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      // Cast: some apps' types (Next.js) make NODE_ENV a required field.
+      const child = spawn(file!, args, { cwd, env: env as NodeJS.ProcessEnv, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
       const out = new OutputCollector(options.onStdout);
       const err = new OutputCollector(options.onStderr);
       child.stdout!.on('data', (b: Buffer) => out.push(b));

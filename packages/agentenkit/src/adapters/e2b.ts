@@ -300,7 +300,8 @@ class E2BFiles implements SandboxFileSystem {
   async writeFile(path: string, content: string | Uint8Array): Promise<void> {
     const full = this.box.path(path);
     const form = new FormData();
-    form.append('file', new Blob([toBytes(content)]), full);
+    // A copy, so its buffer is a plain ArrayBuffer as Blob wants.
+    form.append('file', new Blob([toBytes(content).slice()]), full);
     const res = await this.box.envd(`/files?${new URLSearchParams({ path: full })}`, { method: 'POST', body: form });
     if (!res.ok) throw new Error(`e2b: could not write ${path}: ${res.status} ${(await res.text()).slice(0, 300)}`);
   }
@@ -350,7 +351,7 @@ function base64Bytes(s: string): Uint8Array {
 }
 
 /** One Connect streaming message: a flags byte, a 4-byte length, the JSON. */
-export function envelope(message: unknown, flags = 0): Uint8Array {
+export function envelope(message: unknown, flags = 0): Uint8Array<ArrayBuffer> {
   const json = new TextEncoder().encode(JSON.stringify(message));
   const out = new Uint8Array(5 + json.length);
   out[0] = flags;
