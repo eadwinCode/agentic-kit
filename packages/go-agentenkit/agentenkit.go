@@ -263,6 +263,10 @@ type (
 	BuiltinToolDefinition = core.BuiltinToolDefinition
 	WebSearchOptions      = core.WebSearchOptions
 	WebFetchOptions       = core.WebFetchOptions
+	BashOptions           = core.BashOptions
+	CodeExecutionOptions  = core.CodeExecutionOptions
+	TextEditorOptions     = core.TextEditorOptions
+	ApprovalRule          = core.ApprovalRule
 	Approval              = core.Approval
 	ParkRequest           = core.ParkRequest
 	PublishOptions        = core.PublishOptions
@@ -407,3 +411,10 @@ var (
 func WithSandbox[T any](ctx context.Context, fn func(ThreadSandbox) (T, error)) (T, error) {
 	return core.WithSandbox(ctx, fn)
 }
+
+// AskAlways and AskNever are the two fixed approval rules for the sandbox
+// tools.
+var (
+	AskAlways = core.AskAlways
+	AskNever  = core.AskNever
+)

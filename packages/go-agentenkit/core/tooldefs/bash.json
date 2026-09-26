@@ -1,0 +1,12 @@
+{
+  "name": "bash",
+  "description": "Run a shell command in this conversation's sandbox, a separate machine with its own files. Each command runs in a new bash shell that starts in the folder the last one ended in; variables and background jobs do not carry over. Returns stdout, stderr and the exit code; long output is cut, so filter it (head, tail, grep) when you expect a lot. A command stops at its time limit. Set restart to go back to the start folder.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "command": { "type": "string", "description": "The command to run." },
+      "restart": { "type": "boolean", "description": "Go back to the start folder before running the command, or instead of one." }
+    },
+    "additionalProperties": false
+  }
+}

@@ -195,4 +195,6 @@ export { sandboxFor, withSandbox, type ThreadSandbox } from './core/builtin/sand
 export {
   BUILTIN_TOOL_DEFINITIONS, BUILTIN_TOOL_NAMES, type BuiltinToolName, type BuiltinToolOptions,
   type WebFetchOptions, type WebSearchOptions,
+  type ApprovalRule, type BashInput, type BashOptions, type CodeExecutionInput, type CodeExecutionOptions,
+  type TextEditorInput, type TextEditorOptions,
 } from './core/builtin/index.js';
