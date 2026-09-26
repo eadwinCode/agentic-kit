@@ -101,9 +101,11 @@ export function table(prices: PriceTable, currency: string = USD): Pricer {
   };
 }
 
-/** What one use of a paid tool service costs, in currency units. */
+/** What a paid tool service costs, in currency units: per use (a search, a
+ *  page), per second of sandbox time (bash, code_execution), or both. */
 export interface ToolPrice {
-  perUse: number;
+  perUse?: number;
+  perSecond?: number;
 }
 
 /** Tool prices, keyed by adapter name ('brave', 'jina-search') or by tool
@@ -119,6 +121,9 @@ export type ToolPriceTable = Record<string, ToolPrice>;
  *  pricer: pricing.chain(pricing.table(modelPrices), pricing.tools({ brave: { perUse: 0.005 } }))
  *  ```
  *
+ *  Sandbox tools are priced by the sandbox adapter's name and the seconds
+ *  their commands ran: `{ e2b: { perSecond: 0.000028 } }`.
+ *
  *  A tool's own model calls (reading a page with a question) carry the
  *  model's key, so the model table prices them. */
 export function tools(prices: ToolPriceTable, currency: string = USD): Pricer {
@@ -127,9 +132,11 @@ export function tools(prices: ToolPriceTable, currency: string = USD): Pricer {
       if (u.kind !== 'tool' || !u.model?.startsWith('tool:')) return null;
       const p = (u.modelId ? prices[u.modelId] : undefined) ?? prices[u.model.slice('tool:'.length)];
       if (!p) return null;
-      const raw = (u.providerMetadata as { uses?: unknown } | null | undefined)?.uses;
-      const uses = typeof raw === 'number' && raw > 0 ? raw : 1;
-      return { micros: Math.round(p.perUse * 1_000_000 * uses), currency, source: 'table' };
+      const meta = u.providerMetadata as { uses?: unknown; seconds?: unknown } | null | undefined;
+      const uses = typeof meta?.uses === 'number' && meta.uses > 0 ? meta.uses : 1;
+      const secs = typeof meta?.seconds === 'number' && meta.seconds > 0 ? meta.seconds : 0;
+      const amount = (p.perUse ?? 0) * uses + (p.perSecond ?? 0) * secs;
+      return { micros: Math.round(amount * 1_000_000), currency, source: 'table' };
     },
   };
 }

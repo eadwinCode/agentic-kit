@@ -8,7 +8,7 @@ export interface BuiltinToolDefinition {
   inputSchema: Record<string, unknown>;
 }
 
-export const BUILTIN_TOOL_NAMES = ['web_search', 'web_fetch'] as const;
+export const BUILTIN_TOOL_NAMES = ['web_search', 'web_fetch', 'bash', 'code_execution', 'text_editor'] as const;
 export type BuiltinToolName = (typeof BUILTIN_TOOL_NAMES)[number];
 
 export const BUILTIN_TOOL_DEFINITIONS: Record<BuiltinToolName, BuiltinToolDefinition> = {
@@ -54,6 +54,103 @@ export const BUILTIN_TOOL_DEFINITIONS: Record<BuiltinToolName, BuiltinToolDefini
           "description": "What you want to know from the page. Leave it out to get the page text."
         }
       },
+      "additionalProperties": false
+    }
+  },
+  "bash": {
+    "name": "bash",
+    "description": "Run a shell command in this conversation's sandbox, a separate machine with its own files. Each command runs in a new bash shell that starts in the folder the last one ended in; variables and background jobs do not carry over. Returns stdout, stderr and the exit code; long output is cut, so filter it (head, tail, grep) when you expect a lot. A command stops at its time limit. Set restart to go back to the start folder.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "The command to run."
+        },
+        "restart": {
+          "type": "boolean",
+          "description": "Go back to the start folder before running the command, or instead of one."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "code_execution": {
+    "name": "code_execution",
+    "description": "Run a Python or JavaScript program in this conversation's sandbox and get its output. It runs in the start folder. Files it writes stay for later calls and for the bash and text_editor tools; the files it made or changed are listed in the result (a chart saved as chart.png, say). Returns stdout, stderr, the exit code and an error when it failed. Print what you want to see.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "language": {
+          "type": "string",
+          "enum": [
+            "python",
+            "javascript"
+          ],
+          "description": "Default python."
+        },
+        "code": {
+          "type": "string",
+          "description": "The program to run."
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "text_editor": {
+    "name": "text_editor",
+    "description": "View, create and edit text files in this conversation's sandbox. view shows a file with line numbers (or a folder's contents two levels deep); view_range picks lines. create writes a whole file. str_replace replaces old_str, which must match exactly one place in the file, whitespace included, with new_str. insert puts new_str after line insert_line (0 for the top). undo_edit takes back the last change to the file. A path that does not start with / is taken from the start folder (where code_execution runs and bash begins), not from the folder bash is in now.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "enum": [
+            "view",
+            "create",
+            "str_replace",
+            "insert",
+            "undo_edit"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "description": "The file or folder."
+        },
+        "view_range": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "For view: first and last line, from 1; -1 as the last means to the end."
+        },
+        "file_text": {
+          "type": "string",
+          "description": "For create: the whole file."
+        },
+        "old_str": {
+          "type": "string",
+          "description": "For str_replace: the exact text to replace."
+        },
+        "new_str": {
+          "type": "string",
+          "description": "For str_replace: the new text (empty to delete). For insert: the text to insert."
+        },
+        "insert_line": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For insert: the line to insert after; 0 for the top."
+        }
+      },
+      "required": [
+        "command",
+        "path"
+      ],
       "additionalProperties": false
     }
   }

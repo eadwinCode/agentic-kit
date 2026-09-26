@@ -162,11 +162,11 @@ believed, and if none answers the call is stored unpriced.
 
 The built-in [web tools](./web-tools.md) write a usage row for each search
 and page read (`kind: 'tool'`, `model: 'tool:web_search'`, `modelId` the
-adapter). `pricing.tools` prices them per use, keyed by adapter; chain it with
+adapter). The [sandbox tools](./sandboxes.md#the-sandbox-tools) add the seconds their commands ran. `pricing.tools` prices them per use, per second or both, keyed by adapter; chain it with
 the model table, and tool spend counts against a run's money cap:
 
 ```ts
-pricer: pricing.chain(pricing.table(prices), pricing.tools({ brave: { perUse: 0.005 } })),
+pricer: pricing.chain(pricing.table(prices), pricing.tools({ brave: { perUse: 0.005 }, e2b: { perSecond: 0.000028 } })),
 ```
 
 ```go

@@ -19,7 +19,7 @@ import (
 var toolDefs embed.FS
 
 // BuiltinToolNames are the built-in tools this runtime has.
-var BuiltinToolNames = []string{"web_search", "web_fetch"}
+var BuiltinToolNames = []string{"web_search", "web_fetch", "bash", "code_execution", "text_editor"}
 
 // BuiltinToolDefinition is one built-in tool as the model sees it.
 type BuiltinToolDefinition struct {
@@ -40,8 +40,11 @@ func BuiltinToolDefinitionOf(name string) (BuiltinToolDefinition, error) {
 
 // BuiltinToolOptions are the app's settings for the built-in tools.
 type BuiltinToolOptions struct {
-	WebSearch WebSearchOptions
-	WebFetch  WebFetchOptions
+	WebSearch     WebSearchOptions
+	WebFetch      WebFetchOptions
+	Bash          BashOptions
+	CodeExecution CodeExecutionOptions
+	TextEditor    TextEditorOptions
 }
 
 // BuildBuiltinTools returns the built-in tools, ready for an agent's Tools.
@@ -70,6 +73,24 @@ func BuildBuiltinTools(tp ports.BuiltinToolPorts, names []string, opts BuiltinTo
 			}
 			execute = func(ctx context.Context, args map[string]any, run ToolRun) (string, error) {
 				return RunWebFetch(ctx, tp.Fetcher, opts.WebFetch, args, run)
+			}
+		case "bash", "code_execution", "text_editor":
+			if tp.Sandbox == nil {
+				return nil, fmt.Errorf("builtinTools: %s needs RuntimeOptions.Tools.Sandbox", name)
+			}
+			switch name {
+			case "bash":
+				execute = func(ctx context.Context, args map[string]any, run ToolRun) (string, error) {
+					return RunBash(ctx, opts.Bash, args, run)
+				}
+			case "code_execution":
+				execute = func(ctx context.Context, args map[string]any, run ToolRun) (string, error) {
+					return RunCodeExecution(ctx, opts.CodeExecution, args, run)
+				}
+			default:
+				execute = func(ctx context.Context, args map[string]any, run ToolRun) (string, error) {
+					return RunTextEditor(ctx, opts.TextEditor, args, run)
+				}
 			}
 		}
 		toolName := name

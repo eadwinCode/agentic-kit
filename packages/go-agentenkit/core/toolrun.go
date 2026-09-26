@@ -73,12 +73,19 @@ func RecordToolUsage(ctx context.Context, run ToolRun, u ports.NewUsage) ports.N
 
 // ToolUseRow is a usage row for one use of a paid tool service: no tokens,
 // the tool and the adapter named where a price table looks.
-func ToolUseRow(tool, adapter string, uses int) ports.NewUsage {
+//
+// Seconds, when given, is the sandbox time the call took, for a per-second
+// price.
+func ToolUseRow(tool, adapter string, uses int, seconds ...float64) ports.NewUsage {
+	meta := map[string]any{"tool": tool, "adapter": adapter, "uses": uses}
+	if len(seconds) > 0 {
+		meta["seconds"] = seconds[0]
+	}
 	return ports.NewUsage{
 		Kind:             ports.KindTool,
 		Model:            "tool:" + tool,
 		ModelID:          adapter,
 		Outcome:          ports.UsageFinished,
-		ProviderMetadata: map[string]any{"tool": tool, "adapter": adapter, "uses": uses},
+		ProviderMetadata: meta,
 	}
 }

@@ -60,7 +60,13 @@ export async function recordToolUsage(run: ToolRun, usage: Omit<NewUsage, 'runId
 
 /** A usage row for one use of a paid tool service: no tokens, the tool and
  *  the adapter named where a price table looks. */
-export function toolUseRow(tool: string, adapter: string, uses = 1): Omit<NewUsage, 'runId' | 'agentId' | 'agentName'> {
+export function toolUseRow(
+  tool: string,
+  adapter: string,
+  uses = 1,
+  /** Sandbox time the call took, for a per-second price. */
+  seconds?: number,
+): Omit<NewUsage, 'runId' | 'agentId' | 'agentName'> {
   return {
     kind: 'tool',
     step: 0,
@@ -73,6 +79,6 @@ export function toolUseRow(tool: string, adapter: string, uses = 1): Omit<NewUsa
     reasoningTokens: 0,
     totalTokens: 0,
     outcome: 'finished',
-    providerMetadata: { tool, adapter, uses },
+    providerMetadata: { tool, adapter, uses, ...(seconds !== undefined ? { seconds } : {}) },
   };
 }
