@@ -69,7 +69,7 @@ func verdictReady(ctx context.Context, deps ports.RuntimePorts, pending PendingH
 //
 // A tool failure, or a panic, is surfaced TO THE MODEL as the tool result,
 // so the conversation always stays executable.
-func settleVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadID string, pending PendingHitl, target *ports.Tool, state ports.AgentRunState) (json.RawMessage, bool, error) {
+func settleVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadID string, pending PendingHitl, target *ports.Tool, state ports.AgentRunState, toolRun ToolRun) (json.RawMessage, bool, error) {
 	raw, found, err := deps.Kv.Get(ctx, HitlKey(pending.ToolCallID))
 	if err != nil {
 		return nil, false, err
@@ -103,6 +103,7 @@ func settleVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadI
 	// what the human sent back with the approval.
 	toolCtx := ContextWithPublisher(ContextWithRunState(genCtx, state), ThreadPublisher(deps, threadID))
 	toolCtx = ContextWithApproval(ContextWithToolCallID(toolCtx, pending.ToolCallID), Approval{Payload: answer.Payload})
+	toolCtx = ContextWithToolRun(toolCtx, toolRun)
 	var output string
 	result := json.RawMessage(nil)
 	if err := CallSafely(func() error {
@@ -529,7 +530,7 @@ func findTool(tools []ports.Tool, name string) *ports.Tool {
 // one approval is still open within its TTL: the dispatch is an
 // at-least-once redelivery and the thread stays parked. rawTools must be the
 // UNWRAPPED main toolset.
-func resumePendingHitl(ctx, genCtx context.Context, deps ports.RuntimePorts, threadID string, open []PendingHitl, rawTools []ports.Tool, subCtx *SubagentCtx, state ports.AgentRunState) (bool, error) {
+func resumePendingHitl(ctx, genCtx context.Context, deps ports.RuntimePorts, threadID string, open []PendingHitl, rawTools []ports.Tool, subCtx *SubagentCtx, state ports.AgentRunState, toolRun ToolRun) (bool, error) {
 	// Readiness first, side effects second: the thread resumes only when
 	// EVERY open approval has been answered or has expired (§2.7).
 	for _, p := range open {
@@ -554,7 +555,12 @@ func resumePendingHitl(ctx, genCtx context.Context, deps ports.RuntimePorts, thr
 		expired := false
 		if !pending.Landed {
 			var err error
-			if result, expired, err = settleVerdict(ctx, genCtx, deps, threadID, pending, target, state); err != nil {
+			run := toolRun
+			run.AgentID = pending.AgentID
+			if pending.AgentID != "" && pending.Nested != nil {
+				run.AgentName = pending.Nested.Name
+			}
+			if result, expired, err = settleVerdict(ctx, genCtx, deps, threadID, pending, target, state, run); err != nil {
 				return false, err
 			}
 		}
@@ -961,7 +967,9 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	// The main agent's own toolset: nothing is waiting on its parks (§2.7).
 	// Every tool also sees the run's state (§2.10) and can publish its own
 	// events on the thread.
-	tools := WithRunState(WithPublishEvent(deps, threadID, WithHitl(deps, threadID, rawTools, HitlCtx{Resume: resume, Parks: parks})), input.State)
+	// ...and the run it is part of: its ports, its ledger, its ids.
+	toolRun := ToolRun{Deps: deps, ThreadID: threadID, RunID: runID, AgentName: agent.Name, Ledger: ledger}
+	tools := WithToolRun(WithRunState(WithPublishEvent(deps, threadID, WithHitl(deps, threadID, rawTools, HitlCtx{Resume: resume, Parks: parks})), input.State), toolRun)
 
 	// §2.5 resume: a WAITING thread at segment start is either the /respond
 	// continuation or a redelivery of the original job while still parked.
@@ -975,7 +983,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			// the §2.8 policy rather than corrupting the conversation.
 			return "", fmt.Errorf("thread %s is WAITING_FOR_INPUT without a pending INPUT_REQUIRED", threadID)
 		}
-		resumed, err := resumePendingHitl(ctx, genCtx, deps, threadID, open, rawTools, subCtx, input.State)
+		resumed, err := resumePendingHitl(ctx, genCtx, deps, threadID, open, rawTools, subCtx, input.State, toolRun)
 		if err != nil {
 			return "", err
 		}

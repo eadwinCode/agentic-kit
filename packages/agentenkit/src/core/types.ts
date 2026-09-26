@@ -279,7 +279,12 @@ export type UsageKind =
   /** The summary the platform writes to keep the prompt inside the model's
    *  window (§2.6). Nobody asked for it, so it is worth being able to see
    *  what it costs on its own. */
-  | 'compaction';
+  | 'compaction'
+  /** A built-in tool (§ built-in tools): one row per use of a paid service
+   *  (a search, a page read), with `model` = `tool:<tool name>` and
+   *  `modelId` = the adapter, and one per model call a tool makes itself
+   *  (reading a page with a question). */
+  | 'tool';
 
 /** The money one model call cost. */
 export interface Cost {
@@ -627,6 +632,11 @@ export interface AgentConfig {
   streamFlushMs: number;
   /** Append at once when this many stream events are waiting. */
   streamFlushEvents: number;
+  /** The most characters a built-in tool hands the model in one result: a
+   *  page's text, a reader's answer. Past it the text is cut and the result
+   *  says `truncated: true`, so one huge page cannot fill the context window
+   *  or the database. Default 20,000. */
+  builtinToolResultCapChars: number;
   /** Refuse a new run (RUN_REFUSED, reason `queue_full`) once this many jobs
    *  are ready and waiting (§2.8). Needs a queue that can count; one that
    *  cannot is never refused on. 0 means no cap. */
@@ -704,6 +714,7 @@ export const DEFAULT_CONFIG: AgentConfig = {
   streamTtlMs: 24 * 60 * 60_000,
   streamFlushMs: 50,
   streamFlushEvents: 32,
+  builtinToolResultCapChars: 20_000,
 };
 
 export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
@@ -735,7 +746,7 @@ export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
       `Invalid config: runRedriveDelaySeconds (${config.runRedriveDelaySeconds}) must be a non-negative integer`,
     );
   }
-  for (const key of ['streamGraceMs', 'streamTtlMs', 'streamFlushEvents'] as const) {
+  for (const key of ['streamGraceMs', 'streamTtlMs', 'streamFlushEvents', 'builtinToolResultCapChars'] as const) {
     if (!Number.isInteger(config[key]) || config[key] < 1) {
       throw new Error(`Invalid config: ${key} (${config[key]}) must be an integer of at least 1`);
     }

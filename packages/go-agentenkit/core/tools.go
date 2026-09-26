@@ -26,6 +26,11 @@ type ToolContext struct {
 	// approved park (§2.5): whatever the human sent back with the approval.
 	// Nil on a first, live call.
 	Approval *Approval
+	// ThreadID is the thread this call is acting on.
+	ThreadID string
+	// RunID is the dispatched run this call is part of: a nested run's calls
+	// carry their parent's run id, so one run's work is one query.
+	RunID string
 }
 
 var errNoPublisher = errors.New("agentenkit: PublishEvent is only available inside a run")
@@ -38,6 +43,9 @@ func ToolContextFrom(ctx context.Context) ToolContext {
 		ToolCallID:   goai.ToolCallIDFromContext(ctx),
 		PublishEvent: PublisherFromContext(ctx),
 		Approval:     ApprovalFromContext(ctx),
+	}
+	if run, ok := ToolRunFromContext(ctx); ok {
+		tc.ThreadID, tc.RunID = run.ThreadID, run.RunID
 	}
 	if tc.ToolCallID == "" {
 		tc.ToolCallID = toolCallIDFromContext(ctx)
