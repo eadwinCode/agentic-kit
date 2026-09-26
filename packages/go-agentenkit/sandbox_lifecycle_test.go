@@ -239,6 +239,38 @@ func TestSandboxLifecycle_DeletingTheThreadDestroysItsSandbox(t *testing.T) {
 	mustEqual(t, h.kvGet(core.SandboxKey(threadID)), "", "record")
 }
 
+func TestSandboxLifecycle_TwoCallsThatFindTheSandboxGoneMakeOneNewSandboxBetweenThem(t *testing.T) {
+	core.ForgetSandboxHandles()
+	t.Cleanup(core.ForgetSandboxHandles)
+	ctx := context.Background()
+	sandboxes := memory.NewSandbox(nil, "")
+	run := core.ToolRun{Deps: ports.RuntimePorts{Kv: memory.NewKv(), Config: agentenkit.DefaultConfig(), Tools: ports.BuiltinToolPorts{Sandbox: sandboxes}}, ThreadID: "t-race"}
+	if _, err := core.GetThreadSandbox(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	sandboxes.End("mem-1")
+	write := func(ts core.ThreadSandbox) (string, error) {
+		return ts.Sandbox.ID(), ts.Sandbox.Filesystem().WriteFile(ctx, "a.txt", []byte("x"))
+	}
+	firstDone := make(chan struct{})
+	var first, second string
+	var firstErr, secondErr error
+	go func() {
+		defer close(firstDone)
+		first, firstErr = core.WithThreadSandbox(ctx, run, write)
+	}()
+	// The second finds mem-1 gone only after the first has made mem-2.
+	second, secondErr = core.WithThreadSandbox(ctx, run, func(ts core.ThreadSandbox) (string, error) {
+		<-firstDone
+		return write(ts)
+	})
+	if firstErr != nil || secondErr != nil {
+		t.Fatalf("errors: %v, %v", firstErr, secondErr)
+	}
+	mustStrings(t, []string{first, second}, []string{"mem-2", "mem-2"}, "sandboxes used")
+	mustStrings(t, sandboxes.Live(), []string{"mem-2"}, "live")
+}
+
 func TestSandboxLifecycle_WithNoSandboxSetUpASandboxCallSaysSo(t *testing.T) {
 	cfg := agentenkit.DefaultConfig()
 	run := core.ToolRun{Deps: ports.RuntimePorts{Kv: memory.NewKv(), Config: cfg}, ThreadID: "t"}

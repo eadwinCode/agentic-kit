@@ -83,7 +83,11 @@ export async function withThreadSandbox<T>(run: ToolRun, fn: (ts: ThreadSandbox)
   } catch (e) {
     if (!(e instanceof SandboxGoneError)) throw e;
     handles.delete(ts.sandbox.sandboxId);
-    await run.deps.kv.del(sandboxKey(run.threadId));
+    // Only while the record still names the sandbox that is gone: a parallel
+    // call may already have made the next one.
+    const key = sandboxKey(run.threadId);
+    const raw = await run.deps.kv.get(key);
+    if (parse(raw)?.id === ts.sandbox.sandboxId) await run.deps.kv.delIfValue(key, raw!);
     return fn({ ...(await threadSandbox(run)), lost: true });
   }
 }

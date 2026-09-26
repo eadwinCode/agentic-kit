@@ -7,7 +7,7 @@ import { LocalSandbox } from '../src/adapters/local-sandbox.js';
 import { DockerSandbox } from '../src/adapters/docker.js';
 import { E2BSandbox } from '../src/adapters/e2b.js';
 import { ComputeSdkSandbox, type ComputeSdkProviderLike, type ComputeSdkSandboxLike } from '../src/adapters/computesdk.js';
-import { SandboxUnsupportedError, type Sandbox } from '../src/ports/sandbox.js';
+import { SandboxGoneError, SandboxUnsupportedError, type Sandbox } from '../src/ports/sandbox.js';
 import { sandboxSuite } from './sandbox-suite.js';
 import { startFakeE2B } from './e2b-fake.js';
 
@@ -91,6 +91,28 @@ describe('sandbox adapters', () => {
     await s.destroy();
     await e2b.create({ timeoutMs: 1_000, metadata: { threadId: 't9' } });
     expect(fake.lastCreate.allow_internet_access).toBe(false);
+  });
+
+  it('E2BSandbox does not run a command whose signal is already stopped', async () => {
+    const e2b = new E2BSandbox({ apiKey: 'test-key', apiUrl: fake.url, sandboxUrl: fake.url });
+    const s = await e2b.create({ timeoutMs: 60_000, metadata: { threadId: 't' } });
+    const stop = new AbortController();
+    stop.abort(new Error('stopped'));
+    await expect(s.runCommand('echo x > ran.txt', { signal: stop.signal })).rejects.toThrow('stopped');
+    expect(await s.filesystem.exists('ran.txt')).toBe(false);
+    await s.destroy();
+  });
+
+  it('ComputeSdkSandbox passes on an error that does not mean gone', async () => {
+    const provider: ComputeSdkProviderLike = {
+      sandbox: {
+        create: async () => { throw new Error('not used'); },
+        getById: async () => { throw new Error('computesdk: 503 try again'); },
+      },
+    };
+    const err = await new ComputeSdkSandbox({ provider }).connect('sb-1').catch((e) => e);
+    expect(err.message).toBe('computesdk: 503 try again');
+    expect(err).not.toBeInstanceOf(SandboxGoneError);
   });
 
   it('E2BSandbox needs an API key', () => {

@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemorySandbox, MemoryStorage } from '../src/adapters/memory.js';
-import { forgetSandboxHandles, sandboxKey, threadSandbox, withSandbox } from '../src/core/builtin/sandbox.js';
+import { forgetSandboxHandles, sandboxKey, threadSandbox, withSandbox, withThreadSandbox } from '../src/core/builtin/sandbox.js';
 import { resolveConfig } from '../src/core/types.js';
 
 // One sandbox per thread (spec T3). The same cases run in the Go package
@@ -153,6 +153,24 @@ describe('one sandbox per thread', () => {
     expect((await h.runtime.deleteThread(threadId)).accepted).toBe(true);
     expect(h.sandboxes.destroyed).toEqual(['mem-1']);
     expect(await h.kv.get(sandboxKey(threadId))).toBeNull();
+  });
+
+  it('two calls that find the sandbox gone make one new sandbox between them', async () => {
+    forgetSandboxHandles();
+    const sandboxes = new MemorySandbox();
+    const deps = { kv: new MemoryKv(), config: resolveConfig({}), tools: { sandbox: sandboxes } } as any;
+    const run = { deps, threadId: 't-race', agentId: null };
+    await threadSandbox(run);
+    sandboxes.end('mem-1');
+    const write = (ts: { sandbox: any }) => ts.sandbox.filesystem.writeFile('a.txt', 'x').then(() => ts.sandbox.sandboxId);
+    const first = withThreadSandbox(run, write);
+    // The second finds mem-1 gone only after the first has made mem-2.
+    const second = withThreadSandbox(run, async (ts) => {
+      await first;
+      return write(ts);
+    });
+    expect([await first, await second]).toEqual(['mem-2', 'mem-2']);
+    expect(sandboxes.live()).toEqual(['mem-2']);
   });
 
   it('with no sandbox set up a sandbox call says so', async () => {

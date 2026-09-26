@@ -98,12 +98,9 @@ export class ComputeSdkSandbox implements SandboxProvider {
   }
 
   async connect(sandboxId: string): Promise<Sandbox> {
-    let sandbox: ComputeSdkSandboxLike | null;
-    try {
-      sandbox = await this.options.provider.sandbox.getById(sandboxId);
-    } catch {
-      sandbox = null;
-    }
+    // Only "not found" means gone; any other error is thrown as it is, so a
+    // passing network fault does not throw away a live sandbox.
+    const sandbox = await this.options.provider.sandbox.getById(sandboxId);
     if (!sandbox) throw new SandboxGoneError(sandboxId);
     return new ComputeSdkBox(this.name, sandbox, this.workdir);
   }

@@ -114,7 +114,14 @@ func WithThreadSandbox[T any](ctx context.Context, run ToolRun, fn func(ThreadSa
 		return out, err
 	}
 	forgetHandle(ts.Sandbox.ID())
-	_ = run.Deps.Kv.Del(ctx, SandboxKey(run.ThreadID))
+	// Only while the record still names the sandbox that is gone: a
+	// parallel call may already have made the next one.
+	key := SandboxKey(run.ThreadID)
+	if raw, ok, err := run.Deps.Kv.Get(ctx, key); err == nil && ok {
+		if rec, _ := readSandboxRecord(ctx, run.Deps.Kv, key); rec != nil && rec.ID == ts.Sandbox.ID() {
+			_, _ = run.Deps.Kv.DelIfValue(ctx, key, raw)
+		}
+	}
 	ts, err = GetThreadSandbox(ctx, run)
 	if err != nil {
 		var zero T

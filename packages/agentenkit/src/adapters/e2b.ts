@@ -180,6 +180,10 @@ class E2BBox implements Sandbox {
       void stop();
     }, limit + 1_000);
     const onAbort = () => void stop();
+    if (options.signal?.aborted) {
+      clearTimeout(timer);
+      throw options.signal.reason;
+    }
     options.signal?.addEventListener('abort', onAbort, { once: true });
     let exitCode = -1;
     try {

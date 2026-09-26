@@ -322,6 +322,23 @@ func TestSandboxAdapters_E2BSandboxSendsTheTemplateTimeMetadataAndNetworkItWasGi
 	mustEqual(t, fake.lastCreateBody()["allow_internet_access"], false, "no network by default")
 }
 
+func TestSandboxAdapters_E2BSandboxDoesNotRunACommandWhoseSignalIsAlreadyStopped(t *testing.T) {
+	ctx := context.Background()
+	fake := startFakeE2B(t)
+	p, _ := e2b.New("test-key", e2b.Options{APIURL: fake.url, SandboxURL: fake.url})
+	s, err := p.Create(ctx, ports.CreateSandboxOptions{Timeout: time.Minute, Metadata: ports.SandboxMetadata{ThreadID: "t"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped, cancel := context.WithCancel(ctx)
+	cancel()
+	_, err = s.RunCommand(stopped, "echo x > ran.txt", ports.RunCommandOptions{})
+	mustEqual(t, errors.Is(err, context.Canceled), true, "error: "+fmt.Sprint(err))
+	there, _ := s.Filesystem().Exists(ctx, "ran.txt")
+	mustEqual(t, there, false, "ran.txt")
+	_ = s.Destroy(ctx)
+}
+
 func TestSandboxAdapters_E2BSandboxNeedsAnAPIKey(t *testing.T) {
 	_, err := e2b.New("", e2b.Options{})
 	if err == nil || err.Error() != "E2BSandbox: apiKey is required" {
