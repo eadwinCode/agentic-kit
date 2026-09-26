@@ -2,7 +2,7 @@
 // on the client, and nothing to stand up first.
 //
 //	cd examples/go-app/web && bun install && bun run build   # the SPA
-//	cd .. && go run .                                         # http://localhost:8080
+//	cd .. && go run .                                         # http://localhost:8090
 //
 // Without OPENAI_API_KEY the app runs on a built-in mock model that answers
 // with canned text and calls the tools on keywords, so every feature (tools,
@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -40,7 +41,7 @@ import (
 func main() {
 	// A .env beside the binary, for the API key and the optional Redis URL.
 	loadDotEnv(".env")
-	addr := flag.String("addr", envOr("ADDR", ":8080"), "listen address")
+	addr := flag.String("addr", envOr("ADDR", ":8090"), "listen address")
 	static := flag.String("static", envOr("STATIC_DIR", "web/dist"), "built SPA to serve (empty to serve none)")
 	dbFile := flag.String("db", envOr("DB_FILE", "go-app.sqlite"), "SQLite file: your tables and the platform's own history")
 	flag.Parse()
@@ -135,6 +136,13 @@ func main() {
 					ContextWindow: 128_000,
 					ModelID:       name,
 				}, nil
+			}
+			// Only the models this app knows and prices. The model picks a
+			// subagent's model itself; a name it made up (gpt-3.5-turbo, say)
+			// is refused here, and the child falls back to the parent's
+			// model, so no call goes out unpriced.
+			if _, known := modelPrices[name]; !known && name != os.Getenv("MODEL") {
+				return agentenkit.ResolvedModel{}, fmt.Errorf("unknown model %q", name)
 			}
 			return agentenkit.ResolvedModel{
 				Instance:      func() provider.LanguageModel { return openai.Chat(name, openai.WithAPIKey(apiKey)) },
