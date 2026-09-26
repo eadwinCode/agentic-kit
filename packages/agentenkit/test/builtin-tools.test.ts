@@ -9,7 +9,7 @@ import {
   MemoryBus, MemoryFetcher, MemoryKv, MemoryQueue, MemoryRunStreams, MemorySearch, MemoryStorage,
 } from '../src/adapters/memory.js';
 import { BraveWebSearch } from '../src/adapters/brave.js';
-import { JinaReader, JinaWebSearch } from '../src/adapters/jina.js';
+import { JinaReader, JinaWebSearch, plainSnippet } from '../src/adapters/jina.js';
 import { BlockedUrlError, isPrivateAddress, PageReader } from '../src/adapters/page-reader.js';
 import { BUILTIN_TOOL_DEFINITIONS, BUILTIN_TOOL_NAMES } from '../src/core/builtin/definitions.js';
 import { htmlToText } from '../src/core/builtin/html.js';
@@ -428,6 +428,13 @@ describe('built-in tools: adapters (T2)', () => {
     const got = await new JinaWebSearch({ apiKey: 'k', fetch: fakeFetch }).search('q', { maxResults: 3 });
     expect(got).toHaveLength(1);
     expect(got[0]!.snippet.length).toBeLessThanOrEqual(300);
+  });
+
+  it('jina snippets are plain text', () => {
+    expect(plainSnippet('[Model Context Protocol](https://x.example/) (MCP) is **open**. ![logo](i.png)\n\n## Spec\nUse `tools` __now__.'))
+      .toBe('Model Context Protocol (MCP) is open. Spec Use tools now.');
+    // Cut at 300, counted as JavaScript counts; an emoji is never split.
+    expect(plainSnippet('x'.repeat(299) + '\u{1F600}')).toBe('x'.repeat(299));
   });
 
   it('jina reader asks for markdown and cuts at maxBytes', async () => {

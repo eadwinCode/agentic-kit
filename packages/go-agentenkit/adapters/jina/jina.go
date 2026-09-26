@@ -82,7 +82,37 @@ func NewWebSearch(apiKey string) (*WebSearch, error) {
 
 func (j *WebSearch) Name() string { return "jina-search" }
 
-var reSpaces = regexp.MustCompile(`\s+`)
+var (
+	reImage   = regexp.MustCompile(`!\[[^\]]*\]\([^)]*\)`)
+	reLink    = regexp.MustCompile(`\[([^\]]*)\]\([^)]*\)`)
+	reMarks   = regexp.MustCompile("\\*\\*|__|`")
+	reHeading = regexp.MustCompile(`(^|[ \t\n\r\f\v])#{1,6}[ \t]`)
+	reSpaces  = regexp.MustCompile(`[ \t\n\r\f\v]+`)
+)
+
+// PlainSnippet turns Jina's markdown into a plain-text snippet. The TS
+// adapter follows the same rules: images go, links keep their text, bold,
+// code and heading marks go, spaces collapse, and it is cut at 300
+// characters counted as JavaScript counts them.
+func PlainSnippet(markdown string) string {
+	s := reImage.ReplaceAllString(markdown, "")
+	s = reLink.ReplaceAllString(s, "${1}")
+	s = reMarks.ReplaceAllString(s, "")
+	s = reHeading.ReplaceAllString(s, "${1}")
+	s = strings.TrimPrefix(strings.TrimSuffix(reSpaces.ReplaceAllString(s, " "), " "), " ")
+	n := 0
+	for i, r := range s {
+		w := 1
+		if r >= 0x10000 {
+			w = 2
+		}
+		if n+w > snippetChars {
+			return s[:i]
+		}
+		n += w
+	}
+	return s
+}
 
 func (j *WebSearch) Search(ctx context.Context, query string, opts ports.SearchOptions) ([]ports.SearchHit, error) {
 	base := j.BaseURL
@@ -111,10 +141,7 @@ func (j *WebSearch) Search(ctx context.Context, query string, opts ports.SearchO
 		if text == "" {
 			text = r.Content
 		}
-		snippet := strings.TrimSpace(reSpaces.ReplaceAllString(text, " "))
-		if runes := []rune(snippet); len(runes) > snippetChars {
-			snippet = string(runes[:snippetChars])
-		}
+		snippet := PlainSnippet(text)
 		hits = append(hits, ports.SearchHit{Title: r.Title, URL: r.URL, Snippet: snippet, PublishedAt: r.Date})
 		if len(hits) >= opts.MaxResults {
 			break

@@ -549,6 +549,13 @@ func TestBuiltin_JinaSearchKeepsOnlyASnippet(t *testing.T) {
 	mustEqual(t, len(got[0].Snippet) <= 300, true, "a snippet only")
 }
 
+func TestBuiltin_JinaSnippetsArePlainText(t *testing.T) {
+	mustEqual(t, jina.PlainSnippet("[Model Context Protocol](https://x.example/) (MCP) is **open**. ![logo](i.png)\n\n## Spec\nUse `tools` __now__."),
+		"Model Context Protocol (MCP) is open. Spec Use tools now.", "plain")
+	// Cut at 300, counted as JavaScript counts; an emoji is never split.
+	mustEqual(t, jina.PlainSnippet(strings.Repeat("x", 299)+"\U0001F600"), strings.Repeat("x", 299), "cut")
+}
+
 func TestBuiltin_JinaReaderAsksForMarkdownAndCutsAtMaxBytes(t *testing.T) {
 	var seen *http.Request
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
