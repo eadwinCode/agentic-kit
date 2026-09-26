@@ -32,6 +32,8 @@ type RuntimePorts struct {
 	// failing the run, such as a usage row it failed to store.
 	Log    *slog.Logger
 	Config AgentConfig
+	// Tools are the adapters behind the built-in tools.
+	Tools BuiltinToolPorts
 }
 
 // Pricer turns one model call into money (§4). The runtime calls it after
@@ -83,8 +85,9 @@ type RuntimeOptions struct {
 	// Config is nil for the defaults.
 	Config *AgentConfig
 	// Tools are the adapters behind the built-in tools: a search engine for
-	// web_search, a page reader for web_fetch. Only the tools you ask
-	// BuiltinTools for need theirs.
+	// web_search, a page reader for web_fetch, a sandbox provider for the
+	// tools that run commands. Only the tools you ask BuiltinTools for need
+	// theirs.
 	Tools BuiltinToolPorts
 }
 

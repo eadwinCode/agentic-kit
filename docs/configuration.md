@@ -73,6 +73,8 @@ start from `DefaultConfig()` to keep them on.
 | Setting | Default | Meaning |
 | :--- | ---: | :--- |
 | `builtinToolResultCapChars` | `20000` | The most characters a built-in tool hands the model in one result: a page's text, a reader's answer. Past it the text is cut and the result says `truncated: true`. See [Web tools](./web-tools.md). |
+| `sandboxIdleTtlMs` | `1800000` (30 min) | A thread's sandbox ends after it has sat unused this long; the next call makes a fresh one. Go: `SandboxIdleTTL`. See [Sandboxes](./sandboxes.md). |
+| `sandboxMaxLifetimeMs` | `86400000` (24 h) | A thread's sandbox ends this long after it was made, however much it is used. Go: `SandboxMaxLifetime`. |
 
 ### Context and caching
 

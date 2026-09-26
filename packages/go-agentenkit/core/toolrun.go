@@ -22,6 +22,8 @@ type ToolRun struct {
 	AgentID   string
 	AgentName string
 	Ledger    *RunLedger
+	// State is the run's state (§2.10), for adapters that pick per tenant.
+	State ports.AgentRunState
 }
 
 type toolRunKey struct{}

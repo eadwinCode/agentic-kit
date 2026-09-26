@@ -1,4 +1,17 @@
 import type { FetchedPage, Fetcher, FetchOptions, Search, SearchHit, SearchOptions } from '../ports/tools.js';
+import {
+  SandboxFileNotFoundError,
+  SandboxGoneError,
+  type CommandResult,
+  type CreateSandboxOptions,
+  type FileEntry,
+  type RunCommandOptions,
+  type Sandbox,
+  type SandboxFileSystem,
+  type SandboxInfo,
+  type SandboxProvider,
+} from '../ports/sandbox.js';
+import { resolveIn, sortEntries } from './sandbox-shell.js';
 import type { AgentEvent, ExecutionState, MessageDTO, NewMessage, NewThreadEvent, ThreadEventFilter, NewUsage, RunJob, ThreadDTO, ThreadTransition, UsageFilter, UsageTotals } from '../core/types.js';
 import { sumUsage } from '../core/usage.js';
 import type { Storage } from '../ports/storage.js';
@@ -489,4 +502,181 @@ export class MemoryFetcher implements Fetcher {
       truncated,
     };
   }
+}
+
+/** Sandboxes that live in memory, for tests: files are kept, commands go to
+ *  the `run` function you give (none given, every command fails with 127).
+ *  It records what was made, pushed back and destroyed, and `end(id)` makes
+ *  one go away as a timed-out sandbox would. */
+export class MemorySandbox implements SandboxProvider {
+  readonly name: string;
+  readonly created: CreateSandboxOptions[] = [];
+  readonly destroyed: string[] = [];
+  /** Every setTimeout call, in order. */
+  readonly timeouts: Array<{ sandboxId: string; timeoutMs: number }> = [];
+  readonly commands: Array<{ sandboxId: string; command: string; options: RunCommandOptions }> = [];
+  private readonly boxes = new Map<string, MemoryBox>();
+  private n = 0;
+
+  constructor(
+    private readonly run?: (command: string, options: RunCommandOptions, sandbox: Sandbox) => Partial<CommandResult> | Promise<Partial<CommandResult>>,
+    name = 'memory',
+  ) {
+    this.name = name;
+  }
+
+  async create(options: CreateSandboxOptions): Promise<Sandbox> {
+    this.created.push(options);
+    const box = new MemoryBox(this, `mem-${++this.n}`);
+    this.boxes.set(box.sandboxId, box);
+    return box;
+  }
+
+  async connect(sandboxId: string): Promise<Sandbox> {
+    const box = this.boxes.get(sandboxId);
+    if (!box) throw new SandboxGoneError(sandboxId);
+    return box;
+  }
+
+  /** The sandbox ends on its own, as one past its time does. */
+  end(sandboxId: string) {
+    this.boxes.delete(sandboxId);
+  }
+
+  /** The ids of the sandboxes still there. */
+  live(): string[] {
+    return [...this.boxes.keys()];
+  }
+
+  /** @internal */
+  async exec(box: MemoryBox, command: string, options: RunCommandOptions): Promise<CommandResult> {
+    this.alive(box.sandboxId);
+    this.commands.push({ sandboxId: box.sandboxId, command, options });
+    const r = this.run ? await this.run(command, options, box) : { stderr: `memory sandbox: ${command}: not found`, exitCode: 127 };
+    return { stdout: '', stderr: '', exitCode: 0, durationMs: 0, ...r };
+  }
+
+  /** @internal */
+  alive(sandboxId: string) {
+    if (!this.boxes.has(sandboxId)) throw new SandboxGoneError(sandboxId);
+  }
+
+  /** @internal */
+  remove(sandboxId: string) {
+    if (this.boxes.delete(sandboxId)) this.destroyed.push(sandboxId);
+  }
+}
+
+class MemoryBox implements Sandbox {
+  readonly filesystem: SandboxFileSystem;
+  readonly files = new Map<string, Uint8Array>();
+  readonly dirs = new Set<string>(['/work']);
+  readonly createdAt = new Date();
+  expiresAt?: Date;
+
+  constructor(
+    private readonly owner: MemorySandbox,
+    readonly sandboxId: string,
+  ) {
+    this.filesystem = new MemoryFiles(this, owner);
+  }
+
+  get provider() {
+    return this.owner.name;
+  }
+
+  runCommand(command: string, options: RunCommandOptions = {}): Promise<CommandResult> {
+    return this.owner.exec(this, command, options);
+  }
+
+  async getUrl(options: { port: number; protocol?: 'http' | 'https' }): Promise<string> {
+    this.owner.alive(this.sandboxId);
+    return `${options.protocol ?? 'http'}://${this.sandboxId}.memory:${options.port}`;
+  }
+
+  async getInfo(): Promise<SandboxInfo> {
+    this.owner.alive(this.sandboxId);
+    return {
+      id: this.sandboxId,
+      provider: this.provider,
+      status: 'running',
+      createdAt: this.createdAt,
+      ...(this.expiresAt ? { expiresAt: this.expiresAt } : {}),
+      workdir: '/work',
+    };
+  }
+
+  async setTimeout(timeoutMs: number): Promise<void> {
+    this.owner.alive(this.sandboxId);
+    this.owner.timeouts.push({ sandboxId: this.sandboxId, timeoutMs });
+    this.expiresAt = new Date(Date.now() + timeoutMs);
+  }
+
+  async destroy(): Promise<void> {
+    this.owner.remove(this.sandboxId);
+  }
+}
+
+class MemoryFiles implements SandboxFileSystem {
+  constructor(
+    private readonly box: MemoryBox,
+    private readonly owner: MemorySandbox,
+  ) {}
+
+  private path(p: string) {
+    this.owner.alive(this.box.sandboxId);
+    return resolveIn('/work', p).replace(/\/+$/, '') || '/';
+  }
+
+  private addParents(path: string) {
+    for (let d = posixDir(path); d !== '/'; d = posixDir(d)) this.box.dirs.add(d);
+  }
+
+  async readFile(path: string): Promise<string> {
+    return new TextDecoder().decode(await this.readFileBytes(path));
+  }
+
+  async readFileBytes(path: string): Promise<Uint8Array> {
+    const bytes = this.box.files.get(this.path(path));
+    if (!bytes) throw new SandboxFileNotFoundError(path);
+    return bytes.slice();
+  }
+
+  async writeFile(path: string, content: string | Uint8Array): Promise<void> {
+    const full = this.path(path);
+    this.addParents(full);
+    this.box.files.set(full, typeof content === 'string' ? new TextEncoder().encode(content) : content.slice());
+  }
+
+  async readdir(path: string): Promise<FileEntry[]> {
+    const full = this.path(path);
+    if (!this.box.dirs.has(full)) throw new SandboxFileNotFoundError(path);
+    const entries: FileEntry[] = [];
+    for (const d of this.box.dirs) if (d !== full && posixDir(d) === full) entries.push({ name: d.slice(d.lastIndexOf('/') + 1), type: 'directory' });
+    for (const [f, bytes] of this.box.files) if (posixDir(f) === full) entries.push({ name: f.slice(f.lastIndexOf('/') + 1), type: 'file', size: bytes.length });
+    return sortEntries(entries);
+  }
+
+  async mkdir(path: string): Promise<void> {
+    const full = this.path(path);
+    this.addParents(full);
+    this.box.dirs.add(full);
+  }
+
+  async exists(path: string): Promise<boolean> {
+    const full = this.path(path);
+    return this.box.files.has(full) || this.box.dirs.has(full);
+  }
+
+  async remove(path: string): Promise<void> {
+    const full = this.path(path);
+    const under = (p: string) => p === full || p.startsWith(`${full}/`);
+    for (const f of [...this.box.files.keys()]) if (under(f)) this.box.files.delete(f);
+    for (const d of [...this.box.dirs]) if (under(d)) this.box.dirs.delete(d);
+  }
+}
+
+function posixDir(p: string): string {
+  const i = p.lastIndexOf('/');
+  return i <= 0 ? '/' : p.slice(0, i);
 }

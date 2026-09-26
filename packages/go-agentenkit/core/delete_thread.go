@@ -58,6 +58,9 @@ func DeleteThread(ctx context.Context, deps ports.RuntimePorts, threadID string)
 	if err := deps.Admin.Threads().Delete(ctx, threadID); err != nil {
 		Logger(deps).Error("admin history of a deleted thread not removed", "thread", threadID, "err", err)
 	}
+	// Its sandbox ends with it, rather than at its idle timeout.
+	DestroyThreadSandbox(ctx, deps, threadID)
+
 	// Live UIs subscribed to the thread learn it ceased to exist: bus-only
 	// notice, the event log is gone with it.
 	_ = PublishNotice(ctx, deps, threadID, "THREAD_DELETED", map[string]any{"threadId": threadID})

@@ -71,4 +71,6 @@ type Fetcher interface {
 type BuiltinToolPorts struct {
 	Search  Search
 	Fetcher Fetcher
+	// Sandbox is where commands run and files live: one sandbox per thread.
+	Sandbox SandboxProvider
 }
