@@ -41,6 +41,27 @@ func TestSqlite_OpenTurnsOnWALAndABusyTimeout(t *testing.T) {
 	mustEqual(t, timeout, 5000, "a writer waits for the lock rather than failing")
 }
 
+// Many opening one fresh file at once all succeed: each opens its own
+// connection, as separate processes would.
+func TestSqlite_ManyOpeningOneFreshFileAtOnceAllSucceed(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "race.sqlite")
+	errs := make(chan error, 12)
+	for range 12 {
+		go func() {
+			db, err := sqlite.Open(file)
+			if err == nil {
+				err = db.Close()
+			}
+			errs <- err
+		}()
+	}
+	for range 12 {
+		if err := <-errs; err != nil {
+			t.Fatalf("an open failed: %v", err)
+		}
+	}
+}
+
 func TestSqliteStorage_AMissingThreadCannotBeDeleted(t *testing.T) {
 	s := openSqlite(t)
 	ctx := context.Background()
