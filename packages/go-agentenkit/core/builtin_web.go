@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -23,10 +22,18 @@ type WebSearchOptions struct {
 	// MaxUses is the searches allowed in one run. Past it the tool answers
 	// with an error the model can read, and the run goes on. 0: no limit.
 	MaxUses int
-	// AllowedDomains: only these domains, whatever the model asks for.
+	// AllowedDomains keeps only results from these domains (and their
+	// subdomains). The model cannot change the domain lists or the recency:
+	// small models fill in every field they are offered and narrow the
+	// search by mistake, so these are the app's to set, as in Anthropic's
+	// own web search.
 	AllowedDomains []string
-	// BlockedDomains: never these domains, whatever the model asks for.
+	// BlockedDomains drops results from these domains (and their
+	// subdomains).
 	BlockedDomains []string
+	// Recency keeps only results from the last "day", "week", "month" or
+	// "year".
+	Recency ports.SearchRecency
 }
 
 // WebFetchOptions are the app's settings for web_fetch.
@@ -128,43 +135,6 @@ func cutText(s string, max int) (string, bool) {
 	return s, false
 }
 
-func stringList(v any) []string {
-	items, ok := v.([]any)
-	if !ok {
-		return nil
-	}
-	var out []string
-	for _, it := range items {
-		if s, ok := it.(string); ok && strings.TrimSpace(s) != "" {
-			out = append(out, strings.TrimSpace(s))
-		}
-	}
-	return out
-}
-
-// allowedDomains is the app's list when it has one (the model may only
-// narrow it), else the model's.
-func allowedDomains(app, model []string) []string {
-	if len(app) > 0 {
-		// Never wider than the app's list: a model that names others gets
-		// the app's.
-		var both []string
-		for _, d := range app {
-			if slices.Contains(model, d) {
-				both = append(both, d)
-			}
-		}
-		if len(both) > 0 {
-			return both
-		}
-		return app
-	}
-	if len(model) > 0 {
-		return model
-	}
-	return nil
-}
-
 type webResult struct {
 	ID          string `json:"id"`
 	Title       string `json:"title"`
@@ -193,14 +163,8 @@ func RunWebSearch(ctx context.Context, search ports.Search, opts WebSearchOption
 		asked = int(n)
 	}
 	maxResults := min(max(asked, 1), 10)
-	so := ports.SearchOptions{MaxResults: maxResults}
-	so.AllowedDomains = allowedDomains(opts.AllowedDomains, stringList(args["allowedDomains"]))
-	so.BlockedDomains = append(append([]string{}, opts.BlockedDomains...), stringList(args["blockedDomains"])...)
-	if len(so.BlockedDomains) == 0 {
-		so.BlockedDomains = nil
-	}
-	if r, _ := args["recency"].(string); r == "day" || r == "week" || r == "month" || r == "year" {
-		so.Recency = ports.SearchRecency(r)
+	so := ports.SearchOptions{
+		MaxResults: maxResults, AllowedDomains: opts.AllowedDomains, BlockedDomains: opts.BlockedDomains, Recency: opts.Recency,
 	}
 
 	hits, err := search.Search(ctx, query, so)

@@ -323,14 +323,15 @@ func TestBuiltin_AToolPastItsMaxUsesAnswersWithAnErrorAndTheRunGoesOn(t *testing
 	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "the run goes on")
 }
 
-func TestBuiltin_TheAppsDomainListsWinOverTheModels(t *testing.T) {
+func TestBuiltin_TheDomainListsAndRecencyComeFromTheAppNotTheModel(t *testing.T) {
 	search := memory.NewSearch(testHits, "")
 	h := builtinRuntime(t, scripted(
-		step{calls: []call{{"c1", "web_search", `{"query":"q","allowedDomains":["evil.example"],"blockedDomains":["beta.example"]}`}}},
+		// A model that sends filters anyway: they are not in its schema, and ignored.
+		step{calls: []call{{"c1", "web_search", `{"query":"q","allowedDomains":["evil.example"],"recency":"day"}`}}},
 		step{text: "done"},
 	), ports.BuiltinToolPorts{Search: search}, nil)
 	tools := h.builtin(t, []string{"web_search"}, agentenkit.BuiltinToolOptions{WebSearch: agentenkit.WebSearchOptions{
-		AllowedDomains: []string{"alpha.example", "gamma.example"}, BlockedDomains: []string{"ads.example"},
+		AllowedDomains: []string{"alpha.example", "gamma.example"}, BlockedDomains: []string{"ads.example"}, Recency: "week",
 	}})
 	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat", Tools: tools})
 	h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
@@ -338,7 +339,8 @@ func TestBuiltin_TheAppsDomainListsWinOverTheModels(t *testing.T) {
 
 	q := search.Queries()[0]
 	mustStrings(t, q.Options.AllowedDomains, []string{"alpha.example", "gamma.example"}, "allowed")
-	mustStrings(t, q.Options.BlockedDomains, []string{"ads.example", "beta.example"}, "blocked")
+	mustStrings(t, q.Options.BlockedDomains, []string{"ads.example"}, "blocked")
+	mustEqual(t, q.Options.Recency, ports.SearchRecency("week"), "recency")
 }
 
 func TestBuiltin_SearchResultsGoOnTheRunStreamAsSources(t *testing.T) {
@@ -361,6 +363,32 @@ func TestBuiltin_SearchResultsGoOnTheRunStreamAsSources(t *testing.T) {
 	}
 	mustEqual(t, len(sources), 1, "one source")
 	mustEqual(t, string(sources[0]), `{"sourceType":"url","id":"s1r1","url":"https://alpha.example/a","title":"Alpha"}`, "the source")
+}
+
+func TestBuiltin_ASubagentCanUseTheBuiltinTools(t *testing.T) {
+	search := memory.NewSearch(testHits, "brave")
+	// Parent and child share the one scripted model: the child runs inside
+	// the parent's tool call, so the calls come in order.
+	h := builtinRuntime(t, scripted(
+		step{calls: []call{{"p1", "spawnSubagent", `{"name":"researcher","instructions":"find alpha"}`}}},
+		step{calls: []call{{"k1", "web_search", `{"query":"alpha","maxResults":1}`}}},
+		step{text: "alpha is at alpha.example"},
+		step{text: "done"},
+	), ports.BuiltinToolPorts{Search: search}, nil)
+	web := h.builtin(t, []string{"web_search"}, agentenkit.BuiltinToolOptions{})
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat", Subagents: &agentenkit.SubagentsConfig{Tools: web}})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
+	h.handleNext(t)
+
+	mustEqual(t, len(search.Queries()), 1, "the child searched")
+	mustEqual(t, search.Queries()[0].Query, "alpha", "its query")
+	rows := h.toolRows()
+	mustEqual(t, len(rows), 1, "one tool row")
+	mustEqual(t, rows[0].RunID, ran.RunID, "billed to the parent's run")
+	mustEqual(t, rows[0].AgentID != "", true, "made by the child")
+	mustEqual(t, rows[0].AgentName, "researcher", "the child's name")
+	mustEqual(t, h.toolResult(t, ran.ThreadID, "k1")["results"].([]any)[0].(map[string]any)["id"], "s1r1", "result ids")
+	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "completed")
 }
 
 func TestBuiltin_ToolUsageCountsAgainstTheRunsMoneyCap(t *testing.T) {

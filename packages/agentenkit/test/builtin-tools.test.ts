@@ -255,11 +255,12 @@ describe('built-in tools: web search and fetch (T2)', () => {
     expect((await h.storage.threads.get(ran.threadId))!.state).toBe('COMPLETED');
   });
 
-  it("the app's domain lists win over the model's", async () => {
+  it('the domain lists and recency come from the app, not the model', async () => {
     const search = new MemorySearch(hits);
     const h = await harness(
       [
-        { calls: [{ id: 'c1', name: 'web_search', args: { query: 'q', allowedDomains: ['evil.example'], blockedDomains: ['beta.example'] } }] },
+        // A model that sends filters anyway: they are not in its schema, and ignored.
+        { calls: [{ id: 'c1', name: 'web_search', args: { query: 'q', allowedDomains: ['evil.example'], recency: 'day' } }] },
         { text: 'done' },
       ],
       { search },
@@ -267,14 +268,15 @@ describe('built-in tools: web search and fetch (T2)', () => {
     const chat = h.runtime.createStreamTextAgent({
       name: 'chat',
       tools: h.runtime.builtinTools(['web_search'], {
-        webSearch: { allowedDomains: ['alpha.example', 'gamma.example'], blockedDomains: ['ads.example'] },
+        webSearch: { allowedDomains: ['alpha.example', 'gamma.example'], blockedDomains: ['ads.example'], recency: 'week' },
       }),
     });
     await chat.run({ prompt: 'go' });
     await h.runtime.worker.handleJob(h.queue.items.shift()!);
 
     expect(search.queries[0]!.options.allowedDomains).toEqual(['alpha.example', 'gamma.example']);
-    expect(search.queries[0]!.options.blockedDomains).toEqual(['ads.example', 'beta.example']);
+    expect(search.queries[0]!.options.blockedDomains).toEqual(['ads.example']);
+    expect(search.queries[0]!.options.recency).toBe('week');
   });
 
   it('search results go on the run stream as sources', async () => {
@@ -292,6 +294,33 @@ describe('built-in tools: web search and fetch (T2)', () => {
     expect(sources).toEqual([
       { type: 'SOURCE', source: { sourceType: 'url', id: 's1r1', url: 'https://alpha.example/a', title: 'Alpha' }, offset: sources[0]!.offset },
     ]);
+  });
+
+  it('a subagent can use the built-in tools', async () => {
+    const search = new MemorySearch(hits, 'brave');
+    // Parent and child share the one scripted model: the child runs inside
+    // the parent's tool call, so the calls come in order.
+    const h = await harness(
+      [
+        { calls: [{ id: 'p1', name: 'spawnSubagent', args: { name: 'researcher', instructions: 'find alpha' } }] },
+        { calls: [{ id: 'k1', name: 'web_search', args: { query: 'alpha', maxResults: 1 } }] },
+        { text: 'alpha is at alpha.example' },
+        { text: 'done' },
+      ],
+      { search },
+    );
+    const web = h.runtime.builtinTools(['web_search']);
+    const chat = h.runtime.createStreamTextAgent({ name: 'chat', tools: {}, subagents: { tools: web } });
+    const ran = await chat.run({ prompt: 'go' });
+    await h.runtime.worker.handleJob(h.queue.items.shift()!);
+
+    expect(search.queries.map((q) => q.query)).toEqual(['alpha']);
+    const row = h.storage.usage.recorded.find((r) => r.kind === 'tool')!;
+    expect(row.runId).toBe(ran.runId); // billed to the parent's run
+    expect(row.agentId).not.toBeNull(); // made by the child
+    expect(row.agentName).toBe('researcher');
+    expect(h.toolResult(ran.threadId, 'k1').results[0].id).toBe('s1r1');
+    expect((await h.storage.threads.get(ran.threadId))!.state).toBe('COMPLETED');
   });
 
   it("tool usage counts against the run's money cap", async () => {

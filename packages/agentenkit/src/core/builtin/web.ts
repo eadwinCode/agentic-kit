@@ -11,10 +11,15 @@ export interface WebSearchOptions {
   /** Searches allowed in one run. Past it the tool answers with an error the
    *  model can read, and the run goes on. Default: no limit. */
   maxUses?: number;
-  /** Only these domains, whatever the model asks for. */
+  /** Only results from these domains (and their subdomains). The model
+   *  cannot change the domain lists or the recency: small models fill in
+   *  every field they are offered and narrow the search by mistake, so these
+   *  are the app's to set, as in Anthropic's own web search. */
   allowedDomains?: string[];
-  /** Never these domains, whatever the model asks for. */
+  /** Never results from these domains (and their subdomains). */
   blockedDomains?: string[];
+  /** Only results from the last day, week, month or year. */
+  recency?: SearchRecency;
 }
 
 export interface WebFetchOptions {
@@ -69,20 +74,6 @@ function cut(text: string, max: number): { text: string; cut: boolean } {
   return { text: text.slice(0, end), cut: true };
 }
 
-const listOf = (v: unknown): string[] | undefined =>
-  Array.isArray(v) ? v.filter((d): d is string => typeof d === 'string' && d.trim() !== '').map((d) => d.trim()) : undefined;
-
-/** The allowed domains: the app's list when it has one (the model may only
- *  narrow it), else the model's. */
-function allowedDomains(app: string[] | undefined, model: string[] | undefined): string[] | undefined {
-  if (app?.length) {
-    // Never wider than the app's list: a model that names others gets the app's.
-    const both = model?.length ? app.filter((d) => model.includes(d)) : [];
-    return both.length ? both : app;
-  }
-  return model?.length ? model : undefined;
-}
-
 export async function runWebSearch(
   search: Search,
   options: WebSearchOptions,
@@ -97,18 +88,16 @@ export async function runWebSearch(
   }
   const asked = typeof args.maxResults === 'number' ? Math.floor(args.maxResults) : options.maxResults ?? 5;
   const maxResults = Math.min(Math.max(asked, 1), 10);
-  const allowed = allowedDomains(listOf(options.allowedDomains), listOf(args.allowedDomains));
-  const blocked = [...(listOf(options.blockedDomains) ?? []), ...(listOf(args.blockedDomains) ?? [])];
-  const recency = ['day', 'week', 'month', 'year'].includes(args.recency as string)
-    ? (args.recency as SearchRecency)
-    : undefined;
+  const allowed = options.allowedDomains?.length ? options.allowedDomains : undefined;
+  const blocked = options.blockedDomains?.length ? options.blockedDomains : undefined;
+  const recency = options.recency;
 
   let hits;
   try {
     hits = await search.search(query, {
       maxResults,
       ...(allowed ? { allowedDomains: allowed } : {}),
-      ...(blocked.length ? { blockedDomains: blocked } : {}),
+      ...(blocked ? { blockedDomains: blocked } : {}),
       ...(recency ? { recency } : {}),
       ...(signal ? { signal } : {}),
     });

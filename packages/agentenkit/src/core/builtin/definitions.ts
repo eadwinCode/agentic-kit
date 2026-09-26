@@ -27,30 +27,6 @@ export const BUILTIN_TOOL_DEFINITIONS: Record<BuiltinToolName, BuiltinToolDefini
           "minimum": 1,
           "maximum": 10,
           "description": "How many results to return. Default 5."
-        },
-        "allowedDomains": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Only return results from these domains, like example.com."
-        },
-        "blockedDomains": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Never return results from these domains."
-        },
-        "recency": {
-          "type": "string",
-          "enum": [
-            "day",
-            "week",
-            "month",
-            "year"
-          ],
-          "description": "Only results from the last day, week, month or year."
         }
       },
       "required": [
