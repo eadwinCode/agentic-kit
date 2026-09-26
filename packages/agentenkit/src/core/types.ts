@@ -637,6 +637,12 @@ export interface AgentConfig {
    *  says `truncated: true`, so one huge page cannot fill the context window
    *  or the database. Default 20,000. */
   builtinToolResultCapChars: number;
+  /** A thread's sandbox ends after it has sat unused this long, and the
+   *  next call makes a fresh one. Default 30 minutes. */
+  sandboxIdleTtlMs: number;
+  /** A thread's sandbox ends this long after it was made, however much it
+   *  is used: the backstop on what one sandbox can cost. Default 24 hours. */
+  sandboxMaxLifetimeMs: number;
   /** Refuse a new run (RUN_REFUSED, reason `queue_full`) once this many jobs
    *  are ready and waiting (§2.8). Needs a queue that can count; one that
    *  cannot is never refused on. 0 means no cap. */
@@ -715,6 +721,8 @@ export const DEFAULT_CONFIG: AgentConfig = {
   streamFlushMs: 50,
   streamFlushEvents: 32,
   builtinToolResultCapChars: 20_000,
+  sandboxIdleTtlMs: 30 * 60_000,
+  sandboxMaxLifetimeMs: 24 * 60 * 60_000,
 };
 
 export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
@@ -746,7 +754,7 @@ export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
       `Invalid config: runRedriveDelaySeconds (${config.runRedriveDelaySeconds}) must be a non-negative integer`,
     );
   }
-  for (const key of ['streamGraceMs', 'streamTtlMs', 'streamFlushEvents', 'builtinToolResultCapChars'] as const) {
+  for (const key of ['streamGraceMs', 'streamTtlMs', 'streamFlushEvents', 'builtinToolResultCapChars', 'sandboxIdleTtlMs', 'sandboxMaxLifetimeMs'] as const) {
     if (!Number.isInteger(config[key]) || config[key] < 1) {
       throw new Error(`Invalid config: ${key} (${config[key]}) must be an integer of at least 1`);
     }

@@ -4,6 +4,7 @@ import { publishNotice } from './publish.js';
 import { segmentKey } from './segment.js';
 import { attemptsKey, redriveKey, runIdKey } from './keys.js';
 import { closeIfOpen } from './engine.js';
+import { destroyThreadSandbox } from './builtin/sandbox.js';
 
 /** The §3.2 deletion behavior: one call removes the thread and everything
  *  that follows it — messages, events, usage rows, subagent runs — plus the
@@ -50,6 +51,9 @@ export async function deleteThread(
   await deps.admin.threads.delete(threadId).catch((err) => {
     (deps.log ?? console).error('admin history of a deleted thread not removed', { threadId, err });
   });
+
+  // Its sandbox ends with it, rather than at its idle timeout.
+  await destroyThreadSandbox(deps, threadId);
 
   // Live UIs subscribed to the thread channel learn it ceased to exist —
   // bus-only notice (seq 0, never persisted: the event log is gone with it)

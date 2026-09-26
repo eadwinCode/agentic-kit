@@ -172,13 +172,26 @@ export { PrismaStorage, PrismaRunStreams, type PrismaLike, type PrismaStreamsLik
 export { UpstashBus, UpstashKv, UpstashRunStreams, THREAD_CHANNEL, type UpstashRedisLike, type UpstashSubscriberLike } from './adapters/upstash.js';
 export { RedisBus, RedisKv, RedisRunStreams, type RedisClientLike, type RedisSubscriberLike } from './adapters/redis.js';
 export { QStashQueue, type QStashLike, type QStashQueueOptions } from './adapters/qstash.js';
-export { MemoryStorage, MemoryBus, MemoryQueue, MemoryKv, MemoryRunStreams, MemorySearch, MemoryFetcher } from './adapters/memory.js';
+export { MemoryStorage, MemoryBus, MemoryQueue, MemoryKv, MemoryRunStreams, MemorySearch, MemoryFetcher, MemorySandbox } from './adapters/memory.js';
 export { BraveWebSearch, type BraveWebSearchOptions } from './adapters/brave.js';
 export { JinaWebSearch, JinaReader, type JinaOptions } from './adapters/jina.js';
 export { PageReader, BlockedUrlError, isPrivateAddress, type PageReaderOptions } from './adapters/page-reader.js';
 export type {
   BuiltinToolPorts, FetchedPage, Fetcher, FetchOptions, Search, SearchHit, SearchOptions, SearchRecency,
 } from './ports/tools.js';
+export { LocalSandbox, type LocalSandboxOptions } from './adapters/local-sandbox.js';
+export { DockerSandbox, type DockerSandboxOptions } from './adapters/docker.js';
+export { E2BSandbox, type E2BSandboxOptions } from './adapters/e2b.js';
+export {
+  ComputeSdkSandbox, type ComputeSdkSandboxOptions, type ComputeSdkProviderLike, type ComputeSdkSandboxLike,
+} from './adapters/computesdk.js';
+export {
+  DEFAULT_COMMAND_TIMEOUT_MS, MAX_COMMAND_OUTPUT_BYTES, TIMED_OUT_EXIT_CODE,
+  SandboxFileNotFoundError, SandboxGoneError, SandboxUnsupportedError,
+  type CommandResult, type CreateSandboxOptions, type FileEntry, type RunCommandOptions, type Sandbox,
+  type SandboxFileSystem, type SandboxInfo, type SandboxNetwork, type SandboxProvider,
+} from './ports/sandbox.js';
+export { sandboxFor, withSandbox, type ThreadSandbox } from './core/builtin/sandbox.js';
 export {
   BUILTIN_TOOL_DEFINITIONS, BUILTIN_TOOL_NAMES, type BuiltinToolName, type BuiltinToolOptions,
   type WebFetchOptions, type WebSearchOptions,

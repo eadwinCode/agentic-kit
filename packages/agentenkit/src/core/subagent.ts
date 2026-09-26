@@ -378,6 +378,7 @@ function nestedTools(
       ...(ctx.billingRunId ? { runId: ctx.billingRunId } : {}),
       agentId: d.agentId,
       agentName: d.name,
+      ...(ctx.state ? { state: ctx.state } : {}),
       ledger: ctx.ledger,
     },
   );

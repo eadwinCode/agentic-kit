@@ -129,6 +129,18 @@ type (
 	FetchOptions     = ports.FetchOptions
 	FetchedPage      = ports.FetchedPage
 	BuiltinToolPorts = ports.BuiltinToolPorts
+
+	SandboxProvider      = ports.SandboxProvider
+	Sandbox              = ports.Sandbox
+	SandboxFileSystem    = ports.SandboxFileSystem
+	SandboxInfo          = ports.SandboxInfo
+	SandboxNetwork       = ports.SandboxNetwork
+	SandboxMetadata      = ports.SandboxMetadata
+	SandboxResources     = ports.SandboxResources
+	CreateSandboxOptions = ports.CreateSandboxOptions
+	RunCommandOptions    = ports.RunCommandOptions
+	CommandResult        = ports.CommandResult
+	FileEntry            = ports.FileEntry
 )
 
 const (
@@ -243,8 +255,9 @@ type (
 	ContentPart      = core.ContentPart
 	TokenAttribution = core.TokenAttribution
 
-	ToolContext = core.ToolContext
-	ToolRun     = core.ToolRun
+	ToolContext   = core.ToolContext
+	ToolRun       = core.ToolRun
+	ThreadSandbox = core.ThreadSandbox
 
 	BuiltinToolOptions    = core.BuiltinToolOptions
 	BuiltinToolDefinition = core.BuiltinToolDefinition
@@ -363,6 +376,7 @@ var (
 	WithPublishEvent     = core.WithPublishEvent
 	ToolContextFrom      = core.ToolContextFrom
 	ToolRunFromContext   = core.ToolRunFromContext
+	SandboxFor           = core.SandboxFor
 	IsPermanentError     = core.IsPermanentError
 	BuiltinToolNames     = core.BuiltinToolNames
 	DecodeEntities       = core.DecodeEntities
@@ -378,4 +392,18 @@ var (
 // handler: the run state (§2.10) and PublishEvent.
 func AgentTool[In any](name, description string, execute func(ctx context.Context, input In, tc ToolContext) (string, error)) Tool {
 	return core.AgentTool(name, description, execute)
+}
+
+// The sandbox errors, for errors.Is.
+var (
+	ErrSandboxGone         = ports.ErrSandboxGone
+	ErrSandboxFileNotFound = ports.ErrSandboxFileNotFound
+	ErrSandboxUnsupported  = ports.ErrSandboxUnsupported
+)
+
+// WithSandbox runs fn on the thread's sandbox, from inside a tool. When the
+// sandbox turns out to be gone part way (it ended on its own), a fresh one
+// is made and fn runs once more, told Lost.
+func WithSandbox[T any](ctx context.Context, fn func(ThreadSandbox) (T, error)) (T, error) {
+	return core.WithSandbox(ctx, fn)
 }

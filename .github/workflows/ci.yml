@@ -53,6 +53,9 @@ jobs:
 
     env:
       TEST_ADMIN_PG: postgresql://postgres:password@localhost:5432/agentic_admin_test
+      # The Docker sandbox adapter runs the shared sandbox suite for real:
+      # the runner has a Docker daemon.
+      TEST_DOCKER_SANDBOX: '1'
 
     steps:
       - uses: actions/checkout@v4
@@ -131,6 +134,8 @@ jobs:
 
     env:
       TEST_ADMIN_PG: postgres://postgres:password@localhost:5432/agentic_admin_test?sslmode=disable
+      # The Docker sandbox adapter runs the shared sandbox suite for real.
+      TEST_DOCKER_SANDBOX: '1'
 
     defaults:
       run:

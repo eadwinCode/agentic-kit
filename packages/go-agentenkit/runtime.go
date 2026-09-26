@@ -105,6 +105,7 @@ func (c *AgentCore) scope(state AgentRunState, runID string) ports.RuntimePorts 
 		Pricer:       c.opts.Pricer,
 		Log:          c.opts.Log,
 		Config:       c.config,
+		Tools:        c.opts.Tools,
 	}
 }
 

@@ -1,4 +1,5 @@
 import type { RuntimePorts } from '../../ports/runtime.js';
+import type { AgentRunState } from '../state.js';
 import type { NewUsage } from '../types.js';
 import { recordCall, type RunLedger } from '../usage.js';
 
@@ -15,6 +16,8 @@ export interface ToolRun {
   agentId: string | null;
   agentName?: string;
   ledger?: RunLedger;
+  /** The run's state (§2.10), for adapters that pick per tenant. */
+  state?: AgentRunState;
 }
 
 /** Where a tool call's options carry its ToolRun. A symbol, so it never
