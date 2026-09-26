@@ -34,6 +34,19 @@ describe('sqlite (§3.4)', () => {
     expect(Object.values(db.prepare('PRAGMA busy_timeout').all()[0] as any)[0]).toBe(5000);
   });
 
+  it('many opening one fresh file at once all succeed', async () => {
+    // The workers of a `next build` do this: each opens the same new file.
+    const file = join(mkdtempSync(join(tmpdir(), 'race-')), 'race.sqlite');
+    const script = `
+      import { openSqlite } from ${JSON.stringify(new URL('../src/adapters/sqlite.ts', import.meta.url).pathname)};
+      try { await openSqlite(${JSON.stringify(file)}); console.log('ok'); }
+      catch (e) { console.log('FAIL ' + e.message); }`;
+    const runs = Array.from({ length: 8 }, () =>
+      Bun.spawn(['bun', '-e', script], { stdout: 'pipe', stderr: 'pipe' }));
+    const out = await Promise.all(runs.map((p) => new Response(p.stdout).text()));
+    expect(out.map((o) => o.trim())).toEqual(Array(8).fill('ok'));
+  });
+
   it('storage: a missing thread cannot be deleted', async () => {
     const s = new SqliteStorage(await openSqlite(':memory:'));
     await expect(s.threads.delete('nope')).rejects.toThrow('Unknown thread');

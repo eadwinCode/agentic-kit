@@ -37,17 +37,21 @@ export interface SqliteStatementLike {
 export async function openSqlite(filename = 'agentic-kit.sqlite'): Promise<SqliteLike> {
   const tried: string[] = [];
   for (const specifier of ['bun:sqlite', 'node:sqlite']) {
+    let Ctor: (new (filename: string) => SqliteLike) | undefined;
     try {
       // webpackIgnore keeps this a real runtime import. Bundlers otherwise
       // turn a variable specifier into a context module and fail to resolve
       // `node:sqlite` even on a Node that ships it — which is what happens
       // inside a Next.js server build.
       const mod: any = await import(/* webpackIgnore: true */ /* @vite-ignore */ specifier);
-      const Ctor = mod.Database ?? mod.DatabaseSync;
-      if (Ctor) return tuneSqlite(new Ctor(filename) as SqliteLike);
+      Ctor = mod.Database ?? mod.DatabaseSync;
     } catch (err) {
       tried.push(`${specifier}: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
     }
+    // Outside the try: a driver that loaded but cannot open or set up the
+    // file (locked, unwritable) must say so, not report a missing driver.
+    if (Ctor) return tuneSqlite(new Ctor(filename));
   }
   throw new Error(
     'No SQLite driver available. Run under Bun, or Node 22+ for node:sqlite, ' +
@@ -60,12 +64,31 @@ export async function openSqlite(filename = 'agentic-kit.sqlite'): Promise<Sqlit
  *  the one writer, and busy_timeout makes a writer wait up to five seconds for
  *  the lock rather than fail at once with SQLITE_BUSY. `openSqlite` calls it;
  *  call it yourself on a handle you opened some other way. An in-memory
- *  database keeps its own journal mode, which is fine. */
+ *  database keeps its own journal mode, which is fine.
+ *
+ *  busy_timeout goes FIRST: switching a new file to WAL takes a lock too.
+ *  And SQLite does not always wait on the busy timeout for that switch: with
+ *  several processes opening one fresh file at once (the workers of a
+ *  `next build`) it can give up at once with "database is locked". So the
+ *  switch is tried again for up to five seconds, like any other write. The
+ *  Go runtime's Tune does the same. */
 export function tuneSqlite<T extends SqliteLike>(db: T): T {
-  for (const pragma of ['PRAGMA journal_mode=WAL', 'PRAGMA busy_timeout=5000']) {
-    db.prepare(pragma).all(); // both answer with a row
+  db.prepare('PRAGMA busy_timeout=5000').all(); // answers with a row
+  for (let tries = 0; ; tries++) {
+    try {
+      db.prepare('PRAGMA journal_mode=WAL').all();
+      return db;
+    } catch (err) {
+      const locked = /locked|busy/i.test(err instanceof Error ? err.message : String(err));
+      if (!locked || tries >= 100) throw err;
+      sleepSync(50);
+    }
   }
-  return db;
+}
+
+/** Blocks for `ms`. Only for a setup step that must stay synchronous. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 // SQLite has no date or JSON type: times are epoch milliseconds so they sort
