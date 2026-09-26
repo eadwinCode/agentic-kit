@@ -48,10 +48,17 @@ type Reader struct {
 	client *http.Client
 }
 
-// ErrBlocked is returned, wrapped, for an address the reader must not reach.
+// ErrBlocked is what errors.Is finds for an address the reader must not
+// reach.
 var ErrBlocked = errors.New("page-reader: not allowed")
 
-func blocked(u, why string) error { return fmt.Errorf("%w: %s: %s", ErrBlocked, u, why) }
+// blockedError words the refusal as the TS runtime does; the model reads it.
+type blockedError struct{ url, why string }
+
+func (e *blockedError) Error() string        { return "page-reader: " + e.url + " is not allowed: " + e.why }
+func (e *blockedError) Is(target error) bool { return target == ErrBlocked }
+
+func blocked(u, why string) error { return &blockedError{u, why} }
 
 // New is a page reader.
 func New(opts Options) *Reader {
@@ -178,6 +185,12 @@ func (r *Reader) Fetch(ctx context.Context, target string, opts ports.FetchOptio
 	req.Header.Set("Accept", "text/html,text/plain;q=0.9,*/*;q=0.5")
 	res, err := r.client.Do(req)
 	if err != nil {
+		// A refusal on a redirect comes back inside the client's own
+		// wrapping; the model gets it in the same words as a direct one.
+		var be *blockedError
+		if errors.As(err, &be) {
+			return ports.FetchedPage{}, be
+		}
 		return ports.FetchedPage{}, err
 	}
 	defer res.Body.Close()

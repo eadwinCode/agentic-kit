@@ -405,7 +405,7 @@ func TestBuiltin_PricingToolsPricesToolRowsAndLeavesTheRest(t *testing.T) {
 }
 
 func TestBuiltin_IsPrivateAddressKnowsThePrivateRanges(t *testing.T) {
-	for _, ip := range []string{"127.0.0.1", "10.1.2.3", "172.20.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "224.0.0.1", "::1", "::", "fd00::1", "fe80::1", "::ffff:127.0.0.1", "not-an-ip"} {
+	for _, ip := range []string{"127.0.0.1", "10.1.2.3", "172.20.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "224.0.0.1", "::1", "::", "fd00::1", "fe80::1", "::ffff:127.0.0.1", "::ffff:7f00:1", "::ffff:a9fe:a9fe", "not-an-ip"} {
 		mustEqual(t, pagereader.IsPrivateAddress(ip), true, ip)
 	}
 	for _, ip := range []string{"8.8.8.8", "1.1.1.1", "172.32.0.1", "2606:4700::1111", "::ffff:8.8.8.8"} {
@@ -453,7 +453,8 @@ func TestBuiltin_ThePageReaderRefusesPrivateAddressesAlsoAfterARedirect(t *testi
 		}
 	}
 	_, err := reader.Fetch(context.Background(), "https://public.example/", opts)
-	if !errors.Is(err, pagereader.ErrBlocked) || !strings.Contains(err.Error(), "169.254.169.254") {
+	if !errors.Is(err, pagereader.ErrBlocked) ||
+		err.Error() != "page-reader: http://metadata.example/latest is not allowed: it resolves to a private address (169.254.169.254)" {
 		t.Fatalf("redirect to metadata: got %v", err)
 	}
 	mustStrings(t, asked, []string{"https://public.example/"}, "the private hop was never requested")
@@ -484,7 +485,7 @@ func TestBuiltin_BraveSendsTheQueryFiltersAndKey(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen = r
 		_, _ = io.WriteString(w, `{"web":{"results":[
-			{"title":"A","url":"https://docs.a.example/x","description":"an <strong>a</strong>","page_age":"2026-01-02T00:00:00"},
+			{"title":"A &amp; B","url":"https://docs.a.example/x","description":"an <strong>a</strong> &amp; b","page_age":"2026-01-02T00:00:00"},
 			{"title":"Blocked","url":"https://b.example/y","description":"b"}]}}`)
 	}))
 	defer srv.Close()
@@ -502,7 +503,7 @@ func TestBuiltin_BraveSendsTheQueryFiltersAndKey(t *testing.T) {
 	mustEqual(t, q.Get("freshness"), "pw", "freshness")
 	mustEqual(t, q.Get("count"), "5", "count")
 	mustEqual(t, seen.Header.Get("X-Subscription-Token"), "k1", "key")
-	mustJSON(t, got, []ports.SearchHit{{Title: "A", URL: "https://docs.a.example/x", Snippet: "an a", PublishedAt: "2026-01-02T00:00:00"}}, "hits")
+	mustJSON(t, got, []ports.SearchHit{{Title: "A & B", URL: "https://docs.a.example/x", Snippet: "an a & b", PublishedAt: "2026-01-02T00:00:00"}}, "hits")
 }
 
 func TestBuiltin_JinaSearchKeepsOnlyASnippet(t *testing.T) {

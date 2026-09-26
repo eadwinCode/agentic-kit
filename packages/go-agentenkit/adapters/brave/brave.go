@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/internal/websearch"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/core"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
 
@@ -102,8 +103,10 @@ func (b *WebSearch) Search(ctx context.Context, query string, opts ports.SearchO
 		if r.URL == "" || !websearch.DomainAllowed(r.URL, opts) {
 			continue
 		}
+		// Brave sends text as HTML: tags in snippets, entities in both.
 		hits = append(hits, ports.SearchHit{
-			Title: r.Title, URL: r.URL, Snippet: reTags.ReplaceAllString(r.Description, ""), PublishedAt: r.PageAge,
+			Title: core.DecodeEntities(r.Title), URL: r.URL,
+			Snippet: core.DecodeEntities(reTags.ReplaceAllString(r.Description, "")), PublishedAt: r.PageAge,
 		})
 		if len(hits) >= opts.MaxResults {
 			break

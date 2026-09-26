@@ -1,5 +1,6 @@
 import type { Search, SearchHit, SearchOptions, SearchRecency } from '../ports/tools.js';
 import { domainAllowed, withSiteFilters } from './web-search-shared.js';
+import { decodeEntities } from '../core/builtin/html.js';
 
 export interface BraveWebSearchOptions {
   apiKey: string;
@@ -45,9 +46,10 @@ export class BraveWebSearch implements Search {
     for (const r of body.web?.results ?? []) {
       if (!r.url || !domainAllowed(r.url, opts)) continue;
       hits.push({
-        title: r.title ?? '',
+        // Brave sends text as HTML: tags in snippets, entities in both.
+        title: decodeEntities(r.title ?? ''),
         url: r.url,
-        snippet: (r.description ?? '').replace(/<[^>]*>/g, ''),
+        snippet: decodeEntities((r.description ?? '').replace(/<[^>]*>/g, '')),
         ...(r.page_age ? { publishedAt: r.page_age } : {}),
       });
       if (hits.length >= opts.maxResults) break;

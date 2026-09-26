@@ -331,7 +331,7 @@ describe('built-in tools: web search and fetch (T2)', () => {
 
 describe('built-in tools: adapters (T2)', () => {
   it('isPrivateAddress knows the private ranges', () => {
-    for (const ip of ['127.0.0.1', '10.1.2.3', '172.20.0.1', '192.168.1.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '224.0.0.1', '::1', '::', 'fd00::1', 'fe80::1', '::ffff:127.0.0.1', 'not-an-ip']) {
+    for (const ip of ['127.0.0.1', '10.1.2.3', '172.20.0.1', '192.168.1.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '224.0.0.1', '::1', '::', 'fd00::1', 'fe80::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '::ffff:a9fe:a9fe', 'not-an-ip']) {
       expect({ ip, private: isPrivateAddress(ip) }).toEqual({ ip, private: true });
     }
     for (const ip of ['8.8.8.8', '1.1.1.1', '172.32.0.1', '2606:4700::1111', '::ffff:8.8.8.8']) {
@@ -353,7 +353,9 @@ describe('built-in tools: adapters (T2)', () => {
 
     await expect(reader.fetch('http://127.0.0.1/admin', { maxBytes: 1000, format: 'markdown' })).rejects.toBeInstanceOf(BlockedUrlError);
     await expect(reader.fetch('http://localhost:3000/', { maxBytes: 1000, format: 'markdown' })).rejects.toBeInstanceOf(BlockedUrlError);
-    await expect(reader.fetch('https://public.example/', { maxBytes: 1000, format: 'markdown' })).rejects.toThrow('169.254.169.254');
+    await expect(reader.fetch('https://public.example/', { maxBytes: 1000, format: 'markdown' })).rejects.toThrow(
+      'page-reader: http://metadata.example/latest is not allowed: it resolves to a private address (169.254.169.254)',
+    );
     expect(asked).toEqual(['https://public.example/']); // the private hop was never requested
   });
 
@@ -375,7 +377,7 @@ describe('built-in tools: adapters (T2)', () => {
       seen = { url, headers: init.headers as Record<string, string> };
       return Response.json({
         web: { results: [
-          { title: 'A', url: 'https://docs.a.example/x', description: 'an <strong>a</strong>', page_age: '2026-01-02T00:00:00' },
+          { title: 'A &amp; B', url: 'https://docs.a.example/x', description: 'an <strong>a</strong> &amp; b', page_age: '2026-01-02T00:00:00' },
           { title: 'Blocked', url: 'https://b.example/y', description: 'b' },
         ] },
       });
@@ -388,7 +390,7 @@ describe('built-in tools: adapters (T2)', () => {
     expect(u.searchParams.get('freshness')).toBe('pw');
     expect(u.searchParams.get('count')).toBe('5');
     expect(seen!.headers['x-subscription-token']).toBe('k1');
-    expect(got).toEqual([{ title: 'A', url: 'https://docs.a.example/x', snippet: 'an a', publishedAt: '2026-01-02T00:00:00' }]);
+    expect(got).toEqual([{ title: 'A & B', url: 'https://docs.a.example/x', snippet: 'an a & b', publishedAt: '2026-01-02T00:00:00' }]);
   });
 
   it('jina search keeps only a snippet', async () => {

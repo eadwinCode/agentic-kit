@@ -36,8 +36,10 @@ const failed = (error: string) => ({ error });
 const refTtlSeconds = (run: ToolRun) => Math.ceil(run.deps.config.hitlTtlMs / 1000) + 24 * 60 * 60;
 const scopeOf = (run: ToolRun) => run.runId ?? run.threadId;
 const usesKey = (run: ToolRun, tool: string) => `agent:tool:uses:${scopeOf(run)}:${tool}`;
-const searchKey = (run: ToolRun) => `agent:tool:searches:${scopeOf(run)}`;
-const refKey = (run: ToolRun, id: string) => `agent:tool:ref:${scopeOf(run)}:${id}`;
+// Result ids are the thread's, not the run's: they stay in the history, so a
+// later turn must read the same id as the same page.
+const searchKey = (run: ToolRun) => `agent:tool:searches:${run.threadId}`;
+const refKey = (run: ToolRun, id: string) => `agent:tool:ref:${run.threadId}:${id}`;
 
 /** Count one use and say whether it is over the run's limit. */
 async function overLimit(run: ToolRun, tool: string, maxUses: number | undefined): Promise<boolean> {

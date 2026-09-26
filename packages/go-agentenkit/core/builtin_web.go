@@ -69,8 +69,11 @@ func toolScope(run ToolRun) string {
 func usesKey(run ToolRun, tool string) string {
 	return "agent:tool:uses:" + toolScope(run) + ":" + tool
 }
-func searchKey(run ToolRun) string         { return "agent:tool:searches:" + toolScope(run) }
-func refKey(run ToolRun, id string) string { return "agent:tool:ref:" + toolScope(run) + ":" + id }
+
+// Result ids are the thread's, not the run's: they stay in the history, so
+// a later turn must read the same id as the same page.
+func searchKey(run ToolRun) string         { return "agent:tool:searches:" + run.ThreadID }
+func refKey(run ToolRun, id string) string { return "agent:tool:ref:" + run.ThreadID + ":" + id }
 
 // overLimit counts one use and says whether it is over the run's limit.
 func overLimit(ctx context.Context, run ToolRun, tool string, maxUses int) (bool, error) {

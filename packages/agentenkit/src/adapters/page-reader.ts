@@ -53,6 +53,13 @@ export function isPrivateAddress(ip: string): boolean {
     const v = ip.toLowerCase();
     const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(v);
     if (mapped) return isPrivateAddress(mapped[1]!);
+    // The URL parser writes a mapped address in hex: ::ffff:7f00:1.
+    const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(v);
+    if (hex) {
+      const hi = parseInt(hex[1]!, 16);
+      const lo = parseInt(hex[2]!, 16);
+      return isPrivateAddress(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+    }
     return (
       v === '::' || v === '::1' ||
       /^f[cd]/.test(v) || // fc00::/7, unique local
