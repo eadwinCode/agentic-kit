@@ -91,7 +91,7 @@ func creditCheck(ctx context.Context, check agentenkit.BillingCheck) error {
 	return fmt.Errorf("credit limit reached. resets %s - clear it to continue", resetAt().Format("2 Jan"))
 }
 
-func newApp(rt *agentenkit.AgentCore, model string) *app {
+func newApp(rt *agentenkit.AgentCore, model string, hasSearch bool) *app {
 	a := &app{rt: rt, model: model}
 	// Every tool gets a ToolContext: the run state, the tool call id, and
 	// PublishEvent bound to the thread. Custom events reach the SPA through
@@ -106,6 +106,22 @@ func newApp(rt *agentenkit.AgentCore, model string) *app {
 		// Parked too, but the approval carries answers back into the tool.
 		agentenkit.MarkRequiresConfirmation(a.askDesignQuestions()),
 	}
+	// The built-in web tools: one name and one input shape in every runtime,
+	// so any model can use them. A search result's id (s1r2) opens the page
+	// with web_fetch, and a prompt has a small model read the page and
+	// answer, so the page never fills the main context.
+	names := []string{"web_fetch"}
+	if hasSearch {
+		names = []string{"web_search", "web_fetch"}
+	}
+	web, err := rt.BuiltinTools(names, agentenkit.BuiltinToolOptions{
+		WebSearch: agentenkit.WebSearchOptions{MaxUses: 10},
+		WebFetch:  agentenkit.WebFetchOptions{MaxUses: 20},
+	})
+	if err != nil {
+		panic(err) // a startup error: the adapters are set up in main
+	}
+	tools = append(tools, web...)
 	a.chat = rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
 		Name:  "chat",
 		Model: model,
@@ -113,13 +129,17 @@ func newApp(rt *agentenkit.AgentCore, model string) *app {
 		OnFinish: func(info agentenkit.RunFinishInfo) { credit.spend(info.ThreadID, info.TokensUsed) },
 		System: "You are a concise assistant for a small design studio. Use the tools when they help. " +
 			"Before rendering a design, ask the user questions with askDesignQuestions if the brief is vague. " +
-			"Delegate research to a subagent when a task is self-contained.",
+			"Delegate research to a subagent when a task is self-contained. " +
+			"For anything current, search the web with web_search, then open the most useful results with web_fetch, " +
+			"passing the result id and a prompt that says what you need from the page. Cite the pages you used.",
 		Tools: tools,
 		// Opt-in delegation (§2.7): the platform injects spawnSubagent, and
 		// these tools are merged into every child and HITL-wrapped like the
 		// parent's, so a subagent parks for approval too.
 		Subagents: &agentenkit.SubagentsConfig{
-			Tools: []agentenkit.Tool{a.getWeather(), agentenkit.MarkRequiresConfirmation(a.sendEmail())},
+			// The web tools go to children as well: a researcher subagent
+			// searches and reads on its own, billed to the same run.
+			Tools: append([]agentenkit.Tool{a.getWeather(), agentenkit.MarkRequiresConfirmation(a.sendEmail())}, web...),
 		},
 	})
 	return a

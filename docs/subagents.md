@@ -40,6 +40,10 @@ Tools listed under `subagents` are merged into every child and wrapped exactly
 as the parent's are — so a child that calls a marked tool parks for approval,
 and is resumed where it stopped rather than restarted.
 
+The built-in [web tools](./web-tools.md) work in children too: pass
+`runtime.builtinTools([...])` under `subagents.tools`, and a researcher child
+searches and reads pages on its own, billed to the parent's run.
+
 ## Named profiles
 
 The default child is a generalist with one persona and the shared tools.

@@ -26,8 +26,11 @@ import (
 	_ "modernc.org/sqlite"
 
 	agentenkit "github.com/eadwinCode/agentic-kit/packages/go-agentenkit"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/brave"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/inline"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/jina"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/memory"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/pagereader"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/redis"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/sqlite"
 	sqliteadmin "github.com/eadwinCode/agentic-kit/packages/go-agentenkit/admin/sqlite"
@@ -101,6 +104,7 @@ func main() {
 	queue := inline.New(ctx)
 
 	apiKey := os.Getenv("OPENAI_API_KEY")
+	webTools := webToolPorts()
 	cfg := agentenkit.DefaultConfig()
 	cfg.StopPoll = 200 * time.Millisecond
 	cfg.BillingPreCheck = creditCheck
@@ -118,7 +122,11 @@ func main() {
 		// from — no second table, no wrapper around the model. Swap this for
 		// pricing.Chain(pricing.Receipt(...), modelPrices) if your gateway
 		// sends the real figure back and you want that over a price list.
-		Pricer: modelPrices,
+		// Tool use is priced too, per search, and counts against a run's
+		// money cap.
+		Pricer: pricing.Chain(modelPrices, toolPrices),
+		// The adapters behind the built-in web tools (see newApp).
+		Tools: webTools,
 		// Models come in any shape; the platform only sees ResolvedModel.
 		ResolveModel: func(name string) (agentenkit.ResolvedModel, error) {
 			if apiKey == "" || name == "mock" {
@@ -143,7 +151,7 @@ func main() {
 	defer rt.Close()
 	queue.Bind(rt.Worker.Handler())
 
-	app := newApp(rt, defaultModel(apiKey))
+	app := newApp(rt, defaultModel(apiKey), webTools.Search != nil)
 	srv := &http.Server{Addr: *addr, Handler: app.routes(*static)}
 
 	go func() {
@@ -182,6 +190,34 @@ func defaultModel(apiKey string) string {
 // modelIDs is the wire id each registry key resolves to (§4). It goes onto
 // every usage row, so a price list keyed by wire ids still matches when the
 // key is an alias.
+// toolPrices prices the built-in tools per use, keyed by adapter.
+var toolPrices = pricing.Tools{"brave": {PerUse: 0.005}, "jina-search": {PerUse: 0.0005}}
+
+// webToolPorts builds the web tools' adapters. Each key is passed in here,
+// at setup; nothing reads it later. Brave when its key is set, else Jina;
+// with neither, the agent can still read pages (our page reader is free) but
+// not search.
+func webToolPorts() agentenkit.BuiltinToolPorts {
+	var ports agentenkit.BuiltinToolPorts
+	braveKey, jinaKey := os.Getenv("BRAVE_API_KEY"), os.Getenv("JINA_API_KEY")
+	if braveKey != "" {
+		ports.Search, _ = brave.New(braveKey)
+	} else if jinaKey != "" {
+		ports.Search, _ = jina.NewWebSearch(jinaKey)
+	}
+	// Our own reader by default. The Jina reader reads pages built with
+	// JavaScript and PDFs, for a small price: WEB_READER=jina uses it.
+	if os.Getenv("WEB_READER") == "jina" && jinaKey != "" {
+		ports.Fetcher, _ = jina.NewReader(jinaKey)
+	} else {
+		ports.Fetcher = pagereader.New(pagereader.Options{})
+	}
+	if ports.Search == nil {
+		log.Printf("BRAVE_API_KEY and JINA_API_KEY not set: web_fetch only, no web_search")
+	}
+	return ports
+}
+
 var modelIDs = map[string]string{
 	"gpt-4o":      "gpt-4o-2024-11-20",
 	"gpt-4o-mini": "gpt-4o-mini-2024-07-18",

@@ -4,7 +4,11 @@ import { PrismaClient } from '@prisma/client';
 import { z } from 'zod';
 import { tool } from 'ai';
 import {
+  BraveWebSearch,
+  JinaReader,
+  JinaWebSearch,
   markRequiresConfirmation,
+  PageReader,
   pricing,
   PrismaStorage,
   QStashQueue,
@@ -41,6 +45,20 @@ if (dev) {
   cache.agentPrisma = prisma;
 }
 
+// The web tools' adapters. Each key is passed in here, at setup; nothing
+// reads it later. Brave when its key is set, else Jina; with neither, the
+// agent can still read pages (our PageReader is free) but not search.
+const braveKey = process.env.BRAVE_API_KEY;
+const jinaKey = process.env.JINA_API_KEY;
+const search = braveKey
+  ? new BraveWebSearch({ apiKey: braveKey })
+  : jinaKey
+    ? new JinaWebSearch({ apiKey: jinaKey })
+    : undefined;
+// Our own reader by default. JinaReader reads pages built with JavaScript and
+// PDFs, for a small price: set WEB_READER=jina to use it.
+const fetcher = process.env.WEB_READER === 'jina' && jinaKey ? new JinaReader({ apiKey: jinaKey }) : new PageReader();
+
 /** The ONLY vendor-wiring file in the example app (spec §5). Swap any adapter
  *  here — Mongo/Dynamo storage, SQS/BullMQ queue, Ably/Kafka bus — and every
  *  route below keeps working unchanged. */
@@ -70,7 +88,14 @@ export const runtime = await setupAgentCore({
   // table, no wrapper around the model. Swap `pricing.table` for
   // `pricing.chain(pricing.receipt(...), pricing.table(...))` if your gateway
   // sends the real figure back and you want that instead of a price list.
-  pricer: pricing.table(modelPrices),
+  // Tool use is priced too, per search, and counts against a run's money cap.
+  pricer: pricing.chain(
+    pricing.table(modelPrices),
+    pricing.tools({ brave: { perUse: 0.005 }, 'jina-search': { perUse: 0.0005 } }),
+  ),
+
+  // The adapters behind the built-in web tools (see webTools below).
+  tools: { ...(search ? { search } : {}), fetcher },
 
   // Models can come in any shape — the platform only ever sees
   // ResolvedModel { instance, contextWindow, modelId } (§3.3).
@@ -104,17 +129,33 @@ const sendEmail = markRequiresConfirmation(
   }),
 );
 
+// The built-in web tools: one name and one input shape in every runtime, so
+// any model can use them. A search result's id (s1r2) opens the page with
+// web_fetch, and a `prompt` has a small model read the page and answer, so
+// the page never fills the main context.
+const webTools = runtime.builtinTools(search ? ['web_search', 'web_fetch'] : ['web_fetch'], {
+  webSearch: { maxUses: 10 },
+  webFetch: { maxUses: 20 },
+});
+
 /** Registered agent handles (§4). The worker dispatches queue jobs back to
  *  these by name (`RunJob.agent`). */
 export const chat = runtime.createStreamTextAgent({
   name: 'chat',
   model: 'gpt-4o',
+  system:
+    'You are a helpful assistant. For anything current or that you are unsure of, search the web with ' +
+    'web_search, then open the most useful results with web_fetch, passing the result id and a prompt that ' +
+    'says what you need from the page. Cite the pages you used. For a research task with several parts, ' +
+    'hand each part to a subagent with spawnSubagent.',
   // Opt-in delegation (§2.7): the platform injects the scoped spawnSubagent
   // tool, and `tools` here are merged into every child and HITL-wrapped just
   // like the parent's — so a subagent parks for approval too, and is resumed
-  // where it stopped rather than restarted.
-  subagents: { tools: { sendEmail } },
-  tools: { sendEmail },
+  // where it stopped rather than restarted. The web tools go to children as
+  // well: a researcher subagent searches and reads on its own, billed to the
+  // same run.
+  subagents: { tools: { sendEmail, ...webTools } },
+  tools: { sendEmail, ...webTools },
 });
 
 /** Local dev without QStash cloud: when INLINE_WORKER=1, the run route

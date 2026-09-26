@@ -158,6 +158,21 @@ pricer: pricing.chain(
 The first pricer that answers wins. A pricer that fails is skipped rather than
 believed, and if none answers the call is stored unpriced.
 
+### `tools` — searches and other tool services
+
+The built-in [web tools](./web-tools.md) write a usage row for each search
+and page read (`kind: 'tool'`, `model: 'tool:web_search'`, `modelId` the
+adapter). `pricing.tools` prices them per use, keyed by adapter; chain it with
+the model table, and tool spend counts against a run's money cap:
+
+```ts
+pricer: pricing.chain(pricing.table(prices), pricing.tools({ brave: { perUse: 0.005 } })),
+```
+
+```go
+Pricer: pricing.Chain(prices, pricing.Tools{"brave": {PerUse: 0.005}}),
+```
+
 ### Writing your own
 
 A pricer is one method. In Go it is a `ports.Pricer`, or `ports.PricerFunc`

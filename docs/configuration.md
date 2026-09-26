@@ -12,6 +12,7 @@ const runtime = await setupAgentCore({
   resolveModel,     // required — registry key → { instance, contextWindow, modelId }
   admin,            // optional — defaults to SQLite, or Postgres via env
   pricer,           // optional — prices every model call (§4)
+  tools,            // optional — { search, fetcher } for the built-in web tools
   log,              // optional — defaults to console
   config,           // optional — everything below
 });
@@ -66,6 +67,12 @@ start from `DefaultConfig()` to keep them on.
 | `subagentMaxConcurrent` | `3` | Children running at once per run, at each depth. |
 | `subagentMaxSteps` | `10` | Model round trips per child. |
 | `subagentResultCapChars` | `8000` | Characters of a child's result handed to the parent. |
+
+### Built-in tools
+
+| Setting | Default | Meaning |
+| :--- | ---: | :--- |
+| `builtinToolResultCapChars` | `20000` | The most characters a built-in tool hands the model in one result: a page's text, a reader's answer. Past it the text is cut and the result says `truncated: true`. See [Web tools](./web-tools.md). |
 
 ### Context and caching
 

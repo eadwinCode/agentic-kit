@@ -110,6 +110,9 @@ const lookup = tool({
 });
 ```
 
+For searching the web and reading pages there are built-in tools that work
+with any model: see [Web tools](./web-tools.md).
+
 ### Tools that need a human first
 
 ```ts
