@@ -532,6 +532,11 @@ const (
 	// inside the model's window (§2.6). Nobody asked for it, so it is worth
 	// being able to see what it costs on its own.
 	KindCompaction UsageKind = "compaction"
+	// KindTool is a built-in tool: one row per use of a paid service (a
+	// search, a page read), with Model "tool:<tool name>" and ModelID the
+	// adapter, and one per model call a tool makes itself (reading a page
+	// with a question).
+	KindTool UsageKind = "tool"
 )
 
 // Cost is the money one model call cost.
@@ -907,6 +912,11 @@ type AgentConfig struct {
 	SubagentMaxSteps int
 	// SubagentResultCapChars caps a subagent result handed to the parent.
 	SubagentResultCapChars int
+	// BuiltinToolResultCapChars is the most characters a built-in tool hands
+	// the model in one result: a page's text, a reader's answer. Past it the
+	// text is cut and the result says truncated, so one huge page cannot fill
+	// the context window or the database. Default 20,000.
+	BuiltinToolResultCapChars int
 	// RecordPayloads records prompts, state, step text and tool payloads into
 	// the operational store (§2.9). Turn it off when those carry anything
 	// that should not sit in an operational database.
@@ -971,6 +981,7 @@ func mergeConfig(c, d AgentConfig) AgentConfig {
 	orInt(&c.SubagentMaxConcurrent, d.SubagentMaxConcurrent)
 	orInt(&c.SubagentMaxSteps, d.SubagentMaxSteps)
 	orInt(&c.SubagentResultCapChars, d.SubagentResultCapChars)
+	orInt(&c.BuiltinToolResultCapChars, d.BuiltinToolResultCapChars)
 	orInt(&c.PayloadCapChars, d.PayloadCapChars)
 	orDur(&c.StreamGrace, d.StreamGrace)
 	orDur(&c.StreamTTL, d.StreamTTL)
@@ -997,6 +1008,7 @@ func DefaultConfig() AgentConfig {
 		SubagentMaxConcurrent:      3,
 		SubagentMaxSteps:           10,
 		SubagentResultCapChars:     8_000,
+		BuiltinToolResultCapChars:  20_000,
 		RecordPayloads:             true,
 		PayloadCapChars:            2_000,
 		ContextCeilingTokens:       265_000,
@@ -1051,6 +1063,9 @@ func ResolveConfig(partial *AgentConfig) (AgentConfig, error) {
 	}
 	if config.StreamFlush < 0 {
 		return config, fmt.Errorf("invalid config: StreamFlush (%s) must not be negative", config.StreamFlush)
+	}
+	if config.BuiltinToolResultCapChars < 1 {
+		return config, fmt.Errorf("invalid config: BuiltinToolResultCapChars (%d) must be at least 1", config.BuiltinToolResultCapChars)
 	}
 	if config.StreamGrace < time.Millisecond || config.StreamTTL < time.Millisecond || config.StreamFlushEvents < 1 {
 		return config, errors.New("invalid config: StreamGrace and StreamTTL must be at least 1ms, StreamFlushEvents at least 1")

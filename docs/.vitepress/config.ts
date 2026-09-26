@@ -57,6 +57,7 @@ export default defineConfig({
         text: 'Building with it',
         items: [
           { text: 'Agents and tools', link: '/agents-and-tools' },
+          { text: 'Web tools', link: '/web-tools' },
           { text: 'Human in the loop', link: '/human-in-the-loop' },
           { text: 'Subagents', link: '/subagents' },
           { text: 'Context and tokens', link: '/context-and-tokens' },

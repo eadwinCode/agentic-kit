@@ -101,6 +101,39 @@ export function table(prices: PriceTable, currency: string = USD): Pricer {
   };
 }
 
+/** What one use of a paid tool service costs, in currency units. */
+export interface ToolPrice {
+  perUse: number;
+}
+
+/** Tool prices, keyed by adapter name ('brave', 'jina-search') or by tool
+ *  name ('web_search'). The adapter wins: the same tool costs what the
+ *  service behind it charges. */
+export type ToolPriceTable = Record<string, ToolPrice>;
+
+/** Prices the built-in tools' usage rows (`kind: 'tool'`, `model:
+ *  'tool:<name>'`), per use. Every other row is left to the next pricer, so
+ *  chain it with the model table:
+ *
+ *  ```ts
+ *  pricer: pricing.chain(pricing.table(modelPrices), pricing.tools({ brave: { perUse: 0.005 } }))
+ *  ```
+ *
+ *  A tool's own model calls (reading a page with a question) carry the
+ *  model's key, so the model table prices them. */
+export function tools(prices: ToolPriceTable, currency: string = USD): Pricer {
+  return {
+    price(u: NewUsage): Cost | null {
+      if (u.kind !== 'tool' || !u.model?.startsWith('tool:')) return null;
+      const p = (u.modelId ? prices[u.modelId] : undefined) ?? prices[u.model.slice('tool:'.length)];
+      if (!p) return null;
+      const raw = (u.providerMetadata as { uses?: unknown } | null | undefined)?.uses;
+      const uses = typeof raw === 'number' && raw > 0 ? raw : 1;
+      return { micros: Math.round(p.perUse * 1_000_000 * uses), currency, source: 'table' };
+    },
+  };
+}
+
 /** Pulls a cost out of what the provider attached to the finish: a gateway
  *  receipt, a billing header, whatever your provider sends. Return null when
  *  this call carried no receipt, and the next pricer in a chain gets its

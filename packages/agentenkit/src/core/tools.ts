@@ -24,6 +24,11 @@ export interface ToolContext extends ToolExecutionOptions {
    *  (§2.5): whatever the human sent back with the approval — answers to
    *  questions, a corrected value, a reason. Absent on a first, live call. */
   approval?: { payload?: unknown };
+  /** The thread this call is acting on. */
+  threadId: string;
+  /** The dispatched run this call is part of: a nested run's calls carry
+   *  their parent's run id, so one run's work is one query. */
+  runId?: string;
 }
 
 /** `tool()` with the run state typed.

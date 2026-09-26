@@ -82,6 +82,10 @@ type RuntimeOptions struct {
 	Log *slog.Logger
 	// Config is nil for the defaults.
 	Config *AgentConfig
+	// Tools are the adapters behind the built-in tools: a search engine for
+	// web_search, a page reader for web_fetch. Only the tools you ask
+	// BuiltinTools for need theirs.
+	Tools BuiltinToolPorts
 }
 
 // RunInput starts a run.

@@ -99,7 +99,7 @@ export { countTokens, sumUsage, emptyTotals, UsageMerger, type UsageGroup } from
 /** Pricing (§4): the pricers that ship with the platform. `pricing.table(...)`
  *  is the common case; see the module for `receipt` and `chain`. */
 export * as pricing from './pricing.js';
-export type { ModelPrice, PriceTable, ReceiptReader } from './pricing.js';
+export type { ModelPrice, PriceTable, ReceiptReader, ToolPrice, ToolPriceTable } from './pricing.js';
 export {
   respond,
   parkForApproval,
@@ -132,6 +132,7 @@ export {
   type ToolPublishEvent,
 } from './core/publish.js';
 export { stop } from './core/stop.js';
+export { isPermanentError } from './core/permanent.js';
 export { repairDanglingToolCalls, DANGLING_CALL_RESULT } from './core/messages.js';
 
 // types
@@ -171,4 +172,14 @@ export { PrismaStorage, PrismaRunStreams, type PrismaLike, type PrismaStreamsLik
 export { UpstashBus, UpstashKv, UpstashRunStreams, THREAD_CHANNEL, type UpstashRedisLike, type UpstashSubscriberLike } from './adapters/upstash.js';
 export { RedisBus, RedisKv, RedisRunStreams, type RedisClientLike, type RedisSubscriberLike } from './adapters/redis.js';
 export { QStashQueue, type QStashLike, type QStashQueueOptions } from './adapters/qstash.js';
-export { MemoryStorage, MemoryBus, MemoryQueue, MemoryKv, MemoryRunStreams } from './adapters/memory.js';
+export { MemoryStorage, MemoryBus, MemoryQueue, MemoryKv, MemoryRunStreams, MemorySearch, MemoryFetcher } from './adapters/memory.js';
+export { BraveWebSearch, type BraveWebSearchOptions } from './adapters/brave.js';
+export { JinaWebSearch, JinaReader, type JinaOptions } from './adapters/jina.js';
+export { PageReader, BlockedUrlError, isPrivateAddress, type PageReaderOptions } from './adapters/page-reader.js';
+export type {
+  BuiltinToolPorts, FetchedPage, Fetcher, FetchOptions, Search, SearchHit, SearchOptions, SearchRecency,
+} from './ports/tools.js';
+export {
+  BUILTIN_TOOL_DEFINITIONS, BUILTIN_TOOL_NAMES, type BuiltinToolName, type BuiltinToolOptions,
+  type WebFetchOptions, type WebSearchOptions,
+} from './core/builtin/index.js';

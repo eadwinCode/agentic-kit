@@ -19,4 +19,11 @@ bunx prisma migrate dev --name init
 bun dev
 ```
 
+**Web tools.** Set `BRAVE_API_KEY` (or `JINA_API_KEY`) in `.env` and the agent
+and its subagents can search the web (`web_search`) and read pages
+(`web_fetch`). Without a key the agent can still read pages but not search.
+The keys are passed to the adapters in `lib/runtime.ts`. Try: *"What is the
+latest version of the MCP spec? Cite the page."* See
+[Web tools](../../docs/web-tools.md).
+
 For local queue testing without QStash cloud, the [`@upstash/qstash` dev CLI](https://docs.upstash.com/qstash/how-tos/local-development) replays signed requests to `localhost`.

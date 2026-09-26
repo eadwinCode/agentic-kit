@@ -349,11 +349,15 @@ func nestedTools(sctx *SubagentCtx, d ports.NestedDescriptor, frames []HitlFrame
 	child.Descriptor = &desc
 	raw := append([]ports.Tool{}, nestedRawTools(sctx, &d)...)
 	raw = append(raw, SpawnSubagentTool(&child))
-	// A nested run's tools see the same state as its parent's (§2.10), and
-	// publish on the same thread.
-	return WithRunState(WithPublishEvent(sctx.Ports, sctx.ThreadID, WithHitl(sctx.Ports, sctx.ThreadID, raw, HitlCtx{
+	// A nested run's tools see the same state as its parent's (§2.10),
+	// publish on the same thread, and bill the parent's run on the shared
+	// ledger.
+	return WithToolRun(WithRunState(WithPublishEvent(sctx.Ports, sctx.ThreadID, WithHitl(sctx.Ports, sctx.ThreadID, raw, HitlCtx{
 		Resume: sctx.Resume, AgentID: d.AgentID, Frames: frames, Nested: &desc, Parks: sctx.Parks,
-	})), sctx.State)
+	})), sctx.State), ToolRun{
+		Deps: sctx.Ports, ThreadID: sctx.ThreadID, RunID: sctx.BillingRunID,
+		AgentID: d.AgentID, AgentName: d.Name, Ledger: sctx.Ledger,
+	})
 }
 
 // resolveNestedModel: the delegation tool lets the MODEL name the child's

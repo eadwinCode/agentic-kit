@@ -211,3 +211,61 @@ func Format(micros int64, currency string) string {
 	}
 	return fmt.Sprintf("%.4f %s", Amount(micros), currency)
 }
+
+// ToolPrice is what one use of a paid tool service costs, in currency
+// units.
+type ToolPrice struct {
+	PerUse float64
+}
+
+// Tools prices the built-in tools' usage rows (Kind "tool", Model
+// "tool:<name>"), per use, keyed by adapter name ("brave", "jina-search")
+// or by tool name ("web_search"). The adapter wins: the same tool costs what
+// the service behind it charges. Every other row is left to the next
+// pricer, so chain it with the model table:
+//
+//	Pricer: pricing.Chain(modelPrices, pricing.Tools{"brave": {PerUse: 0.005}})
+//
+// A tool's own model calls (reading a page with a question) carry the
+// model's key, so the model table prices them.
+type Tools map[string]ToolPrice
+
+// Price is in US dollars; use In for another currency.
+func (t Tools) Price(ctx context.Context, u ports.NewUsage) (*ports.Cost, error) {
+	return t.priceIn(USD, u), nil
+}
+
+// In is the same prices in another currency.
+func (t Tools) In(currency string) ports.Pricer {
+	return ports.PricerFunc(func(_ context.Context, u ports.NewUsage) (*ports.Cost, error) {
+		return t.priceIn(currency, u), nil
+	})
+}
+
+func (t Tools) priceIn(currency string, u ports.NewUsage) *ports.Cost {
+	if u.Kind != ports.KindTool || !strings.HasPrefix(u.Model, "tool:") {
+		return nil
+	}
+	p, ok := t[u.ModelID]
+	if !ok || u.ModelID == "" {
+		if p, ok = t[strings.TrimPrefix(u.Model, "tool:")]; !ok {
+			return nil
+		}
+	}
+	uses := 1.0
+	switch n := u.ProviderMetadata["uses"].(type) {
+	case int:
+		if n > 0 {
+			uses = float64(n)
+		}
+	case int64:
+		if n > 0 {
+			uses = float64(n)
+		}
+	case float64:
+		if n > 0 {
+			uses = n
+		}
+	}
+	return &ports.Cost{Micros: int64(math.Round(p.PerUse * 1_000_000 * uses)), Currency: currency, Source: "table"}
+}

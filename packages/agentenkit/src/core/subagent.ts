@@ -15,6 +15,7 @@ import type { RegisteredAgent } from './agent.js';
 import { publish, withPublishEvent } from './publish.js';
 import { HITL_PARKED, RunStoppedError, withHitl, type HitlFrame, type ParkBox } from './hitl.js';
 import { withRunState, type AgentRunState } from './state.js';
+import { withToolRun } from './builtin/run.js';
 import { markPromptCaching } from './cache.js';
 import { promptMessages, repairDanglingToolCalls } from './messages.js';
 import { runLoop, type LoopOutcome, type RunLedger } from './loop.js';
@@ -353,21 +354,32 @@ function nestedTools(
       abortSignal,
     }),
   };
-  // A nested run's tools see the same state as its parent's (§2.10).
-  return withRunState(
-    withPublishEvent(
-      ctx.ports,
-      ctx.threadId,
-      withHitl(ctx.ports, ctx.threadId, raw, {
-        resume: ctx.resume,
-        agentId: d.agentId,
-        frames,
-        nested: d,
-        parks: ctx.parks,
-        toolErrors: ctx.toolErrors,
-      }),
+  // A nested run's tools see the same state as its parent's (§2.10), and
+  // bill the parent's run on the shared ledger.
+  return withToolRun(
+    withRunState(
+      withPublishEvent(
+        ctx.ports,
+        ctx.threadId,
+        withHitl(ctx.ports, ctx.threadId, raw, {
+          resume: ctx.resume,
+          agentId: d.agentId,
+          frames,
+          nested: d,
+          parks: ctx.parks,
+          toolErrors: ctx.toolErrors,
+        }),
+      ),
+      ctx.state ?? {},
     ),
-    ctx.state ?? {},
+    {
+      deps: ctx.ports,
+      threadId: ctx.threadId,
+      ...(ctx.billingRunId ? { runId: ctx.billingRunId } : {}),
+      agentId: d.agentId,
+      agentName: d.name,
+      ledger: ctx.ledger,
+    },
   );
 }
 

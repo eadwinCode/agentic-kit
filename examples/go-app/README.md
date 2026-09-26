@@ -18,7 +18,7 @@ bun run --cwd examples/go-app/web build
 
 # 2. start the server
 cd examples/go-app
-go run .                       # http://localhost:8080, mock model
+go run .                       # http://localhost:8090, mock model
 OPENAI_API_KEY=sk-… go run .   # gpt-4o-mini (MODEL=… to change)
 ```
 
@@ -29,8 +29,15 @@ go run .                                   # terminal 1
 bun run --cwd examples/go-app/web dev      # terminal 2, http://localhost:5173
 ```
 
-Flags and env: `-addr` / `ADDR`, `-db` / `DB_FILE` (SQLite file, default
+Port 8090, so it runs next to the Next.js example, whose local QStash
+takes 8080. Flags and env: `-addr` / `ADDR`, `-db` / `DB_FILE` (SQLite file, default
 `go-app.sqlite`), `-static` / `STATIC_DIR` (built SPA, default `web/dist`).
+
+Web tools: set `BRAVE_API_KEY` (or `JINA_API_KEY`) in `.env` and the agent
+and its subagents can search the web; pages are read with the built-in page
+reader, or through Jina with `WEB_READER=jina`. With no key the agent can
+still read pages but not search. The keys are passed to the adapters in
+`main.go` (`webToolPorts`); see [Web tools](../../docs/web-tools.md).
 
 ## Try these
 
@@ -42,6 +49,8 @@ Flags and env: `-addr` / `ADDR`, `-db` / `DB_FILE` (SQLite file, default
 | `send an email to the client` | approval card; approve or deny, or let it expire |
 | `show my orders` | a tool reading the run state (`orgId`) the client attached |
 | `research goroutines` | a subagent with its own stream and card |
+| `what is the latest version of the MCP spec? cite the page` | `web_search`, then `web_fetch` on a result id with a prompt: a small model reads the page and only its answer comes back (needs a search key) |
+| `research the three biggest vector databases, one subagent each` | subagents that search and read pages on their own, billed to the same run |
 | `what is (12*7)+3` | a plain tool |
 | `think about what 6*7 is` | a reasoning stream first: shown live as a "Thinking" block, folded to one line once the answer starts, restored from the durable message on reload |
 | **Simulate credit limit** button | sets the thread's allowance to zero, like a billing webhook. The composer stays open: the next message meets `BillingPreCheck`, which publishes `CREDIT_LIMIT` and refuses, and the chat shows *credit limit reached. resets … - clear it to continue*. **Clear limit** restores the allowance with `CREDIT_RESTORED` |

@@ -108,15 +108,36 @@ var usageColumns = map[string]string{
 // seconds for the lock rather than fail at once with SQLITE_BUSY. Open calls
 // it; call it yourself on a handle you opened some other way. An in-memory
 // database keeps its own journal mode, which is fine.
+//
+// busy_timeout goes FIRST: switching a new file to WAL takes a lock too. And
+// SQLite does not always wait on the busy timeout for that switch: with
+// several processes opening one fresh file at once it can give up at once
+// with "database is locked". So the switch is tried again for up to five
+// seconds, like any other write. The TS runtime's tuneSqlite does the same.
 func Tune(db *sql.DB) error {
-	for _, pragma := range []string{`PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=5000`} {
-		rows, err := db.Query(pragma) // both answer with a row
-		if err != nil {
-			return fmt.Errorf("sqlite %s: %w", pragma, err)
-		}
-		_ = rows.Close()
+	if err := pragma(db, `PRAGMA busy_timeout=5000`); err != nil {
+		return err
 	}
-	return nil
+	for tries := 0; ; tries++ {
+		err := pragma(db, `PRAGMA journal_mode=WAL`)
+		if err == nil {
+			return nil
+		}
+		msg := strings.ToLower(err.Error())
+		if tries >= 100 || !(strings.Contains(msg, "locked") || strings.Contains(msg, "busy")) {
+			return err
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// pragma runs one PRAGMA that answers with a row.
+func pragma(db *sql.DB, stmt string) error {
+	rows, err := db.Query(stmt)
+	if err != nil {
+		return fmt.Errorf("sqlite %s: %w", stmt, err)
+	}
+	return rows.Close()
 }
 
 func addMissing(db *sql.DB, table string, cols map[string]string) error {

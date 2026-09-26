@@ -22,6 +22,8 @@ import { ACTIVE_STATES, publish, publishEvent, runStatePayload, transition, with
 import { closeNested, nestedRawTools, RunSlots, runNestedAgent, spawnSubagentTool, type SubagentCtx } from './subagent.js';
 import { attemptsKey, COUNTER_TTL_SECONDS, counterScope, redriveKey, runIdKey } from './keys.js';
 import { withRunState, type AgentRunState } from './state.js';
+import { TOOL_RUN, withToolRun, type ToolRun } from './builtin/run.js';
+import { isPermanentError } from './permanent.js';
 import { runLoop, seedRunLedger, type LoopOutcome } from './loop.js';
 import { enqueueJob, Lease, parseLockValue, runLockKey, RunLockLostError } from './lease.js';
 import { activeSegment, closeLostSegment, openSegment, type SegmentStream } from './segment.js';
@@ -92,6 +94,7 @@ async function settleVerdict(
   target: { execute?: (args: unknown, opts: unknown) => Promise<unknown> } | undefined,
   signal: AbortSignal,
   state: AgentRunState,
+  toolRun: ToolRun,
 ): Promise<{ result: unknown; expired: boolean }> {
   const raw = await deps.kv.get(hitlKey(pending.toolCallId));
   if (!raw) {
@@ -119,6 +122,9 @@ async function settleVerdict(
       // What the human sent back with the approval (§2.5): answers to
       // the questions the tool asked, a corrected value, a reason.
       approval: { payload: answer.payload },
+      threadId,
+      runId: toolRun.runId,
+      [TOOL_RUN]: toolRun,
     });
   } catch (err) {
     result = { error: err instanceof Error ? err.message : String(err) };
@@ -403,6 +409,7 @@ async function resumePendingHitl(
   signal: AbortSignal,
   state: AgentRunState,
   runId: string | undefined,
+  toolRun: ToolRun,
 ): Promise<boolean> {
   // Readiness first, side effects second: the thread resumes only when EVERY
   // open approval has been answered or has expired (§2.7).
@@ -422,7 +429,11 @@ async function resumePendingHitl(
 
     const settled = pending.landed
       ? null
-      : await settleVerdict(deps, threadId, pending, target, signal, state);
+      : await settleVerdict(deps, threadId, pending, target, signal, state, {
+          ...toolRun,
+          agentId: pending.agentId,
+          ...(pending.agentId !== null && subCtx ? { agentName: pending.nested?.name } : {}),
+        });
     if (settled?.expired) expiredAny = true;
     if (!(await unwindVerdict(deps, threadId, pending, settled, subCtx, signal))) return false;
   }
@@ -752,13 +763,18 @@ export async function execute(
       // Every tool also sees the run's state (§2.10).
       // Every tool also sees the run's state (§2.10) and can publish its own
       // events on the thread.
-      const tools = withRunState(
-        withPublishEvent(
-          deps,
-          threadId,
-          withHitl(deps, threadId, rawTools, { resume, agentId: null, frames: [], parks, toolErrors }),
+      // ...and the run it is part of: its ports, its ledger, its ids.
+      const toolRun: ToolRun = { deps, threadId, runId, agentId: null, agentName: agent.name, ledger };
+      const tools = withToolRun(
+        withRunState(
+          withPublishEvent(
+            deps,
+            threadId,
+            withHitl(deps, threadId, rawTools, { resume, agentId: null, frames: [], parks, toolErrors }),
+          ),
+          input.state ?? {},
         ),
-        input.state ?? {},
+        toolRun,
       );
 
       // §2.5 resume: a WAITING thread at segment start is either the /respond
@@ -773,7 +789,7 @@ export async function execute(
           throw new Error(`Thread ${threadId} is WAITING_FOR_INPUT without a pending INPUT_REQUIRED`);
         }
         const resumed = await resumePendingHitl(
-          deps, threadId, open, rawTools, subCtx, abort.signal, input.state ?? {}, runId,
+          deps, threadId, open, rawTools, subCtx, abort.signal, input.state ?? {}, runId, toolRun,
         );
         if (!resumed) {
           // Still parked, or parked again one level down while unwinding: the
@@ -1223,6 +1239,17 @@ export async function executeWithPolicy(
     // A run that a newer one replaced failed after it stopped mattering: its
     // error is not the thread's, so it spends no attempt and fails nothing.
     if (input.runId && (await deps.kv.get(runIdKey(input.threadId))) !== input.runId) return;
+
+    // An error that retrying cannot fix fails the run at once (§2.8): a bad
+    // key, an unknown model, no credits. Every retry would fail the same way.
+    if (isPermanentError(err)) {
+      log.error('run failed; not retried, the error cannot pass', {
+        threadId: input.threadId, runId: input.runId, err: String(err),
+      });
+      await failRun(deps, agent, input.threadId, input.runId, err instanceof Error ? err.message : String(err));
+      await deps.kv.del(attemptsKey(scope));
+      return;
+    }
 
     const attempts = await deps.kv.incrWithExpiry(attemptsKey(scope), COUNTER_TTL_SECONDS);
     if (attempts < maxAttempts) {

@@ -1,0 +1,5 @@
+{
+  "baseUrl": "https://example.com/a/b/c.html",
+  "title": "Plain body page",
+  "content": "## Section top\n\nContact us or read [the guide](https://example.com/a/guide/).\n\nName Price\n\nTea &pound;2\n\nQuoted…\n\ncode stays squashed"
+}

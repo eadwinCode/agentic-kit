@@ -1,0 +1,5 @@
+{
+  "baseUrl": "https://example.com/x/y",
+  "title": "My & Page",
+  "content": "# Hello there\n\nSome text with a [link here](https://example.com/docs?a=1&b=2).\n\n- one\n- two [other](https://other.example/x)\n\nLine\nbreak — — &bogus; &#xD800;"
+}
