@@ -23,6 +23,7 @@ import { closeNested, nestedRawTools, RunSlots, runNestedAgent, spawnSubagentToo
 import { attemptsKey, COUNTER_TTL_SECONDS, counterScope, redriveKey, runIdKey } from './keys.js';
 import { withRunState, type AgentRunState } from './state.js';
 import { TOOL_RUN, withToolRun, type ToolRun } from './builtin/run.js';
+import { isPermanentError } from './permanent.js';
 import { runLoop, seedRunLedger, type LoopOutcome } from './loop.js';
 import { enqueueJob, Lease, parseLockValue, runLockKey, RunLockLostError } from './lease.js';
 import { activeSegment, closeLostSegment, openSegment, type SegmentStream } from './segment.js';
@@ -1238,6 +1239,17 @@ export async function executeWithPolicy(
     // A run that a newer one replaced failed after it stopped mattering: its
     // error is not the thread's, so it spends no attempt and fails nothing.
     if (input.runId && (await deps.kv.get(runIdKey(input.threadId))) !== input.runId) return;
+
+    // An error that retrying cannot fix fails the run at once (§2.8): a bad
+    // key, an unknown model, no credits. Every retry would fail the same way.
+    if (isPermanentError(err)) {
+      log.error('run failed; not retried, the error cannot pass', {
+        threadId: input.threadId, runId: input.runId, err: String(err),
+      });
+      await failRun(deps, agent, input.threadId, input.runId, err instanceof Error ? err.message : String(err));
+      await deps.kv.del(attemptsKey(scope));
+      return;
+    }
 
     const attempts = await deps.kv.incrWithExpiry(attemptsKey(scope), COUNTER_TTL_SECONDS);
     if (attempts < maxAttempts) {

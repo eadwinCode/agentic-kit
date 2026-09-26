@@ -1427,6 +1427,15 @@ func ExecuteWithPolicy(ctx context.Context, deps ports.RuntimePorts, agent *Regi
 			return nil
 		}
 	}
+	// An error that retrying cannot fix fails the run at once (§2.8): a bad
+	// key, an unknown model, no credits. Every retry would fail the same way.
+	if IsPermanentError(err) {
+		log.Error("run failed; not retried, the error cannot pass", "err", err)
+		if failErr := failRun(bg, deps, agent, input.ThreadID, input.RunID, err.Error()); failErr != nil {
+			return errors.Join(err, failErr)
+		}
+		return deps.Kv.Del(bg, AttemptsKey(scope))
+	}
 	attempts, kvErr := deps.Kv.IncrWithExpiry(bg, AttemptsKey(scope), counterTTL)
 	if kvErr != nil {
 		return errors.Join(err, kvErr)

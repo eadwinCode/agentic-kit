@@ -132,6 +132,7 @@ export {
   type ToolPublishEvent,
 } from './core/publish.js';
 export { stop } from './core/stop.js';
+export { isPermanentError } from './core/permanent.js';
 export { repairDanglingToolCalls, DANGLING_CALL_RESULT } from './core/messages.js';
 
 // types

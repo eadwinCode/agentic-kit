@@ -363,6 +363,7 @@ var (
 	WithPublishEvent     = core.WithPublishEvent
 	ToolContextFrom      = core.ToolContextFrom
 	ToolRunFromContext   = core.ToolRunFromContext
+	IsPermanentError     = core.IsPermanentError
 	BuiltinToolNames     = core.BuiltinToolNames
 	DecodeEntities       = core.DecodeEntities
 	HTMLToText           = core.HTMLToText
