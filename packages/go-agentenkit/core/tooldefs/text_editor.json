@@ -1,0 +1,24 @@
+{
+  "name": "text_editor",
+  "description": "View, create and edit text files in this conversation's sandbox. view shows a file with line numbers (or a folder's contents two levels deep); view_range picks lines. create writes a whole file. str_replace replaces old_str, which must match exactly one place in the file, whitespace included, with new_str. insert puts new_str after line insert_line (0 for the top). undo_edit takes back the last change to the file. A path that does not start with / is taken from the start folder (where code_execution runs and bash begins), not from the folder bash is in now.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "command": { "type": "string", "enum": ["view", "create", "str_replace", "insert", "undo_edit"] },
+      "path": { "type": "string", "description": "The file or folder." },
+      "view_range": {
+        "type": "array",
+        "items": { "type": "integer" },
+        "minItems": 2,
+        "maxItems": 2,
+        "description": "For view: first and last line, from 1; -1 as the last means to the end."
+      },
+      "file_text": { "type": "string", "description": "For create: the whole file." },
+      "old_str": { "type": "string", "description": "For str_replace: the exact text to replace." },
+      "new_str": { "type": "string", "description": "For str_replace: the new text (empty to delete). For insert: the text to insert." },
+      "insert_line": { "type": "integer", "minimum": 0, "description": "For insert: the line to insert after; 0 for the top." }
+    },
+    "required": ["command", "path"],
+    "additionalProperties": false
+  }
+}

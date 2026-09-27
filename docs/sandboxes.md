@@ -2,9 +2,9 @@
 
 A sandbox is a place apart from your app where an agent's commands run and
 its files live: a Docker container, a hosted machine on E2B, or a folder on
-your machine in development. The built-in tools that run commands and edit
-files (`bash`, `code_execution`, `text_editor`, coming next) use it, and your
-own tools can too.
+your machine in development. The built-in tools `bash`, `code_execution` and
+`text_editor` work in it (see [below](#the-sandbox-tools)), and your own tools
+can too.
 
 Like storage or the queue, it is a port you plug an adapter into. The
 interface has the same shape and names as [ComputeSDK](https://www.computesdk.com)'s,
@@ -86,6 +86,83 @@ environment do not reach what the model runs.
 
 **ComputeSDK cannot push a sandbox's time back**, so a `ComputeSdkSandbox`
 ends `timeoutMs` (default 1 hour) after it was made, used or not.
+
+## The sandbox tools
+
+Three built-in tools work in the thread's sandbox. Like the web tools, each
+has one name and one input shape in TypeScript and Go, so any model that can
+call tools can use them.
+
+```ts
+const coder = runtime.createStreamTextAgent({
+  name: 'coder',
+  tools: runtime.builtinTools(['bash', 'code_execution', 'text_editor'], {
+    bash: { timeoutMs: 120_000 },
+    codeExecution: { timeoutMs: 60_000 },
+  }),
+});
+```
+
+```go
+tools, err := rt.BuiltinTools([]string{"bash", "code_execution", "text_editor"}, agentenkit.BuiltinToolOptions{
+	Bash: agentenkit.BashOptions{Timeout: 2 * time.Minute},
+})
+```
+
+| Tool | What the model can do | Result | Asks for approval by default |
+| --- | --- | --- | --- |
+| `bash` | Run a shell command | `{ stdout, stderr, exitCode }` | Yes |
+| `code_execution` | Run a Python or JavaScript program | `{ stdout, stderr, exitCode, error?, files }` | No |
+| `text_editor` | `view`, `create`, `str_replace`, `insert`, `undo_edit` | `view`: `{ path, content, totalLines }`; changes: `{ ok, message }` | For changes; not for `view` |
+
+- **`bash`** runs each command in a new shell that starts in the folder the
+  last one ended in, so `cd` carries over. Variables do not. `restart: true`
+  goes back to the start folder.
+- **`code_execution`** writes the program to a file and runs it with
+  `python3` or `node`, in the start folder. `files` lists the files it made or
+  changed (a chart saved as `chart.png` comes back as
+  `{ path: 'chart.png', mediaType: 'image/png' }`). Showing images to the
+  model comes in a later step.
+- **`text_editor`** uses the input shape models know from Anthropic's editor.
+  `str_replace` fails unless `old_str` matches exactly one place. Each change
+  can be undone, up to 10 per file.
+
+The tools keep their own files (the bash folder, the programs, the undo
+history) in a hidden `.agentenkit` folder in the start folder.
+
+**Approval.** A call that asks waits for `respond` like any approval, then
+runs when approved; a denied one tells the model it was denied. Pass
+`approval` to change it: `true`, `false`, or a check that decides per call.
+
+```ts
+runtime.builtinTools(['bash'], {
+  // Ask only for commands that delete something.
+  bash: { approval: (input) => /\brm\b/.test(input.command ?? '') },
+});
+```
+
+In Go, `Approval` takes `agentenkit.AskAlways`, `agentenkit.AskNever`, or a
+`func(ctx, input) (bool, error)`.
+
+**Limits.** Each command has a time limit (`bash` 120 s, `code_execution`
+60 s by default); past it the result says `timedOut: true` and exit code 124.
+Output past `builtinToolResultCapChars` keeps its start and its end, with the
+middle cut. `maxUses` caps the calls in one run.
+
+**Live output.** While a command runs, its output goes out as live-only
+`tool.output` events (`{ toolCallId, tool, stream, text }`) on the run's
+stream, so a UI can show it as it comes. They are not kept in the thread.
+
+**Lost files.** When the thread's sandbox had ended and a fresh one was made,
+the result carries a `note` saying the earlier files are gone.
+
+**Cost.** Each call books a usage row (`kind: 'tool'`, `model: 'tool:bash'`,
+the sandbox adapter as `modelId`) with the seconds its command ran. Price it
+per second, per use, or both:
+
+```ts
+pricer: pricing.chain(pricing.table(prices), pricing.tools({ e2b: { perSecond: 0.000028 } })),
+```
 
 ## Using it from your own tool
 

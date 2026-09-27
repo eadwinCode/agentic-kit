@@ -3,16 +3,30 @@ import type { BuiltinToolPorts } from '../../ports/tools.js';
 import { BUILTIN_TOOL_DEFINITIONS, BUILTIN_TOOL_NAMES, type BuiltinToolName } from './definitions.js';
 import { toolRunOf } from './run.js';
 import { runWebFetch, runWebSearch, type WebFetchOptions, type WebSearchOptions } from './web.js';
+import {
+  runBash,
+  runCodeExecution,
+  runTextEditor,
+  type BashOptions,
+  type CodeExecutionOptions,
+  type TextEditorOptions,
+} from './sandbox-tools.js';
 
 export interface BuiltinToolOptions {
   webSearch?: WebSearchOptions;
   webFetch?: WebFetchOptions;
+  bash?: BashOptions;
+  codeExecution?: CodeExecutionOptions;
+  textEditor?: TextEditorOptions;
 }
 
 /** The port each tool needs, as `setupAgentCore({ tools })` names it. */
 const NEEDS: Record<BuiltinToolName, keyof BuiltinToolPorts> = {
   web_search: 'search',
   web_fetch: 'fetcher',
+  bash: 'sandbox',
+  code_execution: 'sandbox',
+  text_editor: 'sandbox',
 };
 
 /** The built-in tools, ready for an agent's `tools`. Each is an ordinary AI
@@ -37,13 +51,25 @@ export function buildBuiltinTools(
     out[name] = tool({
       description: def.description,
       parameters: jsonSchema(def.inputSchema as Parameters<typeof jsonSchema>[0]),
-      execute: async (args: unknown, opts: { abortSignal?: AbortSignal }): Promise<unknown> => {
+      execute: async (
+        args: unknown,
+        opts: { abortSignal?: AbortSignal; toolCallId?: string; approval?: unknown },
+      ): Promise<unknown> => {
         const run = toolRunOf(opts);
         if (!run) return { error: `${name} runs only inside an agentenkit run` };
         const a = (args ?? {}) as Record<string, unknown>;
-        return name === 'web_search'
-          ? runWebSearch(ports.search!, options.webSearch ?? {}, a, run, opts.abortSignal)
-          : runWebFetch(ports.fetcher!, options.webFetch ?? {}, a, run, opts.abortSignal);
+        switch (name) {
+          case 'web_search':
+            return runWebSearch(ports.search!, options.webSearch ?? {}, a, run, opts.abortSignal);
+          case 'web_fetch':
+            return runWebFetch(ports.fetcher!, options.webFetch ?? {}, a, run, opts.abortSignal);
+          case 'bash':
+            return runBash(options.bash ?? {}, a, run, opts);
+          case 'code_execution':
+            return runCodeExecution(options.codeExecution ?? {}, a, run, opts);
+          case 'text_editor':
+            return runTextEditor(options.textEditor ?? {}, a, run, opts);
+        }
       },
     });
   }
@@ -52,3 +78,6 @@ export function buildBuiltinTools(
 
 export { BUILTIN_TOOL_DEFINITIONS, BUILTIN_TOOL_NAMES, type BuiltinToolName } from './definitions.js';
 export type { WebFetchOptions, WebSearchOptions } from './web.js';
+export type {
+  ApprovalRule, BashInput, BashOptions, CodeExecutionInput, CodeExecutionOptions, TextEditorInput, TextEditorOptions,
+} from './sandbox-tools.js';
