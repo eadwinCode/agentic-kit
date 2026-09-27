@@ -917,6 +917,13 @@ type AgentConfig struct {
 	// text is cut and the result says truncated, so one huge page cannot fill
 	// the context window or the database. Default 20,000.
 	BuiltinToolResultCapChars int
+	// SandboxIdleTTL: a thread's sandbox ends after it has sat unused this
+	// long, and the next call makes a fresh one. Default 30 minutes.
+	SandboxIdleTTL time.Duration
+	// SandboxMaxLifetime: a thread's sandbox ends this long after it was
+	// made, however much it is used: the backstop on what one sandbox can
+	// cost. Default 24 hours.
+	SandboxMaxLifetime time.Duration
 	// RecordPayloads records prompts, state, step text and tool payloads into
 	// the operational store (§2.9). Turn it off when those carry anything
 	// that should not sit in an operational database.
@@ -982,6 +989,8 @@ func mergeConfig(c, d AgentConfig) AgentConfig {
 	orInt(&c.SubagentMaxSteps, d.SubagentMaxSteps)
 	orInt(&c.SubagentResultCapChars, d.SubagentResultCapChars)
 	orInt(&c.BuiltinToolResultCapChars, d.BuiltinToolResultCapChars)
+	orDur(&c.SandboxIdleTTL, d.SandboxIdleTTL)
+	orDur(&c.SandboxMaxLifetime, d.SandboxMaxLifetime)
 	orInt(&c.PayloadCapChars, d.PayloadCapChars)
 	orDur(&c.StreamGrace, d.StreamGrace)
 	orDur(&c.StreamTTL, d.StreamTTL)
@@ -1009,6 +1018,8 @@ func DefaultConfig() AgentConfig {
 		SubagentMaxSteps:           10,
 		SubagentResultCapChars:     8_000,
 		BuiltinToolResultCapChars:  20_000,
+		SandboxIdleTTL:             30 * time.Minute,
+		SandboxMaxLifetime:         24 * time.Hour,
 		RecordPayloads:             true,
 		PayloadCapChars:            2_000,
 		ContextCeilingTokens:       265_000,
@@ -1063,6 +1074,9 @@ func ResolveConfig(partial *AgentConfig) (AgentConfig, error) {
 	}
 	if config.StreamFlush < 0 {
 		return config, fmt.Errorf("invalid config: StreamFlush (%s) must not be negative", config.StreamFlush)
+	}
+	if config.SandboxIdleTTL < time.Millisecond || config.SandboxMaxLifetime < time.Millisecond {
+		return config, errors.New("invalid config: SandboxIdleTTL and SandboxMaxLifetime must be at least 1ms")
 	}
 	if config.BuiltinToolResultCapChars < 1 {
 		return config, fmt.Errorf("invalid config: BuiltinToolResultCapChars (%d) must be at least 1", config.BuiltinToolResultCapChars)

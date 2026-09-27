@@ -55,10 +55,14 @@ export interface Fetcher {
   fetch(url: string, options: FetchOptions): Promise<FetchedPage>;
 }
 
+import type { SandboxProvider } from './sandbox.js';
+
 /** The adapters the built-in tools use. A tool whose port is missing cannot
  *  be asked for: `builtinTools` throws at startup rather than a run failing
  *  later. */
 export interface BuiltinToolPorts {
   search?: Search;
   fetcher?: Fetcher;
+  /** Where commands run and files live: one sandbox per thread. */
+  sandbox?: SandboxProvider;
 }

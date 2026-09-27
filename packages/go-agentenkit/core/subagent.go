@@ -356,7 +356,7 @@ func nestedTools(sctx *SubagentCtx, d ports.NestedDescriptor, frames []HitlFrame
 		Resume: sctx.Resume, AgentID: d.AgentID, Frames: frames, Nested: &desc, Parks: sctx.Parks,
 	})), sctx.State), ToolRun{
 		Deps: sctx.Ports, ThreadID: sctx.ThreadID, RunID: sctx.BillingRunID,
-		AgentID: d.AgentID, AgentName: d.Name, Ledger: sctx.Ledger,
+		AgentID: d.AgentID, AgentName: d.Name, Ledger: sctx.Ledger, State: sctx.State,
 	})
 }
 

@@ -764,7 +764,10 @@ export async function execute(
       // Every tool also sees the run's state (§2.10) and can publish its own
       // events on the thread.
       // ...and the run it is part of: its ports, its ledger, its ids.
-      const toolRun: ToolRun = { deps, threadId, runId, agentId: null, agentName: agent.name, ledger };
+      const toolRun: ToolRun = {
+        deps, threadId, runId, agentId: null, agentName: agent.name, ledger,
+        ...(input.state ? { state: input.state } : {}),
+      };
       const tools = withToolRun(
         withRunState(
           withPublishEvent(

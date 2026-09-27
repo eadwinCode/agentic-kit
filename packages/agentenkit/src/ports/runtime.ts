@@ -79,6 +79,8 @@ export interface RuntimePorts {
    *  run, such as a usage row it failed to store. Defaults to `console`. */
   log?: Logger;
   config: AgentConfig;
+  /** The adapters behind the built-in tools. */
+  tools?: BuiltinToolPorts;
 }
 
 /** The little the platform needs from a logger. `console` satisfies it. */
@@ -126,8 +128,9 @@ export interface RuntimeOptions {
   log?: Logger;
   config?: Partial<AgentConfig>;
   /** The adapters behind the built-in tools: a search engine for
-   *  `web_search`, a page reader for `web_fetch`. Only the tools you ask
-   *  `builtinTools` for need theirs. */
+   *  `web_search`, a page reader for `web_fetch`, a sandbox provider for the
+   *  tools that run commands. Only the tools you ask `builtinTools` for need
+   *  theirs. */
   tools?: BuiltinToolPorts;
 }
 

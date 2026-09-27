@@ -90,6 +90,7 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
     pricer: opts.pricer,
     log: opts.log,
     config: resolveConfig(opts.config),
+    ...(opts.tools ? { tools: opts.tools } : {}),
   };
 
   /** Ports for ONE run: the caller's storage with that run's state bound, so

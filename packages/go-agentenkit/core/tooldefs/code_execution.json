@@ -1,0 +1,13 @@
+{
+  "name": "code_execution",
+  "description": "Run a Python or JavaScript program in this conversation's sandbox and get its output. It runs in the start folder. Files it writes stay for later calls and for the bash and text_editor tools; the files it made or changed are listed in the result (a chart saved as chart.png, say). Returns stdout, stderr, the exit code and an error when it failed. Print what you want to see.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "language": { "type": "string", "enum": ["python", "javascript"], "description": "Default python." },
+      "code": { "type": "string", "description": "The program to run." }
+    },
+    "required": ["code"],
+    "additionalProperties": false
+  }
+}

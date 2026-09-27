@@ -968,7 +968,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	// Every tool also sees the run's state (§2.10) and can publish its own
 	// events on the thread.
 	// ...and the run it is part of: its ports, its ledger, its ids.
-	toolRun := ToolRun{Deps: deps, ThreadID: threadID, RunID: runID, AgentName: agent.Name, Ledger: ledger}
+	toolRun := ToolRun{Deps: deps, ThreadID: threadID, RunID: runID, AgentName: agent.Name, Ledger: ledger, State: input.State}
 	tools := WithToolRun(WithRunState(WithPublishEvent(deps, threadID, WithHitl(deps, threadID, rawTools, HitlCtx{Resume: resume, Parks: parks})), input.State), toolRun)
 
 	// §2.5 resume: a WAITING thread at segment start is either the /respond

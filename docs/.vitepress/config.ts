@@ -58,6 +58,7 @@ export default defineConfig({
         items: [
           { text: 'Agents and tools', link: '/agents-and-tools' },
           { text: 'Web tools', link: '/web-tools' },
+          { text: 'Sandboxes', link: '/sandboxes' },
           { text: 'Human in the loop', link: '/human-in-the-loop' },
           { text: 'Subagents', link: '/subagents' },
           { text: 'Context and tokens', link: '/context-and-tokens' },

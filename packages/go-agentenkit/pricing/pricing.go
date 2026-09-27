@@ -212,10 +212,12 @@ func Format(micros int64, currency string) string {
 	return fmt.Sprintf("%.4f %s", Amount(micros), currency)
 }
 
-// ToolPrice is what one use of a paid tool service costs, in currency
-// units.
+// ToolPrice is what a paid tool service costs, in currency units: per use
+// (a search, a page), per second of sandbox time (bash, code_execution), or
+// both.
 type ToolPrice struct {
-	PerUse float64
+	PerUse    float64
+	PerSecond float64
 }
 
 // Tools prices the built-in tools' usage rows (Kind "tool", Model
@@ -225,6 +227,9 @@ type ToolPrice struct {
 // pricer, so chain it with the model table:
 //
 //	Pricer: pricing.Chain(modelPrices, pricing.Tools{"brave": {PerUse: 0.005}})
+//
+// Sandbox tools are priced by the sandbox adapter's name and the seconds
+// their commands ran: pricing.Tools{"e2b": {PerSecond: 0.000028}}.
 //
 // A tool's own model calls (reading a page with a question) carry the
 // model's key, so the model table prices them.
@@ -252,20 +257,28 @@ func (t Tools) priceIn(currency string, u ports.NewUsage) *ports.Cost {
 			return nil
 		}
 	}
-	uses := 1.0
-	switch n := u.ProviderMetadata["uses"].(type) {
+	uses := positive(u.ProviderMetadata["uses"], 1)
+	secs := positive(u.ProviderMetadata["seconds"], 0)
+	amount := p.PerUse*uses + p.PerSecond*secs
+	return &ports.Cost{Micros: int64(math.Round(amount * 1_000_000)), Currency: currency, Source: "table"}
+}
+
+// positive reads a number from provider metadata, or def when it is not a
+// number above zero.
+func positive(v any, def float64) float64 {
+	var n float64
+	switch x := v.(type) {
 	case int:
-		if n > 0 {
-			uses = float64(n)
-		}
+		n = float64(x)
 	case int64:
-		if n > 0 {
-			uses = float64(n)
-		}
+		n = float64(x)
 	case float64:
-		if n > 0 {
-			uses = n
-		}
+		n = x
+	default:
+		return def
 	}
-	return &ports.Cost{Micros: int64(math.Round(p.PerUse * 1_000_000 * uses)), Currency: currency, Source: "table"}
+	if n > 0 {
+		return n
+	}
+	return def
 }
