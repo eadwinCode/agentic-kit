@@ -271,6 +271,21 @@ func TestSandboxTools_CodeExecutionCanImportAModuleFromTheWorkFolder(t *testing.
 	mustJSON(t, h.result(t, threadID, "c1"), map[string]any{"stdout": "42\n", "stderr": "", "exitCode": 0, "files": []any{}}, "c1")
 }
 
+func TestSandboxTools_CodeExecutionOutputGoesOutLiveAsItPrints(t *testing.T) {
+	code := "import time\nprint('one')\ntime.sleep(0.5)\nprint('two')"
+	h := toolsRuntime(t, [][]toolCall{{{id: "c1", name: "code_execution", args: map[string]any{"code": code}}}},
+		[]string{"code_execution"}, agentenkit.BuiltinToolOptions{}, nil)
+	threadID := h.runIn(t, "")
+	var texts []string
+	for _, c := range customOf(t, h.harness, threadID, "tool.output") {
+		var v map[string]any
+		_ = json.Unmarshal(c.Value, &v)
+		texts = append(texts, fmt.Sprint(v["text"]))
+	}
+	// Two events, not one at the end: "one" went out before the program slept.
+	mustStrings(t, texts, []string{"one\n", "two\n"}, "tool.output")
+}
+
 func TestSandboxTools_CodeExecutionReportsAFailingProgram(t *testing.T) {
 	h := toolsRuntime(t, [][]toolCall{{{id: "c1", name: "code_execution", args: map[string]any{"code": "raise ValueError('boom')"}}}},
 		[]string{"code_execution"}, agentenkit.BuiltinToolOptions{}, nil)

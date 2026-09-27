@@ -107,6 +107,15 @@ jobs:
       - name: Build the Go example's SPA
         run: bun run --cwd examples/go-app/web build
 
+      # The four tool examples: one shared page, two small apps per runtime.
+      - name: Build the tool examples' page
+        run: bun run --cwd examples/tools-ui build
+
+      - name: Typecheck the TypeScript tool examples
+        run: |
+          (cd examples/web-tools-ts && bunx tsc --noEmit)
+          (cd examples/sandbox-tools-ts && bunx tsc --noEmit)
+
   go:
     name: go-agentenkit (go ${{ matrix.go }})
     runs-on: ubuntu-latest
@@ -162,3 +171,11 @@ jobs:
       - name: Build the Go example
         working-directory: examples/go-app
         run: go vet ./... && go build -o /dev/null .
+
+      # So must the two Go tool examples (web-tools-go, sandbox-tools-go).
+      - name: Build the Go tool examples
+        working-directory: examples
+        run: |
+          for d in web-tools-go sandbox-tools-go; do
+            (cd "$d" && test -z "$(gofmt -l .)" && go vet ./... && go build -o /dev/null .)
+          done

@@ -12,6 +12,11 @@ in TypeScript and Go, so a new provider is one small adapter.
 
 ## Quick start
 
+To try the sandbox tools first, run
+[sandbox-tools-ts](https://github.com/eadwinCode/agentic-kit/tree/main/examples/sandbox-tools-ts) or
+[sandbox-tools-go](https://github.com/eadwinCode/agentic-kit/tree/main/examples/sandbox-tools-go): one small app each, on a
+Docker sandbox by default.
+
 ```ts
 import { setupAgentCore, DockerSandbox, E2BSandbox, LocalSandbox } from 'agentenkit';
 

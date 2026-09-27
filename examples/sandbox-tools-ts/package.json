@@ -1,0 +1,20 @@
+{
+  "name": "@agent/example-sandbox-tools-ts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run --cwd ../tools-ui build && bun server.ts",
+    "dev": "bun --watch server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^1.3.24",
+    "agentenkit": "workspace:*",
+    "ai": "^4.3.16"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.6.3"
+  }
+}

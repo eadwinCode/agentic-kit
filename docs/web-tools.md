@@ -11,6 +11,10 @@ or Jina for search, our own page reader or Jina for pages.
 
 ## Quick start
 
+To try them first, run [web-tools-ts](https://github.com/eadwinCode/agentic-kit/tree/main/examples/web-tools-ts) or
+[web-tools-go](https://github.com/eadwinCode/agentic-kit/tree/main/examples/web-tools-go): one small app each, with nothing to
+stand up.
+
 ```ts
 import { setupAgentCore, BraveWebSearch, PageReader, pricing } from 'agentenkit';
 
