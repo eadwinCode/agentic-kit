@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -34,7 +35,9 @@ func main() {
 	// Keys come from this folder's .env, then the repo's root .env.
 	loadDotEnv(".env")
 	loadDotEnv("../../.env")
-	addr := envOr("ADDR", ":3102")
+	// This machine only: the agent spends your keys and, in the sandbox app,
+	// runs commands. ADDR=:3102 opens it to your network.
+	addr := envOr("ADDR", "127.0.0.1:3102")
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
 		log.Fatal("Set OPENAI_API_KEY in examples/web-tools-go/.env (or the repo root .env).")
@@ -92,15 +95,21 @@ func main() {
 		Storage: storage, Admin: admin, Bus: memory.NewBus(), Kv: kv, Streams: streams, Queue: queue,
 		Config: &cfg,
 		Tools:  tools,
-		// Money on every usage row: the model calls, and each search.
+		// Money on every usage row: the model calls, each search, and each
+		// page read through Jina. Our own reader is free, so it is priced at
+		// nothing rather than left unpriced.
 		Pricer: pricing.Chain(
-			pricing.Table{
-				"gpt-4o-mini": {InputPerMillion: 0.15, CacheReadPerMillion: 0.075, OutputPerMillion: 0.6},
-				"gpt-4o":      {InputPerMillion: 2.5, CacheReadPerMillion: 1.25, OutputPerMillion: 10},
-			},
-			pricing.Tools{"brave": {PerUse: 0.005}, "jina-search": {PerUse: 0.0005}},
+			modelPrices,
+			pricing.Tools{"brave": {PerUse: 0.005}, "jina-search": {PerUse: 0.0005}, "jina-reader": {PerUse: 0.0005}, "page-reader": {}},
 		),
+		// Only the models this app prices, and MODEL. A subagent model the
+		// agent names itself (gpt-3.5-turbo, say) is refused here, and the
+		// child falls back to the parent's model, so no call goes out
+		// unpriced.
 		ResolveModel: func(name string) (agentenkit.ResolvedModel, error) {
+			if _, priced := modelPrices[name]; !priced && name != model {
+				return agentenkit.ResolvedModel{}, fmt.Errorf("unknown model %q", name)
+			}
 			return agentenkit.ResolvedModel{
 				Instance:      func() provider.LanguageModel { return openai.Chat(name, openai.WithAPIKey(apiKey)) },
 				ContextWindow: 128_000,
@@ -136,7 +145,8 @@ func main() {
 			"you used. For a question with several parts, hand each part to a subagent with spawnSubagent.",
 		Tools: web,
 		// Subagents get the web tools too, and are billed to the same run.
-		Subagents: &agentenkit.SubagentsConfig{Tools: web},
+		// Without Model they would run on the library default, gpt-4o.
+		Subagents: &agentenkit.SubagentsConfig{Model: model, Tools: web},
 	})
 
 	searchNote := "No BRAVE_API_KEY or JINA_API_KEY: web_fetch only, no search"
@@ -167,7 +177,7 @@ func main() {
 		defer cancel()
 		_ = srv.Shutdown(shutdown)
 	}()
-	log.Printf("Web tools (Go) on http://localhost%s", addr)
+	log.Printf("Web tools (Go) on http://%s", addr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
@@ -178,4 +188,10 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// modelPrices are the models this app prices, per million tokens.
+var modelPrices = pricing.Table{
+	"gpt-4o-mini": {InputPerMillion: 0.15, CacheReadPerMillion: 0.075, OutputPerMillion: 0.6},
+	"gpt-4o":      {InputPerMillion: 2.5, CacheReadPerMillion: 1.25, OutputPerMillion: 10},
 }

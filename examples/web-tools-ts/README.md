@@ -25,6 +25,10 @@ cd examples/web-tools-ts && bun server.ts
 
 Then open http://localhost:3101.
 
+It listens on this machine only (`127.0.0.1`). `HOST=0.0.0.0` opens it to your
+network, but there is no login: anyone who can reach it can spend your keys
+on searches and model calls.
+
 ## Try these
 
 | Prompt | What it shows |

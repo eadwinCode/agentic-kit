@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -240,7 +239,7 @@ func truncate(s string, n int) string {
 // does nothing.
 func loadDotEnv(path string) {
 	f, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) || err != nil {
+	if err != nil {
 		return
 	}
 	defer f.Close()

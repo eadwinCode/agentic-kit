@@ -28,6 +28,10 @@ cd examples/sandbox-tools-go && go run .
 
 Then open http://localhost:3104.
 
+It listens on this machine only (`127.0.0.1`). `ADDR=:3104` opens it to your
+network, but there is no login: anyone who can reach it can spend your keys
+and approve commands in the sandbox.
+
 ## Try these
 
 | Prompt | What it shows |

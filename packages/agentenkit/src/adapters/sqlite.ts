@@ -5,6 +5,7 @@ import type {
 } from '../core/types.js';
 import { UsageMerger } from '../core/usage.js';
 import type { Storage } from '../ports/storage.js';
+import type { Kv } from '../ports/kv.js';
 import { StreamClosedError, StreamGoneError, type RunStreams, type StreamMeta, type StreamSnapshot } from '../ports/streams.js';
 import { isStreamEnd, type StreamEnd, type StreamEvent, type StreamItem } from '../core/stream-events.js';
 import { sleep } from './stream-scripts.js';
@@ -652,5 +653,101 @@ export class SqliteRunStreams implements RunStreams {
   async snapshot(streamId: string, after?: string | null): Promise<StreamSnapshot | null> {
     const page = this.page(streamId, after ?? null);
     return page && { meta: page.meta, items: page.items, end: page.end };
+  }
+}
+
+/** A Kv over SQLite, for a local setup whose storage is durable too: one
+ *  file, one lifetime. With an in-memory Kv beside SQLite storage, a restart
+ *  forgets what the kv held while the log keeps it: a thread's sandbox (so
+ *  the next call makes a fresh one without saying the files are gone), a
+ *  run's lock, an answered approval on its way to the worker.
+ *
+ *  Expiry is enforced on read. `incr` and SET NX are single statements, so
+ *  concurrent callers never collide on a counter or a lock. The Go package
+ *  has the same adapter (adapters/sqlite/kv.go), with the same table. */
+export class SqliteKv implements Kv {
+  constructor(private readonly db: SqliteLike) {
+    db.prepare('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, expiresAt INTEGER)').run();
+  }
+
+  private one(sql: string, ...params: unknown[]): Record<string, unknown> | undefined {
+    return this.db.prepare(sql).all(...params)[0] as Record<string, unknown> | undefined;
+  }
+
+  private changes(res: unknown): number {
+    return Number((res as { changes?: number | bigint } | undefined)?.changes ?? 0);
+  }
+
+  private expiry(exSeconds?: number): number | null {
+    return exSeconds && exSeconds > 0 ? Date.now() + exSeconds * 1000 : null;
+  }
+
+  async get(key: string): Promise<string | null> {
+    const row = this.one('SELECT value FROM kv WHERE key = ? AND (expiresAt IS NULL OR expiresAt > ?)', key, Date.now());
+    return row ? String(row.value) : null;
+  }
+
+  async set(key: string, value: string, opts: { exSeconds?: number; onlyIfNotExists?: boolean } = {}): Promise<boolean> {
+    const expires = this.expiry(opts.exSeconds);
+    if (!opts.onlyIfNotExists) {
+      this.db.prepare(
+        `INSERT INTO kv (key, value, expiresAt) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, expiresAt = excluded.expiresAt`,
+      ).run(key, value, expires);
+      return true;
+    }
+    // SET NX: one statement, so exactly one caller can win. An expired row
+    // counts as absent.
+    const res = this.db.prepare(
+      `INSERT INTO kv (key, value, expiresAt) VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, expiresAt = excluded.expiresAt
+       WHERE kv.expiresAt IS NOT NULL AND kv.expiresAt <= ?`,
+    ).run(key, value, expires, Date.now());
+    return this.changes(res) > 0;
+  }
+
+  async del(key: string): Promise<void> {
+    this.db.prepare('DELETE FROM kv WHERE key = ?').run(key);
+  }
+
+  async incr(key: string): Promise<number> {
+    // An expired counter starts again from 1; a live one advances and keeps
+    // its expiry, like Redis INCR.
+    const now = Date.now();
+    const row = this.one(
+      `INSERT INTO kv (key, value, expiresAt) VALUES (?, '1', NULL)
+       ON CONFLICT(key) DO UPDATE SET
+         value = CASE WHEN kv.expiresAt IS NOT NULL AND kv.expiresAt <= ? THEN '1'
+                      ELSE CAST(CAST(kv.value AS INTEGER) + 1 AS TEXT) END,
+         expiresAt = CASE WHEN kv.expiresAt IS NOT NULL AND kv.expiresAt <= ? THEN NULL ELSE kv.expiresAt END
+       RETURNING value`,
+      key, now, now,
+    );
+    return Number(row!.value);
+  }
+
+  async incrWithExpiry(key: string, exSeconds: number): Promise<number> {
+    const now = Date.now();
+    const row = this.one(
+      `INSERT INTO kv (key, value, expiresAt) VALUES (?, '1', ?)
+       ON CONFLICT(key) DO UPDATE SET
+         value = CASE WHEN kv.expiresAt IS NOT NULL AND kv.expiresAt <= ? THEN '1'
+                      ELSE CAST(CAST(kv.value AS INTEGER) + 1 AS TEXT) END,
+         expiresAt = CASE WHEN kv.expiresAt IS NOT NULL AND kv.expiresAt <= ? THEN excluded.expiresAt ELSE kv.expiresAt END
+       RETURNING value`,
+      key, this.expiry(exSeconds), now, now,
+    );
+    return Number(row!.value);
+  }
+
+  async setIfValue(key: string, expected: string, value: string, opts: { exSeconds?: number } = {}): Promise<boolean> {
+    const res = this.db.prepare(
+      'UPDATE kv SET value = ?, expiresAt = ? WHERE key = ? AND value = ? AND (expiresAt IS NULL OR expiresAt > ?)',
+    ).run(value, this.expiry(opts.exSeconds), key, expected, Date.now());
+    return this.changes(res) > 0;
+  }
+
+  async delIfValue(key: string, expected: string): Promise<boolean> {
+    return this.changes(this.db.prepare('DELETE FROM kv WHERE key = ? AND value = ?').run(key, expected)) > 0;
   }
 }

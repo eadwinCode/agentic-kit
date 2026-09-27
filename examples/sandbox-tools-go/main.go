@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -35,7 +36,9 @@ func main() {
 	// Keys come from this folder's .env, then the repo's root .env.
 	loadDotEnv(".env")
 	loadDotEnv("../../.env")
-	addr := envOr("ADDR", ":3104")
+	// This machine only: the agent spends your keys and, in the sandbox app,
+	// runs commands. ADDR=:3104 opens it to your network.
+	addr := envOr("ADDR", "127.0.0.1:3104")
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
 		log.Fatal("Set OPENAI_API_KEY in examples/sandbox-tools-go/.env (or the repo root .env).")
@@ -103,13 +106,17 @@ func main() {
 		// (2 vCPUs). A Docker or local sandbox runs on your machine and costs
 		// nothing.
 		Pricer: pricing.Chain(
-			pricing.Table{
-				"gpt-4o-mini": {InputPerMillion: 0.15, CacheReadPerMillion: 0.075, OutputPerMillion: 0.6},
-				"gpt-4o":      {InputPerMillion: 2.5, CacheReadPerMillion: 1.25, OutputPerMillion: 10},
-			},
+			modelPrices,
 			pricing.Tools{"e2b": {PerSecond: 0.000028}, "docker": {}, "local": {}},
 		),
+		// Only the models this app prices, and MODEL. A subagent model the
+		// agent names itself (gpt-3.5-turbo, say) is refused here, and the
+		// child falls back to the parent's model, so no call goes out
+		// unpriced.
 		ResolveModel: func(name string) (agentenkit.ResolvedModel, error) {
+			if _, priced := modelPrices[name]; !priced && name != model {
+				return agentenkit.ResolvedModel{}, fmt.Errorf("unknown model %q", name)
+			}
 			return agentenkit.ResolvedModel{
 				Instance:      func() provider.LanguageModel { return openai.Chat(name, openai.WithAPIKey(apiKey)) },
 				ContextWindow: 128_000,
@@ -147,7 +154,8 @@ func main() {
 			"files. Say what you did and show the results.",
 		Tools: tools,
 		// Subagents get the same tools and share the thread's sandbox.
-		Subagents: &agentenkit.SubagentsConfig{Tools: tools},
+		// Without Model they would run on the library default, gpt-4o.
+		Subagents: &agentenkit.SubagentsConfig{Model: model, Tools: tools},
 	})
 
 	askNote := "bash and file changes ask first"
@@ -179,7 +187,7 @@ func main() {
 		defer cancel()
 		_ = srv.Shutdown(shutdown)
 	}()
-	log.Printf("Sandbox tools (Go) on http://localhost%s", addr)
+	log.Printf("Sandbox tools (Go) on http://%s", addr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
@@ -190,4 +198,10 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// modelPrices are the models this app prices, per million tokens.
+var modelPrices = pricing.Table{
+	"gpt-4o-mini": {InputPerMillion: 0.15, CacheReadPerMillion: 0.075, OutputPerMillion: 0.6},
+	"gpt-4o":      {InputPerMillion: 2.5, CacheReadPerMillion: 1.25, OutputPerMillion: 10},
 }
