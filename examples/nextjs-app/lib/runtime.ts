@@ -75,6 +75,15 @@ const sandbox =
       : process.env.SANDBOX === 'local'
         ? new LocalSandbox()
         : undefined;
+if (process.env.SANDBOX && !sandbox) {
+  console.warn(
+    `SANDBOX=${process.env.SANDBOX}: no sandbox made (use docker, e2b with E2B_API_KEY, or local): no sandbox tools`,
+  );
+}
+// The local sandbox is a folder on this machine, and its paths reach the rest
+// of it: a program or a file view could read this app's .env. So there every
+// sandbox tool asks first, not only bash and file changes.
+const localSandbox = sandbox instanceof LocalSandbox;
 
 /** The ONLY vendor-wiring file in the example app (spec §5). Swap any adapter
  *  here — Mongo/Dynamo storage, SQS/BullMQ queue, Ably/Kafka bus — and every
@@ -166,11 +175,13 @@ const webTools = runtime.builtinTools(search ? ['web_search', 'web_fetch'] : ['w
 });
 
 // The built-in sandbox tools, when a sandbox is set up. bash and file changes
-// wait for your approval; code_execution and viewing files do not.
+// wait for your approval; code_execution and viewing files do not, except on
+// the local sandbox, where everything asks.
 const sandboxTools = sandbox
   ? runtime.builtinTools(['bash', 'code_execution', 'text_editor'], {
       bash: { maxUses: 30 },
-      codeExecution: { maxUses: 20 },
+      codeExecution: { maxUses: 20, ...(localSandbox ? { approval: true } : {}) },
+      ...(localSandbox ? { textEditor: { approval: true } } : {}),
     })
   : {};
 

@@ -31,8 +31,9 @@ latest version of the MCP spec? Cite the page."* See
 subagents get `bash`, `code_execution` and `text_editor`, in one sandbox per
 thread that is kept between messages. `local` runs the model's commands on
 your machine with no isolation: use it only to try things out. `bash` and
-file changes wait for your approval, and a command's output shows under it as
-it runs. Try: *"Plot y = x² for x from -5 to 5 and save it as chart.png."* See
+file changes wait for your approval; with `local`, every sandbox tool does,
+since a program or a file view could read the rest of your machine. A
+command's output shows under it as it runs. Try: *"Plot y = x² for x from -5 to 5 and save it as chart.png."* See
 [Sandboxes](../../docs/sandboxes.md).
 
 **Admin view.** `/admin` lists threads and runs. Open a thread to see its

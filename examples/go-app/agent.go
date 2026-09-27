@@ -91,7 +91,9 @@ func creditCheck(ctx context.Context, check agentenkit.BillingCheck) error {
 	return fmt.Errorf("credit limit reached. resets %s - clear it to continue", resetAt().Format("2 Jan"))
 }
 
-func newApp(rt *agentenkit.AgentCore, model string, hasSearch, hasSandbox bool) *app {
+// sandboxName is the sandbox adapter's name ("docker", "e2b", "local"), or empty
+// for none.
+func newApp(rt *agentenkit.AgentCore, model string, hasSearch bool, sandboxName string) *app {
 	a := &app{rt: rt, model: model}
 	// Every tool gets a ToolContext: the run state, the tool call id, and
 	// PublishEvent bound to the thread. Custom events reach the SPA through
@@ -123,14 +125,22 @@ func newApp(rt *agentenkit.AgentCore, model string, hasSearch, hasSandbox bool) 
 	}
 	tools = append(tools, web...)
 	// The built-in sandbox tools, when a sandbox is set up. bash and file
-	// changes wait for your approval; code_execution and viewing files do not.
+	// changes wait for your approval; code_execution and viewing files do
+	// not, except on the local sandbox. That one is a folder on this machine,
+	// and its paths reach the rest of it: a program or a file view could read
+	// this app's .env. So there every sandbox tool asks first.
 	var sandbox []agentenkit.Tool
 	system := ""
-	if hasSandbox {
-		sandbox, err = rt.BuiltinTools([]string{"bash", "code_execution", "text_editor"}, agentenkit.BuiltinToolOptions{
+	if sandboxName != "" {
+		opts := agentenkit.BuiltinToolOptions{
 			Bash:          agentenkit.BashOptions{MaxUses: 30},
 			CodeExecution: agentenkit.CodeExecutionOptions{MaxUses: 20},
-		})
+		}
+		if sandboxName == "local" {
+			opts.CodeExecution.Approval = agentenkit.AskAlways
+			opts.TextEditor.Approval = agentenkit.AskAlways
+		}
+		sandbox, err = rt.BuiltinTools([]string{"bash", "code_execution", "text_editor"}, opts)
 		if err != nil {
 			panic(err)
 		}

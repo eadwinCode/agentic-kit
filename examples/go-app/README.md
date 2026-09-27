@@ -44,7 +44,9 @@ Sandbox tools: set `SANDBOX=docker` (needs a Docker daemon), `SANDBOX=e2b`
 `code_execution` and `text_editor`, in one sandbox per thread that is kept
 between messages. `local` runs the model's commands on your machine with no
 isolation: use it only to try things out. `bash` and file changes wait for
-your approval; a command's output shows under it as it runs. See
+your approval; with `local`, every sandbox tool does, since a program or a
+file view could read the rest of your machine. A command's output shows
+under it as it runs. See
 [Sandboxes](../../docs/sandboxes.md).
 
 ## Try these

@@ -162,7 +162,11 @@ func main() {
 	defer rt.Close()
 	queue.Bind(rt.Worker.Handler())
 
-	app := newApp(rt, defaultModel(apiKey), webTools.Search != nil, webTools.Sandbox != nil)
+	sandboxName := "" // none
+	if webTools.Sandbox != nil {
+		sandboxName = webTools.Sandbox.Name()
+	}
+	app := newApp(rt, defaultModel(apiKey), webTools.Search != nil, sandboxName)
 	srv := &http.Server{Addr: *addr, Handler: app.routes(*static)}
 
 	go func() {
@@ -247,6 +251,9 @@ func webToolPorts() agentenkit.BuiltinToolPorts {
 		}
 	case "local":
 		ports.Sandbox = localsandbox.New(localsandbox.Options{})
+	case "":
+	default:
+		log.Printf("SANDBOX=%s: not docker, e2b or local: no sandbox tools", os.Getenv("SANDBOX"))
 	}
 	return ports
 }

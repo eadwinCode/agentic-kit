@@ -82,6 +82,14 @@ const ago = (iso: string) => {
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
   return `${Math.floor(s / 3600)}h ago`;
 };
+/** Money for the admin view. Unlike `formatCost`, which leaves a zero out so
+ *  a server with no pricer shows nothing, a priced zero shows as one: a
+ *  Docker or local sandbox call costs nothing, and must not read as unpriced.
+ *  "—" is only for what nobody priced. */
+const money = (micros: number | undefined, currency: string | undefined) =>
+  !currency ? '—' : micros ? (formatCost({ costMicros: micros, currency, unpriced: 0 }) ?? '—')
+    : new Intl.NumberFormat(undefined, { style: 'currency', currency, minimumFractionDigits: 2 }).format(0);
+
 /** The token split, everywhere tokens appear — a total alone hides where the
  *  spend actually is, and prompt tokens usually dominate. */
 const split = (t: Tokens) =>
@@ -265,7 +273,7 @@ function ThreadView({ detail, onStep, selected }: {
         <Tile label="Tokens" value={num(thread.tokens.totalTokens)} detail={split(thread.tokens)} />
         <Tile
           label="Spend"
-          value={formatCost(thread.tokens) ?? '—'}
+          value={thread.tokens.costMicros ? (formatCost(thread.tokens) ?? '—') : money(0, thread.tokens.currency)}
           detail={thread.tokens.unpriced ? `${thread.tokens.unpriced} calls unpriced` : undefined}
           bad={Boolean(thread.tokens.unpriced)}
         />
@@ -349,7 +357,7 @@ function SpendTable({ lines }: { lines: SpendLine[] }) {
                 </td>
                 <td>{num(l.calls)}</td>
                 <td>{tool ? '—' : split(tokens)}</td>
-                <td>{formatCost({ costMicros: l.costMicros, currency: l.currency, unpriced: 0 }) ?? '—'}</td>
+                <td>{money(l.costMicros, l.currency)}</td>
               </tr>
             );
           })}
