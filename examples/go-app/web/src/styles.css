@@ -756,3 +756,16 @@ table.runs .sub { display: block; color: var(--muted); font-size: 10px; }
   border: 1px solid #f59e0b; background: rgba(245, 158, 11, 0.14); color: var(--text);
 }
 .notice.budget { border-color: #38bdf8; background: rgba(56, 189, 248, 0.12); }
+
+/* A sandbox command's output, as it runs. */
+.tool-output {
+  margin: 0 0 0.5rem 1.5rem;
+  max-height: 12rem;
+  overflow: auto;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.8rem;
+  background: #111;
+  color: #ddd;
+  border-radius: 6px;
+  white-space: pre-wrap;
+}

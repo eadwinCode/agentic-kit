@@ -263,6 +263,46 @@ chat := rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
 The platform owns the model, the messages, the step ceiling and the stop handling. Every
 other goai option is yours, passed through `Options`.
 
+## Built-in tools
+
+Tools with one name and one input shape in both runtimes, so any model that can
+call tools can use them. The adapters take their API keys here, at setup;
+nothing reads the environment later.
+
+```go
+search, err := brave.New(os.Getenv("BRAVE_API_KEY"))                // or jina.NewWebSearch
+sandbox, err := e2b.New(os.Getenv("E2B_API_KEY"), e2b.Options{})     // or docker.New, localsandbox.New
+rt, err := agentenkit.SetupAgentCore(ctx, agentenkit.RuntimeOptions{
+	// ... ports ...
+	Tools: agentenkit.BuiltinToolPorts{
+		Search:  search,
+		Fetcher: pagereader.New(pagereader.Options{}),                // or jina.NewReader
+		Sandbox: sandbox,
+	},
+})
+
+tools, err := rt.BuiltinTools(
+	[]string{"web_search", "web_fetch", "bash", "code_execution", "text_editor"},
+	agentenkit.BuiltinToolOptions{Bash: agentenkit.BashOptions{Timeout: 2 * time.Minute}},
+)
+coder := rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "coder", Tools: append(tools, lookup)})
+```
+
+| Tool | What the model can do | Needs | Asks for approval |
+| :--- | :--- | :--- | :--- |
+| `web_search` | Search; results come back with short ids | `Search` | No |
+| `web_fetch` | Read a page, by URL or result id; with a `prompt`, a small model answers from the page | `Fetcher` | No |
+| `bash` | Run a command in the thread's sandbox | `Sandbox` | Yes |
+| `code_execution` | Run a Python or JavaScript program; lists the files it made | `Sandbox` | No |
+| `text_editor` | View, create and edit files by exact replacement, with undo | `Sandbox` | For changes |
+
+A thread has **one sandbox**, kept between messages; it ends when the thread is
+deleted or has been idle for `SandboxIdleTTL` (30 minutes). Each tool call is a
+usage row, so `pricing.Tools{"brave": {PerUse: 0.005}, "e2b": {PerSecond: 0.000028}}`
+puts tool spend on the bill. `Approval` takes `agentenkit.AskAlways`,
+`agentenkit.AskNever`, or a check per call. Your own tools reach the sandbox
+with `agentenkit.WithSandbox(ctx, fn)`.
+
 ## The spec's hooks
 
 ```go
@@ -404,6 +444,9 @@ cycle between `core` and `ports`, so the shared types (`core/types.ts`, the type
 | `src/core/*.ts` | `core/*.go` (`core/messages.go` is new: JSON ⇄ goai messages) |
 | `src/adapters/memory.ts`, `inline.ts`, `sqlite.ts`, `redis.ts`, `qstash.ts`, `upstash.ts` | `adapters/<name>/<name>.go` |
 | `src/adapters/prisma.ts` | `adapters/postgres/postgres.go` |
+| `src/adapters/brave.ts`, `jina.ts`, `page-reader.ts` | `adapters/brave`, `adapters/jina`, `adapters/pagereader` |
+| `src/adapters/docker.ts`, `e2b.ts`, `local-sandbox.ts` | `adapters/docker`, `adapters/e2b`, `adapters/localsandbox` |
+| `src/adapters/computesdk.ts` | none: ComputeSDK is a TypeScript library |
 | `src/admin/memory.ts`, `sqlite.ts`, `postgres.ts`, `default.ts` | `admin/<name>/<name>.go`, `admin/default.go` |
 | `test/*.test.ts` | `*_test.go` |
 
@@ -428,4 +471,5 @@ one database.
 ```bash
 go test ./...                               # memory + SQLite; Postgres tests skip
 TEST_ADMIN_PG=postgres://... go test ./...  # also runs the Postgres store tests
+TEST_DOCKER_SANDBOX=1 go test ./...         # also runs the sandbox suite on Docker
 ```

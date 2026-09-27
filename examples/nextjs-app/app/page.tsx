@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import {
   formatCost,
   useAgentThread,
@@ -38,8 +38,18 @@ export default function Page() {
     run,
     stop,
     respondToInput,
-  } = useAgentThread();
+  } = useAgentThread({ onCustom: useCallback((name: string, value: unknown) => onToolOutput(name, value), []) });
   const [prompt, setPrompt] = useState('');
+  // What a sandbox command printed, live, by tool call: the built-in bash and
+  // code_execution tools send it as tool.output events while they run. Live
+  // only, so a reload shows the result, not this.
+  const [liveOutput, setLiveOutput] = useState<Record<string, string>>({});
+  function onToolOutput(name: string, value: unknown) {
+    if (name !== 'tool.output') return;
+    const { toolCallId, text } = value as { toolCallId?: string; text?: string };
+    if (!toolCallId || !text) return;
+    setLiveOutput((prev) => ({ ...prev, [toolCallId]: ((prev[toolCallId] ?? '') + text).slice(-4_000) }));
+  }
   // The message being edited, and its working text. Editing is a resend: the
   // turn and everything after it is replaced (§5.1).
   const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
@@ -179,9 +189,16 @@ export default function Page() {
               isOpen={thoughtOpen(e.id)}
             />
           ) : e.kind === 'tool' ? (
-            <p key={e.id} className="tool">
-              {e.text}
-            </p>
+            <div key={e.id}>
+              <p className="tool">{e.text}</p>
+              {e.parts.map((p) =>
+                p.type === 'tool-call' && liveOutput[p.toolCallId] ? (
+                  <pre key={p.toolCallId} className="tool-output">
+                    {liveOutput[p.toolCallId]}
+                  </pre>
+                ) : null,
+              )}
+            </div>
           ) : (
             <div key={e.id} className={`message ${e.role}`}>
               <span className="message-role">{e.role === 'user' ? 'You' : 'Agent'}</span>

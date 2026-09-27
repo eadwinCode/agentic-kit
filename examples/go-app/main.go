@@ -28,8 +28,11 @@ import (
 
 	agentenkit "github.com/eadwinCode/agentic-kit/packages/go-agentenkit"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/brave"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/docker"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/e2b"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/inline"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/jina"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/localsandbox"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/memory"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/pagereader"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/redis"
@@ -159,7 +162,11 @@ func main() {
 	defer rt.Close()
 	queue.Bind(rt.Worker.Handler())
 
-	app := newApp(rt, defaultModel(apiKey), webTools.Search != nil)
+	sandboxName := "" // none
+	if webTools.Sandbox != nil {
+		sandboxName = webTools.Sandbox.Name()
+	}
+	app := newApp(rt, defaultModel(apiKey), webTools.Search != nil, sandboxName)
 	srv := &http.Server{Addr: *addr, Handler: app.routes(*static)}
 
 	go func() {
@@ -198,8 +205,14 @@ func defaultModel(apiKey string) string {
 // modelIDs is the wire id each registry key resolves to (§4). It goes onto
 // every usage row, so a price list keyed by wire ids still matches when the
 // key is an alias.
-// toolPrices prices the built-in tools per use, keyed by adapter.
-var toolPrices = pricing.Tools{"brave": {PerUse: 0.005}, "jina-search": {PerUse: 0.0005}}
+// toolPrices prices the built-in tools, keyed by adapter: per search, and
+// per second of E2B sandbox time (2 vCPUs). A Docker or local sandbox runs
+// on your own machine, so its calls are priced at nothing rather than left
+// unpriced.
+var toolPrices = pricing.Tools{
+	"brave": {PerUse: 0.005}, "jina-search": {PerUse: 0.0005},
+	"e2b": {PerSecond: 0.000028}, "docker": {}, "local": {},
+}
 
 // webToolPorts builds the web tools' adapters. Each key is passed in here,
 // at setup; nothing reads it later. Brave when its key is set, else Jina;
@@ -222,6 +235,25 @@ func webToolPorts() agentenkit.BuiltinToolPorts {
 	}
 	if ports.Search == nil {
 		log.Printf("BRAVE_API_KEY and JINA_API_KEY not set: web_fetch only, no web_search")
+	}
+	// Where bash, code_execution and text_editor run: one sandbox per thread,
+	// kept between messages. Off unless SANDBOX says which. "local" runs the
+	// model's commands on this machine with no isolation, so use it only to
+	// try things out; "docker" needs a Docker daemon; "e2b" needs E2B_API_KEY.
+	switch os.Getenv("SANDBOX") {
+	case "docker":
+		ports.Sandbox = docker.New(docker.Options{})
+	case "e2b":
+		if s, err := e2b.New(os.Getenv("E2B_API_KEY"), e2b.Options{}); err == nil {
+			ports.Sandbox = s
+		} else {
+			log.Printf("SANDBOX=e2b needs E2B_API_KEY: no sandbox tools")
+		}
+	case "local":
+		ports.Sandbox = localsandbox.New(localsandbox.Options{})
+	case "":
+	default:
+		log.Printf("SANDBOX=%s: not docker, e2b or local: no sandbox tools", os.Getenv("SANDBOX"))
 	}
 	return ports
 }

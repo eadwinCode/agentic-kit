@@ -14,17 +14,23 @@ export interface CustomState {
    *  budget. Cleared by the next user turn or a restored credit. */
   notice: { kind: 'credit' | 'budget'; text: string } | null;
   error: string | null;
+  /** What a sandbox command printed, live, by tool call: bash and
+   *  code_execution send it as tool.output while they run. Live only, so a
+   *  reload shows the result, not this. */
+  toolOutput: Record<string, string>;
   /** Every custom event seen, newest first: the demo's inspector. */
   log: Array<{ seq: number; type: string; payload: unknown; at: string }>;
 }
 
 export const initialCustomState: CustomState = {
-  progress: null, preview: null, emailSent: null, answers: null, creditLimit: null, notice: null, error: null, log: [],
+  progress: null, preview: null, emailSent: null, answers: null, creditLimit: null, notice: null, error: null,
+  toolOutput: {}, log: [],
 };
 
-const CUSTOM = new Set(['PROGRESS', 'DESIGN_PREVIEW', 'EMAIL_SENT', 'QUESTIONS_ANSWERED', 'CREDIT_LIMIT', 'CREDIT_RESTORED']);
-/** Platform events the app also logs, without claiming them from the hook. */
-const LOGGED = new Set([...CUSTOM, 'RUN_REFUSED', 'TOKEN_BUDGET_EXHAUSTED']);
+const CUSTOM = new Set(['PROGRESS', 'DESIGN_PREVIEW', 'EMAIL_SENT', 'QUESTIONS_ANSWERED', 'CREDIT_LIMIT', 'CREDIT_RESTORED', 'tool.output']);
+/** Platform events the app also logs, without claiming them from the hook.
+ *  Command output is left out: there is too much of it. */
+const LOGGED = new Set([...[...CUSTOM].filter((t) => t !== 'tool.output'), 'RUN_REFUSED', 'TOKEN_BUDGET_EXHAUSTED']);
 
 export type Action = { type: 'event'; event: StreamEvent } | { type: 'reset' } | { type: 'clear' };
 
@@ -48,6 +54,11 @@ export function reduceCustom(state: CustomState, action: Action): CustomState {
       if (p.state === 'FAILED') return { ...state, progress: null, error: p.error ?? 'Run failed' };
       if (p.state === 'COMPLETED' || p.state === 'CANCELLED') return { ...state, progress: null };
       return state;
+    case 'tool.output': {
+      if (!p.toolCallId || !p.text) return state;
+      const text = ((state.toolOutput[p.toolCallId] ?? '') + p.text).slice(-4_000);
+      return { ...state, toolOutput: { ...state.toolOutput, [p.toolCallId]: text } };
+    }
     case 'PROGRESS':
       return { ...state, progress: p.label ?? null, log: logged };
     case 'DESIGN_PREVIEW':

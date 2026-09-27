@@ -26,4 +26,19 @@ The keys are passed to the adapters in `lib/runtime.ts`. Try: *"What is the
 latest version of the MCP spec? Cite the page."* See
 [Web tools](../../docs/web-tools.md).
 
+**Sandbox tools.** Set `SANDBOX=docker` (needs a Docker daemon),
+`SANDBOX=e2b` (with `E2B_API_KEY`) or `SANDBOX=local` and the agent and its
+subagents get `bash`, `code_execution` and `text_editor`, in one sandbox per
+thread that is kept between messages. `local` runs the model's commands on
+your machine with no isolation: use it only to try things out. `bash` and
+file changes wait for your approval; with `local`, every sandbox tool does,
+since a program or a file view could read the rest of your machine. A
+command's output shows under it as it runs. Try: *"Plot y = x² for x from -5 to 5 and save it as chart.png."* See
+[Sandboxes](../../docs/sandboxes.md).
+
+**Admin view.** `/admin` lists threads and runs. Open a thread to see its
+steps, what each tool call was sent and returned, and its spend: a line per
+agent and model, and per tool, so a search or a sandbox command sits next to
+the model calls that asked for it.
+
 For local queue testing without QStash cloud, the [`@upstash/qstash` dev CLI](https://docs.upstash.com/qstash/how-tos/local-development) replays signed requests to `localhost`.

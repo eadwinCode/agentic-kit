@@ -91,7 +91,9 @@ func creditCheck(ctx context.Context, check agentenkit.BillingCheck) error {
 	return fmt.Errorf("credit limit reached. resets %s - clear it to continue", resetAt().Format("2 Jan"))
 }
 
-func newApp(rt *agentenkit.AgentCore, model string, hasSearch bool) *app {
+// sandboxName is the sandbox adapter's name ("docker", "e2b", "local"), or empty
+// for none.
+func newApp(rt *agentenkit.AgentCore, model string, hasSearch bool, sandboxName string) *app {
 	a := &app{rt: rt, model: model}
 	// Every tool gets a ToolContext: the run state, the tool call id, and
 	// PublishEvent bound to the thread. Custom events reach the SPA through
@@ -122,6 +124,31 @@ func newApp(rt *agentenkit.AgentCore, model string, hasSearch bool) *app {
 		panic(err) // a startup error: the adapters are set up in main
 	}
 	tools = append(tools, web...)
+	// The built-in sandbox tools, when a sandbox is set up. bash and file
+	// changes wait for your approval; code_execution and viewing files do
+	// not, except on the local sandbox. That one is a folder on this machine,
+	// and its paths reach the rest of it: a program or a file view could read
+	// this app's .env. So there every sandbox tool asks first.
+	var sandbox []agentenkit.Tool
+	system := ""
+	if sandboxName != "" {
+		opts := agentenkit.BuiltinToolOptions{
+			Bash:          agentenkit.BashOptions{MaxUses: 30},
+			CodeExecution: agentenkit.CodeExecutionOptions{MaxUses: 20},
+		}
+		if sandboxName == "local" {
+			opts.CodeExecution.Approval = agentenkit.AskAlways
+			opts.TextEditor.Approval = agentenkit.AskAlways
+		}
+		sandbox, err = rt.BuiltinTools([]string{"bash", "code_execution", "text_editor"}, opts)
+		if err != nil {
+			panic(err)
+		}
+		tools = append(tools, sandbox...)
+		system = " You also have a sandbox, a separate machine kept for this conversation: run Python with " +
+			"code_execution to calculate or chart things, use bash for shell commands, and text_editor to " +
+			"write and change files there."
+	}
 	a.chat = rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
 		Name:  "chat",
 		Model: model,
@@ -131,15 +158,16 @@ func newApp(rt *agentenkit.AgentCore, model string, hasSearch bool) *app {
 			"Before rendering a design, ask the user questions with askDesignQuestions if the brief is vague. " +
 			"Delegate research to a subagent when a task is self-contained. " +
 			"For anything current, search the web with web_search, then open the most useful results with web_fetch, " +
-			"passing the result id and a prompt that says what you need from the page. Cite the pages you used.",
+			"passing the result id and a prompt that says what you need from the page. Cite the pages you used." + system,
 		Tools: tools,
 		// Opt-in delegation (§2.7): the platform injects spawnSubagent, and
 		// these tools are merged into every child and HITL-wrapped like the
 		// parent's, so a subagent parks for approval too.
 		Subagents: &agentenkit.SubagentsConfig{
-			// The web tools go to children as well: a researcher subagent
-			// searches and reads on its own, billed to the same run.
-			Tools: append([]agentenkit.Tool{a.getWeather(), agentenkit.MarkRequiresConfirmation(a.sendEmail())}, web...),
+			// The web and sandbox tools go to children as well: a researcher
+			// subagent searches and reads on its own, billed to the same run,
+			// and every subagent shares the thread's sandbox.
+			Tools: append(append([]agentenkit.Tool{a.getWeather(), agentenkit.MarkRequiresConfirmation(a.sendEmail())}, web...), sandbox...),
 		},
 	})
 	return a

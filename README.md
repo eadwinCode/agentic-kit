@@ -28,6 +28,10 @@ const { threadId, runId } = await chat.run({ prompt: 'send the quarterly report'
 Everything vendor-specific lives behind four small interfaces — storage, queue,
 event bus, key-value — so the engine never imports a database driver.
 
+It also ships a few **built-in tools that any model can use**: web search, web
+fetch, and `bash`, `code_execution` and `text_editor` in a sandbox. Unlike a
+provider's own tools, they work the same on every model and in both runtimes.
+
 ## Packages
 
 | Package | | |
@@ -119,6 +123,8 @@ export function Chat() {
 | **Prompt caching** | Breakpoints on the stable prefix, with provider-correct token attribution. |
 | **Operational history** | Runs, steps, timings and token splits in the platform's own tables, so a dashboard never touches your database. |
 | **Cost on the row** | One usage row per model call, priced before it is stored. Read spend per thread or per run from the store the engine already fills — no second table, and a budget in money as well as tokens. |
+| **Built-in tools** | `web_search` and `web_fetch` (Brave or Jina search; our own page reader or Jina), and `bash`, `code_execution` and `text_editor`. One name and one input shape everywhere, so any model that can call tools can use them. Each call is a usage row, so tool spend counts against a run's money cap. |
+| **Sandboxes** | One sandbox per thread, kept between messages and ended when idle: Docker, E2B, or a folder on your machine in development. Commands that change things wait for approval by default. |
 | **Your database** | Four interfaces. Postgres, Mongo, Dynamo, SQLite — the engine does not know. |
 
 ## Documentation
@@ -134,11 +140,15 @@ them here.
 | [setupAgentCore](./docs/setup.md) | Every option, fully |
 | [HTTP API](./docs/http-api.md) | The endpoints you expose |
 | [Agents and tools](./docs/agents-and-tools.md) | Registering what runs |
+| [Web tools](./docs/web-tools.md) | `web_search` and `web_fetch` |
+| [Sandboxes](./docs/sandboxes.md) | One sandbox per thread; `bash`, `code_execution`, `text_editor` |
 | [Human in the loop](./docs/human-in-the-loop.md) | Approvals |
 | [Subagents](./docs/subagents.md) | Nested runs |
 | [Context and tokens](./docs/context-and-tokens.md) | Compaction, caching, token attribution |
 | [Cost and pricing](./docs/cost-and-pricing.md) | Money on the usage rows |
 | [Provider options](./docs/provider-options.md) | Provider-specific settings |
+| [Run streams](./docs/run-streams.md) | Live output of a run, and reconnecting |
+| [Custom events](./docs/custom-events.md) | Your own events on a thread |
 | [Run state](./docs/run-state.md) | Carrying context through a run |
 | [Multi-tenancy](./docs/multi-tenancy.md) | A worked isolation story |
 | [Ports and adapters](./docs/ports-and-adapters.md) | Wiring your stack |
@@ -157,14 +167,16 @@ description of that behaviour; the test suite is the executable one.
 ```
 packages/
   agentenkit/         the runtime
-    src/core/         the engine: loop, HITL, subagents, compaction, run identity
-    src/ports/        the four interfaces you implement
-    src/adapters/     reference adapters (Prisma, Redis, QStash, Upstash, SQLite, memory)
+    src/core/         the engine: loop, HITL, subagents, compaction, run identity, built-in tools
+    src/ports/        the four interfaces you implement, and the tool ports (search, page reader, sandbox)
+    src/adapters/     reference adapters (Prisma, Redis, QStash, Upstash, SQLite, memory;
+                      Brave, Jina, PageReader; Docker, E2B, local sandbox, ComputeSDK)
     src/admin/        the platform's own operational store
   use-agentenkit/       the React hook
   go-agentenkit/        the runtime in Go, on goai — same ports, same events, same schemas
+  parity/             files both runtimes test against: tool definitions, events, page reader cases
 examples/
-  nextjs-app/         a full integration — an example, not the product
+  nextjs-app/         a full integration — an example, not the product; its agent searches and reads the web
   go-app/             the same, in Go: a Go server serving a React SPA, with custom events
 docs/                 the documentation
 ```
@@ -193,6 +205,14 @@ unreachable database fails loudly rather than passing with nothing asserted.
 ```bash
 docker run -d -p 5433:5432 \
   -e POSTGRES_PASSWORD=password -e POSTGRES_DB=agentic_admin_test postgres:16
+```
+
+The sandbox adapters run one shared test suite. The Docker cases run when
+`TEST_DOCKER_SANDBOX=1` (CI sets it); the live E2B cases run when
+`E2B_API_KEY` is set.
+
+```bash
+TEST_DOCKER_SANDBOX=1 bun run test
 ```
 
 The example app additionally expects Postgres, Redis and a local QStash; see
