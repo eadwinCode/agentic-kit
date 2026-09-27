@@ -278,7 +278,9 @@ type codeRunner struct{ ext, run string }
 
 // Python writes no __pycache__, which would show up among the files the
 // program made.
-var codeRunners = map[string]codeRunner{"python": {"py", "PYTHONDONTWRITEBYTECODE=1 python3"}, "javascript": {"js", "node"}}
+// -u: Python sends its output as it prints, not when it ends, so it streams
+// live.
+var codeRunners = map[string]codeRunner{"python": {"py", "PYTHONDONTWRITEBYTECODE=1 python3 -u"}, "javascript": {"js", "node"}}
 
 // MediaTypeOf is the media type of a file a program made, from its name.
 func MediaTypeOf(path string) string {

@@ -203,6 +203,16 @@ describe('sandbox tools (T4)', () => {
     expect(h.result(threadId, 'c1')).toEqual({ stdout: '42\n', stderr: '', exitCode: 0, files: [] });
   });
 
+  it('code_execution output goes out live as it prints', async () => {
+    const code = "import time\nprint('one')\ntime.sleep(0.5)\nprint('two')";
+    const h = await harness([[{ id: 'c1', name: 'code_execution', args: { code } }]], ['code_execution']);
+    const threadId = await h.run();
+    const custom = ofType(await threadItems(h.runtime.ports(), threadId), 'CUSTOM') as any[];
+    const texts = custom.filter((c) => c.name === 'tool.output').map((c) => c.value.text);
+    // Two events, not one at the end: "one" went out before the program slept.
+    expect(texts).toEqual(['one\n', 'two\n']);
+  });
+
   it('code_execution reports a failing program', async () => {
     const h = await harness([[{ id: 'c1', name: 'code_execution', args: { code: "raise ValueError('boom')" } }]], ['code_execution']);
     const threadId = await h.run();

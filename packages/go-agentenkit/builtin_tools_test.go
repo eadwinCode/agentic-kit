@@ -258,6 +258,21 @@ func TestBuiltin_WebFetchRefusesAnUnknownId(t *testing.T) {
 	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "the run goes on")
 }
 
+func TestBuiltin_WebFetchReadsTheUrlWhenTheIdSentWithItIsUnknown(t *testing.T) {
+	fetcher := memory.NewFetcher(map[string]memory.Page{"https://beta.example/b": {Title: "Beta page", Content: "Beta body"}}, "")
+	h := builtinRuntime(t, scripted(
+		step{calls: []call{{"c1", "web_fetch", `{"id":"s9r9","url":"https://beta.example/b"}`}}}, step{text: "done"},
+	), ports.BuiltinToolPorts{Fetcher: fetcher}, nil)
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat", Tools: h.builtin(t, []string{"web_fetch"}, agentenkit.BuiltinToolOptions{})})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
+	h.handleNext(t)
+
+	mustStrings(t, fetcher.Fetched(), []string{"https://beta.example/b"}, "fetched")
+	res := h.toolResult(t, ran.ThreadID, "c1")
+	mustEqual(t, res["url"], "https://beta.example/b", "url")
+	mustEqual(t, res["title"], "Beta page", "title")
+}
+
 func TestBuiltin_WebFetchWithAPromptReturnsOnlyTheSmallModelsAnswerAndBillsIt(t *testing.T) {
 	fetcher := memory.NewFetcher(map[string]memory.Page{"https://a.example/": {Title: "A", Content: strings.Repeat("The answer is 42. ", 50)}}, "")
 	h := builtinRuntime(t, scripted(

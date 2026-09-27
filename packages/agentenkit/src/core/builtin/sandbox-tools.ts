@@ -200,8 +200,9 @@ export async function runBash(
 // --- code_execution -------------------------------------------------------
 
 const RUNNERS = {
-  // No __pycache__, which would show up among the files the program made.
-  python: { ext: 'py', run: 'PYTHONDONTWRITEBYTECODE=1 python3' },
+  // No __pycache__, which would show up among the files the program made;
+  // -u sends the output as it prints, not when it ends, so it streams live.
+  python: { ext: 'py', run: 'PYTHONDONTWRITEBYTECODE=1 python3 -u' },
   javascript: { ext: 'js', run: 'node' },
 } as const;
 

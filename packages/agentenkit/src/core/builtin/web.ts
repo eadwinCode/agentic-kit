@@ -136,8 +136,9 @@ export async function runWebFetch(
   const id = typeof args.id === 'string' ? args.id.trim() : '';
   if (id) {
     const known = await run.deps.kv.get(refKey(run, id));
-    if (!known) return failed(`web_fetch: no search result has the id ${id}; search again or pass a url`);
-    url = known;
+    // A model sometimes sends a url with an id it made up; the url is enough.
+    if (!known && !url) return failed(`web_fetch: no search result has the id ${id}; search again or pass a url`);
+    if (known) url = known;
   }
   if (!url) return failed('web_fetch needs a url or the id of a search result');
   if (!/^https?:\/\//i.test(url)) return failed(`web_fetch: ${url} is not an http or https address`);

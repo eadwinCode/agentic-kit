@@ -127,6 +127,21 @@ export function Chat() {
 | **Sandboxes** | One sandbox per thread, kept between messages and ended when idle: Docker, E2B, or a folder on your machine in development. Commands that change things wait for approval by default. |
 | **Your database** | Four interfaces. Postgres, Mongo, Dynamo, SQLite — the engine does not know. |
 
+## Try the built-in tools
+
+Four small apps, each with nothing to stand up (SQLite, a queue in the same
+process) and the same page:
+
+| | TypeScript | Go |
+| :--- | :--- | :--- |
+| `web_search`, `web_fetch` | [web-tools-ts](./examples/web-tools-ts) | [web-tools-go](./examples/web-tools-go) |
+| `bash`, `code_execution`, `text_editor` | [sandbox-tools-ts](./examples/sandbox-tools-ts) | [sandbox-tools-go](./examples/sandbox-tools-go) |
+
+```bash
+bun install && bun run --cwd examples/tools-ui build
+cd examples/web-tools-ts && bun server.ts     # needs OPENAI_API_KEY, and BRAVE_API_KEY or JINA_API_KEY to search
+```
+
 ## Documentation
 
 **[https://eadwincode.github.io/agentic-kit/](https://eadwincode.github.io/agentic-kit/)** — the docs as a site, with search.
@@ -178,6 +193,11 @@ packages/
 examples/
   nextjs-app/         a full integration — an example, not the product; its agent searches and reads the web
   go-app/             the same, in Go: a Go server serving a React SPA, with custom events
+  web-tools-ts/       web_search and web_fetch alone, in one small app with nothing to stand up
+  web-tools-go/       the same, in Go
+  sandbox-tools-ts/   bash, code_execution and text_editor alone, on a Docker (or E2B) sandbox
+  sandbox-tools-go/   the same, in Go
+  tools-ui/           the one page those four share
 docs/                 the documentation
 ```
 

@@ -197,6 +197,20 @@ describe('built-in tools: web search and fetch (T2)', () => {
     expect((await h.storage.threads.get(ran.threadId))!.state).toBe('COMPLETED'); // the run goes on
   });
 
+  it('web_fetch reads the url when the id sent with it is unknown', async () => {
+    const fetcher = new MemoryFetcher({ 'https://beta.example/b': { title: 'Beta page', content: 'Beta body' } });
+    const h = await harness(
+      [{ calls: [{ id: 'c1', name: 'web_fetch', args: { id: 's9r9', url: 'https://beta.example/b' } }] }, { text: 'done' }],
+      { fetcher },
+    );
+    const chat = h.runtime.createStreamTextAgent({ name: 'chat', tools: h.runtime.builtinTools(['web_fetch']) });
+    const ran = await chat.run({ prompt: 'go' });
+    await h.runtime.worker.handleJob(h.queue.items.shift()!);
+
+    expect(fetcher.fetched).toEqual(['https://beta.example/b']);
+    expect(h.toolResult(ran.threadId, 'c1')).toMatchObject({ url: 'https://beta.example/b', title: 'Beta page' });
+  });
+
   it("web_fetch with a prompt returns only the small model's answer and bills it", async () => {
     const fetcher = new MemoryFetcher({ 'https://a.example/': { title: 'A', content: 'The answer is 42. '.repeat(50) } });
     const h = await harness(

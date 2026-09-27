@@ -215,10 +215,14 @@ func RunWebFetch(ctx context.Context, fetcher ports.Fetcher, opts WebFetchOption
 		if err != nil {
 			return "", err
 		}
-		if !found {
+		// A model sometimes sends a url with an id it made up; the url is
+		// enough.
+		if !found && u == "" {
 			return failed("web_fetch: no search result has the id " + id + "; search again or pass a url")
 		}
-		u = known
+		if found {
+			u = known
+		}
 	}
 	if u == "" {
 		return failed("web_fetch needs a url or the id of a search result")
