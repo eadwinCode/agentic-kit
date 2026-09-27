@@ -5,8 +5,11 @@ import { z } from 'zod';
 import { tool } from 'ai';
 import {
   BraveWebSearch,
+  DockerSandbox,
+  E2BSandbox,
   JinaReader,
   JinaWebSearch,
+  LocalSandbox,
   markRequiresConfirmation,
   PageReader,
   pricing,
@@ -59,6 +62,20 @@ const search = braveKey
 // PDFs, for a small price: set WEB_READER=jina to use it.
 const fetcher = process.env.WEB_READER === 'jina' && jinaKey ? new JinaReader({ apiKey: jinaKey }) : new PageReader();
 
+// Where bash, code_execution and text_editor run: one sandbox per thread,
+// kept between messages. Off unless SANDBOX says which. `local` runs the
+// model's commands on this machine with no isolation, so use it only to try
+// things out; `docker` needs a Docker daemon; `e2b` needs E2B_API_KEY.
+const e2bKey = process.env.E2B_API_KEY;
+const sandbox =
+  process.env.SANDBOX === 'docker'
+    ? new DockerSandbox()
+    : process.env.SANDBOX === 'e2b' && e2bKey
+      ? new E2BSandbox({ apiKey: e2bKey })
+      : process.env.SANDBOX === 'local'
+        ? new LocalSandbox()
+        : undefined;
+
 /** The ONLY vendor-wiring file in the example app (spec §5). Swap any adapter
  *  here — Mongo/Dynamo storage, SQS/BullMQ queue, Ably/Kafka bus — and every
  *  route below keeps working unchanged. */
@@ -88,14 +105,24 @@ export const runtime = await setupAgentCore({
   // table, no wrapper around the model. Swap `pricing.table` for
   // `pricing.chain(pricing.receipt(...), pricing.table(...))` if your gateway
   // sends the real figure back and you want that instead of a price list.
-  // Tool use is priced too, per search, and counts against a run's money cap.
+  // Tool use is priced too, per search and per second of E2B sandbox time
+  // (2 vCPUs), and counts against a run's money cap. A Docker or local
+  // sandbox runs on your own machine, so its calls are priced at nothing
+  // rather than left unpriced.
   pricer: pricing.chain(
     pricing.table(modelPrices),
-    pricing.tools({ brave: { perUse: 0.005 }, 'jina-search': { perUse: 0.0005 } }),
+    pricing.tools({
+      brave: { perUse: 0.005 },
+      'jina-search': { perUse: 0.0005 },
+      e2b: { perSecond: 0.000028 },
+      docker: {},
+      local: {},
+    }),
   ),
 
-  // The adapters behind the built-in web tools (see webTools below).
-  tools: { ...(search ? { search } : {}), fetcher },
+  // The adapters behind the built-in tools (see webTools and sandboxTools
+  // below).
+  tools: { ...(search ? { search } : {}), fetcher, ...(sandbox ? { sandbox } : {}) },
 
   // Models can come in any shape — the platform only ever sees
   // ResolvedModel { instance, contextWindow, modelId } (§3.3).
@@ -138,6 +165,15 @@ const webTools = runtime.builtinTools(search ? ['web_search', 'web_fetch'] : ['w
   webFetch: { maxUses: 20 },
 });
 
+// The built-in sandbox tools, when a sandbox is set up. bash and file changes
+// wait for your approval; code_execution and viewing files do not.
+const sandboxTools = sandbox
+  ? runtime.builtinTools(['bash', 'code_execution', 'text_editor'], {
+      bash: { maxUses: 30 },
+      codeExecution: { maxUses: 20 },
+    })
+  : {};
+
 /** Registered agent handles (§4). The worker dispatches queue jobs back to
  *  these by name (`RunJob.agent`). */
 export const chat = runtime.createStreamTextAgent({
@@ -147,15 +183,20 @@ export const chat = runtime.createStreamTextAgent({
     'You are a helpful assistant. For anything current or that you are unsure of, search the web with ' +
     'web_search, then open the most useful results with web_fetch, passing the result id and a prompt that ' +
     'says what you need from the page. Cite the pages you used. For a research task with several parts, ' +
-    'hand each part to a subagent with spawnSubagent.',
+    'hand each part to a subagent with spawnSubagent.' +
+    (sandbox
+      ? ' You also have a sandbox, a separate machine kept for this conversation: run Python with ' +
+        'code_execution to calculate or chart things, use bash for shell commands, and text_editor to ' +
+        'write and change files there.'
+      : ''),
   // Opt-in delegation (§2.7): the platform injects the scoped spawnSubagent
   // tool, and `tools` here are merged into every child and HITL-wrapped just
   // like the parent's — so a subagent parks for approval too, and is resumed
-  // where it stopped rather than restarted. The web tools go to children as
-  // well: a researcher subagent searches and reads on its own, billed to the
-  // same run.
-  subagents: { tools: { sendEmail, ...webTools } },
-  tools: { sendEmail, ...webTools },
+  // where it stopped rather than restarted. The web and sandbox tools go to
+  // children as well: a researcher subagent searches and reads on its own,
+  // billed to the same run, and every subagent shares the thread's sandbox.
+  subagents: { tools: { sendEmail, ...webTools, ...sandboxTools } },
+  tools: { sendEmail, ...webTools, ...sandboxTools },
 });
 
 /** Local dev without QStash cloud: when INLINE_WORKER=1, the run route

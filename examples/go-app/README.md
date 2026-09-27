@@ -39,6 +39,14 @@ reader, or through Jina with `WEB_READER=jina`. With no key the agent can
 still read pages but not search. The keys are passed to the adapters in
 `main.go` (`webToolPorts`); see [Web tools](../../docs/web-tools.md).
 
+Sandbox tools: set `SANDBOX=docker` (needs a Docker daemon), `SANDBOX=e2b`
+(with `E2B_API_KEY`) or `SANDBOX=local` and the agent gets `bash`,
+`code_execution` and `text_editor`, in one sandbox per thread that is kept
+between messages. `local` runs the model's commands on your machine with no
+isolation: use it only to try things out. `bash` and file changes wait for
+your approval; a command's output shows under it as it runs. See
+[Sandboxes](../../docs/sandboxes.md).
+
 ## Try these
 
 | Prompt | What it shows |
@@ -51,6 +59,8 @@ still read pages but not search. The keys are passed to the adapters in
 | `research goroutines` | a subagent with its own stream and card |
 | `what is the latest version of the MCP spec? cite the page` | `web_search`, then `web_fetch` on a result id with a prompt: a small model reads the page and only its answer comes back (needs a search key) |
 | `research the three biggest vector databases, one subagent each` | subagents that search and read pages on their own, billed to the same run |
+| `plot y = x² for x from -5 to 5 and save it as chart.png` | `code_execution` runs Python in the sandbox and lists `chart.png` among the files it made (needs `SANDBOX`) |
+| `make a folder called site with an index.html that says hello, then show me the folder` | `bash` and `text_editor` ask for approval; the folder and file are still there on your next message (needs `SANDBOX`) |
 | `what is (12*7)+3` | a plain tool |
 | `think about what 6*7 is` | a reasoning stream first: shown live as a "Thinking" block, folded to one line once the answer starts, restored from the durable message on reload |
 | **Simulate credit limit** button | sets the thread's allowance to zero, like a billing webhook. The composer stays open: the next message meets `BillingPreCheck`, which publishes `CREDIT_LIMIT` and refuses, and the chat shows *credit limit reached. resets … - clear it to continue*. **Clear limit** restores the allowance with `CREDIT_RESTORED` |

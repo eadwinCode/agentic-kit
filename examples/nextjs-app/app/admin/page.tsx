@@ -1,10 +1,26 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import { formatCost } from 'use-agentenkit';
 
 type State = 'IDLE' | 'QUEUED' | 'RUNNING' | 'WAITING_FOR_INPUT' | 'CANCELLED' | 'COMPLETED' | 'FAILED';
 interface Tokens {
   inputTokens: number; cachedInputTokens: number; outputTokens: number; totalTokens: number;
+}
+
+/** One agent's spend on one model, or on one tool (`model: 'tool:bash'`,
+ *  `modelId` the adapter): a line of the bill (§4). */
+interface SpendLine {
+  agentId?: string | null; agentName?: string | null;
+  model?: string | null; modelId?: string | null; currency?: string;
+  inputTokens: number; cacheReadInputTokens: number; outputTokens: number;
+  calls: number; costMicros: number;
+}
+
+/** A thread opened up reads its usage rows, so its tokens carry the money
+ *  too; a listing's do not. */
+interface Spend extends Tokens {
+  costMicros?: number; currency?: string; unpriced?: number; lines?: SpendLine[];
 }
 
 /** What started a thread (§2.9): the first dispatched run's parameters,
@@ -20,7 +36,7 @@ interface ThreadSummary extends Tokens {
   id: string; state: State; model: string;
   firstSeenAt: string; updatedAt: string;
   runs: number; steps: number; durationMs: number;
-  tokens: Tokens; prompt: string | null;
+  tokens: Spend; prompt: string | null;
   startedWith?: ThreadStart | null;
 }
 
@@ -247,9 +263,17 @@ function ThreadView({ detail, onStep, selected }: {
       <section className="tiles">
         <Tile label="Runs" value={num(thread.runs)} detail={`${num(thread.steps)} steps`} />
         <Tile label="Tokens" value={num(thread.tokens.totalTokens)} detail={split(thread.tokens)} />
+        <Tile
+          label="Spend"
+          value={formatCost(thread.tokens) ?? '—'}
+          detail={thread.tokens.unpriced ? `${thread.tokens.unpriced} calls unpriced` : undefined}
+          bad={Boolean(thread.tokens.unpriced)}
+        />
         <Tile label="Time in runs" value={ms(thread.durationMs)} />
         <Tile label="Model" value={thread.model} />
       </section>
+
+      <SpendTable lines={thread.tokens.lines ?? []} />
 
       {(thread.startedWith || thread.prompt) && (
         <StartedWith start={thread.startedWith ?? null} prompt={thread.prompt} />
@@ -297,6 +321,41 @@ function ThreadView({ detail, onStep, selected }: {
         );
       })}
     </>
+  );
+}
+
+/** The thread's bill: a line per agent and model, and per tool, so a search
+ *  or a sandbox command sits next to the model calls that asked for it. */
+function SpendTable({ lines }: { lines: SpendLine[] }) {
+  if (lines.length === 0) return null;
+  const sorted = [...lines].sort((a, b) => b.costMicros - a.costMicros);
+  return (
+    <section className="started">
+      <h3>Spend</h3>
+      <table className="runs">
+        <thead>
+          <tr><th>Agent</th><th>Model or tool</th><th>Calls</th><th>Tokens</th><th>Cost</th></tr>
+        </thead>
+        <tbody>
+          {sorted.map((l, i) => {
+            const tool = l.model?.startsWith('tool:') ? l.model.slice('tool:'.length) : null;
+            const tokens = { inputTokens: l.inputTokens, cachedInputTokens: l.cacheReadInputTokens, outputTokens: l.outputTokens, totalTokens: 0 };
+            return (
+              <tr key={i}>
+                <td>{l.agentName ?? (l.agentId ? l.agentId.slice(0, 8) : 'main')}</td>
+                <td>
+                  {tool ? <>⚙ {tool}</> : l.model}
+                  {l.modelId && l.modelId !== l.model && <span className="sub">{l.modelId}</span>}
+                </td>
+                <td>{num(l.calls)}</td>
+                <td>{tool ? '—' : split(tokens)}</td>
+                <td>{formatCost({ costMicros: l.costMicros, currency: l.currency, unpriced: 0 }) ?? '—'}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </section>
   );
 }
 

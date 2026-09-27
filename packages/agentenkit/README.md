@@ -2,7 +2,8 @@
 
 A durable runtime for AI agent runs, as a **library**.
 
-It does not own your prompts, models, or tools — the [AI SDK](https://sdk.vercel.ai) does.
+It does not own your prompts, models, or tools — the [AI SDK](https://sdk.vercel.ai) does —
+though it ships a few [built-in tools](#built-in-tools) any model can use.
 It owns the **lifecycle of a run**: that a run outlives the request that started it,
 survives a worker dying mid-step, can be stopped, parked for a human, resumed exactly
 where it stopped, nested, metered, and watched by several people at once.
@@ -217,6 +218,51 @@ tokens.
 `chain`, to try one then the other. See
 [Cost and pricing](https://eadwincode.github.io/agentic-kit/cost-and-pricing).
 
+## Built-in tools
+
+Tools with one name and one input shape in both runtimes, so any model that can
+call tools can use them. What does the work is an adapter you pass in, with its
+API key, at setup; nothing reads the environment later.
+
+```ts
+import { BraveWebSearch, E2BSandbox, PageReader, setupAgentCore } from 'agentenkit';
+
+const runtime = await setupAgentCore({
+  // ... ports ...
+  tools: {
+    search: new BraveWebSearch({ apiKey: process.env.BRAVE_API_KEY! }),   // or JinaWebSearch
+    fetcher: new PageReader(),                                           // or JinaReader
+    sandbox: new E2BSandbox({ apiKey: process.env.E2B_API_KEY! }),        // or DockerSandbox, LocalSandbox
+  },
+});
+
+const coder = runtime.createStreamTextAgent({
+  name: 'coder',
+  tools: {
+    ...runtime.builtinTools(['web_search', 'web_fetch', 'bash', 'code_execution', 'text_editor']),
+    lookupInvoice,
+  },
+});
+```
+
+| Tool | What the model can do | Needs | Asks for approval |
+| :--- | :--- | :--- | :--- |
+| `web_search` | Search; results come back with short ids | `search` | No |
+| `web_fetch` | Read a page, by URL or result id; with a `prompt`, a small model answers from the page | `fetcher` | No |
+| `bash` | Run a command in the thread's sandbox | `sandbox` | Yes |
+| `code_execution` | Run a Python or JavaScript program; lists the files it made | `sandbox` | No |
+| `text_editor` | View, create and edit files by exact replacement, with undo | `sandbox` | For changes |
+
+A thread has **one sandbox**, kept between messages: every later run finds the
+same files, and it ends when the thread is deleted or has been idle for
+`sandboxIdleTtlMs` (30 minutes). Each tool call is a usage row, so
+`pricing.tools({ brave: { perUse: 0.005 }, e2b: { perSecond: 0.000028 } })`
+puts tool spend on the bill and under a run's money cap.
+
+Your own tools can use the thread's sandbox with `withSandbox(opts, fn)`. See
+[Web tools](https://eadwincode.github.io/agentic-kit/web-tools) and
+[Sandboxes](https://eadwincode.github.io/agentic-kit/sandboxes).
+
 ## The admin store (§2.9) — not yours
 
 Run records, step timings and a thread index are the **platform's** data, in the
@@ -278,6 +324,7 @@ reading your database at all.
 | §2.8 Queue dispatch + redrive/FAIL policy | `ports/queue.ts`, `core/engine.ts` |
 | §2.9 Operational history | `ports/admin.ts`, `admin/*`, `core/admin.ts` |
 | §2.10 Run state | `core/state.ts` |
+| Built-in tools | `core/builtin/*`, `ports/tools.ts`, `ports/sandbox.ts`, `adapters/{brave,jina,page-reader,docker,e2b,local-sandbox,computesdk}.ts` |
 | §5 Reference HTTP integration | `examples/nextjs-app` |
 
 ## Development

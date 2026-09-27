@@ -200,7 +200,14 @@ export function App() {
                 onToggle={() => setOpenThoughts((prev) => ({ ...prev, [e.id]: !thoughtOpen(e.id) }))}
               />
             ) : e.kind === 'tool' ? (
-              <p key={e.id} className="tool">{e.text}</p>
+              <div key={e.id}>
+                <p className="tool">{e.text}</p>
+                {e.parts.map((part) =>
+                  part.type === 'tool-call' && custom.toolOutput[part.toolCallId] ? (
+                    <pre key={part.toolCallId} className="tool-output">{custom.toolOutput[part.toolCallId]}</pre>
+                  ) : null,
+                )}
+              </div>
             ) : (
               <div key={e.id} className={`message ${e.role}`}>
                 <span className="message-role">{e.role === 'user' ? 'You' : 'Agent'}</span>
