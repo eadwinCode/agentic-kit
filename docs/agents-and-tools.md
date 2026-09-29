@@ -111,7 +111,8 @@ const lookup = tool({
 ```
 
 For searching the web and reading pages there are built-in tools that work
-with any model: see [Web tools](./web-tools.md).
+with any model: see [Web tools](./web-tools.md). For tools from MCP servers,
+see [MCP tools](./mcp.md).
 
 ### Tools that need a human first
 
