@@ -110,10 +110,24 @@ func (b BoundEvents) ListByType(ctx context.Context, threadID, typ string) ([]Ag
 	return b.s.ListByType(ctx, threadID, typ, b.sc)
 }
 
-// Pruner is the store's EventPruner, or nil when it cannot prune.
-func (b BoundEvents) Pruner() EventPruner {
-	p, _ := b.s.(EventPruner)
-	return p
+// Pruner is the store's EventPruner with the StorageContext bound, or nil
+// when it cannot prune.
+func (b BoundEvents) Pruner() *BoundPruner {
+	p, ok := b.s.(EventPruner)
+	if !ok {
+		return nil
+	}
+	return &BoundPruner{s: p, sc: b.sc}
+}
+
+// BoundPruner is EventPruner with the StorageContext bound.
+type BoundPruner struct {
+	s  EventPruner
+	sc StorageContext
+}
+
+func (b *BoundPruner) Prune(ctx context.Context, types []string, limit int, dryRun bool) (map[string]int64, error) {
+	return b.s.Prune(ctx, types, limit, dryRun, b.sc)
 }
 
 // BoundUsage is UsageStore with the StorageContext bound.

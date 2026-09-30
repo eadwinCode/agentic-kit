@@ -80,7 +80,10 @@ with runs, not with tokens.
 - `list(threadId, { types, runId, after, limit })` reads entries by filter,
   oldest first.
 - `prune` is optional. It backs `runtime.pruneEvents`; a storage without it
-  cannot prune.
+  cannot prune. Like every other method it gets the context last, so a
+  storage with a database per tenant prunes the tenant it names. In Go, 0.7.0
+  added that `sc ports.StorageContext` to `EventPruner.Prune`: a custom
+  adapter that prunes adds it as the last parameter.
 
 ### `messages.list` scoping
 

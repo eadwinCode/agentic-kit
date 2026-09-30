@@ -97,11 +97,12 @@ type EventStore interface {
 }
 
 // EventPruner is what an EventStore may add to back PruneEvents: one batch
-// of it. Prune deletes up to limit entries of these types, on every thread,
-// and says how many of each went. With dryRun it deletes nothing and counts
-// every entry of these types instead.
+// of it. Prune deletes up to limit entries of these types, on every thread
+// the store holds for sc, and says how many of each went. With dryRun it
+// deletes nothing and counts every entry of these types instead. A store
+// with a database per tenant opens the one sc names, as for any other call.
 type EventPruner interface {
-	Prune(ctx context.Context, types []string, limit int, dryRun bool) (map[string]int64, error)
+	Prune(ctx context.Context, types []string, limit int, dryRun bool, sc StorageContext) (map[string]int64, error)
 }
 
 // UsageStore is the usage section of Storage: one row per model call (§4).

@@ -30,8 +30,9 @@ export interface StorageContext {
 
 /** Strips the trailing StorageContext from every method of T. */
 type Bound<T> = {
-  [K in keyof T]: T[K] extends (...args: [...infer A, StorageContext]) => infer R
-    ? (...args: A) => R
+  // An optional method (events.prune) is bound too, and stays optional.
+  [K in keyof T]: NonNullable<T[K]> extends (...args: [...infer A, StorageContext]) => infer R
+    ? ((...args: A) => R) | Extract<T[K], undefined>
     : T[K] extends object
       ? Bound<T[K]>
       : T[K];

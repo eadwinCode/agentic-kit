@@ -1,4 +1,5 @@
 import type { RuntimePorts } from '../ports/runtime.js';
+import type { AgentRunState } from './state.js';
 
 /** The types older releases kept in the event log that now live only on a
  *  run stream or the bus. Nothing reads them from the table any more, so
@@ -23,6 +24,10 @@ export interface PruneOptions {
   dryRun?: boolean;
   /** Rows per batch; each batch is its own short delete. Default 10,000. */
   batchSize?: number;
+  /** Whose events to prune, passed to the storage like a run's state: a
+   *  store with a database per tenant prunes the one it names. Run it once
+   *  per tenant. Omitted, it prunes what an unscoped store holds. */
+  state?: AgentRunState;
 }
 
 export interface PruneReport {

@@ -3,6 +3,7 @@ package agentenkit_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -94,4 +95,64 @@ func TestPruneEvents(t *testing.T) {
 			mustEqual(t, again.Total, int64(0), "safe to run again")
 		})
 	}
+}
+
+// A storage that keeps each tenant's events in their own database can only
+// prune when it is told whose. PruneOptions.State reaches it like a run's
+// state; without it the prune fails and nothing goes.
+func TestPruneEvents_ATenantsEventsArePrunedWithTheCallersState(t *testing.T) {
+	ctx, sc := context.Background(), ports.StorageContext{}
+	byTenant := map[string]*memory.Storage{"a": memory.NewStorage(), "b": memory.NewStorage()}
+	threads := map[string]string{}
+	for tenant, s := range byTenant {
+		th, err := s.Threads().Create(ctx, ports.ThreadInit{}, sc)
+		must(t, err)
+		threads[tenant] = th.ID
+		for _, typ := range []string{"CHUNK", "STATE_CHANGE", "INPUT_REQUIRED"} {
+			_, err := s.Events().Append(ctx, th.ID, ports.NewThreadEvent{Type: typ, Payload: json.RawMessage(`{}`)}, sc)
+			must(t, err)
+		}
+	}
+	storage := perTenantPruning{Storage: byTenant["a"], byTenant: byTenant}
+	rt, err := agentenkit.SetupAgentCore(ctx, agentenkit.RuntimeOptions{
+		Storage: storage, Admin: memoryadmin.New(), Bus: memory.NewBus(), Queue: memory.NewQueue(), Kv: memory.NewKv(),
+		Streams:      memory.NewRunStreams(),
+		ResolveModel: func(string) (agentenkit.ResolvedModel, error) { return agentenkit.ResolvedModel{}, nil },
+	})
+	must(t, err)
+
+	if _, err := rt.PruneEvents(ctx, agentenkit.PruneOptions{}); err == nil {
+		t.Fatal("a prune with no tenant must fail, not guess")
+	}
+	done, err := rt.PruneEvents(ctx, agentenkit.PruneOptions{State: agentenkit.AgentRunState{"tenant": "a"}})
+	must(t, err)
+	mustEqual(t, done.Total, int64(2), "tenant a's old rows went")
+	left, _ := byTenant["a"].Events().ListSince(ctx, threads["a"], -1, sc)
+	mustEqual(t, len(left), 1, "tenant a keeps its record")
+	other, _ := byTenant["b"].Events().ListSince(ctx, threads["b"], -1, sc)
+	mustEqual(t, len(other), 3, "tenant b is untouched")
+}
+
+// perTenantPruning prunes the events of the tenant sc names.
+type perTenantPruning struct {
+	*memory.Storage
+	byTenant map[string]*memory.Storage
+}
+
+func (s perTenantPruning) Events() ports.EventStore {
+	return tenantPruner{EventStore: s.Storage.Events(), byTenant: s.byTenant}
+}
+
+type tenantPruner struct {
+	ports.EventStore
+	byTenant map[string]*memory.Storage
+}
+
+func (p tenantPruner) Prune(ctx context.Context, types []string, limit int, dryRun bool, sc ports.StorageContext) (map[string]int64, error) {
+	tenant, _ := sc.State["tenant"].(string)
+	s, ok := p.byTenant[tenant]
+	if !ok {
+		return nil, errors.New("no tenant")
+	}
+	return s.Events().(ports.EventPruner).Prune(ctx, types, limit, dryRun, sc)
 }

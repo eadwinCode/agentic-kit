@@ -25,6 +25,10 @@ type PruneOptions struct {
 	// BatchSize is rows per batch; each batch is its own short delete.
 	// Zero means 10,000.
 	BatchSize int
+	// State is whose events to prune, passed to the storage like a run's
+	// state: a store with a database per tenant prunes the one it names.
+	// Run it once per tenant. Empty prunes what an unscoped store holds.
+	State ports.AgentRunState
 }
 
 // PruneReport says what PruneEvents did.
