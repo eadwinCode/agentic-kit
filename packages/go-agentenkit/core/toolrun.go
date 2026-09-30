@@ -83,7 +83,7 @@ func ToolUseRow(tool, adapter string, uses int, seconds ...float64) ports.NewUsa
 	}
 	return ports.NewUsage{
 		Kind:             ports.KindTool,
-		Model:            "tool:" + tool,
+		Model:            ports.ToolUsePrefix + tool,
 		ModelID:          adapter,
 		Outcome:          ports.UsageFinished,
 		ProviderMetadata: meta,

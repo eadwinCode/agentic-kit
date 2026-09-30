@@ -87,7 +87,7 @@ else.
 ## The thread record
 
 `Storage.events` now keeps only these platform types: `INPUT_REQUIRED`,
-`INPUT_EXPIRED`, `HITL_RESPONSE`, `RUN_REFUSED`, `TOKEN_BUDGET_EXHAUSTED`,
+`INPUT_EXPIRED`, `HITL_RESPONSE`, `RUN_REFUSED` (at pickup only), `TOKEN_BUDGET_EXHAUSTED`,
 `COST_BUDGET_EXHAUSTED`, `CONTEXT_COMPACTED`, `MESSAGES_DROPPED`,
 `RUN_STARTED`, `RUN_ENDED` — plus your own events published with
 `{ durable: true }`.

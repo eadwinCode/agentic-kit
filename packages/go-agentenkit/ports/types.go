@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/zendev-sh/goai"
@@ -538,6 +539,17 @@ const (
 	// with a question).
 	KindTool UsageKind = "tool"
 )
+
+// ToolUsePrefix starts the Model of a usage row, and so of its UsageLine,
+// for one use of a paid tool service: "tool:web_search". A tool's own model
+// calls carry the model's key instead.
+const ToolUsePrefix = "tool:"
+
+// IsToolUse says whether a usage row's or line's Model is one use of a paid
+// tool service (a search, a page read, sandbox time) rather than a model
+// call. A bill prices such a line per use, and must not look it up as a
+// model.
+func IsToolUse(model string) bool { return strings.HasPrefix(model, ToolUsePrefix) }
 
 // Cost is the money one model call cost.
 type Cost struct {

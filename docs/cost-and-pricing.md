@@ -162,7 +162,7 @@ believed, and if none answers the call is stored unpriced.
 
 The built-in [web tools](./web-tools.md) write a usage row for each search
 and page read (`kind: 'tool'`, `model: 'tool:web_search'`, `modelId` the
-adapter). The [sandbox tools](./sandboxes.md#the-sandbox-tools) add the seconds their commands ran. `pricing.tools` prices them per use, per second or both, keyed by adapter; chain it with
+adapter). The [sandbox tools](./sandboxes.md#the-sandbox-tools) add the seconds their commands ran. When your own bill walks `usage.lines`, `isToolUse(line.model)` (Go: `agentenkit.IsToolUse`) tells such a line from a model call, so it is never looked up as a model. A tool's own model call, like reading a page with a question, carries the model's key and is a model call. `pricing.tools` prices them per use, per second or both, keyed by adapter; chain it with
 the model table, and tool spend counts against a run's money cap:
 
 ```ts

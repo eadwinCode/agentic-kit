@@ -28,7 +28,9 @@ func MarshalPayload(payload any) json.RawMessage {
 // RecordEventTypes are the platform's types that go in the thread record:
 // what must outlive a run (see ports.EventStore). Every other platform type
 // is live only: a notice on the bus, and an event on the run stream when
-// one is open. The TS runtime has the same set.
+// one is open. RUN_REFUSED is stored only when it belongs to a run (a
+// refusal at pickup); a refusal at dispatch, before any run exists, is sent
+// live only. The TS runtime has the same set.
 var RecordEventTypes = map[string]bool{
 	"INPUT_REQUIRED": true, "INPUT_EXPIRED": true, "HITL_RESPONSE": true,
 	"RUN_REFUSED": true, "TOKEN_BUDGET_EXHAUSTED": true, "COST_BUDGET_EXHAUSTED": true,

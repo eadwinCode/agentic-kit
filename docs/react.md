@@ -95,6 +95,17 @@ the conversation back exactly as it was and sets `error`; it does not mark the
 thread `FAILED`. The next accepted send clears `error`. An edit of a turn the
 server has not confirmed yet is refused too: it has no id the server knows.
 
+A refused `run()` resolves to `{ accepted: false, error }`, plus `reason`
+(`active_run`, `queue_full`, `billing`, or your route's own code) and
+`retryAfterSeconds` when the server gave them. The error may be a string or
+`{ error: { code, message } }`; the wait comes from the body's
+`retryAfterSeconds` or a `Retry-After` header.
+
+After a reload, a tool call's card carries its stored `result`, as it does
+live. `isToolError(result)` reads a failure from an object, from `error: …`
+text, from JSON text, or from a list of results. `isToolParked(result)`
+spots the marker a tool leaves while it waits for a person.
+
 The turn a send adds right away is swapped for the real one by an id the hook
 sends with it (`clientMessageId`, echoed on `MESSAGE_APPENDED`), never by
 matching its text.

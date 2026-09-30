@@ -6,7 +6,10 @@ import type { AgentEvent } from './types.js';
 
 /** The platform's types that go in the thread record: what must outlive a
  *  run (see Storage.events). Every other platform type is live only: a
- *  notice on the bus, and an event on the run stream when one is open. */
+ *  notice on the bus, and an event on the run stream when one is open.
+ *  RUN_REFUSED is stored only when it belongs to a run (a refusal at
+ *  pickup); a refusal at dispatch, before any run exists, is sent live
+ *  only. The Go runtime has the same set. */
 export const RECORD_EVENT_TYPES: ReadonlySet<string> = new Set([
   'INPUT_REQUIRED',
   'INPUT_EXPIRED',

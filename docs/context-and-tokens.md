@@ -152,9 +152,10 @@ config: {
 A rejected run writes no message and returns `accepted: false` with your
 error. It does publish: your own event, if the check sent one, and the
 platform's `RUN_REFUSED` with the error, so the chat can show the refusal
-where the user is looking rather than only in an HTTP response. `RUN_REFUSED`
-is kept in the thread record; your own event is kept only with
-`{ durable: true }`, as above.
+where the user is looking rather than only in an HTTP response. A refusal
+when the user sends is live only, so a user who keeps pressing Send does not
+grow the thread; a refusal at pickup belongs to a run and is kept in the
+thread record. Your own event is kept only with `{ durable: true }`, as above.
 
 Mid-run, the budget is the credit check. When the run's cumulative spend
 crosses `tokenBudget` between steps, the platform publishes

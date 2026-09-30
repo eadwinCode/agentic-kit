@@ -5,7 +5,7 @@ import { reclaimIfOrphaned } from './reclaim.js';
 import { runIdKey, THREAD_KEY_TTL_SECONDS } from './keys.js';
 import { recordStoppedRun } from './stop.js';
 import { randomUUID } from 'node:crypto';
-import { ACTIVE_STATES, publish, publishEvent, transition } from './publish.js';
+import { ACTIVE_STATES, publish, publishEvent, publishNotice, transition } from './publish.js';
 import { mergeProviderOptions, type ExecutionState } from './types.js';
 import { enqueueJob } from './lease.js';
 
@@ -41,7 +41,8 @@ export async function run(
 
   // Billing pre-execution check (§4) — user-injected hook. A refusal is
   // published on the thread as well as returned, so every client on the
-  // thread sees it, and a reload still shows it.
+  // thread sees it. It is live only: no run exists yet, and a user who keeps
+  // pressing Send must not grow the thread by a row each time.
   if (deps.config.billingPreCheck) {
     const check = await deps.config.billingPreCheck({
       threadId,
@@ -51,7 +52,7 @@ export async function run(
     });
     if (!check.ok) {
       const error = check.error ?? 'Billing check failed';
-      await publish(deps, threadId, 'RUN_REFUSED', { reason: 'billing', error });
+      await publishNotice(deps, threadId, 'RUN_REFUSED', { reason: 'billing', error });
       return { accepted: false, threadId, reason: 'billing', error };
     }
   }
@@ -71,7 +72,7 @@ export async function run(
       ((deps.log ?? console) as { warn?: (m: string, ...r: unknown[]) => void }).warn?.(
         'run refused: queue full', { threadId, ready, maxQueueDepth: deps.config.maxQueueDepth },
       );
-      await publish(deps, threadId, 'RUN_REFUSED', { reason: 'queue_full', error: new QueueFullError().message });
+      await publishNotice(deps, threadId, 'RUN_REFUSED', { reason: 'queue_full', error: new QueueFullError().message });
       return { accepted: false, threadId, reason: 'queue_full', error: 'The assistant is busy right now. Try again shortly.' };
     }
   }

@@ -286,6 +286,18 @@ export type UsageKind =
    *  (reading a page with a question). */
   | 'tool';
 
+/** Starts the `model` of a usage row, and so of its line, for one use of a
+ *  paid tool service: `tool:web_search`. A tool's own model calls carry the
+ *  model's key instead. */
+export const TOOL_USE_PREFIX = 'tool:';
+
+/** Whether a usage row's or line's `model` is one use of a paid tool service
+ *  (a search, a page read, sandbox time) rather than a model call. A bill
+ *  prices such a line per use, and must not look it up as a model. */
+export function isToolUse(model: string | null | undefined): boolean {
+  return typeof model === 'string' && model.startsWith(TOOL_USE_PREFIX);
+}
+
 /** The money one model call cost. */
 export interface Cost {
   /** Millionths of one `currency` unit: 1_000_000 is one dollar when the

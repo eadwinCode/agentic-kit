@@ -11,7 +11,7 @@
  *    `chain`   — try several in order; the first that answers wins.
  *
  *  Anything else is a `Pricer` of your own: an object with a `price` method. */
-import type { Cost, NewUsage } from './core/types.js';
+import { isToolUse, TOOL_USE_PREFIX, type Cost, type NewUsage } from './core/types.js';
 import type { Pricer } from './ports/runtime.js';
 
 /** The currency the shipped pricers use unless told otherwise. */
@@ -129,8 +129,8 @@ export type ToolPriceTable = Record<string, ToolPrice>;
 export function tools(prices: ToolPriceTable, currency: string = USD): Pricer {
   return {
     price(u: NewUsage): Cost | null {
-      if (u.kind !== 'tool' || !u.model?.startsWith('tool:')) return null;
-      const p = (u.modelId ? prices[u.modelId] : undefined) ?? prices[u.model.slice('tool:'.length)];
+      if (u.kind !== 'tool' || !u.model || !isToolUse(u.model)) return null;
+      const p = (u.modelId ? prices[u.modelId] : undefined) ?? prices[u.model.slice(TOOL_USE_PREFIX.length)];
       if (!p) return null;
       const meta = u.providerMetadata as { uses?: unknown; seconds?: unknown } | null | undefined;
       const uses = typeof meta?.uses === 'number' && meta.uses > 0 ? meta.uses : 1;

@@ -423,6 +423,29 @@ export interface AgentHandle {
   stop(threadId: string, state?: AgentRunState): Promise<StopResult>;
 }
 
+/** Operational reads (§2.9); see `AgentCore.admin`. */
+export interface AdminApi {
+  overview(range?: { since?: Date }): Promise<AdminOverview>;
+  listRuns(filter?: RunFilter): Promise<RunRecord[]>;
+  stats(range?: { since?: Date; until?: Date }): Promise<RunStats>;
+  getRun(runId: string): Promise<RunDetail | null>;
+  listRunsByThread(threadId: string): Promise<RunRecord[]>;
+  listSteps(runId: string): Promise<StepRecord[]>;
+  /** Threads with their runs rolled up — the top level of an operational
+   *  view, since a thread is what a person recognises (§2.9). */
+  listThreads(filter?: {
+    state?: ExecutionState[];
+    since?: Date;
+    limit?: number;
+  }): Promise<ThreadSummary[]>;
+  getThread(threadId: string): Promise<ThreadDetail | null>;
+  /** The same reads, with their Storage reads (a thread's or a run's spend,
+   *  a run's events) made with `state`, as a run's are. A storage that needs
+   *  a tenant to open the right database reads it from state; without it
+   *  those reads fail, and the view shows no spend. */
+  withState(state: AgentRunState): AdminApi;
+}
+
 export interface AgentCore {
   /** Resolve a registry key to the stable identity and provider instance used
    *  by execution, compaction, usage attribution, and persisted run metadata. */
@@ -534,23 +557,9 @@ export interface AgentCore {
 
   /** Operational reads (§2.9). The platform records what runs did; building a
    *  view over it is the caller's business. Everything here comes from the
-   *  platform's OWN store — it never reads the caller's database. */
-  admin: {
-    overview(range?: { since?: Date }): Promise<AdminOverview>;
-    listRuns(filter?: RunFilter): Promise<RunRecord[]>;
-    stats(range?: { since?: Date; until?: Date }): Promise<RunStats>;
-    getRun(runId: string): Promise<RunDetail | null>;
-    listRunsByThread(threadId: string): Promise<RunRecord[]>;
-    listSteps(runId: string): Promise<StepRecord[]>;
-    /** Threads with their runs rolled up — the top level of an operational
-     *  view, since a thread is what a person recognises (§2.9). */
-    listThreads(filter?: {
-      state?: ExecutionState[];
-      since?: Date;
-      limit?: number;
-    }): Promise<ThreadSummary[]>;
-    getThread(threadId: string): Promise<ThreadDetail | null>;
-  };
+   *  platform's OWN store — it never reads the caller's database — except a
+   *  thread's or a run's spend and a run's events, which live in Storage. */
+  admin: AdminApi;
 
   /** The queue dispatch side of the platform (§2.8): resolves the handle,
    *  applies the failure policy, and is idempotent under at-least-once

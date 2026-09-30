@@ -1,6 +1,6 @@
 import type { RuntimePorts } from '../../ports/runtime.js';
 import type { AgentRunState } from '../state.js';
-import type { NewUsage } from '../types.js';
+import { TOOL_USE_PREFIX, type NewUsage } from '../types.js';
 import { recordCall, type RunLedger } from '../usage.js';
 
 /** What a tool call knows about the run it is part of, beyond `state`: the
@@ -70,7 +70,7 @@ export function toolUseRow(
   return {
     kind: 'tool',
     step: 0,
-    model: `tool:${tool}`,
+    model: `${TOOL_USE_PREFIX}${tool}`,
     modelId: adapter,
     inputTokens: 0,
     cacheReadInputTokens: 0,

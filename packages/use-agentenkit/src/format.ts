@@ -36,13 +36,42 @@ export function contentToText(content: unknown, format: EntryFormat): string {
     .join('\n');
 }
 
+/** A tool result as a value: a result a tool returned as JSON text is
+ *  parsed, anything else is kept as it is. */
+function resultValue(result: unknown): unknown {
+  if (typeof result !== 'string') return result;
+  const head = result.trimStart()[0];
+  if (head !== '{' && head !== '[') return result;
+  try {
+    return JSON.parse(result) as unknown;
+  } catch {
+    return result;
+  }
+}
+
 /** Whether a tool result reports a failure: an object with an `error` key
  *  (a tool that threw, or an unknown tool), or the `error: …` text a failed
- *  tool's stored result carries. A denial or a cancellation is an answer,
- *  not a failure. */
+ *  tool's stored result carries, also when the tool returned it as JSON text.
+ *  A list of results (one per file, say) failed when any of them did. A
+ *  denial or a cancellation is an answer, not a failure. */
 export function isToolError(result: unknown): boolean {
-  if (typeof result === 'string') return result.startsWith('error: ');
-  return !!result && typeof result === 'object' && 'error' in (result as object);
+  const value = resultValue(result);
+  if (Array.isArray(value)) return value.some(hasErrorText);
+  if (typeof value === 'string') return value.startsWith('error: ');
+  return hasErrorText(value);
+}
+
+/** An object whose `error` is text. `error: null` or a record that merely
+ *  has an `error` field of another kind is not a failure. */
+function hasErrorText(value: unknown): boolean {
+  return !!value && typeof value === 'object' && typeof (value as { error?: unknown }).error === 'string';
+}
+
+/** Whether a tool result is the marker a tool leaves when it parks for a
+ *  person's answer. It is not a result: the call is still waiting. */
+export function isToolParked(result: unknown): boolean {
+  const value = resultValue(result);
+  return !!value && typeof value === 'object' && '__hitl_parked__' in (value as object);
 }
 
 /** What a stored history says about each tool call: `done` when a result is
@@ -66,6 +95,7 @@ function durableToolState(
 export function contentToParts(
   content: unknown,
   answered: ReadonlySet<string> | ToolCallOutcomes = new Set(),
+  results?: ReadonlyMap<string, unknown>,
 ): EntryPart[] {
   if (typeof content === 'string') return content ? [{ type: 'text', text: content }] : [];
   if (!Array.isArray(content)) {
@@ -88,6 +118,7 @@ export function contentToParts(
           toolName: part.toolName ?? 'tool',
           args: part.args ?? {},
           state: durableToolState(part.toolCallId, answered),
+          ...(results?.has(part.toolCallId) ? { result: results.get(part.toolCallId) } : {}),
         });
         break;
       case 'tool-result':
@@ -110,9 +141,10 @@ export function messageToEntry(
   message: SnapshotMessage,
   format: EntryFormat,
   answered: ReadonlySet<string> | ToolCallOutcomes = new Set(),
+  results?: ReadonlyMap<string, unknown>,
 ): ChatEntry | null {
   const text = contentToText(message.content, format);
-  const structured = contentToParts(message.content, answered);
+  const structured = contentToParts(message.content, answered, results);
   if (!text && structured.length === 0) return null;
   const parts = Array.isArray(message.content) ? message.content : [];
   const containsText = parts.some((part: any) => part?.type === 'text' && part.text);
@@ -152,6 +184,7 @@ export function messageToEntries(
   message: SnapshotMessage,
   format: EntryFormat,
   answered: ReadonlySet<string> | ToolCallOutcomes = new Set(),
+  results?: ReadonlyMap<string, unknown>,
 ): ChatEntry[] {
   const out: ChatEntry[] = [];
   const thought = reasoningText(message.content);
@@ -165,7 +198,7 @@ export function messageToEntries(
       parts: [{ type: 'reasoning', text: thought }],
     });
   }
-  const entry = messageToEntry(message, format, answered);
+  const entry = messageToEntry(message, format, answered, results);
   if (entry) out.push(entry);
   return out;
 }
@@ -175,15 +208,26 @@ export function messageToEntries(
  *  streams a result, so this is the only way a reload learns their state. */
 export function toolCallOutcomes(messages: readonly SnapshotMessage[]): Map<string, 'done' | 'error'> {
   const outcomes = new Map<string, 'done' | 'error'>();
+  for (const [id, result] of toolCallResults(messages)) {
+    outcomes.set(id, isToolError(result) ? 'error' : 'done');
+  }
+  return outcomes;
+}
+
+/** Every tool call a stored history has a result for, with the result, so a
+ *  reload can show what a call returned on its own card, as a live run does.
+ *  A park marker is left out: that call is still waiting. */
+export function toolCallResults(messages: readonly SnapshotMessage[]): Map<string, unknown> {
+  const results = new Map<string, unknown>();
   for (const m of messages) {
     if (!Array.isArray(m.content)) continue;
     for (const part of m.content as any[]) {
-      if (part?.type === 'tool-result' && typeof part.toolCallId === 'string') {
-        outcomes.set(part.toolCallId, isToolError(part.result) ? 'error' : 'done');
+      if (part?.type === 'tool-result' && typeof part.toolCallId === 'string' && !isToolParked(part.result)) {
+        results.set(part.toolCallId, part.result);
       }
     }
   }
-  return outcomes;
+  return results;
 }
 
 /** Every tool call a stored history has a result for. */

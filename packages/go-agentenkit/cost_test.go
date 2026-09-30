@@ -2,12 +2,16 @@ package agentenkit_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	agentenkit "github.com/eadwinCode/agentic-kit/packages/go-agentenkit"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/memory"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/core"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/pricing"
 )
 
@@ -218,4 +222,72 @@ func TestCost_CompactionIsBilledUnderItsOwnKind(t *testing.T) {
 	if compactions == 0 {
 		t.Fatal("no compaction call recorded")
 	}
+}
+
+// A storage that opens a tenant's own database needs the tenant on every
+// read. The admin views read a run's and a thread's spend from Storage, so
+// WithState carries the tenant there; without it the read fails and the
+// view shows no spend.
+type tenantUsage struct{ ports.UsageStore }
+
+func (u tenantUsage) Total(ctx context.Context, threadID string, f ports.UsageFilter, sc ports.StorageContext) (ports.UsageTotals, error) {
+	if sc.State["tenant"] != "acme" {
+		return ports.UsageTotals{}, errors.New("no tenant")
+	}
+	return u.UsageStore.Total(ctx, threadID, f, sc)
+}
+
+type tenantStorage struct{ *memory.Storage }
+
+func (s tenantStorage) Usage() ports.UsageStore { return tenantUsage{s.Storage.Usage()} }
+
+func TestCost_AdminReadsSpendWithTheCallersState(t *testing.T) {
+	h := makeRuntime(t, scripted(step{text: "done"}))
+	rt, err := agentenkit.SetupAgentCore(h.ctx, agentenkit.RuntimeOptions{
+		Storage: tenantStorage{h.storage}, Admin: h.admin, Bus: h.bus, Kv: h.kv, Queue: h.queue,
+		Streams: h.rt.Ports(nil).Streams, ResolveModel: h.rt.Ports(nil).ResolveModel,
+		Pricer: testTable,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat := rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat", Model: "gpt-4o"})
+	state := agentenkit.AgentRunState{"tenant": "acme"}
+	ran, err := chat.Run(h.ctx, agentenkit.RunInput{Prompt: "hi", State: state})
+	if err != nil || !ran.Accepted {
+		t.Fatalf("run: %v %+v", err, ran)
+	}
+	job, _ := h.queue.Shift()
+	if _, err := rt.Worker.HandleJob(h.ctx, job); err != nil {
+		t.Fatal(err)
+	}
+
+	bare, err := rt.Admin.GetRun(h.ctx, ran.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustEqual(t, bare.Usage.CostMicros, int64(0), "no tenant, no spend")
+
+	run, err := rt.Admin.WithState(state).GetRun(h.ctx, ran.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Usage.CostMicros == 0 {
+		t.Fatal("the run's spend must be read with the tenant")
+	}
+	thread, err := rt.Admin.WithState(state).GetThread(h.ctx, ran.ThreadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustEqual(t, thread.Thread.Tokens.CostMicros, run.Usage.CostMicros, "the thread's spend too")
+}
+
+// A bill reads each line as a model call or as one use of a paid tool
+// service. A tool's own model call (reading a page with a question) is a
+// model call, even though its row's kind is "tool".
+func TestCost_IsToolUseTellsAServiceFromAModelCall(t *testing.T) {
+	mustEqual(t, agentenkit.IsToolUse(core.ToolUseRow("web_search", "brave", 1).Model), true, "a search")
+	mustEqual(t, agentenkit.IsToolUse(core.ToolUseRow("bash", "docker", 1, 2.5).Model), true, "sandbox time")
+	mustEqual(t, agentenkit.IsToolUse("gpt-4o-mini"), false, "a model call")
+	mustEqual(t, agentenkit.IsToolUse(""), false, "no model")
 }

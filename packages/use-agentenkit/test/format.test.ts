@@ -3,9 +3,13 @@ import {
   contentToText,
   defaultFormat,
   formatCost,
+  isToolError,
+  isToolParked,
   messageToEntries,
   messageToEntry,
   reasoningText,
+  toolCallOutcomes,
+  toolCallResults,
 } from '../src/index.js';
 import type { SnapshotMessage } from '../src/index.js';
 
@@ -130,6 +134,48 @@ describe('structured parts', () => {
     ]);
     const [thought] = messageToEntries(msg([{ type: 'reasoning', text: 'hm' }, { type: 'text', text: 'ok' }]), defaultFormat);
     expect(thought!.parts).toEqual([{ type: 'reasoning', text: 'hm' }]);
+  });
+});
+
+describe('tool results', () => {
+  it('reads a failure from an object, from error text, from JSON text, and from a list', () => {
+    expect(isToolError({ error: 'boom' })).toBe(true);
+    expect(isToolError('error: boom')).toBe(true);
+    expect(isToolError('{"error":"boom"}')).toBe(true);
+    expect(isToolError('["ok", {"error":"not found"}]')).toBe(true); // one per file; one failed
+    expect(isToolError([{ ok: true }, { ok: true }])).toBe(false);
+    expect(isToolError('{"ok":true}')).toBe(false);
+    expect(isToolError('not json {')).toBe(false);
+    expect(isToolError('{"items":[1],"error":null}')).toBe(false);
+    expect(isToolError('["error: in a snippet", {"ok":true}]')).toBe(false);
+  });
+
+  it('knows a park marker, as an object or as JSON text', () => {
+    expect(isToolParked({ __hitl_parked__: true })).toBe(true);
+    expect(isToolParked('{"__hitl_parked__":true,"reason":"approval"}')).toBe(true);
+    expect(isToolParked({ ok: true })).toBe(false);
+  });
+
+  it('puts a stored result on its call after a reload, and leaves a parked call waiting', () => {
+    const history = [
+      msg([
+        { type: 'tool-call', toolCallId: 'c1', toolName: 'lookup', args: {} },
+        { type: 'tool-call', toolCallId: 'c2', toolName: 'rm', args: {} },
+        { type: 'tool-call', toolCallId: 'c3', toolName: 'sendEmail', args: {} },
+      ], { id: 'a1', role: 'assistant' }),
+      msg([
+        { type: 'tool-result', toolCallId: 'c1', result: { found: true } },
+        { type: 'tool-result', toolCallId: 'c2', result: '[{"ok":true},{"error":"denied"}]' },
+        { type: 'tool-result', toolCallId: 'c3', result: { __hitl_parked__: true } },
+      ], { id: 't1', role: 'tool' }),
+    ];
+    const results = toolCallResults(history);
+    const [entry] = messageToEntries(history[0]!, defaultFormat, toolCallOutcomes(history), results);
+    const calls = entry!.parts.filter((p) => p.type === 'tool-call');
+    expect(calls[0]).toMatchObject({ toolCallId: 'c1', state: 'done', result: { found: true } });
+    expect(calls[1]).toMatchObject({ toolCallId: 'c2', state: 'error' });
+    expect(calls[2]).toMatchObject({ toolCallId: 'c3', state: 'running' });
+    expect('result' in calls[2]!).toBe(false);
   });
 });
 

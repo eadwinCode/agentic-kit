@@ -248,12 +248,12 @@ func (t Tools) In(currency string) ports.Pricer {
 }
 
 func (t Tools) priceIn(currency string, u ports.NewUsage) *ports.Cost {
-	if u.Kind != ports.KindTool || !strings.HasPrefix(u.Model, "tool:") {
+	if u.Kind != ports.KindTool || !ports.IsToolUse(u.Model) {
 		return nil
 	}
 	p, ok := t[u.ModelID]
 	if !ok || u.ModelID == "" {
-		if p, ok = t[strings.TrimPrefix(u.Model, "tool:")]; !ok {
+		if p, ok = t[strings.TrimPrefix(u.Model, ports.ToolUsePrefix)]; !ok {
 			return nil
 		}
 	}

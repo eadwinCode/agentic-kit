@@ -3,6 +3,7 @@ import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import { useAgentThread } from '../src/useAgentThread.js';
 import type { AgentRunConfigLike } from './helpers.js';
 import { harness } from './helpers.js';
+import type { RunResult } from '../src/types.js';
 
 afterEach(() => {
   cleanup();
@@ -359,6 +360,32 @@ describe('run and stop (§2.1)', () => {
     expect(view.result.current.entries).toEqual(before);
     expect(view.result.current.agentState).toBe('COMPLETED');
     expect(view.result.current.error).toContain('Out of credits');
+  });
+
+  it('says why a send was refused and how long to wait', async () => {
+    const { view } = await mount({
+      runResult: { accepted: false, reason: 'queue_full', error: 'Busy', retryAfterSeconds: 30 },
+      runStatus: 503,
+    });
+    let r: RunResult | undefined;
+    await act(async () => {
+      r = await view.result.current.run('hi');
+    });
+    expect(r).toMatchObject({ accepted: false, reason: 'queue_full', error: 'Busy', retryAfterSeconds: 30 });
+  });
+
+  it('reads an error object and a Retry-After header', async () => {
+    const { view } = await mount({
+      runResult: { accepted: false, error: { code: 'rate_limited', message: 'Slow down' } },
+      runStatus: 429,
+      runHeaders: { 'Retry-After': '12' },
+    });
+    let r: RunResult | undefined;
+    await act(async () => {
+      r = await view.result.current.run('hi');
+    });
+    expect(r).toMatchObject({ accepted: false, reason: 'rate_limited', error: 'Slow down', retryAfterSeconds: 12 });
+    expect(view.result.current.error).toBe('Slow down');
   });
 
   it('stops the open thread', async () => {

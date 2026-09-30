@@ -9,6 +9,7 @@ import (
 
 	agentenkit "github.com/eadwinCode/agentic-kit/packages/go-agentenkit"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/core"
+	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
 
 func TestRun_CreatesThreadPersistsMarksRunningEnqueues(t *testing.T) {
@@ -82,9 +83,58 @@ func TestRun_RejectsWhenTheBillingPreCheckFails(t *testing.T) {
 	refused := h.events(res.ThreadID, "RUN_REFUSED")
 	mustEqual(t, len(refused), 1, "RUN_REFUSED")
 	mustEqual(t, payload(refused[0])["error"], "no credits", "reason")
-	if refused[0].Seq == 0 {
-		t.Fatal("the refusal must be durable")
+}
+
+// A refusal at dispatch is sent live only: no run exists yet, and a user
+// who keeps pressing Send must not grow the thread by a row each time. A
+// refusal at pickup belongs to a run, so it is kept with the run.
+func TestRun_ARefusalAtDispatchIsLiveOnly(t *testing.T) {
+	h := makeRuntime(t, scripted(step{text: "ok"}), func(c *agentenkit.AgentConfig) {
+		c.BillingPreCheck = func(context.Context, agentenkit.BillingCheck) error { return errors.New("no credits") }
+	})
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
+	thread, err := h.storage.Threads().Create(h.ctx, ports.ThreadInit{Model: "gpt-4o"}, ports.StorageContext{})
+	if err != nil {
+		t.Fatal(err)
 	}
+	for range 3 {
+		res, err := chat.Run(h.ctx, agentenkit.RunInput{ThreadID: thread.ID, Prompt: "x"})
+		if err != nil || res.Accepted {
+			t.Fatalf("must be refused: %v %v", res, err)
+		}
+	}
+	refused := h.events(thread.ID, "RUN_REFUSED")
+	mustEqual(t, len(refused), 3, "every client saw each refusal")
+	mustEqual(t, refused[0].Seq, int64(0), "sent live")
+	stored, err := h.storage.Events().ListSince(h.ctx, thread.ID, -1, ports.StorageContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustEqual(t, len(stored), 0, "the thread did not grow")
+
+	pickup := makeRuntime(t, scripted(step{text: "never"}), func(c *agentenkit.AgentConfig) {
+		c.BillingPreCheck = func(_ context.Context, check agentenkit.BillingCheck) error {
+			if check.Stage == ports.BillingAtPickup {
+				return errors.New("out of credits")
+			}
+			return nil
+		}
+	})
+	chat2 := pickup.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat"})
+	ran := pickup.run(t, chat2, agentenkit.RunInput{Prompt: "go"})
+	pickup.handleNext(t)
+	stored, err = pickup.storage.Events().ListSince(pickup.ctx, ran.ThreadID, -1, ports.StorageContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kept []agentenkit.AgentEvent
+	for _, e := range stored {
+		if e.Type == "RUN_REFUSED" {
+			kept = append(kept, e)
+		}
+	}
+	mustEqual(t, len(kept), 1, "a refusal at pickup is kept")
+	mustEqual(t, payload(kept[0])["runId"], ran.RunID, "with its run")
 }
 
 func TestRun_ThreadsTokenBudgetThroughTheJob(t *testing.T) {

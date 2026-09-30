@@ -31,7 +31,7 @@ Put `setupAgentCore` and every `create*Agent` call in one module.
 ### `run()` returns `accepted: false`
 
 Either the thread has an active run — stop it first, or wait — or your
-`billingPreCheck` rejected it. The `error` says which, and the thread carries a durable `RUN_REFUSED` event with the same text. No message was written.
+`billingPreCheck` rejected it. The `error` says which, and every open client gets a live `RUN_REFUSED` event with the same text. No message or event row was written.
 
 ### A thread is stuck in `RUNNING` with no worker
 
