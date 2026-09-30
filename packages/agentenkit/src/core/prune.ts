@@ -1,4 +1,5 @@
 import type { RuntimePorts } from '../ports/runtime.js';
+import type { AgentRunState } from './state.js';
 
 /** The types older releases kept in the event log that now live only on a
  *  run stream or the bus. Nothing reads them from the table any more, so
@@ -23,6 +24,12 @@ export interface PruneOptions {
   dryRun?: boolean;
   /** Rows per batch; each batch is its own short delete. Default 10,000. */
   batchSize?: number;
+  /** Whose events to prune, passed to the storage like a run's state: a
+   *  store with a database per tenant prunes the one it names. Run it once
+   *  per tenant. Omitted, it prunes what an unscoped store holds.
+   *  `runtime.pruneEvents` applies it; `pruneEvents(deps)` prunes with the
+   *  state `deps` was bound with, so bind that one instead. */
+  state?: AgentRunState;
 }
 
 export interface PruneReport {
@@ -35,7 +42,9 @@ export interface PruneReport {
 /** Delete the stream-only rows older releases left in the event log (see
  *  STREAM_ONLY_TYPES), a batch at a time, so a large table never holds one
  *  long lock. Safe to stop and run again: each batch stands on its own.
- *  Needs a storage whose events port can prune; one that cannot throws. */
+ *  Needs a storage whose events port can prune; one that cannot throws.
+ *  It prunes with the state `deps` is bound with; `runtime.pruneEvents`
+ *  binds `opts.state` for you. */
 export async function pruneEvents(deps: RuntimePorts, opts: PruneOptions = {}): Promise<PruneReport> {
   const prune = deps.storage.events.prune;
   if (!prune) throw new Error('pruneEvents: this storage cannot prune its events');

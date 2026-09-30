@@ -207,7 +207,7 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
         publishEvent(scope(options.state), threadId, type, payload, options),
     },
 
-    pruneEvents: (options) => pruneEvents(deps, options),
+    pruneEvents: (options) => pruneEvents(scope(options?.state), options),
 
     streams: {
       read: (streamId, after, signal) => {

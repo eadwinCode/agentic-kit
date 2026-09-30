@@ -421,7 +421,7 @@ func (e events) ListByType(ctx context.Context, threadID, typ string, _ ports.St
 	return e.query(ctx, `SELECT `+eventCols+` FROM `+e.s.t("events")+` WHERE "threadId" = $1 AND type = $2 ORDER BY seq`, threadID, typ)
 }
 
-func (e events) Prune(ctx context.Context, types []string, limit int, dryRun bool) (map[string]int64, error) {
+func (e events) Prune(ctx context.Context, types []string, limit int, dryRun bool, _ ports.StorageContext) (map[string]int64, error) {
 	counts := map[string]int64{}
 	if len(types) == 0 {
 		return counts, nil

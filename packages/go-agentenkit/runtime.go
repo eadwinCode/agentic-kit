@@ -325,9 +325,10 @@ func (e *EventsAPI) SSE(ctx context.Context, threadID string, opts SSEStateOptio
 // PruneEvents deletes the stream-only rows (chunks, step markers, state
 // changes…) releases before run streams left in the event table, a batch at
 // a time. Nothing reads them any more; an app's own types are kept. Run it
-// when it suits you, after upgrading: DryRun counts first.
+// when it suits you, after upgrading: DryRun counts first. With a storage
+// that keeps a database per tenant, run it once per tenant with State.
 func (c *AgentCore) PruneEvents(ctx context.Context, opts core.PruneOptions) (core.PruneReport, error) {
-	return core.PruneEvents(ctx, c.scope(nil, ""), opts)
+	return core.PruneEvents(ctx, c.scope(opts.State, ""), opts)
 }
 
 // StreamsAPI reads run streams by id, for a caller that only cares about

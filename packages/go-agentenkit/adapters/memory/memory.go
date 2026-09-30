@@ -699,7 +699,7 @@ func (e events) ListByType(_ context.Context, threadID, typ string, sc ports.Sto
 	return out, nil
 }
 
-func (e events) Prune(_ context.Context, types []string, limit int, dryRun bool) (map[string]int64, error) {
+func (e events) Prune(_ context.Context, types []string, limit int, dryRun bool, _ ports.StorageContext) (map[string]int64, error) {
 	e.s.mu.Lock()
 	defer e.s.mu.Unlock()
 	counts := map[string]int64{}

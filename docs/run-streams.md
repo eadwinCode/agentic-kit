@@ -252,5 +252,16 @@ cursor still rides on each message's `id:`, so reconnects work the same way.
   thread record are kept. Each batch is its own short delete, so it is safe to
   stop and run again. It needs a storage whose `events` has `prune`; the
   reference ones do.
+
+  With a storage that keeps a database per tenant, run it once per tenant and
+  pass whose events to prune, as you would a run's state:
+
+  ```ts
+  await runtime.pruneEvents({ state: { orgId } });
+  ```
+
+  ```go
+  report, err := rt.PruneEvents(ctx, agentenkit.PruneOptions{State: agentenkit.AgentRunState{"orgId": orgID}})
+  ```
 - **Admin `getRun`** now returns the run's record entries as `events`, not
   the whole log with chunks stripped.

@@ -93,10 +93,15 @@ export interface Storage {
      *  is derived from these. */
     listByType(threadId: string, type: string, ctx: StorageContext): Promise<AgentEvent[]>;
     /** Optional: one batch of `runtime.pruneEvents`. Deletes up to `limit`
-     *  entries of these types, on every thread, and says how many of each
-     *  went. With `dryRun` it deletes nothing and counts every entry of
-     *  these types instead. */
-    prune?(types: string[], opts: { limit: number; dryRun?: boolean }): Promise<Record<string, number>>;
+     *  entries of these types, on every thread the store holds for `ctx`,
+     *  and says how many of each went. With `dryRun` it deletes nothing and
+     *  counts every entry of these types instead. A store with a database per
+     *  tenant opens the one `ctx` names, as for any other call. */
+    prune?(
+      types: string[],
+      opts: { limit: number; dryRun?: boolean },
+      ctx: StorageContext,
+    ): Promise<Record<string, number>>;
   };
   /** One row per model call (§4).
    *

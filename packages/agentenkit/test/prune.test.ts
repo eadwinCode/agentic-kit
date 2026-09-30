@@ -63,4 +63,46 @@ describe('prune events', () => {
       expect((await runtime.pruneEvents()).total).toBe(0); // safe to run again
     });
   }
+
+  // A storage that keeps each tenant's events in their own database can only
+  // prune when it is told whose. The state reaches it like a run's state;
+  // without it the prune fails and nothing goes.
+  it("a tenant's events are pruned with the caller's state", async () => {
+    const ctx = { state: {} };
+    const byTenant: Record<string, Storage> = { a: new MemoryStorage(), b: new MemoryStorage() };
+    const threads: Record<string, string> = {};
+    for (const [tenant, s] of Object.entries(byTenant)) {
+      const t = await s.threads.create({}, ctx);
+      threads[tenant] = t.id;
+      for (const type of ['CHUNK', 'STATE_CHANGE', 'INPUT_REQUIRED']) {
+        await s.events.append(t.id, { type, payload: {} }, ctx);
+      }
+    }
+    const base = byTenant.a!;
+    const storage: Storage = {
+      threads: base.threads,
+      messages: base.messages,
+      usage: base.usage,
+      events: {
+        ...base.events,
+        prune: async (types, opts, scope) => {
+          const s = byTenant[(scope.state as { tenant?: string }).tenant ?? ''];
+          if (!s) throw new Error('no tenant');
+          return s.events.prune!(types, opts, scope);
+        },
+      },
+    };
+    const runtime = await setupAgentCore({
+      storage, admin: new MemoryAdminStore(), bus: new MemoryBus(), queue: new MemoryQueue(), kv: new MemoryKv(),
+      streams: new MemoryRunStreams(),
+      resolveModel: () => ({ instance: () => ({}) as any, contextWindow: 128_000 }),
+      config: resolveConfig(),
+    });
+
+    await expect(runtime.pruneEvents()).rejects.toThrow('no tenant'); // no tenant: fail, never guess
+    const done = await runtime.pruneEvents({ state: { tenant: 'a' } });
+    expect(done.total).toBe(2); // tenant a's old rows went
+    expect(await byTenant.a!.events.listSince(threads.a!, -1, ctx)).toHaveLength(1); // a keeps its record
+    expect(await byTenant.b!.events.listSince(threads.b!, -1, ctx)).toHaveLength(3); // b is untouched
+  });
 });

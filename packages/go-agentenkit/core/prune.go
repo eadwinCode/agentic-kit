@@ -25,6 +25,12 @@ type PruneOptions struct {
 	// BatchSize is rows per batch; each batch is its own short delete.
 	// Zero means 10,000.
 	BatchSize int
+	// State is whose events to prune, passed to the storage like a run's
+	// state: a store with a database per tenant prunes the one it names.
+	// Run it once per tenant. Empty prunes what an unscoped store holds.
+	// AgentCore.PruneEvents applies it; core.PruneEvents prunes with the
+	// state deps was bound with, so bind that one instead.
+	State ports.AgentRunState
 }
 
 // PruneReport says what PruneEvents did.
@@ -38,7 +44,8 @@ type PruneReport struct {
 // PruneEvents deletes the stream-only rows older releases left in the event
 // log (see StreamOnlyTypes), a batch at a time, so a large table never holds
 // one long lock. Safe to stop and run again: each batch stands on its own.
-// Needs a storage whose event store is an EventPruner.
+// Needs a storage whose event store is an EventPruner. It prunes with the
+// state deps is bound with; AgentCore.PruneEvents binds opts.State for you.
 func PruneEvents(ctx context.Context, deps ports.RuntimePorts, opts PruneOptions) (PruneReport, error) {
 	pruner := deps.Storage.Events.Pruner()
 	if pruner == nil {
