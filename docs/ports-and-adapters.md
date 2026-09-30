@@ -83,7 +83,10 @@ with runs, not with tokens.
   cannot prune. Like every other method it gets the context last, so a
   storage with a database per tenant prunes the tenant it names. In Go, 0.7.0
   added that `sc ports.StorageContext` to `EventPruner.Prune`: a custom
-  adapter that prunes adds it as the last parameter.
+  adapter that prunes adds it as the last parameter. `BoundEvents.Pruner()`
+  now returns a `*ports.BoundPruner` (the context already attached, so its
+  `Prune` has no `sc`) rather than an `EventPruner`: code that kept the
+  result as an `EventPruner` holds a `*ports.BoundPruner` instead.
 
 ### `messages.list` scoping
 
