@@ -128,7 +128,7 @@ Common stream events (the shapes follow [AG-UI](https://docs.ag-ui.com)):
 | `RUN_FINISHED` / `RUN_ERROR` | The segment ended; always the last item |
 
 Common record entries: `INPUT_REQUIRED`, `INPUT_EXPIRED`, `HITL_RESPONSE`,
-`RUN_REFUSED`, `TOKEN_BUDGET_EXHAUSTED`, `COST_BUDGET_EXHAUSTED`,
+`RUN_REFUSED` (at pickup only), `TOKEN_BUDGET_EXHAUSTED`, `COST_BUDGET_EXHAUSTED`,
 `CONTEXT_COMPACTED`, `MESSAGES_DROPPED`, `RUN_STARTED`, `RUN_ENDED`.
 `STATE_CHANGE` is still sent live on the bus, but it is not stored.
 

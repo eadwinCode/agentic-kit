@@ -25,6 +25,7 @@ export type { SnapshotStream } from './core/snapshot.js';
 export { agUiState, toAgUi, type AgUiState, type WireFormat } from './core/agui.js';
 export { pruneEvents, STREAM_ONLY_TYPES, type PruneOptions, type PruneReport } from './core/prune.js';
 export type {
+  AdminApi,
   AgentCore,
   AgentHandle,
   AgentKind,
@@ -93,6 +94,7 @@ export {
 export type { AgentRunState, BoundStorage, StorageContext } from './core/state.js';
 export type { AdminThread, ThreadStart, StepRecord, RunFilter, AdminThreadFilter, RunCursor, RunDeltas, RunTotals } from './ports/admin.js';
 export type { BillingCheck } from './core/types.js';
+export { isToolUse, TOOL_USE_PREFIX } from './core/types.js';
 export { claimRun, redriveKey, runIdKey } from './core/keys.js';
 export { countTokens, sumUsage, emptyTotals, UsageMerger, type UsageGroup } from './core/usage.js';
 

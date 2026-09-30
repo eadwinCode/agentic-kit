@@ -11,7 +11,7 @@ import type {
   RuntimePorts,
   ThreadSnapshot,
 } from './ports/runtime.js';
-import type { ReclaimReport, ThreadUsage } from './ports/runtime.js';
+import type { AdminApi, ReclaimReport, ThreadUsage } from './ports/runtime.js';
 import type { RunFilter } from './ports/admin.js';
 import type { RunRecord } from './core/types.js';
 import type { RegisteredAgent } from './core/agent.js';
@@ -155,16 +155,7 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
       state?: AgentRunState,
     ): Promise<ThreadSnapshot | null> => threadSnapshot(scope(state), threadId),
 
-    admin: {
-      overview: (range) => adminReads.overview(deps, range),
-      listRuns: (filter) => adminReads.listRuns(deps, filter),
-      stats: (range) => adminReads.runStats(deps, range),
-      getRun: (runId: string) => adminReads.getRun(deps, runId),
-      listRunsByThread: (threadId: string) => deps.admin.runs.listByThread(threadId),
-      listSteps: (runId: string) => adminReads.listSteps(deps, runId),
-      listThreads: (filter) => adminReads.listThreads(deps, filter),
-      getThread: (threadId: string) => adminReads.getThread(deps, threadId),
-    },
+    admin: adminApi(deps, scope),
 
     getThreadUsage: async (
       threadId: string,
@@ -330,3 +321,17 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
   return core;
 }
 
+/** The admin reads over `deps`; `withState` rebinds them to a run state. */
+function adminApi(deps: RuntimePorts, scope: (state?: AgentRunState) => RuntimePorts): AdminApi {
+  return {
+    overview: (range) => adminReads.overview(deps, range),
+    listRuns: (filter) => adminReads.listRuns(deps, filter),
+    stats: (range) => adminReads.runStats(deps, range),
+    getRun: (runId: string) => adminReads.getRun(deps, runId),
+    listRunsByThread: (threadId: string) => deps.admin.runs.listByThread(threadId),
+    listSteps: (runId: string) => adminReads.listSteps(deps, runId),
+    listThreads: (filter) => adminReads.listThreads(deps, filter),
+    getThread: (threadId: string) => adminReads.getThread(deps, threadId),
+    withState: (state) => adminApi(scope(state), scope),
+  };
+}

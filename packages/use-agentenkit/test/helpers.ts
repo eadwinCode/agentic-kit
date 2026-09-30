@@ -7,7 +7,10 @@ export type AgentRunConfigLike = Partial<AgentRunConfig> & {
   /** Status for the history route — 404 exercises the "thread is gone" path. */
   historyStatus?: number;
   /** What the run route returns. */
-  runResult?: { accepted: boolean; threadId?: string; error?: string };
+  runResult?: Record<string, unknown> & { accepted: boolean };
+  /** Status and headers for the run route. */
+  runStatus?: number;
+  runHeaders?: Record<string, string>;
 };
 
 export interface FakeStream {
@@ -33,15 +36,15 @@ const defaultSnapshot: ThreadSnapshot = {
  *  network or EventSource is involved — the transport being injectable is the
  *  same property that makes the hook testable. */
 export function harness(over: AgentRunConfigLike = {}) {
-  const { snapshot, historyStatus, runResult, ...config } = over;
+  const { snapshot, historyStatus, runResult, runStatus, runHeaders, ...config } = over;
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const streams: FakeStream[] = [];
 
-  const json = (body: unknown, status = 200) =>
+  const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
     Promise.resolve(
       new Response(JSON.stringify(body), {
         status,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...headers },
       }),
     );
 
@@ -62,7 +65,7 @@ export function harness(over: AgentRunConfigLike = {}) {
     }
     if (url.includes('threads')) return json({ threads: [] });
     if (url.includes('run') || url.includes('start')) {
-      return json(runResult ?? { accepted: true, threadId: 't1', runId: 'r1' });
+      return json(runResult ?? { accepted: true, threadId: 't1', runId: 'r1' }, runStatus, runHeaders);
     }
     return json({ ok: true });
   };

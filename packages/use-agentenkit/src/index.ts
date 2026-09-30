@@ -35,11 +35,13 @@ export {
   contentToText,
   formatCost,
   isToolError,
+  isToolParked,
   messageToEntry,
   messageToEntries,
   reasoningText,
   stateActivity,
   toolCallOutcomes,
+  toolCallResults,
 } from './format.js';
 export type { ToolCallOutcomes } from './format.js';
 export { formatCursor, streamItemEvents, type ThreadCursor } from './frames.js';

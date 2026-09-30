@@ -147,6 +147,8 @@ const (
 	KindStep       = ports.KindStep
 	KindCompaction = ports.KindCompaction
 	KindTool       = ports.KindTool
+	// ToolUsePrefix starts the Model of a row for one use of a paid tool service.
+	ToolUsePrefix = ports.ToolUsePrefix
 
 	UsageFinished = ports.UsageFinished
 	UsageAborted  = ports.UsageAborted
@@ -193,6 +195,9 @@ var (
 )
 
 var (
+	// IsToolUse says whether a usage row's or line's Model is one use of a
+	// paid tool service rather than a model call.
+	IsToolUse = ports.IsToolUse
 	// MainAgent scopes a message listing to the main agent's stream.
 	MainAgent = ports.MainAgent
 	// AgentScope scopes a message listing to one nested run's stream.

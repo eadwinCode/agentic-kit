@@ -59,6 +59,9 @@ await runtime.getThreadUsage(threadId, { orgId });
 await runtime.deleteThread(threadId, { orgId });
 await runtime.hitl.respond({ threadId, toolCallId, approved, state: { orgId } });
 await chat.stop(threadId, { orgId });
+// The admin reads come from the platform's own store, but a run's or a
+// thread's spend and a run's events live in yours:
+await runtime.admin.withState({ orgId }).getRun(runId); // Go: rt.Admin.WithState(state).GetRun
 ```
 
 Omit it and that one call reaches your storage with an empty context. Make your

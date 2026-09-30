@@ -67,7 +67,7 @@ func SetupAgentCore(ctx context.Context, opts RuntimeOptions) (*AgentCore, error
 	c := &AgentCore{opts: opts, admin: store, config: config, registry: map[string]*core.Handle{}}
 	c.HITL = &HITLAPI{c}
 	c.Events = &EventsAPI{c}
-	c.Admin = &AdminAPI{c}
+	c.Admin = &AdminAPI{c: c}
 	c.Worker = &WorkerAPI{c}
 	c.Streams = &StreamsAPI{c}
 	return c, nil
@@ -361,10 +361,22 @@ func (e *EventsAPI) PublishEvent(ctx context.Context, threadID, typ string, payl
 }
 
 // AdminAPI reads operational history (§2.9). Everything here comes from the
-// platform's OWN store; it never reads the caller's database.
-type AdminAPI struct{ c *AgentCore }
+// platform's OWN store; it never reads the caller's database, except for a
+// thread's or a run's spend and a run's events, which live in Storage.
+type AdminAPI struct {
+	c     *AgentCore
+	state AgentRunState
+}
 
-func (a *AdminAPI) deps() ports.RuntimePorts { return a.c.scope(nil, "") }
+// WithState is the admin API with its Storage reads (a thread's or a run's
+// spend, a run's events) made with state, as a run's are. A storage that
+// needs a tenant to open the right database reads them from state; without
+// it those reads fail, and the view shows no spend.
+func (a *AdminAPI) WithState(state AgentRunState) *AdminAPI {
+	return &AdminAPI{c: a.c, state: state}
+}
+
+func (a *AdminAPI) deps() ports.RuntimePorts { return a.c.scope(a.state, "") }
 
 // Overview: threads and runs by state, plus what is in flight.
 func (a *AdminAPI) Overview(ctx context.Context, since *time.Time) (AdminOverview, error) {

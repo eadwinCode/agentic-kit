@@ -9,6 +9,10 @@ import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
 import type { Pricer, RunFinishInfo, RuntimeOptions } from '../src/ports/runtime.js';
 import * as pricing from '../src/pricing.js';
+import { isToolUse } from '../src/index.js';
+import { toolUseRow } from '../src/core/builtin/run.js';
+import type { StorageContext } from '../src/core/state.js';
+import type { UsageFilter } from '../src/core/types.js';
 
 /** $10 per million input, $30 per million output. A step of 10 input + 5
  *  output is therefore 100 + 150 = 250 micros, a quarter of a cent. */
@@ -56,9 +60,9 @@ function scriptedModel(steps: ScriptedStep[]) {
 
 async function makeRuntime(
   steps: ScriptedStep[],
-  opts: { pricer?: Pricer; config?: Partial<AgentConfig> } = {},
+  opts: { pricer?: Pricer; config?: Partial<AgentConfig>; storage?: MemoryStorage } = {},
 ) {
-  const storage = new MemoryStorage();
+  const storage = opts.storage ?? new MemoryStorage();
   const bus = new MemoryBus();
   const queue = new MemoryQueue();
   const kv = new MemoryKv();
@@ -102,6 +106,42 @@ const terminal = (bus: MemoryBus) =>
   bus.published.filter((e) => e.type === 'STATE_CHANGE').at(-1)!.payload as any;
 
 describe('cost as part of the usage store (§4)', () => {
+  // A bill reads each line as a model call or as one use of a paid tool
+  // service. A tool's own model call (reading a page with a question) is a
+  // model call, even though its row's kind is 'tool'.
+  it('isToolUse tells a service from a model call', () => {
+    expect(isToolUse(toolUseRow('web_search', 'brave').model)).toBe(true); // a search
+    expect(isToolUse(toolUseRow('bash', 'docker', 1, 2.5).model)).toBe(true); // sandbox time
+    expect(isToolUse('gpt-4o-mini')).toBe(false); // a model call
+    expect(isToolUse(null)).toBe(false); // no model
+  });
+
+  // A storage that opens a tenant's own database needs the tenant on every
+  // read. The admin views read a run's and a thread's spend from Storage, so
+  // withState carries the tenant there; without it the read fails and the
+  // view shows no spend.
+  it('admin reads spend with the caller\'s state', async () => {
+    const storage = new MemoryStorage();
+    const total = storage.usage.total.bind(storage.usage);
+    storage.usage.total = (async (threadId: string, filter: UsageFilter, ctx: StorageContext) => {
+      if (ctx.state.tenant !== 'acme') throw new Error('no tenant');
+      return total(threadId, filter);
+    }) as typeof storage.usage.total;
+    const { runtime, queue } = await makeRuntime([{ text: 'done' }], { pricer: priceList, storage });
+    const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o' });
+    const state = { tenant: 'acme' };
+    const ran = await chat.run({ prompt: 'hi', state });
+    await runtime.worker.handleJob(queue.items[0]!);
+
+    const bare = (await runtime.admin.getRun(ran.runId!))!;
+    expect(bare.usage.costMicros).toBe(0); // no tenant, no spend
+
+    const run = (await runtime.admin.withState(state).getRun(ran.runId!))!;
+    expect(run.usage.costMicros).toBeGreaterThan(0);
+    const thread = (await runtime.admin.withState(state).getThread(ran.threadId))!;
+    expect(thread.thread.tokens.costMicros).toBe(run.usage.costMicros); // the thread's spend too
+  });
+
   it('prices every call on the row that stores it', async () => {
     const { runtime, storage, queue } = await makeRuntime(
       [{ toolCalls: [{ toolCallId: 'c1', toolName: 'probe', args: {} }] }, { text: 'done' }],

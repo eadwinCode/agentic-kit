@@ -99,7 +99,8 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 
 	// Billing pre-execution check (§4), a user-injected hook. A refusal is
 	// published on the thread as well as returned, so every client on the
-	// thread sees it, and a reload still shows it.
+	// thread sees it. It is live only: no run exists yet, and a user who
+	// keeps pressing Send must not grow the thread by a row each time.
 	if deps.Config.BillingPreCheck != nil {
 		check := ports.BillingCheck{
 			ThreadID: threadID, State: input.State, Stage: ports.BillingAtDispatch,
@@ -108,7 +109,7 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 			},
 		}
 		if err := deps.Config.BillingPreCheck(ctx, check); err != nil {
-			_, _ = Publish(ctx, deps, threadID, "RUN_REFUSED", map[string]any{"reason": "billing", "error": err.Error()})
+			_ = PublishNotice(ctx, deps, threadID, "RUN_REFUSED", map[string]any{"reason": "billing", "error": err.Error()})
 			return refuseFor(ports.RefusedBilling, err.Error())
 		}
 	}
@@ -125,7 +126,7 @@ func Run(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, i
 		}
 		if err == nil && stats.Ready >= deps.Config.MaxQueueDepth {
 			Logger(deps).Warn("run refused: queue full", "thread", threadID, "ready", stats.Ready, "maxQueueDepth", deps.Config.MaxQueueDepth)
-			_, _ = Publish(ctx, deps, threadID, "RUN_REFUSED", map[string]any{"reason": ports.RefusedQueueFull, "error": ports.ErrQueueFull.Error()})
+			_ = PublishNotice(ctx, deps, threadID, "RUN_REFUSED", map[string]any{"reason": ports.RefusedQueueFull, "error": ports.ErrQueueFull.Error()})
 			return refuseFor(ports.RefusedQueueFull, "The assistant is busy right now. Try again shortly.")
 		}
 	}

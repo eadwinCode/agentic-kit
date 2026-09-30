@@ -95,13 +95,40 @@ describe('runtime.run via handle (§5.1)', () => {
     const chat = runtime.createStreamTextAgent({ name: 'chat' });
     const res = await chat.run({ prompt: 'x', state: { orgId: 'acme' } });
     expect(res.accepted).toBe(false);
-    // Both the check's own event and the platform's refusal are on the log, durably
+    // Both the check's own event and the platform's refusal went out
     const limit = bus.published.find((e) => e.type === 'CREDIT_LIMIT')!;
     expect(limit.payload).toEqual({ org: 'acme' });
     const refused = bus.published.find((e) => e.type === 'RUN_REFUSED')!;
     expect(refused.payload).toEqual({ reason: 'billing', error: 'Insufficient credits' });
-    expect(refused.seq).toBeGreaterThan(limit.seq);
     expect(res.error).toMatch(/Insufficient credits/);
+  });
+
+  // A refusal at dispatch is sent live only: no run exists yet, and a user
+  // who keeps pressing Send must not grow the thread by a row each time. A
+  // refusal at pickup belongs to a run, so it is kept with the run.
+  it('a refusal at dispatch is live only', async () => {
+    const { runtime, bus, store } = await makeDeps({
+      billingPreCheck: async () => ({ ok: false, error: 'no credits' }),
+    });
+    const chat = runtime.createStreamTextAgent({ name: 'chat' });
+    const thread = await store.threads.create({ model: 'gpt-4o' });
+    for (let i = 0; i < 3; i++) {
+      expect((await chat.run({ threadId: thread.id, prompt: 'x' })).accepted).toBe(false);
+    }
+    const refused = bus.published.filter((e) => e.threadId === thread.id && e.type === 'RUN_REFUSED');
+    expect(refused).toHaveLength(3); // every client saw each refusal
+    expect(refused[0]!.seq).toBe(0); // sent live
+    expect(await store.events.listSince(thread.id, -1)).toEqual([]); // the thread did not grow
+
+    const pickup = await makeDeps({
+      billingPreCheck: async ({ stage }) => (stage === 'pickup' ? { ok: false, error: 'out of credits' } : { ok: true }),
+    });
+    const chat2 = pickup.runtime.createStreamTextAgent({ name: 'chat' });
+    const ran = await chat2.run({ prompt: 'go' });
+    await pickup.runtime.worker.handleJob(pickup.queue.items[0]!);
+    const kept = (await pickup.store.events.listSince(ran.threadId, -1)).filter((e) => e.type === 'RUN_REFUSED');
+    expect(kept).toHaveLength(1); // a refusal at pickup is kept
+    expect((kept[0]!.payload as { runId?: string }).runId).toBe(ran.runId); // with its run
   });
 
   it('threads tokenBudget through the job (§2.1)', async () => {

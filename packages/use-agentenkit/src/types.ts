@@ -257,4 +257,10 @@ export interface RunResult {
   threadId?: string;
   runId?: string;
   error?: string;
+  /** Why the server refused the run: `active_run`, `queue_full`,
+   *  `billing`, or your route's own code. */
+  reason?: string;
+  /** How long to wait before sending again, when the server said: the
+   *  body's `retryAfterSeconds`, or else a `Retry-After` header in seconds. */
+  retryAfterSeconds?: number;
 }

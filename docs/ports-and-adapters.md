@@ -63,7 +63,8 @@ Every method takes a trailing `ctx` carrying the run's
 ### `events` — the thread record
 
 The events table is small now. It keeps only what must outlive a run:
-`INPUT_REQUIRED`, `INPUT_EXPIRED`, `HITL_RESPONSE`, `RUN_REFUSED`,
+`INPUT_REQUIRED`, `INPUT_EXPIRED`, `HITL_RESPONSE`, `RUN_REFUSED` (at pickup;
+a refusal when the user sends is live only),
 `TOKEN_BUDGET_EXHAUSTED`, `COST_BUDGET_EXHAUSTED`, `CONTEXT_COMPACTED`,
 `MESSAGES_DROPPED`, `RUN_STARTED`, `RUN_ENDED`, and an app's events published
 with `durable: true`. Text chunks, step markers and state changes are live

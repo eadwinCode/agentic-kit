@@ -9,7 +9,7 @@ import {
   type ResolvedConfig,
 } from './config.js';
 import { mergeConfig, useAgentRunConfig } from './context.js';
-import { isToolError, messageToEntries, messageToEntry, stateActivity, toolCallOutcomes } from './format.js';
+import { isToolError, isToolParked, messageToEntries, messageToEntry, stateActivity, toolCallOutcomes, toolCallResults } from './format.js';
 import { formatCursor, streamItemEvents } from './frames.js';
 import type {
   AgentActivity,
@@ -657,7 +657,7 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
           } else if (p?.type === 'tool-result') {
             // The park sentinel is an internal marker, not a result — it is
             // never persisted and must never be shown.
-            if (p.result && typeof p.result === 'object' && '__hitl_parked__' in p.result) break;
+            if (isToolParked(p.result)) break;
             if (p.toolCallId && seenToolResults.current.has(p.toolCallId)) break; // already durable
             if (p.toolCallId) seenToolResults.current.add(p.toolCallId);
             setActivity({ phase: 'tool-result', label: labels.toolCompleted, detail: p.toolName });
@@ -838,7 +838,8 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
       // approval or a stop never streams a result, so this is where a
       // reload learns how those calls ended.
       const outcomes = toolCallOutcomes(snapshot.messages);
-      setEntries(mainMessages.flatMap((m) => messageToEntries(m, cfg.format, outcomes)));
+      const results = toolCallResults(snapshot.messages);
+      setEntries(mainMessages.flatMap((m) => messageToEntries(m, cfg.format, outcomes, results)));
 
       // Rebuild each child's card from what it actually wrote, so a reload
       // does not lose a subagent's output.
@@ -1131,17 +1132,18 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
         });
         // The status first: an error page is not JSON, and its parse error
         // would hide what actually went wrong.
-        const data = (await response.json().catch(() => null)) as RunResult | null;
+        const data = (await response.json().catch(() => null)) as Record<string, unknown> | null;
         if (!response.ok || !data?.accepted) {
-          throw new Error(data?.error ?? `Run request failed (${response.status})`);
+          throw new RunRefused(refusal(response, data, `Run request failed (${response.status})`));
         }
         setError(null);
-        if (data.threadId) setThreadId(data.threadId);
+        const accepted = data as unknown as RunResult;
+        if (accepted.threadId) setThreadId(accepted.threadId);
         // The stream usually names the run first; a late answer must not
         // wipe the start it already carried.
-        if (data.runId) setCurrentRun((prev) => (prev?.id === data.runId ? prev : { id: data.runId! }));
+        if (accepted.runId) setCurrentRun((prev) => (prev?.id === accepted.runId ? prev : { id: accepted.runId! }));
         void loadThreads(); // the sidebar reflects a new thread immediately
-        return data;
+        return accepted;
       } catch (err) {
         // Nothing was sent: the conversation goes back to exactly what it
         // was, and the reason is shown apart from the thread's own state.
@@ -1153,7 +1155,8 @@ export function useAgentThread(options: UseAgentThreadOptions = {}): UseAgentThr
         setAgentState(shown.agentState);
         setActivity(shown.activity);
         setError(why);
-        return { accepted: false, threadId: threadRef.current, error: why };
+        const refused = err instanceof RunRefused ? err.result : {};
+        return { ...refused, accepted: false, threadId: threadRef.current, error: why };
       } finally {
         sending.current = false;
       }
@@ -1242,6 +1245,41 @@ async function checkControlResponse(response: Response, field: 'accepted' | 'del
   // always wins over that legacy envelope.
   if (!response.ok || !data || data[field] === false ||
       (data[field] !== true && data.ok !== true)) {
-    throw new Error(data?.error ?? data?.reason ?? `${label} (${response.status})`);
+    throw new Error(errorText(data?.error) ?? data?.reason ?? `${label} (${response.status})`);
   }
+}
+
+/** A run the server would not start, with what it said about it. */
+class RunRefused extends Error {
+  constructor(readonly result: Omit<RunResult, 'accepted'> & { error: string }) {
+    super(result.error);
+  }
+}
+
+/** The error text a route sent: a string, or an object with a `message`
+ *  (`{ error: { code, message } }`). */
+function errorText(error: unknown): string | undefined {
+  if (typeof error === 'string') return error;
+  if (error && typeof error === 'object' && typeof (error as { message?: unknown }).message === 'string') {
+    return (error as { message: string }).message;
+  }
+  return undefined;
+}
+
+/** What a refused run request said: the error, the reason (the body's
+ *  `reason`, or the code of an `{ error: { code, message } }`), and how long
+ *  to wait before sending again. */
+function refusal(response: Response, data: Record<string, unknown> | null, fallback: string) {
+  const code = data?.error && typeof data.error === 'object' ? (data.error as { code?: unknown }).code : undefined;
+  const reason = typeof data?.reason === 'string' ? data.reason : typeof code === 'string' ? code : undefined;
+  let retryAfterSeconds = typeof data?.retryAfterSeconds === 'number' ? data.retryAfterSeconds : undefined;
+  if (retryAfterSeconds === undefined) {
+    const header = Number(response.headers.get('Retry-After'));
+    if (response.headers.has('Retry-After') && Number.isFinite(header) && header >= 0) retryAfterSeconds = header;
+  }
+  return {
+    error: errorText(data?.error) ?? fallback,
+    ...(reason ? { reason } : {}),
+    ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
+  };
 }
