@@ -67,9 +67,9 @@ func Logger(deps ports.RuntimePorts) *slog.Logger {
 // the run: a bill that is short a line is recoverable, a run that died over
 // a price list is not.
 //
-// The write uses a context that a user stop cannot cancel, because the
-// tokens of a stopped run were still spent. Storage failures are logged, not
-// returned: the same reasoning.
+// Pricing and the write use a context that a user stop cannot cancel,
+// because the tokens of a stopped run were still spent. Storage failures are
+// logged, not returned: the same reasoning.
 //
 // A run's own calls go through its RunLedger.Record instead, which also holds
 // the run to one currency and books the spend against its caps.
@@ -80,10 +80,12 @@ func RecordCall(ctx context.Context, deps ports.RuntimePorts, threadID string, u
 }
 
 // price puts the pricer's cost on a usage row, leaving it unpriced when the
-// pricer fails or has nothing to say.
+// pricer fails or has nothing to say. Like the write, it runs on a context a
+// stop cannot cancel: the call was answered and paid for, and a pricer that
+// reads a price list must not fail over the stop and leave it free.
 func price(ctx context.Context, deps ports.RuntimePorts, u ports.NewUsage) ports.NewUsage {
 	if deps.Pricer != nil && u.Cost == nil {
-		cost, err := deps.Pricer.Price(ctx, u)
+		cost, err := deps.Pricer.Price(context.WithoutCancel(ctx), u)
 		switch {
 		case err != nil:
 			Logger(deps).Error("usage not priced",

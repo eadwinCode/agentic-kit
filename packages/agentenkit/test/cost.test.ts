@@ -11,7 +11,9 @@ import type { Pricer, RunFinishInfo, RuntimeOptions } from '../src/ports/runtime
 import * as pricing from '../src/pricing.js';
 import { isToolUse } from '../src/index.js';
 import { toolUseRow } from '../src/core/builtin/run.js';
-import type { StorageContext } from '../src/core/state.js';
+import { bindStorage, type StorageContext } from '../src/core/state.js';
+import { recordCall, RunLedger } from '../src/core/usage.js';
+import type { RuntimePorts } from '../src/ports/runtime.js';
 import type { UsageFilter } from '../src/core/types.js';
 
 /** $10 per million input, $30 per million output. A step of 10 input + 5
@@ -114,6 +116,33 @@ describe('cost as part of the usage store (§4)', () => {
     expect(isToolUse(toolUseRow('bash', 'docker', 1, 2.5).model)).toBe(true); // sandbox time
     expect(isToolUse('gpt-4o-mini')).toBe(false); // a model call
     expect(isToolUse(null)).toBe(false); // no model
+  });
+
+  // A stop can land after the provider answered and before the call is
+  // priced. The call was still paid for, so it is priced and billed like any
+  // other. The pricer is handed no signal, so a stop cannot reach it; the Go
+  // runtime prices on a context a stop cannot cancel for the same result.
+  it('a stopped call is still priced', async () => {
+    const storage = new MemoryStorage();
+    const deps = {
+      storage: bindStorage(storage, { state: {} }),
+      pricer: { price: () => ({ micros: 42, currency: 'USD', source: 'table' as const }) },
+    } as unknown as RuntimePorts;
+    const call = {
+      kind: 'step' as const, step: 1, runId: 'r1', model: 'gpt-4o',
+      inputTokens: 10, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 5,
+      reasoningTokens: 0, totalTokens: 15, outcome: 'aborted' as const,
+    };
+
+    // Outside a run's ledger, and on it.
+    await recordCall(deps, 't1', call);
+    const ledger = new RunLedger();
+    await ledger.record(deps, 't1', call);
+
+    const totals = await storage.usage.total('t1', { runId: 'r1' });
+    expect(totals.unpriced).toBe(0); // no call left unpriced
+    expect(totals.costMicros).toBe(84); // both calls priced
+    expect(ledger.costMicros).toBe(42); // the run's cap counts it
   });
 
   // A storage that opens a tenant's own database needs the tenant on every
