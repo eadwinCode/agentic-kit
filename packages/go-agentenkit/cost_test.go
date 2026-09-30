@@ -291,3 +291,42 @@ func TestCost_IsToolUseTellsAServiceFromAModelCall(t *testing.T) {
 	mustEqual(t, agentenkit.IsToolUse("gpt-4o-mini"), false, "a model call")
 	mustEqual(t, agentenkit.IsToolUse(""), false, "no model")
 }
+
+// A stop can land after the provider answered and before the call is priced.
+// The call was still paid for, so it is priced and billed like any other:
+// the pricer never sees the stop, the same way the write never does.
+func TestCost_AStoppedCallIsStillPriced(t *testing.T) {
+	storage := memory.NewStorage()
+	deps := ports.RuntimePorts{
+		Storage: ports.BindStorage(storage, ports.StorageContext{}),
+		Pricer:  cancelAwarePricer{},
+	}
+	stopped, stop := context.WithCancel(context.Background())
+	stop()
+	call := ports.NewUsage{Kind: ports.KindStep, RunID: "r1", Model: "gpt-4o", InputTokens: 10, OutputTokens: 5}
+
+	// Outside a run's ledger, and on it.
+	core.RecordCall(stopped, deps, "t1", call)
+	ledger := core.SeedRunLedger(stopped, deps, "t1", "")
+	core.RecordToolUsage(stopped, core.ToolRun{Deps: deps, ThreadID: "t1", RunID: "r1", Ledger: ledger}, call)
+
+	totals, err := storage.Usage().Total(context.Background(), "t1", ports.UsageFilter{RunID: "r1"}, ports.StorageContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustEqual(t, totals.Unpriced, 0, "no call left unpriced")
+	mustEqual(t, totals.CostMicros, int64(84), "both calls priced")
+	spent, _ := ledger.Spent()
+	mustEqual(t, spent, int64(42), "the run's cap counts it")
+}
+
+// cancelAwarePricer fails on a cancelled context, as a price list read over
+// the network would.
+type cancelAwarePricer struct{}
+
+func (cancelAwarePricer) Price(ctx context.Context, _ ports.NewUsage) (*ports.Cost, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return &ports.Cost{Micros: 42, Currency: "USD", Source: "table"}, nil
+}
