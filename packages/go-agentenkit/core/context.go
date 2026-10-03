@@ -172,51 +172,20 @@ func CompactContext(ctx context.Context, deps ports.RuntimePorts, threadID, mode
 
 	// ... and summarize everything before it with a cheap model: the last
 	// summary and the turns since, never the whole history again.
-	var sb strings.Builder
+	lines := make([]string, 0, len(older))
 	for _, m := range older {
-		fmt.Fprintf(&sb, "%s: %s\n", m.Role, string(m.Content))
+		lines = append(lines, fmt.Sprintf("%s: %s\n", m.Role, string(m.Content)))
 	}
-	resolved, err := deps.ResolveModel(deps.Config.CompactionModel)
-	if err != nil {
-		return nil, fmt.Errorf("compaction model %q: %w", deps.Config.CompactionModel, err)
-	}
-	genCtx := opts.GenCtx
-	if genCtx == nil {
-		genCtx = ctx
-	}
-	res, err := goai.GenerateText(genCtx, resolved.Instance(), goai.WithPrompt(
-		"Summarize the following conversation history into a dense context brief "+
-			"(decisions, open threads, key facts) for an AI agent:\n\n"+sb.String()))
+	text, err := summarizeLines(ctx, deps, threadID, opts, lines)
 	if err != nil {
 		return nil, err
 	}
 	summary, err := deps.Storage.Messages.Append(ctx, threadID, ports.NewMessage{
-		Role: ports.RoleSystem, Content: ContextSummaryContent(res.Text, coversUpTo),
+		Role: ports.RoleSystem, Content: ContextSummaryContent(text, coversUpTo),
 	})
 	if err != nil {
 		return nil, err
 	}
-	// Compaction is a model call the platform made on its own account (§2.6),
-	// so it gets its own priced row like any other (§4). Kind "compaction"
-	// keeps it separable: nobody asked for this call, and it is worth being
-	// able to see what the platform's own housekeeping costs. It is billed to
-	// the run it served, so it is on that run's bill and under its cap.
-	record := RecordCall
-	if opts.Ledger != nil {
-		record = opts.Ledger.Record
-	}
-	record(ctx, deps, threadID, ports.NewUsage{
-		RunID: opts.RunID,
-		Kind:  ports.KindCompaction, Model: deps.Config.CompactionModel,
-		ModelID:               resolved.WireID(deps.Config.CompactionModel),
-		Outcome:               ports.UsageFinished,
-		ProviderMetadata:      providerMeta(res.ProviderMetadata, res.Response),
-		InputTokens:           max(res.TotalUsage.InputTokens, 0),
-		CacheReadInputTokens:  max(res.TotalUsage.CacheReadTokens, 0),
-		CacheWriteInputTokens: max(res.TotalUsage.CacheWriteTokens, 0),
-		OutputTokens:          max(res.TotalUsage.OutputTokens, 0),
-		ReasoningTokens:       max(res.TotalUsage.ReasoningTokens, 0),
-	})
 	if _, err := Publish(ctx, deps, threadID, "CONTEXT_COMPACTED", map[string]any{"summarizedMessages": len(older)}); err != nil {
 		return nil, err
 	}
@@ -266,4 +235,123 @@ var contextOverflow = regexp.MustCompile(`(?i)prompt is too long|context[_ ]leng
 // prompt did not fit the model's context window.
 func IsContextOverflow(err error) bool {
 	return err != nil && contextOverflow.MatchString(err.Error())
+}
+
+const (
+	summaryPrompt = "Summarize the following conversation history into a dense context brief " +
+		"(decisions, open threads, key facts) for an AI agent:\n\n"
+	mergePrompt = "These are summaries of consecutive parts of one conversation, oldest first. " +
+		"Merge them into one dense context brief (decisions, open threads, key facts) for an AI agent, " +
+		"keeping later decisions over earlier ones:\n\n"
+)
+
+// summaryChunkTokens is how much history one summary call carries: half the
+// compaction model's own window, leaving room for its answer and for the
+// estimate being rough. The history can be larger than the summarizer's
+// window, and a call past it would be refused.
+func summaryChunkTokens(deps ports.RuntimePorts) int {
+	return max(ContextBudget(deps, deps.Config.CompactionModel)/2, 1_000)
+}
+
+// summarizeLines summarizes the lines in as many calls as fit the
+// compaction model, then merges the partial summaries the same way until
+// one is left.
+func summarizeLines(ctx context.Context, deps ports.RuntimePorts, threadID string, opts CompactOptions, lines []string) (string, error) {
+	limit := summaryChunkTokens(deps)
+	prompt := summaryPrompt
+	for {
+		chunks := chunkLines(lines, limit)
+		parts := make([]string, 0, len(chunks))
+		for _, chunk := range chunks {
+			text, err := summaryCall(ctx, deps, threadID, opts, prompt+chunk)
+			if err != nil {
+				return "", err
+			}
+			parts = append(parts, text)
+		}
+		if len(parts) == 1 {
+			return parts[0], nil
+		}
+		// A third of a chunk per part fits at least two per merge call, so
+		// every round at least halves the parts and the loop ends.
+		lines = make([]string, len(parts))
+		for i, part := range parts {
+			lines[i] = trimMiddle(fmt.Sprintf("Part %d:\n%s\n\n", i+1, part), limit/3)
+		}
+		prompt = mergePrompt
+	}
+}
+
+// chunkLines packs lines in order into chunks of at most limit tokens. A
+// line larger than a chunk keeps its start and end; its middle goes.
+func chunkLines(lines []string, limit int) []string {
+	var chunks []string
+	var sb strings.Builder
+	used := 0
+	for _, line := range lines {
+		line = trimMiddle(line, limit)
+		t := estimateTokens([]byte(line))
+		if used > 0 && used+t > limit {
+			chunks = append(chunks, sb.String())
+			sb.Reset()
+			used = 0
+		}
+		sb.WriteString(line)
+		used += t
+	}
+	if used > 0 || len(chunks) == 0 {
+		chunks = append(chunks, sb.String())
+	}
+	return chunks
+}
+
+// trimMiddle cuts a line past limit tokens down to its start and end.
+func trimMiddle(line string, limit int) string {
+	if estimateTokens([]byte(line)) <= limit {
+		return line
+	}
+	runes := []rune(line)
+	keep := limit * 4 / 2 // the estimate is about four characters a token
+	if keep*2 >= len(runes) {
+		return line
+	}
+	return string(runes[:keep]) + "\n[... cut ...]\n" + string(runes[len(runes)-keep:])
+}
+
+// summaryCall is one summary call, recorded on its own priced row.
+func summaryCall(ctx context.Context, deps ports.RuntimePorts, threadID string, opts CompactOptions, prompt string) (string, error) {
+	resolved, err := deps.ResolveModel(deps.Config.CompactionModel)
+	if err != nil {
+		return "", fmt.Errorf("compaction model %q: %w", deps.Config.CompactionModel, err)
+	}
+	genCtx := opts.GenCtx
+	if genCtx == nil {
+		genCtx = ctx
+	}
+	res, err := goai.GenerateText(genCtx, resolved.Instance(), goai.WithPrompt(prompt))
+	if err != nil {
+		return "", err
+	}
+	// Compaction is a model call the platform made on its own account (§2.6),
+	// so it gets its own priced row like any other (§4). Kind "compaction"
+	// keeps it separable: nobody asked for this call, and it is worth being
+	// able to see what the platform's own housekeeping costs. It is billed to
+	// the run it served, so it is on that run's bill and under its cap.
+	record := RecordCall
+	if opts.Ledger != nil {
+		record = opts.Ledger.Record
+	}
+	record(ctx, deps, threadID, ports.NewUsage{
+		RunID: opts.RunID,
+		Kind:  ports.KindCompaction, Model: deps.Config.CompactionModel,
+		ModelID:               resolved.WireID(deps.Config.CompactionModel),
+		Outcome:               ports.UsageFinished,
+		ProviderMetadata:      providerMeta(res.ProviderMetadata, res.Response),
+		InputTokens:           max(res.TotalUsage.InputTokens, 0),
+		CacheReadInputTokens:  max(res.TotalUsage.CacheReadTokens, 0),
+		CacheWriteInputTokens: max(res.TotalUsage.CacheWriteTokens, 0),
+		OutputTokens:          max(res.TotalUsage.OutputTokens, 0),
+		ReasoningTokens:       max(res.TotalUsage.ReasoningTokens, 0),
+	})
+	return res.Text, nil
 }
