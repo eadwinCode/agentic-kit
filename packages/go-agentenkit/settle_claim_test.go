@@ -296,3 +296,31 @@ func TestAdmin_AThreadDetailCarriesItsCost(t *testing.T) {
 	mustEqual(t, detail.Thread.Tokens.CostMicros, int64(250), "the thread's cost")
 	mustEqual(t, detail.Thread.Tokens.Currency, "USD", "in its currency")
 }
+
+// A settle the sweep retries sees the run's state, as the first try did:
+// the hook keys its tenant work on it.
+func TestSettle_TheSweepGivesTheHookTheRunsState(t *testing.T) {
+	var seen []string
+	h := makeRuntime(t, scripted(step{text: "ok"}))
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
+		Name: "chat",
+		OnSettle: func(ctx context.Context, _ agentenkit.RunFinishInfo) error {
+			team, _ := agentenkit.RunStateFromContext(ctx)["teamId"].(string)
+			seen = append(seen, team)
+			if len(seen) == 1 {
+				return errors.New("ledger down")
+			}
+			return nil
+		},
+	})
+	h.run(t, chat, agentenkit.RunInput{Prompt: "go", State: agentenkit.AgentRunState{"teamId": "team-1"}})
+	h.handleNext(t)
+	report, err := h.rt.ReclaimStuckRuns(h.ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustEqual(t, report.Settled, 1, "settled by the sweep")
+	if len(seen) != 2 || seen[0] != "team-1" || seen[1] != "team-1" {
+		t.Fatalf("the hook saw teams %q", seen)
+	}
+}

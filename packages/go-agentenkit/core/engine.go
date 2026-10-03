@@ -400,6 +400,11 @@ func settleEndedRun(ctx context.Context, deps ports.RuntimePorts, agent *Registe
 	if err != nil || rec == nil || rec.SettledAt != nil || !isTerminal(rec.State) {
 		return false
 	}
+	// A late settle (the sweep, a stop of a dead worker) runs outside the
+	// run, so the hook would see no run state; the stored one is the run's.
+	if len(RunStateFromContext(ctx)) == 0 && len(rec.RunState) > 0 {
+		ctx = ContextWithRunState(ctx, rec.RunState)
+	}
 	bill, billErr := runBill(ctx, deps, threadID, runID)
 	info := ports.RunFinishInfo{
 		ThreadID: threadID, RunID: runID, State: rec.State, StopReason: rec.StopReason, Error: rec.Error,
