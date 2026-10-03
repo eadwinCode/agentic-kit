@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/zendev-sh/goai"
@@ -101,6 +102,10 @@ type CompactOptions struct {
 	// Ledger is the run's ledger, so the summary call counts against the
 	// run's caps like any other call. Nil records the row on its own.
 	Ledger *RunLedger
+	// Force compacts whatever the history's size: everything older than the
+	// recent tail goes into the summary. Used when a provider has refused a
+	// prompt as too long, and for a compaction someone asked for.
+	Force bool
 }
 
 // CompactContext returns a history guaranteed to fit the model's budget.
@@ -123,7 +128,7 @@ func CompactContext(ctx context.Context, deps ports.RuntimePorts, threadID, mode
 	for _, m := range history {
 		total += estimateTokens(m.Content)
 	}
-	if float64(total) <= float64(budget)*deps.Config.CompactionTrigger {
+	if !opts.Force && float64(total) <= float64(budget)*deps.Config.CompactionTrigger {
 		return history, nil
 	}
 
@@ -144,6 +149,11 @@ func CompactContext(ctx context.Context, deps ports.RuntimePorts, threadID, mode
 	// accepts. The first user turn inside the budget, or failing that the
 	// last one before it.
 	tailStart = userTurnAtOrAfter(history, tailStart)
+	if opts.Force {
+		// Forced (a refusal, or asked for): the tail share is what proved
+		// too much, so only the latest user turn stays verbatim.
+		tailStart = userTurnAtOrAfter(history, len(history))
+	}
 	older := history[:tailStart]
 	tail := history[tailStart:]
 	coversUpTo := ""
@@ -247,4 +257,13 @@ func userTurnAtOrAfter(history []ports.MessageDTO, start int) int {
 		}
 	}
 	return len(history)
+}
+
+// contextOverflow matches the "prompt too long" refusals providers send.
+var contextOverflow = regexp.MustCompile(`(?i)prompt is too long|context[_ ]length[_ ]exceeded|maximum context length|exceeds the context window|too many (input )?tokens|input is too long`)
+
+// IsContextOverflow reports whether a model call was refused because the
+// prompt did not fit the model's context window.
+func IsContextOverflow(err error) bool {
+	return err != nil && contextOverflow.MatchString(err.Error())
 }

@@ -1008,41 +1008,61 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		log.Info("run already made its last step; finalized without calling the model again")
 		loop = &LoopOutcome{Text: text, FinishReason: provider.FinishStop}
 	} else {
-		// Durable compaction pass: history always fits the model budget (§2.6)
-		var history []ports.MessageDTO
-		history, err = CompactContext(ctx, deps, threadID, input.Model, CompactOptions{RunID: runID, GenCtx: genCtx, Ledger: ledger})
-		if err != nil {
-			return "", err
-		}
 		var model ports.ResolvedModel
 		model, err = deps.ResolveModel(input.Model)
 		if err != nil {
 			return "", err
 		}
-		// Prompt caching (§2.6): stamp the stable prefix once; appended step
-		// messages extend the prompt without invalidating the breakpoints.
-		messages := RepairDanglingToolCalls(MessagesFromDTOs(history))
-		if deps.Config.PromptCaching {
-			messages = MarkPromptCaching(messages)
+		// runLoop compacts (§2.6) and runs the loop. force compacts whatever
+		// the estimate says; steps is how many steps are left.
+		runLoop := func(force bool, steps int) (*LoopOutcome, error) {
+			history, err := CompactContext(ctx, deps, threadID, input.Model, CompactOptions{RunID: runID, GenCtx: genCtx, Ledger: ledger, Force: force})
+			if err != nil {
+				return nil, err
+			}
+			// Prompt caching (§2.6): stamp the stable prefix once; appended step
+			// messages extend the prompt without invalidating the breakpoints.
+			messages := RepairDanglingToolCalls(MessagesFromDTOs(history))
+			if deps.Config.PromptCaching {
+				messages = MarkPromptCaching(messages)
+			}
+			return RunLoop(ctx, deps, agent, threadID, LoopInput{
+				AgentID: "", RunID: runID, Kind: agent.Kind, Model: model.Instance(),
+				Messages: messages, Tools: tools, MaxSteps: steps,
+				GenCtx: genCtx, Aborted: aborted, Fenced: lease.Lost,
+				CommitParks:     func(c context.Context) error { return CommitParks(c, deps, parks) },
+				ProviderOptions: providerOptions, TokenBudget: tokenBudget,
+				SystemFn: agent.Args.SystemFn, PrepareStep: agent.Args.PrepareStep, State: input.State,
+				CostBudgetMicros: costBudget, BillingRunID: runID,
+				ModelKey: input.Model, ModelID: model.WireID(input.Model), AgentName: agent.Name,
+				CacheSystemPrompt: deps.Config.PromptCaching,
+				// One canonical path for every client: durable log + live bus (§2.1,
+				// §2.2), with token deltas merged (see chunkBatcher).
+				PublishChunk: func(p map[string]any) {
+					_, _ = Publish(ctx, deps, threadID, "CHUNK", p)
+				},
+				OnChunk: agent.Args.OnChunk, // the user callback sees every raw chunk
+			}, ledger)
 		}
-
-		loop, err = RunLoop(ctx, deps, agent, threadID, LoopInput{
-			AgentID: "", RunID: runID, Kind: agent.Kind, Model: model.Instance(),
-			Messages: messages, Tools: tools, MaxSteps: maxSteps,
-			GenCtx: genCtx, Aborted: aborted, Fenced: lease.Lost,
-			CommitParks:     func(c context.Context) error { return CommitParks(c, deps, parks) },
-			ProviderOptions: providerOptions, TokenBudget: tokenBudget,
-			SystemFn: agent.Args.SystemFn, PrepareStep: agent.Args.PrepareStep, State: input.State,
-			CostBudgetMicros: costBudget, BillingRunID: runID,
-			ModelKey: input.Model, ModelID: model.WireID(input.Model), AgentName: agent.Name,
-			CacheSystemPrompt: deps.Config.PromptCaching,
-			// One canonical path for every client: durable log + live bus (§2.1,
-			// §2.2), with token deltas merged (see chunkBatcher).
-			PublishChunk: func(p map[string]any) {
-				_, _ = Publish(ctx, deps, threadID, "CHUNK", p)
-			},
-			OnChunk: agent.Args.OnChunk, // the user callback sees every raw chunk
-		}, ledger)
+		loop, err = runLoop(false, maxSteps)
+		// The provider refused the prompt as too long: the estimate missed.
+		// Compact now and go on from the steps already saved, once.
+		if IsContextOverflow(err) && !lockLost.Load() && !aborted() {
+			log.Warn("prompt too long for the model; compacting and retrying", "err", err)
+			done := 0
+			if loop != nil {
+				done = loop.Steps
+			}
+			var retried *LoopOutcome
+			retried, err = runLoop(true, max(1, maxSteps-done))
+			if retried != nil {
+				retried.Steps += done
+				loop = retried
+			}
+		}
+		if loop == nil {
+			loop = &LoopOutcome{}
+		}
 		// A lost lock ends the segment whatever the loop returned: another
 		// worker may own the thread now, so nothing below may write to it. A
 		// loop cut short by the lock loss can even come back without an error.
