@@ -160,6 +160,50 @@ func (c *AgentCore) GetThreadSnapshot(ctx context.Context, threadID string, stat
 	return core.ThreadSnapshotOf(ctx, c.scope(state, ""), threadID, "")
 }
 
+// CompactResult is what CompactThread did.
+type CompactResult struct {
+	// Compacted is false when there was nothing older than the recent tail
+	// to summarize, or the thread is gone.
+	Compacted bool `json:"compacted"`
+	// Reason says why nothing was compacted.
+	Reason string `json:"reason,omitempty"`
+}
+
+// CompactThread summarizes a thread's history now, whatever its size: the
+// recent tail stays as it is and everything before it goes into a durable
+// summary (§2.6), as an automatic compaction would write it. Refused while a
+// run is queued or running. The summary call is recorded without a run.
+func (c *AgentCore) CompactThread(ctx context.Context, threadID string, state AgentRunState) (CompactResult, error) {
+	deps := c.scope(state, "")
+	thread, err := deps.Storage.Threads.Get(ctx, threadID)
+	if err != nil {
+		return CompactResult{}, err
+	}
+	if thread == nil {
+		return CompactResult{Reason: "thread not found"}, nil
+	}
+	if thread.State == ports.StateRunning || thread.State == ports.StateQueued {
+		return CompactResult{Reason: "the thread has an active run; wait for it or stop it first"}, nil
+	}
+	before, err := deps.Storage.Messages.List(ctx, threadID, ports.MainAgent)
+	if err != nil {
+		return CompactResult{}, err
+	}
+	if _, err := core.CompactContext(ctx, deps, threadID, thread.Model, core.CompactOptions{Force: true}); err != nil {
+		return CompactResult{}, err
+	}
+	after, err := deps.Storage.Messages.List(ctx, threadID, ports.MainAgent)
+	if err != nil {
+		return CompactResult{}, err
+	}
+	// A compaction appends its summary message; nothing else writes here
+	// while no run is active.
+	if len(after) == len(before) {
+		return CompactResult{Reason: "nothing older than the recent messages to summarize"}, nil
+	}
+	return CompactResult{Compacted: true}, nil
+}
+
 // GetThreadUsage is tokens spent so far and the §2.6 context load. Nil when
 // the thread is gone.
 func (c *AgentCore) GetThreadUsage(ctx context.Context, threadID string, state AgentRunState) (*ThreadUsage, error) {

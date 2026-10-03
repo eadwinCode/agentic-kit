@@ -462,6 +462,11 @@ one database.
   result; an infrastructure failure comes back as an `error`.
 - **Config is a value.** `cfg := agentenkit.DefaultConfig()`, change what you need, pass
   `&cfg`. `CompactionModel` names the cheap model used for context summaries.
+- **Compaction recovers and can be asked for.** A model call refused as too long
+  ("prompt is too long", `context_length_exceeded`…) compacts the thread at once,
+  keeping only the latest user turn, and the run goes on (once per segment).
+  `rt.CompactThread(ctx, threadID, state)` does the same on request, refused while a
+  run is queued or running. The TypeScript package does neither yet.
 - **A mixed step keeps its results.** When one tool parks and another runs in the same
   step, the executed result is persisted. The TypeScript package drops the whole message.
 - **Total tokens** are always input + cached + output, for every provider.
