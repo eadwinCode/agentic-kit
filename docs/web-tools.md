@@ -190,6 +190,7 @@ The second argument to `builtinTools` (Go: `BuiltinToolOptions`) is the app's:
 | `maxBytes` | 2,000,000 | Stop reading a page after this many bytes. |
 | `maxUses` | no limit | Pages read in one run. |
 | `model` | `compactionModel` | The small model that answers a `prompt`. |
+| `onlyKnownUrls` | `false` | Open only a link a `web_search` on the thread returned, or one the user wrote. Go: `OnlyKnownURLs`. |
 
 ```ts
 runtime.builtinTools(['web_search', 'web_fetch'], {
@@ -197,6 +198,14 @@ runtime.builtinTools(['web_search', 'web_fetch'], {
   webFetch: { maxUses: 20, model: 'gpt-4o-mini' },
 });
 ```
+
+Turn on `onlyKnownUrls` when the agent has tools that matter: it then opens
+only links from its own searches or from the user. A page can no longer send
+it to a url of the page's choosing, for example one with your project's data
+in the query string. The match ignores the scheme, `www.`, a trailing slash
+and the fragment, so the user's `example.com/menu` opens
+`https://www.example.com/menu/`. A refused link is an error the model reads,
+and does not count as a use.
 
 ## Subagents
 
