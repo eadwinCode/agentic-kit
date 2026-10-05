@@ -30,6 +30,12 @@ export interface WebFetchOptions {
   /** Registry key of the small model that answers a `prompt` from the page.
    *  Default: the config's `compactionModel`. */
   model?: string;
+  /** Open only a link a web_search on this thread returned, or one the user
+   *  wrote in a message. Any other url, a link found on a page or one the
+   *  model made up, gets an error it can read. It keeps text on a page from
+   *  sending the agent to a url of its choosing, with private data in the
+   *  query string. */
+  onlyKnownUrls?: boolean;
 }
 
 /** What a tool call hands back to the model when it cannot do the work: a
@@ -45,6 +51,50 @@ const usesKey = (run: ToolRun, tool: string) => `agent:tool:uses:${scopeOf(run)}
 // later turn must read the same id as the same page.
 const searchKey = (run: ToolRun) => `agent:tool:searches:${run.threadId}`;
 const refKey = (run: ToolRun, id: string) => `agent:tool:ref:${run.threadId}:${id}`;
+/** Marks a link a search on the thread returned, by its sameUrl form. */
+const knownKey = (run: ToolRun, url: string) => `agent:tool:known:${run.threadId}:${sameUrl(url)}`;
+
+/** A link reduced to what makes it the same page: host without "www.", path
+ *  without a trailing slash, and the query. The scheme and the fragment do
+ *  not count, so a user's "example.com/menu" matches the model's
+ *  "https://www.example.com/menu/". */
+function sameUrl(raw: string): string {
+  let s = raw.trim();
+  if (!/^https?:\/\//i.test(s)) s = `https://${s}`;
+  try {
+    const u = new URL(s);
+    const host = u.host.toLowerCase().replace(/^www\./, '');
+    return host + u.pathname.replace(/\/$/, '') + u.search;
+  } catch {
+    return s.toLowerCase();
+  }
+}
+
+/** Links in what the user wrote, with or without a scheme. */
+const USER_LINK = /\b(?:https?:\/\/)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[^\s<>"'()[\]]*)?/gi;
+
+/** A stored message's text: a plain string, or its text parts. */
+function messageText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((p) => (p && typeof p === 'object' && typeof (p as { text?: unknown }).text === 'string' ? (p as { text: string }).text : ''))
+    .filter(Boolean)
+    .join('\n');
+}
+
+/** Whether a search on the thread returned url, or the user wrote it. */
+async function knownUrl(run: ToolRun, url: string): Promise<boolean> {
+  if (await run.deps.kv.get(knownKey(run, url))) return true;
+  const want = sameUrl(url);
+  for (const m of await run.deps.storage.messages.list(run.threadId, { agentId: null })) {
+    if (m.role !== 'user') continue;
+    for (const link of messageText(m.content).match(USER_LINK) ?? []) {
+      if (sameUrl(link.replace(/[.,;:!?]+$/, '')) === want) return true;
+    }
+  }
+  return false;
+}
 
 /** Count one use and say whether it is over the run's limit. */
 async function overLimit(run: ToolRun, tool: string, maxUses: number | undefined): Promise<boolean> {
@@ -116,7 +166,10 @@ export async function runWebSearch(
     snippet: cut(h.snippet, 500).text,
     ...(h.publishedAt ? { publishedAt: h.publishedAt } : {}),
   }));
-  for (const r of results) await run.deps.kv.set(refKey(run, r.id), r.url, { exSeconds: refTtlSeconds(run) });
+  for (const r of results) {
+    await run.deps.kv.set(refKey(run, r.id), r.url, { exSeconds: refTtlSeconds(run) });
+    await run.deps.kv.set(knownKey(run, r.url), '1', { exSeconds: refTtlSeconds(run) });
+  }
   await publishSources(run, results);
   return { results };
 }
@@ -142,6 +195,9 @@ export async function runWebFetch(
   }
   if (!url) return failed('web_fetch needs a url or the id of a search result');
   if (!/^https?:\/\//i.test(url)) return failed(`web_fetch: ${url} is not an http or https address`);
+  if (options.onlyKnownUrls && !(await knownUrl(run, url))) {
+    return failed(`web_fetch can only open a link from your web_search results or one the user gave; ${url} is neither`);
+  }
   if (await overLimit(run, 'web_fetch', options.maxUses)) {
     return failed(`web_fetch can be used ${options.maxUses} times in one run, and that is used up`);
   }
