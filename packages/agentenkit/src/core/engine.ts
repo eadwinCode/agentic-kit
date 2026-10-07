@@ -834,7 +834,7 @@ export async function execute(
         // Compacts (§2.6; the budget uses the resolved model's contextWindow,
         // §3.3) and runs the loop. `force` compacts whatever the estimate
         // says; `steps` is how many steps are left.
-        const progress = { steps: 0 };
+        const progress: { steps: number; attribution?: TokenAttribution } = { steps: 0 };
         const compactAndRun = async (force: boolean, steps: number) => {
           const history = await compactContext(deps, threadId, input.model, {
             runId,
@@ -902,8 +902,19 @@ export async function execute(
               threadId, runId, err: err instanceof Error ? err.message : String(err),
             });
           const done = progress.steps;
+          const spent = progress.attribution;
           const retried = await compactAndRun(true, Math.max(1, maxSteps - done));
-          loop = { ...retried, steps: retried.steps + done };
+          // The segment is both tries: their steps and their tokens.
+          loop = {
+            ...retried,
+            steps: retried.steps + done,
+            attribution: {
+              inputTokens: retried.attribution.inputTokens + (spent?.inputTokens ?? 0),
+              cachedInputTokens: retried.attribution.cachedInputTokens + (spent?.cachedInputTokens ?? 0),
+              outputTokens: retried.attribution.outputTokens + (spent?.outputTokens ?? 0),
+              totalTokens: retried.attribution.totalTokens + (spent?.totalTokens ?? 0),
+            },
+          };
         }
 
         // A lost lock aborts the run the way a stop does, but it is not a stop:

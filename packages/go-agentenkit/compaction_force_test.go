@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/provider"
 
 	agentenkit "github.com/eadwinCode/agentic-kit/packages/go-agentenkit"
@@ -99,5 +100,12 @@ func TestIsContextOverflow(t *testing.T) {
 	}
 	if core.IsContextOverflow(errors.New("rate limited")) || core.IsContextOverflow(nil) {
 		t.Fatal("false positive")
+	}
+	// A throttle is not an overflow, however it is worded.
+	if core.IsContextOverflow(errors.New("ThrottlingException: Too many tokens, please wait before trying again.")) {
+		t.Fatal("a throttle taken for an overflow")
+	}
+	if core.IsContextOverflow(&goai.APIError{StatusCode: 429, Message: "prompt is too long"}) {
+		t.Fatal("a 429 taken for an overflow")
 	}
 }

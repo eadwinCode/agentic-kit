@@ -263,9 +263,9 @@ export interface LoopInput {
   /** Carry the system prompt as a stamped message rather than the SDK's
    *  `system:` string, so it can hold a cache breakpoint (§2.6). */
   cacheSystemPrompt?: boolean;
-  /** Kept up to date with the steps this loop has saved, so a caller still
-   *  knows how many ran when the loop throws part way. */
-  progress?: { steps: number };
+  /** Kept up to date with the steps this loop has saved and the tokens it
+   *  spent, so a caller still knows both when the loop throws part way. */
+  progress?: { steps: number; attribution?: TokenAttribution };
 }
 
 export interface LoopOutcome {
@@ -311,6 +311,8 @@ export async function runLoop(
     outputTokens: 0,
     totalTokens: 0,
   };
+  // The same object, so it holds every call recorded below, a cut one too.
+  if (input.progress) input.progress.attribution = attribution;
   let tokensUsed = 0;
   let lastText = '';
   let lastFinishReason = '';

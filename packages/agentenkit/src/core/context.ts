@@ -162,14 +162,18 @@ function warnOverBudget(deps: RuntimePorts, threadId: string, used: number, budg
   });
 }
 
-/** The "prompt too long" refusals providers send. */
+/** The "prompt too long" refusals providers send. Not "too many tokens":
+ *  that is also how a throttle is worded (Bedrock). */
 const CONTEXT_OVERFLOW =
-  /prompt is too long|context[_ ]length[_ ]exceeded|maximum context length|exceeds the context window|too many (input )?tokens|input is too long/i;
+  /prompt is too long|context[_ ]length[_ ]exceeded|maximum context length|exceeds the context window|input is too long/i;
 
 /** Whether a model call was refused because the prompt did not fit the
- *  model's context window. */
+ *  model's context window. A rate limit (429) never is, whatever its
+ *  wording: compacting would not help it. */
 export function isContextOverflow(err: unknown): boolean {
   if (err === undefined || err === null) return false;
+  const e = err as { statusCode?: unknown; lastError?: { statusCode?: unknown } };
+  if (e.statusCode === 429 || e.lastError?.statusCode === 429) return false;
   return CONTEXT_OVERFLOW.test(err instanceof Error ? err.message : String(err));
 }
 

@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -229,12 +230,21 @@ func userTurnAtOrAfter(history []ports.MessageDTO, start int) int {
 }
 
 // contextOverflow matches the "prompt too long" refusals providers send.
-var contextOverflow = regexp.MustCompile(`(?i)prompt is too long|context[_ ]length[_ ]exceeded|maximum context length|exceeds the context window|too many (input )?tokens|input is too long`)
+// Not "too many tokens": that is also how a throttle is worded (Bedrock).
+var contextOverflow = regexp.MustCompile(`(?i)prompt is too long|context[_ ]length[_ ]exceeded|maximum context length|exceeds the context window|input is too long`)
 
 // IsContextOverflow reports whether a model call was refused because the
-// prompt did not fit the model's context window.
+// prompt did not fit the model's context window. A rate limit (429) never
+// is, whatever its wording: compacting would not help it.
 func IsContextOverflow(err error) bool {
-	return err != nil && contextOverflow.MatchString(err.Error())
+	if err == nil {
+		return false
+	}
+	var api *goai.APIError
+	if errors.As(err, &api) && api.StatusCode == 429 {
+		return false
+	}
+	return contextOverflow.MatchString(err.Error())
 }
 
 const (

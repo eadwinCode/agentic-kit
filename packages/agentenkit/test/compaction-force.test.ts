@@ -120,6 +120,9 @@ describe('forced compaction (§2.6)', () => {
     }
     expect(isContextOverflow(new Error('rate limited'))).toBe(false);
     expect(isContextOverflow(null)).toBe(false);
+    // A throttle is not an overflow, however it is worded.
+    expect(isContextOverflow(new Error('ThrottlingException: Too many tokens, please wait before trying again.'))).toBe(false);
+    expect(isContextOverflow(Object.assign(new Error('prompt is too long'), { statusCode: 429 }))).toBe(false);
   });
 
   it('a history larger than the summarizer is chunked', async () => {
