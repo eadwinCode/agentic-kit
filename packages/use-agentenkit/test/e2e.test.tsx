@@ -39,12 +39,22 @@ function model(...replies: string[][]) {
   const parts = () => {
     const pieces = replies[Math.min(call++, replies.length - 1)]!;
     return [
-      ...pieces.map((textDelta) => ({ type: 'text-delta', textDelta })),
-      { type: 'finish', finishReason: 'stop', usage: { promptTokens: 10, completionTokens: 5 } },
+      { type: 'text-start', id: 't' },
+      ...pieces.map((delta) => ({ type: 'text-delta', id: 't', delta })),
+      { type: 'text-end', id: 't' },
+      {
+        type: 'finish',
+        finishReason: { unified: 'stop', raw: 'stop' },
+        usage: {
+          inputTokens: { total: 10, noCache: 10, cacheRead: undefined, cacheWrite: undefined },
+          outputTokens: { total: 5, text: 5, reasoning: undefined },
+        },
+      },
     ];
   };
+  // A provider in the AI SDK's v4 provider shape.
   return {
-    specificationVersion: 'v1', provider: 'mock', modelId: 'mock', defaultObjectGenerationMode: undefined,
+    specificationVersion: 'v4', provider: 'mock', modelId: 'mock', supportedUrls: {},
     doStream: async () => ({
       stream: new ReadableStream({
         start(controller) {
@@ -52,7 +62,6 @@ function model(...replies: string[][]) {
           controller.close();
         },
       }),
-      rawCall: { rawPrompt: null, rawSettings: {} },
     }),
     doGenerate: async () => { throw new Error('not used'); },
   };

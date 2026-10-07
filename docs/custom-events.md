@@ -26,7 +26,7 @@ import { agentTool } from 'agentenkit';
 
 const renderDesign = agentTool({
   description: 'Render a design preview',
-  parameters: z.object({ brief: z.string() }),
+  inputSchema: z.object({ brief: z.string() }),
   execute: async ({ brief }, { publishEvent, state }) => {
     await publishEvent('PROGRESS', { label: 'Rendering…' });   // live only
     const url = await render(brief, state.orgId);

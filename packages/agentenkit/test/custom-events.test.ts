@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { simulateReadableStream } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
-import { MockLanguageModelV1 } from 'ai/test';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
@@ -69,7 +69,7 @@ describe('custom events', () => {
       name: 'chat', model: 'gpt-4o',
       tools: {
         render: agentTool({
-          parameters: z.object({}),
+          inputSchema: z.object({}),
           execute: async (_args, { publishEvent, state }) => {
             const event = await publishEvent('DESIGN_PREVIEW', { url: 'https://x/1.png', org: state.orgId }, { durable: true });
             expect(event.seq).toBeGreaterThan(0);
@@ -101,7 +101,7 @@ describe('custom events', () => {
       name: 'chat', model: 'gpt-4o',
       tools: {
         slow: agentTool({
-          parameters: z.object({}),
+          inputSchema: z.object({}),
           execute: async (_args, { publishEvent }) => {
             await publishEvent('PROGRESS', { label: 'Rendering…' });
             return 'ok';
@@ -159,7 +159,7 @@ describe('custom events', () => {
         tools: {
           wipe: markRequiresConfirmation(
             agentTool({
-              parameters: z.object({}),
+              inputSchema: z.object({}),
               execute: async (_args, { publishEvent, state }) => {
                 seen.push(`wipe:${state.orgId}`);
                 await publishEvent('WIPED', { by: 'kid' });
@@ -193,7 +193,7 @@ describe('approval payload', () => {
       tools: {
         askQuestions: markRequiresConfirmation(
           agentTool({
-            parameters: z.object({ questions: z.array(z.string()) }),
+            inputSchema: z.object({ questions: z.array(z.string()) }),
             execute: async (_args, { approval }) => {
               seen = approval?.payload;
               return { answers: approval?.payload };

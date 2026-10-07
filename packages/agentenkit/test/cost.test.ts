@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'bun:test';
 import { tool, simulateReadableStream } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
 import { z } from 'zod';
-import { MockLanguageModelV1 } from 'ai/test';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
@@ -97,7 +97,7 @@ async function makeRuntime(
 const probe = {
   probe: tool({
     description: 'probe',
-    parameters: z.object({}),
+    inputSchema: z.object({}),
     execute: async () => ({ ok: true }),
   }),
 };

@@ -239,21 +239,21 @@ export async function runWebFetch(
     ? cut(page.content, Math.max(window - 4_000, 1_000) * 3)
     : { text: page.content, cut: false };
   try {
-    const { text, usage, ...rest } = await generateText({
+    const { text, finalStep } = await generateText({
       model: reader.instance(),
-      system: READER_SYSTEM,
+      instructions: READER_SYSTEM,
       prompt: `<page url="${page.url}" title="${page.title.replace(/"/g, "'")}">\n${fit.text}\n</page>\n\nQuestion: ${prompt}`,
       ...(signal ? { abortSignal: signal } : {}),
     });
-    const meta = (rest as any).providerMetadata ?? (rest as any).experimental_providerMetadata;
+    const meta = finalStep.providerMetadata;
     await recordToolUsage(run, {
       kind: 'tool',
       step: 0,
       model: key,
       modelId: wireId(reader, key),
       outcome: 'finished',
-      providerMetadata: { tool: 'web_fetch', ...(providerMeta(meta, (rest as any).response) ?? {}) },
-      ...fillTokens(usage, meta),
+      providerMetadata: { tool: 'web_fetch', ...(providerMeta(meta, finalStep.response) ?? {}) },
+      ...fillTokens(finalStep.usage, meta),
     });
     const answer = cut(text, cap);
     const partial = answer.cut || fit.cut || page.truncated;

@@ -2,15 +2,11 @@ import { createOpenAI } from '@ai-sdk/openai';
 
 /** §2.3 — users register any `ai`-SDK models here. Keys feed the UI dropdown
  *  and `modelPrices` below prices them (§4). */
+const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
 export const modelRegistry = {
-  'gpt-4o': createOpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-    compatibility: 'strict',
-  })('gpt-4o'),
-  'gpt-4o-mini': createOpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-    compatibility: 'strict',
-  })('gpt-4o-mini'),
+  'gpt-4o': openai.chat('gpt-4o'),
+  'gpt-4o-mini': openai.chat('gpt-4o-mini'),
 };
 
 

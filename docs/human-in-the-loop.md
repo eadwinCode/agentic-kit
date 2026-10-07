@@ -11,7 +11,7 @@ import { markRequiresConfirmation } from 'agentenkit';
 const sendEmail = markRequiresConfirmation(
   tool({
     description: 'Sends an email (destructive — requires approval)',
-    parameters: z.object({ to: z.string().email(), subject: z.string(), body: z.string() }),
+    inputSchema: z.object({ to: z.string().email(), subject: z.string(), body: z.string() }),
     execute: async (args) => send(args),
   }),
 );
@@ -90,7 +90,7 @@ build, a render, a job on another system. Same machinery, no human.
 ```ts
 const render = agentTool({
   description: 'Render the scene',
-  parameters: z.object({ scene: z.string() }),
+  inputSchema: z.object({ scene: z.string() }),
   execute: async ({ scene }, { approval }) => {
     if (approval) return approval.payload;          // second call: the job finished
     const job = await renders.start(scene);         // first call: start it

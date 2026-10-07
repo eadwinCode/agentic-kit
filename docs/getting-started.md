@@ -2,9 +2,10 @@
 
 ## Requirements
 
-- [Bun](https://bun.sh) ≥ 1.1, or Node ≥ 20 (contributing to the repository
-  itself needs Bun ≥ 1.4 — see its readme)
-- A model provider through the [AI SDK](https://sdk.vercel.ai) (v4)
+- [Bun](https://bun.sh) ≥ 1.1, or Node ≥ 22, which AI SDK 7 needs
+  (contributing to the repository itself needs Bun ≥ 1.4 — see its readme)
+- A model provider through the [AI SDK](https://sdk.vercel.ai) (v7). `ai` is a
+  peer dependency: install it next to `agentenkit`, as below.
 
 ## Install
 

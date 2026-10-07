@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { simulateReadableStream, tool } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
-import { MockLanguageModelV1 } from 'ai/test';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
@@ -81,10 +81,10 @@ async function setup(
     model: 'gpt-4o',
     tools: {
       send: markRequiresConfirmation(
-        tool({ parameters: z.object({}), execute: async () => { sent.push('sent'); return { sent: true }; } }),
+        tool({ inputSchema: z.object({}), execute: async () => { sent.push('sent'); return { sent: true }; } }),
       ),
       lookup: tool({
-        parameters: z.object({ bad: z.boolean().optional() }),
+        inputSchema: z.object({ bad: z.boolean().optional() }),
         execute: async ({ bad }) => {
           if (bad) throw new Error('bad input');
           return { found: 42 };
@@ -97,7 +97,7 @@ async function setup(
             tools: {
               wipe: markRequiresConfirmation(
                 tool({
-                  parameters: z.object({ target: z.string() }),
+                  inputSchema: z.object({ target: z.string() }),
                   execute: async ({ target }) => { wiped.push(target); return { wiped: true }; },
                 }),
               ),

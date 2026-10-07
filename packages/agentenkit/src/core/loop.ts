@@ -1,4 +1,4 @@
-import { generateText, streamText } from 'ai';
+import { generateText, isStepCount, streamText } from 'ai';
 import type { LanguageModel } from 'ai';
 import type { RuntimePorts } from '../ports/runtime.js';
 import type { AgentKind, ProviderOptions } from './types.js';
@@ -18,6 +18,14 @@ import { ChunkBatcher, chunkPayload, drainOrThrow } from './stream.js';
 import { publish, publishNotice } from './publish.js';
 import { HITL_PARKED } from './hitl.js';
 import { RunLockLostError } from './lease.js';
+import {
+  ChunkMapper,
+  finishedByProvider,
+  storedToolResults,
+  thrownByTool,
+  toModelMessages,
+  toStoredMessages,
+} from './sdk.js';
 
 /** True for the sentinel a parked `requiresConfirmation` tool returns (§2.5).
  *  It is never a real tool result and is never persisted. */
@@ -26,19 +34,20 @@ export const isParked = (result: unknown): boolean =>
   result !== null &&
   (result as Record<string, unknown>)[HITL_PARKED] !== undefined;
 
-/** One platform-owned step (§2.1, §5.6): a single SDK round-trip with
- *  maxSteps: 1. The SDK executes the step's tool calls and reports a
+/** One platform-owned step (§2.1, §5.6): a single SDK round-trip that stops
+ *  after one step. The SDK executes the step's tool calls and reports a
  *  structured result; whether to continue is the loop's decision, never
  *  the SDK's. */
 export interface StepResult {
   text: string;
   finishReason: string;
   usage: Record<string, number> | undefined;
-  /** Assistant + tool messages this step produced — appended to the
-   *  conversation (in memory AND storage) before the next step. */
+  /** Assistant + tool messages this step produced, in the stored shape —
+   *  appended to the conversation (in memory AND storage) before the next
+   *  step. */
   responseMessages: Array<{ role: string; content: unknown }>;
   /** The step's executed tool calls and their results. */
-  toolResults: Array<{ toolCallId: string; toolName: string; result: unknown }>;
+  toolResults: Array<{ toolCallId: string; toolName: string; args: unknown; result: unknown }>;
   /** Provider metadata for this step — the only place a cache hit is reported
    *  (§2.6). Without carrying it, cachedInputTokens can never be anything but
    *  zero. */
@@ -64,7 +73,9 @@ export async function executeStep(
     tools: Record<string, any>;
     providerOptions?: ProviderOptions;
     abortSignal: AbortSignal;
-    onChunk?: (chunk: unknown) => Promise<void>;
+    /** Every SDK stream part, raw, and the platform chunk it maps to (null
+     *  when it has none). */
+    onChunk?: (chunk: unknown, platform: unknown | null) => Promise<void>;
     /** Overrides the user's spec args — a nested run brings its own persona
      *  and must not inherit the parent's (§2.7). */
     system?: string;
@@ -84,7 +95,12 @@ export async function executeStep(
     onChunk: _userOnChunk,
     onFinish: _userOnFinish,
     onStepFinish: userOnStepFinish,
+    onStepEnd: userOnStepEnd,
+    onEnd: _userOnEnd,
     system: specSystem,
+    instructions: specInstructions,
+    stopWhen: _stopWhen,
+    maxSteps: _maxSteps,
     // Platform hooks, not SDK options: the engine calls these itself.
     systemFn: _systemFn,
     prepareStep: _prepareStep,
@@ -93,39 +109,41 @@ export async function executeStep(
   } = agent.args as Record<string, any>;
 
   // A nested run brings its own persona and must not inherit the parent's.
-  const system = call.system ?? specSystem;
+  const system = call.system ?? specInstructions ?? specSystem;
   const hoistSystem =
     call.cacheSystemPrompt === true && typeof system === 'string' && system.length > 0;
 
+  const chunks = new ChunkMapper();
+  const onStep = userOnStepEnd ?? userOnStepFinish;
   const shared = {
     ...userArgs,
     model: call.model,
     // Hoisted, the system prompt leads the messages and carries the
     // breakpoint; a fresh array each step leaves the loop's own array alone.
-    messages: hoistSystem ? [systemCacheMessage(system), ...call.messages] : call.messages,
+    // The stored shape is turned into the SDK's here, at the call, so the
+    // loop and storage never see the SDK's.
+    messages: toModelMessages(
+      hoistSystem ? [systemCacheMessage(system), ...call.messages] : call.messages,
+    ),
+    // History carries system turns: the hoisted persona and the compaction
+    // summary. The SDK refuses them in `messages` unless told otherwise.
+    allowSystemInMessages: true,
     tools: call.tools,
     abortSignal: call.abortSignal,
-    maxSteps: 1, // the loop owns continuation
-    ...(hoistSystem || system === undefined ? {} : { system }),
-    // Provider-specific options (§3.1): forwarded under both the v5-native
-    // key and the v4 alias.
-    ...(call.providerOptions
-      ? {
-          providerOptions: call.providerOptions,
-          experimental_providerMetadata: call.providerOptions as any,
-        }
-      : {}),
+    stopWhen: isStepCount(1), // the loop owns continuation
+    ...(hoistSystem || system === undefined ? {} : { instructions: system }),
+    // Provider-specific options (§3.1).
+    ...(call.providerOptions ? { providerOptions: call.providerOptions } : {}),
     onChunk: async ({ chunk }: any) => {
+      const platform = chunks.map(chunk);
       // Accumulated first, so the text is already banked if the call is
       // stopped before its finish arrives (§4).
       if (call.partial && chunk?.type === 'text-delta') {
-        call.partial.text += chunk.textDelta ?? chunk.text ?? '';
+        call.partial.text += chunk.text ?? '';
       }
-      await call.onChunk?.(chunk);
+      await call.onChunk?.(chunk, platform);
     },
-    ...(userOnStepFinish
-      ? { onStepFinish: (step: any) => userOnStepFinish?.(step) } // user callback still fires
-      : {}),
+    ...(onStep ? { onStepEnd: (step: any) => onStep(step) } : {}), // user callback still fires
   };
 
   if (call.kind === 'stream-text') {
@@ -133,44 +151,40 @@ export async function executeStep(
     // streamText is lazy: drain the full stream so onChunk fires per part, and
     // let a provider failure throw here rather than hanging on promises that
     // never settle (see drainOrThrow).
-    await drainOrThrow(result.fullStream);
+    await drainOrThrow(result.stream);
 
-    const [text, usage, finishReason, response, steps, meta] = await Promise.all([
+    const [text, step, responseMessages] = await Promise.all([
       result.text,
-      result.usage,
-      result.finishReason,
-      result.response,
-      result.steps,
-      // v4 exposes it under the experimental name; v5 drops the prefix.
-      (result as any).providerMetadata ?? (result as any).experimental_providerMetadata,
+      result.finalStep,
+      result.responseMessages,
     ]);
+    const thrown = thrownByTool(step.content as any);
+    if (thrown !== undefined) throw thrown;
     return {
       text,
-      finishReason,
-      usage: usage as any,
-      responseMessages: (response?.messages ?? []) as any,
-      toolResults: (steps?.at(-1)?.toolResults ?? []) as any,
-      providerMetadata: meta as any,
-      response: { id: (response as any)?.id, headers: (response as any)?.headers },
+      finishReason: step.finishReason,
+      usage: step.usage as any,
+      responseMessages: toStoredMessages(responseMessages as any) as any,
+      toolResults: storedToolResults(step.toolResults as any),
+      providerMetadata: step.providerMetadata as any,
+      response: { id: step.response?.id, headers: step.response?.headers },
       streamedText: call.partial?.text || text,
-      // The SDK makes up a finish when the provider's stream closes without
-      // one, with reason 'unknown'. A step like that did not finish: the
-      // provider cut it short without saying so.
-      finished: finishReason !== 'unknown',
+      finished: finishedByProvider(step.finishReason, step.rawFinishReason),
     };
   }
 
   const result = await generateText(shared as any);
+  const step = result.finalStep;
+  const thrown = thrownByTool(step.content as any);
+  if (thrown !== undefined) throw thrown;
   return {
     text: result.text,
-    finishReason: result.finishReason,
-    usage: result.usage as any,
-    responseMessages: (result.response?.messages ?? []) as any,
-    toolResults: (result.steps?.at(-1)?.toolResults ?? []) as any,
-    providerMetadata:
-      ((result as any).providerMetadata ??
-        (result as any).experimental_providerMetadata) as any,
-    response: { id: (result.response as any)?.id, headers: (result.response as any)?.headers },
+    finishReason: step.finishReason,
+    usage: step.usage as any,
+    responseMessages: toStoredMessages(result.responseMessages as any) as any,
+    toolResults: storedToolResults(step.toolResults as any),
+    providerMetadata: step.providerMetadata as any,
+    response: { id: step.response?.id, headers: step.response?.headers },
     streamedText: result.text,
     finished: true,
   };
@@ -343,8 +357,8 @@ export async function runLoop(
         abortSignal: stepAbort.signal,
         onChunk:
           input.kind === 'stream-text'
-            ? async (chunk: unknown) => {
-                const published = chunkPayload(chunk, input.toolErrors);
+            ? async (chunk: unknown, platform: unknown | null) => {
+                const published = platform === null ? null : chunkPayload(platform, input.toolErrors);
                 if (published !== null) await batcher?.push(published);
                 await input.onChunk?.(chunk);
               }

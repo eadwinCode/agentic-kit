@@ -167,7 +167,7 @@ describe('AGENTIC_KIT_ADMIN_DATABASE_URL (§2.9)', () => {
     const { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } = await import(
       '../src/adapters/memory.js'
     );
-    const { MockLanguageModelV1 } = await import('ai/test');
+    const { MockLanguageModelV1 } = await import('./v1-mock.js');
     const { simulateReadableStream } = await import('ai');
 
     const before = process.env.AGENTIC_KIT_ADMIN_DATABASE_URL;

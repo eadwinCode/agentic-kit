@@ -121,7 +121,7 @@ await chat.run({ threadId, prompt, model, providerOptions });
 
 ## What not to put here
 
-Anything the platform owns: `model`, `messages`, `tools`, `maxSteps`,
+Anything the platform owns: `model`, `messages`, `tools`, `stopWhen`,
 `abortSignal`. Those are set by the engine and cannot be overridden.
 
 Cache breakpoints are also handled for you — see
@@ -130,6 +130,7 @@ Cache breakpoints are also handled for you — see
 
 ## Compatibility note
 
-The engine forwards the options under both the SDK v5 name (`providerOptions`)
-and the v4 alias (`experimental_providerMetadata`), so the same configuration
-works across that version boundary.
+The engine forwards the options as the SDK's `providerOptions`. Messages stored
+before the AI SDK 7 upgrade may carry the old v4 name,
+`experimental_providerMetadata`; those are read as `providerOptions` when the
+prompt is built.

@@ -3,8 +3,8 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { simulateReadableStream, tool } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
-import { MockLanguageModelV1 } from 'ai/test';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
@@ -160,7 +160,7 @@ async function parkedRuntime() {
     resolveModel: () => ({ instance: () => model, contextWindow: 128_000 }),
     config: resolveConfig({ hitlTtlMs: 60 * 60_000 }),
   });
-  const wipe = markRequiresConfirmation(tool({ parameters: z.object({}), execute: async () => 'wiped' }));
+  const wipe = markRequiresConfirmation(tool({ inputSchema: z.object({}), execute: async () => 'wiped' }));
   const chat = runtime.createStreamTextAgent({ name: 'chat', tools: { wipe } });
   const ran = await chat.run({ prompt: 'delete' });
   await runtime.worker.handleJob(queue.items.shift()!);

@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { simulateReadableStream, tool } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
-import { MockLanguageModelV1 } from 'ai/test';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { SqliteStorage } from '../src/adapters/sqlite.js';
@@ -190,7 +190,7 @@ describe('a locally assembled runtime', () => {
       name: 'chat', model: 'gpt-4o',
       tools: {
         sendEmail: markRequiresConfirmation(
-          tool({ parameters: z.object({ to: z.string() }), execute: async () => ({ sent: true }) }),
+          tool({ inputSchema: z.object({ to: z.string() }), execute: async () => ({ sent: true }) }),
         ),
       },
     });

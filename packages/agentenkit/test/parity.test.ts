@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { simulateReadableStream, tool } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
-import { MockLanguageModelV1 } from 'ai/test';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
@@ -102,7 +102,7 @@ async function harness(steps: Step[], config: Partial<AgentConfig> = {}) {
   return { ...s, runtime, storage, bus, queue, kv, admin, resolved, next, drain, events, lastTerminal, state, messages };
 }
 
-const ping = tool({ parameters: z.object({}), execute: async () => 'pong' });
+const ping = tool({ inputSchema: z.object({}), execute: async () => 'pong' });
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe('run input (§2.1)', () => {
@@ -230,7 +230,7 @@ describe('subagent profiles (§2.7)', () => {
             systemFn: (_t, state) => { persona++; return `You are the researcher for ${state.orgId}.`; },
             tools: {
               lookup: tool({
-                parameters: z.object({ q: z.string() }),
+                inputSchema: z.object({ q: z.string() }),
                 execute: async ({ q }) => { looked.push(q); return { found: true }; },
               }),
             },
@@ -286,7 +286,7 @@ describe('subagent profiles (§2.7)', () => {
             system: 'You mail.',
             tools: {
               sendEmail: markRequiresConfirmation(tool({
-                parameters: z.object({ to: z.string() }),
+                inputSchema: z.object({ to: z.string() }),
                 execute: async ({ to }) => { sent.push(to); return { sent: true }; },
               })),
             },
@@ -341,7 +341,7 @@ describe('overload (§2.8)', () => {
 
   it('the ticket carries the tenant and housekeeping queues behind users', async () => {
     const h = await harness([{ calls: [{ id: 'c1', name: 'wipe' }] }], { hitlTtlMs: 60 * 60_000 });
-    const wipe = markRequiresConfirmation(tool({ parameters: z.object({}), execute: async () => 'wiped' }));
+    const wipe = markRequiresConfirmation(tool({ inputSchema: z.object({}), execute: async () => 'wiped' }));
     const chat = h.runtime.createStreamTextAgent({ name: 'chat', tools: { wipe } });
     await chat.run({ prompt: 'delete', partitionKey: 'team-a' });
     const job = h.queue.items[0]!;

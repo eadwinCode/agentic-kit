@@ -14,9 +14,9 @@ export interface TokenAttribution {
   totalTokens: number;
 }
 
-/** Where a cache hit is reported, per provider. The AI SDK's `usage` carries
- *  only prompt/completion/total — cache counts live in provider metadata, so
- *  reading `usage` alone can never see one. */
+/** Where a cache hit is reported, per provider, when the AI SDK's `usage`
+ *  does not say: an older provider package puts cache counts only in provider
+ *  metadata, so reading `usage` alone would never see one. */
 export type ProviderMetadataLike =
   | Record<string, Record<string, unknown> | undefined>
   | undefined;
@@ -28,7 +28,32 @@ type UsageLike = {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  /** AI SDK v7: the split of the input count, where the provider reports it. */
+  inputTokenDetails?: {
+    noCacheTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+  };
+  outputTokenDetails?: { textTokens?: number; reasoningTokens?: number };
 } | undefined;
+
+/** The input split as the SDK reported it, or null when it did not. The SDK
+ *  (v7) reports cache reads and writes in `usage` itself, with `inputTokens`
+ *  counting them in; when it does, that is the answer, and provider metadata
+ *  is not read on top of it, or the same cache hit would count twice. */
+function inputDetails(usage: UsageLike): { cacheRead: number; noCache: number } | null {
+  const d = usage?.inputTokenDetails;
+  if (!d || (d.cacheReadTokens === undefined && d.noCacheTokens === undefined)) return null;
+  const total = pick(usage?.inputTokens);
+  const cacheRead = pick(d.cacheReadTokens);
+  // Providers count cache writes inside the total and outside the uncached
+  // count; they are billed on their own line (cacheWriteTokens), so they are
+  // taken out here too, or they would be charged twice.
+  const noCache = d.noCacheTokens !== undefined
+    ? pick(d.noCacheTokens)
+    : Math.max(0, total - cacheRead - pick(d.cacheWriteTokens));
+  return { cacheRead, noCache };
+}
 
 const pick = (...vals: (number | undefined)[]): number => {
   for (const v of vals) {
@@ -56,6 +81,16 @@ export function attributeTokens(
   const u = usage ?? {};
   const reportedInput = pick(u.inputTokens, u.promptTokens);
   const outputTokens = pick(u.outputTokens, u.completionTokens);
+
+  const details = inputDetails(u);
+  if (details) {
+    return {
+      inputTokens: details.noCache,
+      cachedInputTokens: details.cacheRead,
+      outputTokens,
+      totalTokens: details.noCache + details.cacheRead + outputTokens,
+    };
+  }
 
   const openaiCached = pick(meta?.openai?.cachedPromptTokens as number | undefined);
   const anthropicCached = pick(
@@ -87,8 +122,9 @@ export function countTokens(usage: UsageLike, meta?: ProviderMetadataLike): numb
  *  them in provider metadata, and they are a separate line on the bill — a
  *  cache write costs more than a fresh input token, so a pricer needs them
  *  apart from the rest. */
-export function cacheWriteTokens(meta?: ProviderMetadataLike): number {
+export function cacheWriteTokens(meta?: ProviderMetadataLike, usage?: UsageLike): number {
   return pick(
+    usage?.inputTokenDetails?.cacheWriteTokens,
     meta?.anthropic?.cacheCreationInputTokens as number | undefined,
     meta?.bedrock?.cacheWriteInputTokens as number | undefined,
   );
@@ -99,6 +135,7 @@ export function cacheWriteTokens(meta?: ProviderMetadataLike): number {
  *  at zero by default. */
 export function reasoningTokens(usage: UsageLike, meta?: ProviderMetadataLike): number {
   return pick(
+    usage?.outputTokenDetails?.reasoningTokens,
     (usage as { reasoningTokens?: number } | undefined)?.reasoningTokens,
     meta?.openai?.reasoningTokens as number | undefined,
   );
@@ -124,7 +161,7 @@ export function fillTokens(
   return {
     inputTokens: a.inputTokens,
     cacheReadInputTokens: a.cachedInputTokens,
-    cacheWriteInputTokens: cacheWriteTokens(meta),
+    cacheWriteInputTokens: cacheWriteTokens(meta, usage),
     outputTokens: a.outputTokens,
     reasoningTokens: reasoningTokens(usage, meta),
     totalTokens: a.totalTokens,

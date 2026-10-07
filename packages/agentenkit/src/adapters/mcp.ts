@@ -123,7 +123,7 @@ function buildTools(options: MCPServerOptions, infos: MCPToolInfo[], channel: Ch
     const schema = info.inputSchema && typeof info.inputSchema === 'object' ? info.inputSchema : { type: 'object', properties: {} };
     const t = tool({
       description: info.description ?? '',
-      parameters: jsonSchema(schema as Parameters<typeof jsonSchema>[0]),
+      inputSchema: jsonSchema(schema as Parameters<typeof jsonSchema>[0]),
       execute: async (args: unknown, opts: { abortSignal?: AbortSignal }): Promise<unknown> => {
         try {
           const res = (await channel.request('tools/call', { name: info.name, arguments: args ?? {} }, opts.abortSignal)) as {

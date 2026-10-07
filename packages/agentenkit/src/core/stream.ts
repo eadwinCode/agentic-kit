@@ -1,18 +1,23 @@
 /** Drain a `streamText` result, turning a provider failure into a throw.
  *
- *  streamText reports a failure — an aborted call included — as an `error`
- *  part and then ends the stream NORMALLY, while its `text`/`usage`/`response`
- *  promises never settle. Awaiting those without rethrowing hangs the caller
+ *  streamText reports a failure as an `error` part, and a stopped call as an
+ *  `abort` part, and then ends the stream NORMALLY, while its result promises
+ *  may never settle. Awaiting those without rethrowing hangs the caller
  *  forever, still holding whatever it owns: for a run segment that is the
  *  thread's run lock, which wedges every later message on the thread.
  *
  *  Draining fully first also means `onChunk` fires for every part that did
  *  arrive before the failure. */
-export async function drainOrThrow(fullStream: AsyncIterable<unknown>): Promise<void> {
+export async function drainOrThrow(stream: AsyncIterable<unknown>): Promise<void> {
   let streamError: unknown;
-  for await (const part of fullStream) {
-    if ((part as { type?: string } | null)?.type === 'error' && streamError === undefined) {
-      streamError = (part as { error?: unknown }).error;
+  for await (const part of stream) {
+    const p = part as { type?: string; error?: unknown; reason?: string } | null;
+    if (streamError !== undefined) continue;
+    if (p?.type === 'error') streamError = p.error;
+    else if (p?.type === 'abort') {
+      const err = new Error(p.reason ? `aborted: ${p.reason}` : 'aborted');
+      err.name = 'AbortError';
+      streamError = err;
     }
   }
   if (streamError !== undefined) throw streamError;

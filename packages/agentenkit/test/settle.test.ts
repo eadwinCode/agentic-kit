@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from 'bun:test';
 import { simulateReadableStream, tool } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
-import { MockLanguageModelV1 } from 'ai/test';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
@@ -100,8 +100,8 @@ async function makeRuntime(
   return { runtime, storage, queue, kv, admin, calls, handleNext, drain, events, lastTerminal, state };
 }
 
-const wipe = markRequiresConfirmation(tool({ parameters: z.object({}), execute: async () => 'wiped' }));
-const probe = tool({ parameters: z.object({}), execute: async () => 'ok' });
+const wipe = markRequiresConfirmation(tool({ inputSchema: z.object({}), execute: async () => 'wiped' }));
+const probe = tool({ inputSchema: z.object({}), execute: async () => 'ok' });
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const waitFor = async (cond: () => boolean) => {
   for (let i = 0; i < 400 && !cond(); i++) await sleep(5);

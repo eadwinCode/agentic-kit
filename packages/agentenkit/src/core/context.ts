@@ -131,7 +131,7 @@ export async function compactContext(
         `${err instanceof Error ? err.message : String(err)}`,
     );
   }
-  const { text, usage, ...rest } = await generateText({
+  const result = await generateText({
     model: compactor.instance(),
     prompt:
       'Summarize the following conversation history into a dense context brief ' +
@@ -139,6 +139,7 @@ export async function compactContext(
       older.map((m) => `${m.role}: ${JSON.stringify(m.content)}`).join('\n'),
     ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
   });
+  const { text, finalStep } = result;
 
   const summary = await deps.storage.messages.append(threadId, {
     role: 'system',
@@ -153,8 +154,7 @@ export async function compactContext(
   //
   // The cache hit is reported in provider metadata, never in `usage` —
   // attributing without it books every cached prompt at the full input price.
-  const meta =
-    (rest as any).providerMetadata ?? (rest as any).experimental_providerMetadata;
+  const meta = finalStep.providerMetadata;
   const usageRow: NewUsage = {
     ...(opts.runId ? { runId: opts.runId } : {}),
     agentId: null,
@@ -163,8 +163,8 @@ export async function compactContext(
     model: compactionModel,
     modelId: wireId(compactor, compactionModel),
     outcome: 'finished',
-    providerMetadata: providerMeta(meta, (rest as any).response),
-    ...fillTokens(usage, meta),
+    providerMetadata: providerMeta(meta, finalStep.response),
+    ...fillTokens(finalStep.usage, meta),
   };
   if (opts.ledger) await opts.ledger.record(deps, threadId, usageRow);
   else await recordCall(deps, threadId, usageRow);
