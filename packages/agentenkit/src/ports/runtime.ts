@@ -271,6 +271,20 @@ export interface RunFinishInfo {
    *  rather than charge nothing: throw from `onSettle` and the run fails
    *  instead of going free. */
   usageError?: unknown;
+  /** The run's state (§2.10), as the run was given it. A settle retried later
+   *  (the sweep, a stop of a dead worker) gets the stored one, so a hook that
+   *  keys its tenant work on it works on every try. The Go runtime hands it
+   *  over on the context (RunStateFromContext). */
+  runState?: AgentRunState;
+}
+
+/** What `compactThread` did. */
+export interface CompactResult {
+  /** False when there was nothing older than the recent tail to summarize,
+   *  or the thread is gone. */
+  compacted: boolean;
+  /** Why nothing was compacted. */
+  reason?: string;
 }
 
 /** A spec's settle hook (§5.6): where a run is charged. It runs once per run,
@@ -463,6 +477,13 @@ export interface AgentCore {
 
   /** One call for UIs / history routes: thread + messages + recent events. */
   getThreadSnapshot(threadId: string, state?: AgentRunState): Promise<ThreadSnapshot | null>;
+
+  /** Summarizes a thread's history now, whatever its size (for a /compact
+   *  command): the latest user turn stays as it is and everything before it
+   *  goes into a durable summary (§2.6), as an automatic compaction would
+   *  write it. Refused while a run is queued or running. The summary call is
+   *  recorded without a run. */
+  compactThread(threadId: string, state?: AgentRunState): Promise<CompactResult>;
 
   /** Tokens spent so far and the §2.6 context load. Null when the thread is
    *  gone. Kept out of the snapshot so hydration stays one cheap read. */

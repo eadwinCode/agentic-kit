@@ -1,7 +1,7 @@
 import type { RunFinishInfo, RuntimePorts } from '../ports/runtime.js';
 import type { ExecutionState, JobKind, ProviderOptions, ResumeInfo, RunPatch, UsageTotals } from './types.js';
 import { wireId } from './types.js';
-import { compactContext } from './context.js';
+import { compactContext, isContextOverflow } from './context.js';
 import type { TokenAttribution } from './usage.js';
 import { markPromptCaching } from './cache.js';
 import { promptMessages, repairDanglingToolCalls } from './messages.js';
@@ -830,60 +830,81 @@ export async function execute(
           tokensUsed: 0, parked: false, aborted: false, interrupted: false, steps: 0, costExhausted: false,
         };
       } else {
-        // Durable compaction pass — history always fits the model budget (§2.6);
-        // the budget uses the resolved model's contextWindow (§3.3)
-        const history = await compactContext(deps, threadId, input.model, {
-          runId,
-          abortSignal: abort.signal,
-          ledger,
-        });
         const model = deps.resolveModel(input.model);
-
-        // Prompt caching (§2.6): stamp the stable prefix once — appended step
-        // messages extend the prompt without invalidating the breakpoints.
-        let messages = repairDanglingToolCalls(promptMessages(history) as any[]);
-        if (deps.config.promptCaching) {
-          messages = markPromptCaching(messages);
-        }
-
-        loop = await runLoop(
-          deps,
-          agent,
-          threadId,
-          {
-            agentId: null, // the main agent's stream (§2.7)
+        // Compacts (§2.6; the budget uses the resolved model's contextWindow,
+        // §3.3) and runs the loop. `force` compacts whatever the estimate
+        // says; `steps` is how many steps are left.
+        const progress = { steps: 0 };
+        const compactAndRun = async (force: boolean, steps: number) => {
+          const history = await compactContext(deps, threadId, input.model, {
             runId,
-            kind: agent.kind,
-            model: model.instance(),
-            messages,
-            tools,
-            maxSteps,
             abortSignal: abort.signal,
-            providerOptions,
-            tokenBudget,
-            systemFn: userArgs.systemFn,
-            prepareStep: userArgs.prepareStep,
-            state: input.state ?? {},
-            costBudgetMicros: costBudget,
-            billingRunId: runId,
-            modelKey: input.model,
-            modelId: wireId(model, input.model),
-            agentName: agent.name,
-            cacheSystemPrompt: deps.config.promptCaching,
-            fenced: () => lease.lost,
-            commitParks: () => commitParks(deps, parks),
-            // One canonical path for every client: durable log + live Pub/Sub
-            // (§2.1, §2.2), with token deltas merged (see ChunkBatcher).
-            publishChunk: async (chunk) => {
-              await publish(deps, threadId, 'CHUNK', chunk);
+            ledger,
+            force,
+          });
+
+          // Prompt caching (§2.6): stamp the stable prefix once — appended step
+          // messages extend the prompt without invalidating the breakpoints.
+          let messages = repairDanglingToolCalls(promptMessages(history) as any[]);
+          if (deps.config.promptCaching) {
+            messages = markPromptCaching(messages);
+          }
+
+          progress.steps = 0;
+          return runLoop(
+            deps,
+            agent,
+            threadId,
+            {
+              agentId: null, // the main agent's stream (§2.7)
+              runId,
+              kind: agent.kind,
+              model: model.instance(),
+              messages,
+              tools,
+              maxSteps: steps,
+              abortSignal: abort.signal,
+              providerOptions,
+              tokenBudget,
+              systemFn: userArgs.systemFn,
+              prepareStep: userArgs.prepareStep,
+              state: input.state ?? {},
+              costBudgetMicros: costBudget,
+              billingRunId: runId,
+              modelKey: input.model,
+              modelId: wireId(model, input.model),
+              agentName: agent.name,
+              cacheSystemPrompt: deps.config.promptCaching,
+              fenced: () => lease.lost,
+              commitParks: () => commitParks(deps, parks),
+              // One canonical path for every client: durable log + live Pub/Sub
+              // (§2.1, §2.2), with token deltas merged (see ChunkBatcher).
+              publishChunk: async (chunk) => {
+                await publish(deps, threadId, 'CHUNK', chunk);
+              },
+              toolErrors,
+              onChunk: async (chunk) => {
+                userArgs.onChunk?.({ chunk }); // the user callback sees every raw chunk
+              },
+              progress,
             },
-            toolErrors,
-            onChunk: async (chunk) => {
-              userArgs.onChunk?.({ chunk }); // the user callback sees every raw chunk
-            },
-          },
-          ledger,
-        );
+            ledger,
+          );
+        };
+        try {
+          loop = await compactAndRun(false, maxSteps);
+        } catch (err) {
+          // The provider refused the prompt as too long: the estimate missed.
+          // Compact now and go on from the steps already saved, once.
+          if (!isContextOverflow(err) || lease.lost || abort.signal.aborted) throw err;
+          ((deps.log ?? console) as { warn?: (m: string, ...r: unknown[]) => void }).warn?.(
+            'prompt too long for the model; compacting and retrying', {
+              threadId, runId, err: err instanceof Error ? err.message : String(err),
+            });
+          const done = progress.steps;
+          const retried = await compactAndRun(true, Math.max(1, maxSteps - done));
+          loop = { ...retried, steps: retried.steps + done };
+        }
 
         // A lost lock aborts the run the way a stop does, but it is not a stop:
         // another worker may own the thread now, so nothing below may write.
@@ -952,6 +973,7 @@ export async function execute(
         cancelled: state === 'CANCELLED', ...(error ? { error } : {}),
         tokensUsed, attribution, steps: loop.steps,
         usage: bill.usage, ...(bill.error !== undefined ? { usageError: bill.error } : {}),
+        ...(input.state ? { runState: input.state } : {}),
       });
       const settled = await settleRun(deps, agent, info());
       if (settled.error !== undefined && state !== 'CANCELLED') {

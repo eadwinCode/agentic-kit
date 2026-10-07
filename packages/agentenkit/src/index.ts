@@ -49,6 +49,7 @@ export type {
   Pricer,
   Logger,
   RunFinishInfo,
+  CompactResult,
   SettleFn,
   SystemFn,
   PrepareStepFn,
@@ -123,7 +124,9 @@ export {
   type PendingHitl,
 } from './core/hitl.js';
 export { reclaimIfOrphaned } from './core/reclaim.js';
-export { contextBudget, contextUsage, compactContext, CONTEXT_TOKEN_CEILING } from './core/context.js';
+export {
+  contextBudget, contextUsage, compactContext, isContextOverflow, CONTEXT_TOKEN_CEILING, type CompactOptions,
+} from './core/context.js';
 export { Semaphore, runNestedAgent, spawnSubagentTool, type SubagentCtx } from './core/subagent.js';
 export { run } from './core/run.js';
 export {

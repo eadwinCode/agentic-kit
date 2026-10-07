@@ -17,7 +17,7 @@ import type { RunRecord } from './core/types.js';
 import type { RegisteredAgent } from './core/agent.js';
 import { settleLate } from './core/settle.js';
 import { failLostRun } from './core/engine.js';
-import { contextUsage } from './core/context.js';
+import { compactContext, contextUsage } from './core/context.js';
 import { createGenerateTextAgent, createStreamTextAgent } from './core/agent.js';
 import { buildBuiltinTools } from './core/builtin/index.js';
 import * as adminReads from './core/admin.js';
@@ -154,6 +154,24 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
       threadId: string,
       state?: AgentRunState,
     ): Promise<ThreadSnapshot | null> => threadSnapshot(scope(state), threadId),
+
+    compactThread: async (threadId: string, state?: AgentRunState) => {
+      const ports = scope(state);
+      const thread = await ports.storage.threads.get(threadId);
+      if (!thread) return { compacted: false, reason: 'thread not found' };
+      if (thread.state === 'RUNNING' || thread.state === 'QUEUED') {
+        return { compacted: false, reason: 'the thread has an active run; wait for it or stop it first' };
+      }
+      const before = await ports.storage.messages.list(threadId, { agentId: null });
+      await compactContext(ports, threadId, thread.model, { force: true });
+      const after = await ports.storage.messages.list(threadId, { agentId: null });
+      // A compaction appends its summary message; nothing else writes here
+      // while no run is active.
+      if (after.length === before.length) {
+        return { compacted: false, reason: 'nothing older than the recent messages to summarize' };
+      }
+      return { compacted: true };
+    },
 
     admin: adminApi(deps, scope),
 

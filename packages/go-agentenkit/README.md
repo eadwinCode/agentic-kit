@@ -468,9 +468,9 @@ one database.
   ("prompt is too long", `context_length_exceeded`…) compacts the thread at once,
   keeping only the latest user turn, and the run goes on (once per segment).
   `rt.CompactThread(ctx, threadID, state)` does the same on request, refused while a
-  run is queued or running. The TypeScript package does neither yet.
+  run is queued or running. The TypeScript package does the same (`compactThread`).
 - **A mixed step keeps its results.** When one tool parks and another runs in the same
-  step, the executed result is persisted. The TypeScript package drops the whole message.
+  step, the executed result is persisted, in both packages.
 - **Total tokens** are always input + cached + output, for every provider.
 
 ## Development

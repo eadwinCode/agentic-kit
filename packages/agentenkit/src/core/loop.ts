@@ -263,6 +263,9 @@ export interface LoopInput {
   /** Carry the system prompt as a stamped message rather than the SDK's
    *  `system:` string, so it can hold a cache breakpoint (§2.6). */
   cacheSystemPrompt?: boolean;
+  /** Kept up to date with the steps this loop has saved, so a caller still
+   *  knows how many ran when the loop throws part way. */
+  progress?: { steps: number };
 }
 
 export interface LoopOutcome {
@@ -506,6 +509,7 @@ export async function runLoop(
     lastText = step.text ?? '';
     lastFinishReason = step.finishReason;
     stepsRun += 1;
+    if (input.progress) input.progress.steps = stepsRun;
 
     // §2.9: one row per step in the platform's OWN store, plus a bus-only
     // notice so live dashboards see it. The notice is not persisted to the
