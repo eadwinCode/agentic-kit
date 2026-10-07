@@ -2,7 +2,8 @@ import type { RuntimePorts } from '../../ports/runtime.js';
 import { SandboxGoneError, SandboxUnsupportedError, type Sandbox, type SandboxProvider } from '../../ports/sandbox.js';
 import { toolRunOf, type ToolRun } from './run.js';
 
-/** One sandbox per thread, kept between messages.
+/** One sandbox per thread, kept between messages (`sandboxScope: 'thread'`,
+ *  the default), or one per run (`'run'`).
  *
  *  The first sandbox call in a thread makes it and keeps its id in the kv
  *  under the thread. Every later call, in this run or the next (a new
@@ -15,7 +16,15 @@ import { toolRunOf, type ToolRun } from './run.js';
  *  use pushes the sandbox's own timeout back, so an idle one shuts itself
  *  down even when no app is running to end it. The next call then makes a
  *  fresh one and says the old files are lost. The Go runtime does the same
- *  (core/sandbox.go). */
+ *  (core/sandbox.go).
+ *
+ *  With `sandboxScope: 'run'` the record also names the run that made the
+ *  sandbox. The run's later calls and its subagents share it; when the run
+ *  ends (finished, failed, stopped) the runtime ends it (releaseRunSandbox),
+ *  and when the run parks it does too, unless `sandboxKeepOnPark`. The next
+ *  run, or the resumed one, makes a fresh one. A sandbox an earlier run left
+ *  behind (a crash, a stop with no worker) is ended by the next run that
+ *  finds it, and by its own timeout before that. */
 
 export interface ThreadSandbox {
   sandbox: Sandbox;
@@ -25,6 +34,10 @@ export interface ThreadSandbox {
    *  past its lifetime, or ended on its own. Its files are lost, and a tool
    *  should tell the model so it does not expect them. */
   lost: boolean;
+  /** True when the provider gives every new sandbox the work folder back
+   *  (`restoresWorkdir`): after `lost`, the project files are there again
+   *  and only what was outside the work folder is gone. */
+  restored: boolean;
 }
 
 /** What the kv keeps for a thread's sandbox. */
@@ -33,6 +46,11 @@ interface SandboxRecord {
   provider: string;
   createdAt: number;
   lastUsedAt: number;
+  /** The run that made the sandbox (`sandboxScope: 'run'` only). */
+  runId?: string;
+  /** A sandbox the run gave back when it parked: it is gone, and the resumed
+   *  run's next call must say so. */
+  released?: boolean;
 }
 
 export const sandboxKey = (threadId: string) => `agent:tool:sandbox:${threadId}`;
@@ -96,11 +114,15 @@ export function threadSandbox(run: ToolRun): Promise<ThreadSandbox> {
   const provider = run.deps.tools?.sandbox;
   if (!provider) return Promise.reject(new Error('No sandbox: pass setupAgentCore({ tools: { sandbox } })'));
   const key = run.threadId;
-  const inFlight = pending.get(key);
-  if (inFlight) return inFlight;
-  const p = acquire(run, provider).finally(() => pending.delete(key));
-  pending.set(key, p);
-  return p;
+  let p = pending.get(key);
+  if (!p) {
+    p = acquire(run, provider).finally(() => pending.delete(key));
+    pending.set(key, p);
+  }
+  return p.then((ts) => {
+    run.onSandbox?.(ts.sandbox);
+    return ts;
+  });
 }
 
 async function acquire(run: ToolRun, provider: SandboxProvider): Promise<ThreadSandbox> {
@@ -113,6 +135,18 @@ async function acquire(run: ToolRun, provider: SandboxProvider): Promise<ThreadS
   if (rec && rec.provider !== provider.name) rec = null;
 
   let lost = false;
+  if (rec && config.sandboxScope === 'run') {
+    if (rec.released) {
+      // Given back at a park: for the same run, its files are gone.
+      lost = rec.runId === run.runId;
+      rec = null;
+    } else if (rec.runId !== run.runId) {
+      // Left by an earlier run that never gave it back. This run starts
+      // fresh; that is the normal case here, not a loss.
+      await destroyQuietly(run.deps, provider, rec.id);
+      rec = null;
+    }
+  }
   if (rec && (now - rec.lastUsedAt > idle || now - rec.createdAt > lifetime)) {
     await destroyQuietly(run.deps, provider, rec.id);
     rec = null;
@@ -141,6 +175,8 @@ async function acquire(run: ToolRun, provider: SandboxProvider): Promise<ThreadS
   }
   if (!rec) {
     sandbox = await provider.create({
+      // The app's defaults, then the two the runtime owns.
+      ...config.sandboxDefaults,
       timeoutMs: Math.min(idle + PUSH_EVERY_MS, lifetime),
       metadata: {
         threadId: run.threadId,
@@ -149,11 +185,14 @@ async function acquire(run: ToolRun, provider: SandboxProvider): Promise<ThreadS
       },
     });
     remember(sandbox, now);
-    rec = { id: sandbox.sandboxId, provider: provider.name, createdAt: now, lastUsedAt: now };
+    rec = {
+      id: sandbox.sandboxId, provider: provider.name, createdAt: now, lastUsedAt: now,
+      ...(config.sandboxScope === 'run' && run.runId ? { runId: run.runId } : {}),
+    };
     created = true;
   }
   await kv.set(sandboxKey(run.threadId), JSON.stringify(rec), { exSeconds: Math.ceil(lifetime / 1000) });
-  return { sandbox: sandbox!, created, lost };
+  return { sandbox: sandbox!, created, lost, restored: provider.restoresWorkdir === true };
 }
 
 async function connect(provider: SandboxProvider, id: string): Promise<Sandbox> {
@@ -192,6 +231,84 @@ export async function destroyThreadSandbox(deps: RuntimePorts, threadId: string)
   const rec = parse(await deps.kv.get(sandboxKey(threadId)).catch(() => null));
   if (provider && rec && rec.provider === provider.name) await destroyQuietly(deps, provider, rec.id);
   await deps.kv.del(sandboxKey(threadId)).catch(() => undefined);
+}
+
+/** Ends the sandbox a run made, when the run is done with it
+ *  (`sandboxScope: 'run'` only; otherwise it does nothing). `parked` says the
+ *  run is waiting rather than ended: then the sandbox is kept when
+ *  `sandboxKeepOnPark`, and otherwise a mark is left so the resumed run is
+ *  told its files are gone. A sandbox another run made is left alone. Never
+ *  throws: the sandbox's own timeout ends it anyway. */
+export async function releaseRunSandbox(
+  deps: RuntimePorts,
+  threadId: string,
+  runId: string | undefined,
+  parked: boolean,
+): Promise<void> {
+  const provider = deps.tools?.sandbox;
+  if (!provider || !runId || deps.config.sandboxScope !== 'run') return;
+  if (parked && deps.config.sandboxKeepOnPark) return;
+  try {
+    const key = sandboxKey(threadId);
+    const raw = await deps.kv.get(key);
+    const rec = parse(raw);
+    if (!rec || rec.released || rec.runId !== runId || rec.provider !== provider.name) return;
+    await destroyQuietly(deps, provider, rec.id);
+    if (!parked) {
+      await deps.kv.delIfValue(key, raw!);
+      return;
+    }
+    await deps.kv.set(key, JSON.stringify({ ...rec, released: true }), {
+      exSeconds: Math.ceil(deps.config.sandboxMaxLifetimeMs / 1000),
+    });
+  } catch (err) {
+    (deps.log ?? console).error('sandbox release not recorded', { threadId, runId, err });
+  }
+}
+
+/** Runs one tool call and, when it used the sandbox and the app set
+ *  `afterSandboxCall`, calls the hook once after it. What the hook throws
+ *  becomes the call's error, unless the call failed on its own. `call` gets
+ *  the ToolRun to hand the tool, which notes the sandbox it used. A park is
+ *  not a failure: the hook sees no error for it. */
+export async function callWithSandboxHook<T>(
+  run: ToolRun | undefined,
+  toolName: string,
+  toolCallId: string | undefined,
+  isPark: (err: unknown) => boolean,
+  call: (run: ToolRun | undefined) => Promise<T>,
+): Promise<T> {
+  const hook = run?.deps.tools?.afterSandboxCall;
+  if (!run || !hook) return call(run);
+  let used: Sandbox | undefined;
+  const tracked: ToolRun = { ...run, onSandbox: (s) => { used = s; } };
+  let out: T | undefined;
+  let failed = false;
+  let error: unknown;
+  try {
+    out = await call(tracked);
+  } catch (err) {
+    failed = true;
+    error = err;
+  }
+  if (used) {
+    const ownError = failed && !isPark(error);
+    try {
+      await hook({
+        threadId: run.threadId,
+        ...(run.runId ? { runId: run.runId } : {}),
+        agentId: run.agentId,
+        toolName,
+        ...(toolCallId ? { toolCallId } : {}),
+        sandbox: used,
+        ...(ownError ? { error } : {}),
+      });
+    } catch (hookErr) {
+      if (!failed) throw hookErr;
+    }
+  }
+  if (failed) throw error;
+  return out as T;
 }
 
 function parse(raw: string | null): SandboxRecord | null {

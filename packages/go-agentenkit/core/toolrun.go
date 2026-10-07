@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"sync"
 
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
@@ -50,13 +51,64 @@ func WithToolRun(tools []ports.Tool, run ToolRun) []ports.Tool {
 			continue
 		}
 		inner := t.Execute
+		name := t.Name
 		wrapped := t
 		wrapped.Execute = func(ctx context.Context, input json.RawMessage) (string, error) {
-			return inner(ContextWithToolRun(ctx, run), input)
+			return callWithSandboxHook(ContextWithToolRun(ctx, run), run, name, func(ctx context.Context) (string, error) {
+				return inner(ctx, input)
+			})
 		}
 		out = append(out, wrapped)
 	}
 	return out
+}
+
+// sandboxUse is where a tool call notes the sandbox it used, for
+// AfterSandboxCall.
+type sandboxUse struct {
+	mu      sync.Mutex
+	sandbox ports.Sandbox
+}
+
+type sandboxUseKey struct{}
+
+// noteSandboxUse records that the call in ctx used s. The last sandbox
+// wins: a call that found its sandbox gone and got a fresh one saves to the
+// fresh one.
+func noteSandboxUse(ctx context.Context, s ports.Sandbox) {
+	if use, ok := ctx.Value(sandboxUseKey{}).(*sandboxUse); ok {
+		use.mu.Lock()
+		use.sandbox = s
+		use.mu.Unlock()
+	}
+}
+
+// callWithSandboxHook runs one tool call and, when it used the sandbox and
+// the app set AfterSandboxCall, calls the hook once after it. The hook's
+// error becomes the call's, unless the call failed on its own.
+func callWithSandboxHook(ctx context.Context, run ToolRun, name string, call func(context.Context) (string, error)) (string, error) {
+	hook := run.Deps.Tools.AfterSandboxCall
+	if hook == nil {
+		return call(ctx)
+	}
+	use := &sandboxUse{}
+	output, err := call(context.WithValue(ctx, sandboxUseKey{}, use))
+	use.mu.Lock()
+	s := use.sandbox
+	use.mu.Unlock()
+	if s == nil {
+		return output, err
+	}
+	// A park is not a failure, and it is not undone by the hook either: the
+	// call waits, whatever the hook said.
+	_, parked := IsParked(output)
+	if hookErr := hook(ctx, ports.SandboxCall{
+		ThreadID: run.ThreadID, RunID: run.RunID, AgentID: run.AgentID,
+		ToolName: name, ToolCallID: toolCallIDOr(ctx), Sandbox: s, Err: err,
+	}); hookErr != nil && err == nil && !parked {
+		return "", hookErr
+	}
+	return output, err
 }
 
 // RecordToolUsage books one row of a tool's spend: on the run's ledger when

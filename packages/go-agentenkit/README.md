@@ -297,7 +297,9 @@ coder := rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{Name: "coder", 
 | `text_editor` | View, create and edit files by exact replacement, with undo | `Sandbox` | For changes |
 
 A thread has **one sandbox**, kept between messages; it ends when the thread is
-deleted or has been idle for `SandboxIdleTTL` (30 minutes). Each tool call is a
+deleted or has been idle for `SandboxIdleTTL` (30 minutes). With
+`SandboxScope: agentenkit.SandboxScopeRun`, each run gets its own, ended with
+the run. Each tool call is a
 usage row, so `pricing.Tools{"brave": {PerUse: 0.005}, "e2b": {PerSecond: 0.000028}}`
 puts tool spend on the bill. `Approval` takes `agentenkit.AskAlways`,
 `agentenkit.AskNever`, or a check per call. Your own tools reach the sandbox

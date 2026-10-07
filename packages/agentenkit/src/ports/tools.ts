@@ -55,7 +55,7 @@ export interface Fetcher {
   fetch(url: string, options: FetchOptions): Promise<FetchedPage>;
 }
 
-import type { SandboxProvider } from './sandbox.js';
+import type { Sandbox, SandboxProvider } from './sandbox.js';
 
 /** The adapters the built-in tools use. A tool whose port is missing cannot
  *  be asked for: `builtinTools` throws at startup rather than a run failing
@@ -63,6 +63,27 @@ import type { SandboxProvider } from './sandbox.js';
 export interface BuiltinToolPorts {
   search?: Search;
   fetcher?: Fetcher;
-  /** Where commands run and files live: one sandbox per thread. */
+  /** Where commands run and files live: one sandbox per thread, or per run
+   *  (`sandboxScope`). */
   sandbox?: SandboxProvider;
+  /** Called once after every tool call that used the sandbox: the built-in
+   *  bash, code_execution and text_editor, and a tool of your own that called
+   *  `sandboxFor` or `withSandbox`. Save the work there, for example. What it
+   *  throws becomes the call's error, so the model knows; a call that already
+   *  failed keeps its own error. */
+  afterSandboxCall?: (call: SandboxCall) => void | Promise<void>;
+}
+
+/** One tool call that used the sandbox, as `afterSandboxCall` gets it. */
+export interface SandboxCall {
+  threadId: string;
+  /** The dispatched run; a nested run's calls carry their parent's. */
+  runId?: string;
+  /** null for the main agent, the nested run's id otherwise. */
+  agentId: string | null;
+  toolName: string;
+  toolCallId?: string;
+  sandbox: Sandbox;
+  /** The call's own error, absent when it went through. */
+  error?: unknown;
 }

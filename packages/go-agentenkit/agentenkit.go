@@ -138,6 +138,9 @@ type (
 	SandboxMetadata      = ports.SandboxMetadata
 	SandboxResources     = ports.SandboxResources
 	CreateSandboxOptions = ports.CreateSandboxOptions
+	SandboxScope         = ports.SandboxScope
+	SandboxCall          = ports.SandboxCall
+	WorkdirRestorer      = ports.WorkdirRestorer
 	RunCommandOptions    = ports.RunCommandOptions
 	CommandResult        = ports.CommandResult
 	FileEntry            = ports.FileEntry
@@ -402,6 +405,13 @@ var (
 func AgentTool[In any](name, description string, execute func(ctx context.Context, input In, tc ToolContext) (string, error)) Tool {
 	return core.AgentTool(name, description, execute)
 }
+
+// SandboxScopeThread keeps one sandbox per thread (the default);
+// SandboxScopeRun gives each run its own. See AgentConfig.SandboxScope.
+const (
+	SandboxScopeThread = ports.SandboxScopeThread
+	SandboxScopeRun    = ports.SandboxScopeRun
+)
 
 // The sandbox errors, for errors.Is.
 var (

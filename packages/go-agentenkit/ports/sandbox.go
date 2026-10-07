@@ -219,3 +219,29 @@ type silent struct{ err error }
 
 func (s silent) Error() string { return "" }
 func (s silent) Unwrap() error { return s.err }
+
+// SandboxScope is how long the runtime keeps a sandbox. See
+// AgentConfig.SandboxScope.
+type SandboxScope string
+
+const (
+	// SandboxScopeThread keeps one sandbox per thread, between messages.
+	SandboxScopeThread SandboxScope = "thread"
+	// SandboxScopeRun gives each run its own sandbox, ended with the run.
+	SandboxScopeRun SandboxScope = "run"
+)
+
+// WorkdirRestorer is a provider whose new sandboxes start with the same work
+// folder: the files are loaded from somewhere else, not kept in the sandbox.
+// When a thread's sandbox is replaced, the tools then tell the model its
+// project files are back, rather than that they are lost.
+type WorkdirRestorer interface {
+	RestoresWorkdir() bool
+}
+
+// RestoresWorkdir reports whether p says its new sandboxes get the work
+// folder back.
+func RestoresWorkdir(p SandboxProvider) bool {
+	r, ok := p.(WorkdirRestorer)
+	return ok && r.RestoresWorkdir()
+}

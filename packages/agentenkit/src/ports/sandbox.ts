@@ -44,11 +44,23 @@ export interface CreateSandboxOptions {
   extra?: Record<string, unknown>;
 }
 
+/** How long the runtime keeps a sandbox. See `AgentConfig.sandboxScope`. */
+export type SandboxScope = 'thread' | 'run';
+
+/** What an app can set for every sandbox the runtime makes. The runtime
+ *  sets `timeoutMs` and `metadata` itself. */
+export type SandboxDefaults = Omit<Partial<CreateSandboxOptions>, 'timeoutMs' | 'metadata'>;
+
 /** Makes sandboxes and finds them again. One per app, passed to
  *  `setupAgentCore({ tools: { sandbox } })`. */
 export interface SandboxProvider {
   /** The adapter's name: 'docker', 'e2b', 'local'. */
   readonly name: string;
+  /** True when every new sandbox starts with the same work folder: the
+   *  files are loaded from somewhere else, not kept in the sandbox. When a
+   *  thread's sandbox is replaced, the tools then tell the model its project
+   *  files are back, rather than that they are lost. */
+  readonly restoresWorkdir?: boolean;
   create(options: CreateSandboxOptions): Promise<Sandbox>;
   /** Finds a sandbox made earlier, by this process or another. Throws
    *  SandboxGoneError when it no longer exists. */

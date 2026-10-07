@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { simulateReadableStream } from 'ai';
@@ -15,6 +15,7 @@ import { toolUseRow } from '../src/core/builtin/run.js';
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
 import type { BuiltinToolName, BuiltinToolOptions } from '../src/core/builtin/index.js';
 import type { Pricer } from '../src/ports/runtime.js';
+import type { SandboxProvider } from '../src/ports/sandbox.js';
 import * as pricing from '../src/pricing.js';
 import { ofType, threadItems } from './stream-helpers.js';
 
@@ -33,7 +34,7 @@ async function harness(
   steps: Call[][],
   names: BuiltinToolName[],
   options: BuiltinToolOptions = {},
-  opts: { config?: Partial<AgentConfig>; pricer?: Pricer } = {},
+  opts: { config?: Partial<AgentConfig>; pricer?: Pricer; wrapSandbox?: (s: SandboxProvider) => SandboxProvider } = {},
 ) {
   forgetSandboxHandles();
   let call = 0;
@@ -56,7 +57,9 @@ async function harness(
   const runtime = await setupAgentCore({
     storage, bus, queue, kv,
     admin: new MemoryAdminStore(),
-    tools: { sandbox: new LocalSandbox({ rootDir: mkdtempSync(join(tmpdir(), 'sandbox-tools-')) }) },
+    tools: {
+      sandbox: (opts.wrapSandbox ?? ((s) => s))(new LocalSandbox({ rootDir: mkdtempSync(join(tmpdir(), 'sandbox-tools-')) })),
+    },
     resolveModel: () => ({ instance: () => model, contextWindow: 128_000 }),
     ...(opts.pricer ? { pricer: opts.pricer } : {}),
     config: resolveConfig({ stopPollMs: 5, promptCaching: false, ...opts.config }),
@@ -302,6 +305,50 @@ describe('sandbox tools (T4)', () => {
       error: 'text_editor: a.txt does not exist',
       note: 'The sandbox this conversation used before has ended, so files from earlier are gone. This is a fresh one.',
     });
+  });
+
+  it('a fresh sandbox from a provider that restores the work folder says the files are back', async () => {
+    const h = await harness(
+      [[edit('e1', { command: 'create', path: 'a.txt', file_text: 'x' })], [], [edit('e2', { command: 'view', path: 'a.txt' })]],
+      ['text_editor'],
+      noApproval,
+      { wrapSandbox: (s) => Object.assign(Object.create(s), { restoresWorkdir: true }) },
+    );
+    const threadId = await h.run();
+    const rec = JSON.parse((await h.kv.get(sandboxKey(threadId)))!);
+    await h.kv.set(sandboxKey(threadId), JSON.stringify({ ...rec, lastUsedAt: 0 }));
+    await h.run(threadId);
+    // The local sandbox does not really restore; the note is what is tested.
+    expect(h.result(threadId, 'e2').note).toBe(
+      'The sandbox restarted. The project files are back as they were; anything outside the work folder (installed tools, temp files, running processes) is gone.',
+    );
+  });
+
+  it("sandboxStateDir keeps the tools' own files out of the work folder", async () => {
+    const state = join(mkdtempSync(join(tmpdir(), 'sandbox-state-')), 'agentenkit-state');
+    const h = await harness(
+      [
+        [edit('e1', { command: 'create', path: 'a.txt', file_text: 'one\n' })],
+        [edit('e2', { command: 'str_replace', path: 'a.txt', old_str: 'one', new_str: 'two' })],
+        [edit('e3', { command: 'undo_edit', path: 'a.txt' })],
+        [bash('b1', 'mkdir -p sub && cd sub')],
+        [bash('b2', 'basename "$PWD"')],
+        [{ id: 'c1', name: 'code_execution', args: { code: "open('out.txt', 'w').write('1')" } }],
+        [bash('b3', 'cd .. && ls -A')],
+      ],
+      ['bash', 'code_execution', 'text_editor'],
+      noApproval,
+      { config: { sandboxStateDir: state } },
+    );
+    const threadId = await h.run();
+    expect(h.result(threadId, 'e3').error).toBeUndefined(); // undo works from the state folder
+    expect(h.result(threadId, 'b2').stdout).toBe('sub\n'); // bash keeps its folder there
+    expect(h.result(threadId, 'c1').files).toEqual([{ path: 'out.txt', mediaType: 'text/plain' }]);
+    expect(h.result(threadId, 'b3').stdout).toBe('a.txt\nout.txt\nsub\n'); // no .agentenkit in the work folder
+    // One folder per sandbox under it, holding the history.
+    const boxes = readdirSync(state);
+    expect(boxes).toHaveLength(1);
+    expect(readdirSync(join(state, boxes[0]!, 'history')).length).toBeGreaterThan(0);
   });
 
   it('the sandbox tools stop at maxUses', async () => {
