@@ -673,7 +673,8 @@ export interface AgentConfig {
   /** Where the sandbox tools keep their own files (the bash folder, the
    *  programs code_execution ran, the editor's undo history). A relative
    *  path is inside the work folder; an absolute one, such as
-   *  `/home/app/.agentenkit`, keeps them out of it. Default `.agentenkit`. */
+   *  `/home/app/.agentenkit`, keeps them out of it, with a folder per sandbox
+   *  under it. Default `.agentenkit`. */
   sandboxStateDir: string;
   /** Refuse a new run (RUN_REFUSED, reason `queue_full`) once this many jobs
    *  are ready and waiting (§2.8). Needs a queue that can count; one that

@@ -465,7 +465,12 @@ func TestSandboxTools_SandboxStateDirKeepsTheToolsOwnFilesOutOfTheWorkFolder(t *
 	mustEqual(t, len(files), 1, "files made")
 	mustEqual(t, files[0].(map[string]any)["path"], "out.txt", "the program's file, and nothing of the tools'")
 	mustEqual(t, h.resultMap(t, threadID, "b3")["stdout"], "a.txt\nout.txt\nsub\n", "no .agentenkit in the work folder")
-	entries, err := os.ReadDir(state + "/history")
+	// One folder per sandbox under it, holding the history.
+	boxes, err := os.ReadDir(state)
+	if err != nil || len(boxes) != 1 {
+		t.Fatalf("want one sandbox folder in the state folder: %v %v", boxes, err)
+	}
+	entries, err := os.ReadDir(state + "/" + boxes[0].Name() + "/history")
 	if err != nil || len(entries) == 0 {
 		t.Fatalf("no history in the state folder: %v", err)
 	}

@@ -62,7 +62,12 @@ export interface TextEditorOptions {
  *  code_execution ran, the editor's undo history. By default `.agentenkit` in
  *  the work folder, hidden so a plain `ls` does not show it;
  *  `sandboxStateDir` can move it, out of the work folder too. */
-const stateDir = (run: ToolRun) => run.deps.config.sandboxStateDir?.replace(/\/+$/, '') || '.agentenkit';
+const stateDir = (run: ToolRun, sandbox: Sandbox) => {
+  const dir = run.deps.config.sandboxStateDir?.replace(/\/+$/, '') || '.agentenkit';
+  // An absolute one gets a folder per sandbox under it: sandboxes that share
+  // a filesystem (the local one, a reused pool slot) must not share these.
+  return dir.startsWith('/') ? `${dir}/${sandbox.sandboxId}` : dir;
+};
 
 /** Quotes text for sh. */
 const shellQuote = (text: string) => `'${text.replace(/'/g, `'\\''`)}'`;
@@ -191,7 +196,7 @@ export async function runBash(
   try {
     return await withThreadSandbox(run, async (ts) => {
       const { sandbox } = ts;
-      const r = await sandbox.runCommand(bashScript(command || ':', restart, stateDir(run)), {
+      const r = await sandbox.runCommand(bashScript(command || ':', restart, stateDir(run, sandbox)), {
         timeoutMs: options.timeoutMs ?? 120_000,
         onStdout: live.onStdout,
         onStderr: live.onStderr,
@@ -255,7 +260,7 @@ export async function runCodeExecution(
     return await withThreadSandbox(run, async (ts) => {
       const { sandbox } = ts;
       const name = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const dir = stateDir(run);
+      const dir = stateDir(run, sandbox);
       const base = `${dir}/code/${name}`;
       const file = `${base}.${runner.ext}`;
       await sandbox.filesystem.writeFile(file, code);
@@ -408,7 +413,7 @@ async function edit(sandbox: Sandbox, run: ToolRun, input: TextEditorInput): Pro
     case 'create': {
       if (typeof input.file_text !== 'string') return failed('text_editor: create needs file_text');
       const before = await readOrNull(sandbox, path);
-      await remember(sandbox, stateDir(run), path, before);
+      await remember(sandbox, stateDir(run, sandbox), path, before);
       await sandbox.filesystem.writeFile(path, input.file_text);
       return { ok: true, message: `${before === null ? 'Created' : 'Replaced'} ${path}.` };
     }
@@ -419,7 +424,7 @@ async function edit(sandbox: Sandbox, run: ToolRun, input: TextEditorInput): Pro
       const n = count(text, input.old_str);
       if (n === 0) return failed(`text_editor: old_str was not found in ${path}; it must match exactly, whitespace included`);
       if (n > 1) return failed(`text_editor: old_str matches ${n} places in ${path}; include more of the text around it so it matches one`);
-      await remember(sandbox, stateDir(run), path, text);
+      await remember(sandbox, stateDir(run, sandbox), path, text);
       const i = text.indexOf(input.old_str);
       await sandbox.filesystem.writeFile(path, text.slice(0, i) + (input.new_str ?? '') + text.slice(i + input.old_str.length));
       return { ok: true, message: `Replaced 1 place in ${path}.` };
@@ -433,18 +438,18 @@ async function edit(sandbox: Sandbox, run: ToolRun, input: TextEditorInput): Pro
       if (!Number.isInteger(at) || at! < 0 || at! > lines.length) {
         return failed(`text_editor: insert_line must be within 0 and ${lines.length}`);
       }
-      await remember(sandbox, stateDir(run), path, text);
+      await remember(sandbox, stateDir(run, sandbox), path, text);
       lines.splice(at!, 0, ...input.new_str.split('\n'));
       await sandbox.filesystem.writeFile(path, lines.join('\n'));
       return { ok: true, message: `Inserted after line ${at} of ${path}.` };
     }
     case 'undo_edit': {
-      const history = await readHistory(sandbox, stateDir(run), path);
+      const history = await readHistory(sandbox, stateDir(run, sandbox), path);
       if (history.length === 0) return failed(`text_editor: there is no change to ${path} to undo`);
       const before = history.pop()!;
       if (before === null) await sandbox.filesystem.remove(path);
       else await sandbox.filesystem.writeFile(path, before);
-      await sandbox.filesystem.writeFile(historyPath(stateDir(run), path), JSON.stringify(history));
+      await sandbox.filesystem.writeFile(historyPath(stateDir(run, sandbox), path), JSON.stringify(history));
       return { ok: true, message: before === null ? `Removed ${path}, which the change had created.` : `Undid the last change to ${path}.` };
     }
     default:

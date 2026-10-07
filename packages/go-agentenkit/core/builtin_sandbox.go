@@ -67,12 +67,19 @@ type TextEditorOptions struct {
 // stateDir is where the tools keep their own files: the bash folder, the
 // programs code_execution ran, the editor's undo history. By default
 // ".agentenkit" in the work folder, hidden so a plain ls does not show it;
-// AgentConfig.SandboxStateDir can move it, out of the work folder too.
-func stateDir(run ToolRun) string {
-	if d := strings.TrimRight(run.Deps.Config.SandboxStateDir, "/"); d != "" {
+// AgentConfig.SandboxStateDir can move it, out of the work folder too. An
+// absolute one gets a folder per sandbox under it: sandboxes that share a
+// filesystem (the local one, a reused pool slot) must not share these files.
+func stateDir(run ToolRun, s ports.Sandbox) string {
+	d := strings.TrimRight(run.Deps.Config.SandboxStateDir, "/")
+	switch {
+	case d == "":
+		return ".agentenkit"
+	case strings.HasPrefix(d, "/"):
+		return d + "/" + s.ID()
+	default:
 		return d
 	}
-	return ".agentenkit"
 }
 
 // shellQuote quotes s for sh.
@@ -285,7 +292,7 @@ func RunBash(ctx context.Context, opts BashOptions, args map[string]any, run Too
 	live := newLiveOutput(ctx, run, "bash")
 	defer live.done()
 	return WithThreadSandbox(ctx, run, func(ts ThreadSandbox) (string, error) {
-		r, err := ts.Sandbox.RunCommand(ctx, bashScript(command, restart, stateDir(run)), ports.RunCommandOptions{
+		r, err := ts.Sandbox.RunCommand(ctx, bashScript(command, restart, stateDir(run, ts.Sandbox)), ports.RunCommandOptions{
 			Timeout: limit, OnStdout: live.push("stdout"), OnStderr: live.push("stderr"),
 		})
 		if err != nil {
@@ -366,7 +373,7 @@ func RunCodeExecution(ctx context.Context, opts CodeExecutionOptions, args map[s
 	return WithThreadSandbox(ctx, run, func(ts ThreadSandbox) (string, error) {
 		fs := ts.Sandbox.Filesystem()
 		name := fmt.Sprintf("%d-%s", time.Now().UnixMilli(), randomSuffix())
-		dir := stateDir(run)
+		dir := stateDir(run, ts.Sandbox)
 		base := dir + "/code/" + name
 		file := base + "." + runner.ext
 		if err := fs.WriteFile(ctx, file, []byte(code)); err != nil {
@@ -598,7 +605,7 @@ func runEdit(ctx context.Context, s ports.Sandbox, run ToolRun, command, path st
 		if err != nil {
 			return nil, err
 		}
-		if err := rememberVersion(ctx, s, stateDir(run), path, before); err != nil {
+		if err := rememberVersion(ctx, s, stateDir(run, s), path, before); err != nil {
 			return nil, err
 		}
 		if err := fs.WriteFile(ctx, path, []byte(fileText)); err != nil {
@@ -627,7 +634,7 @@ func runEdit(ctx context.Context, s ports.Sandbox, run ToolRun, command, path st
 		case n > 1:
 			return editFailed(fmt.Sprintf("text_editor: old_str matches %d places in %s; include more of the text around it so it matches one", n, path)), nil
 		}
-		if err := rememberVersion(ctx, s, stateDir(run), path, text); err != nil {
+		if err := rememberVersion(ctx, s, stateDir(run, s), path, text); err != nil {
 			return nil, err
 		}
 		newStr, _ := args["new_str"].(string)
@@ -652,7 +659,7 @@ func runEdit(ctx context.Context, s ports.Sandbox, run ToolRun, command, path st
 		if !ok || at < 0 || at > len(lines) {
 			return editFailed(fmt.Sprintf("text_editor: insert_line must be within 0 and %d", len(lines))), nil
 		}
-		if err := rememberVersion(ctx, s, stateDir(run), path, text); err != nil {
+		if err := rememberVersion(ctx, s, stateDir(run, s), path, text); err != nil {
 			return nil, err
 		}
 		merged := append(append(append([]string{}, lines[:at]...), strings.Split(newStr, "\n")...), lines[at:]...)
@@ -661,7 +668,7 @@ func runEdit(ctx context.Context, s ports.Sandbox, run ToolRun, command, path st
 		}
 		return editResult{"ok": true, "message": fmt.Sprintf("Inserted after line %d of %s.", at, path)}, nil
 	case "undo_edit":
-		h := readHistory(ctx, s, stateDir(run), path)
+		h := readHistory(ctx, s, stateDir(run, s), path)
 		if len(h) == 0 {
 			return editFailed("text_editor: there is no change to " + path + " to undo"), nil
 		}
@@ -674,7 +681,7 @@ func runEdit(ctx context.Context, s ports.Sandbox, run ToolRun, command, path st
 		} else if err := fs.WriteFile(ctx, path, []byte(*before)); err != nil {
 			return nil, err
 		}
-		if err := writeHistory(ctx, s, stateDir(run), path, h); err != nil {
+		if err := writeHistory(ctx, s, stateDir(run, s), path, h); err != nil {
 			return nil, err
 		}
 		if before == nil {

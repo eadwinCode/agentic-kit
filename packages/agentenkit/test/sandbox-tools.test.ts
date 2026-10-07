@@ -345,7 +345,10 @@ describe('sandbox tools (T4)', () => {
     expect(h.result(threadId, 'b2').stdout).toBe('sub\n'); // bash keeps its folder there
     expect(h.result(threadId, 'c1').files).toEqual([{ path: 'out.txt', mediaType: 'text/plain' }]);
     expect(h.result(threadId, 'b3').stdout).toBe('a.txt\nout.txt\nsub\n'); // no .agentenkit in the work folder
-    expect(readdirSync(join(state, 'history')).length).toBeGreaterThan(0);
+    // One folder per sandbox under it, holding the history.
+    const boxes = readdirSync(state);
+    expect(boxes).toHaveLength(1);
+    expect(readdirSync(join(state, boxes[0]!, 'history')).length).toBeGreaterThan(0);
   });
 
   it('the sandbox tools stop at maxUses', async () => {

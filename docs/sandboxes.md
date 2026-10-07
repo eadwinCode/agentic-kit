@@ -217,7 +217,8 @@ The tools keep their own files (the bash folder, the programs, the undo
 history) in a hidden `.agentenkit` folder in the start folder. When the work
 folder is a Git checkout, that folder shows up in `git status`; set
 `sandboxStateDir` (Go: `SandboxStateDir`) to an absolute path, such as
-`/home/app/.agentenkit`, to keep it out.
+`/home/app/.agentenkit`, to keep it out; each sandbox then gets its own
+folder under it.
 
 **Approval.** A call that asks waits for `respond` like any approval, then
 runs when approved; a denied one tells the model it was denied. Pass

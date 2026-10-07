@@ -954,8 +954,8 @@ type AgentConfig struct {
 	// SandboxStateDir is where the sandbox tools keep their own files (the
 	// bash folder, the programs code_execution ran, the editor's undo
 	// history). A relative path is inside the work folder; an absolute one,
-	// such as /home/app/.agentenkit, keeps them out of it. Default
-	// ".agentenkit".
+	// such as /home/app/.agentenkit, keeps them out of it, with a folder per
+	// sandbox under it. Default ".agentenkit".
 	SandboxStateDir string
 	// RecordPayloads records prompts, state, step text and tool payloads into
 	// the operational store (§2.9). Turn it off when those carry anything
