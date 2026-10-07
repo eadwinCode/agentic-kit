@@ -296,7 +296,9 @@ chat.Run(ctx, agentenkit.RunInput{
 `onFinish` fires after the terminal state is written, which is too late for
 work every client must see as done the moment the run ends: committing the
 files a run edited, charging for it. `onSettle` (Go: `OnSettle`) runs after
-the last step and **before** the terminal `STATE_CHANGE`:
+the last step and **before** the terminal `STATE_CHANGE`. It gets the run's
+state as `info.runState` (Go: `RunStateFromContext(ctx)`), also when the
+sweep retries it later:
 
 ```ts
 runtime.createStreamTextAgent({

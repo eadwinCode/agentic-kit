@@ -4,6 +4,7 @@ import type { ExecutionState, UsageTotals } from './types.js';
 import type { RegisteredAgent } from './agent.js';
 import { emptyTotals } from './usage.js';
 import { Lease } from './lease.js';
+import type { AgentRunState } from './state.js';
 import { releaseRunSandbox } from './builtin/sandbox.js';
 
 /** How long a settle claim holds (§5.6). A claim older than this belongs to a
@@ -63,6 +64,12 @@ export async function settleRun(
     const onSettle = agent?.args.onSettle;
     if (typeof onSettle !== 'function') return undefined;
     try {
+      // A settle outside the run (the sweep, a stop of a dead worker) has no
+      // state of its own; the stored one is the run's.
+      if (info.runState === undefined && info.runId) {
+        const rec = await deps.admin.runs.get(info.runId).catch(() => null);
+        if (rec?.runState) info = { ...info, runState: rec.runState as AgentRunState };
+      }
       await onSettle(info);
       return undefined;
     } catch (err) {

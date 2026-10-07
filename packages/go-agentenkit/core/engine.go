@@ -1068,13 +1068,21 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		if IsContextOverflow(err) && !lockLost.Load() && !aborted() {
 			log.Warn("prompt too long for the model; compacting and retrying", "err", err)
 			done := 0
+			var spent TokenAttribution
 			if loop != nil {
 				done = loop.Steps
+				spent = loop.Attribution
 			}
 			var retried *LoopOutcome
 			retried, err = runLoop(true, max(1, maxSteps-done))
 			if retried != nil {
+				// The segment is both tries: their steps and their tokens.
 				retried.Steps += done
+				retried.Attribution.InputTokens += spent.InputTokens
+				retried.Attribution.CachedInputTokens += spent.CachedInputTokens
+				retried.Attribution.OutputTokens += spent.OutputTokens
+				retried.Attribution.TotalTokens += spent.TotalTokens
+				retried.Attribution.CostMicros += spent.CostMicros
 				loop = retried
 			}
 		}

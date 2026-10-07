@@ -69,6 +69,10 @@ export interface CompactOptions {
   /** The run's ledger, so the summary call counts against the run's caps like
    *  any other call. Absent records the row on its own. */
   ledger?: RunLedger;
+  /** Compact whatever the history's size: everything older than the recent
+   *  tail goes into the summary. Used when a provider has refused a prompt as
+   *  too long, and for a compaction someone asked for. */
+  force?: boolean;
 }
 
 // Returns a history array guaranteed to fit the model's budget. Compaction is
@@ -90,7 +94,7 @@ export async function compactContext(
   const history = promptHistory(await deps.storage.messages.list(threadId, { agentId: null }));
 
   const total = history.reduce((sum, m) => sum + estimateTokens(m.content), 0);
-  if (total <= budget * deps.config.compactionTrigger) return history;
+  if (!opts.force && total <= budget * deps.config.compactionTrigger) return history;
 
   // Keep the most recent tail verbatim ...
   let tailStart = history.length;
@@ -105,6 +109,11 @@ export async function compactContext(
   // tool result whose call went into the summary, which no provider accepts.
   // The first user turn inside the budget, or failing that the last one before.
   tailStart = userTurnAtOrAfter(history, tailStart);
+  if (opts.force) {
+    // Forced (a refusal, or asked for): the tail share is what proved too
+    // much, so only the latest user turn stays verbatim.
+    tailStart = userTurnAtOrAfter(history, history.length);
+  }
   const older = history.slice(0, tailStart);
   const tail = history.slice(tailStart);
   const coversUpTo = [...older].reverse().find((m) => !summaryOf(m))?.id;
@@ -115,59 +124,14 @@ export async function compactContext(
     return history;
   }
 
-  // ... and summarize everything before it with a cheap model, named in config
-  // so a registry that has never heard of 'gpt-4o-mini' can point this at its
-  // own (§2.6): the last summary and the turns since, never the whole history
-  // again. Naming the key in the error matters: resolveModel throws from deep
-  // inside compaction, on a run that never mentioned this model, so the bare
-  // "Unknown model" says nothing about where it came from.
-  const compactionModel = deps.config.compactionModel;
-  let compactor;
-  try {
-    compactor = deps.resolveModel(compactionModel);
-  } catch (err) {
-    throw new Error(
-      `compactionModel ${JSON.stringify(compactionModel)} could not be resolved: ` +
-        `${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-  const result = await generateText({
-    model: compactor.instance(),
-    prompt:
-      'Summarize the following conversation history into a dense context brief ' +
-      '(decisions, open threads, key facts) for an AI agent:\n\n' +
-      older.map((m) => `${m.role}: ${JSON.stringify(m.content)}`).join('\n'),
-    ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
-  });
-  const { text, finalStep } = result;
-
+  // ... and summarize everything before it with a cheap model: the last
+  // summary and the turns since, never the whole history again.
+  const lines = older.map((m) => `${m.role}: ${JSON.stringify(m.content)}\n`);
+  const text = await summarizeLines(deps, threadId, opts, lines);
   const summary = await deps.storage.messages.append(threadId, {
     role: 'system',
     content: { type: 'CONTEXT_SUMMARY', text, coversUpTo },
   });
-
-  // Compaction is a model call the platform made on its own account (§2.6),
-  // so it gets its own priced row like any other (§4). Kind 'compaction' keeps
-  // it separable: nobody asked for this call, and it is worth being able to
-  // see what the platform's own housekeeping costs. It is billed to the run it
-  // served, so it is on that run's bill and under its cap.
-  //
-  // The cache hit is reported in provider metadata, never in `usage` —
-  // attributing without it books every cached prompt at the full input price.
-  const meta = finalStep.providerMetadata;
-  const usageRow: NewUsage = {
-    ...(opts.runId ? { runId: opts.runId } : {}),
-    agentId: null,
-    kind: 'compaction',
-    step: 0,
-    model: compactionModel,
-    modelId: wireId(compactor, compactionModel),
-    outcome: 'finished',
-    providerMetadata: providerMeta(meta, finalStep.response),
-    ...fillTokens(finalStep.usage, meta),
-  };
-  if (opts.ledger) await opts.ledger.record(deps, threadId, usageRow);
-  else await recordCall(deps, threadId, usageRow);
   await publish(deps, threadId, 'CONTEXT_COMPACTED', { summarizedMessages: older.length });
 
   const out = [summary, ...tail];
@@ -196,4 +160,142 @@ function warnOverBudget(deps: RuntimePorts, threadId: string, used: number, budg
   log.warn?.('prompt larger than the context window after compaction', {
     threadId, estimatedTokens: used, budgetTokens: budget,
   });
+}
+
+/** The "prompt too long" refusals providers send. Not "too many tokens":
+ *  that is also how a throttle is worded (Bedrock). */
+const CONTEXT_OVERFLOW =
+  /prompt is too long|context[_ ]length[_ ]exceeded|maximum context length|exceeds the context window|input is too long/i;
+
+/** Whether a model call was refused because the prompt did not fit the
+ *  model's context window. A rate limit (429) never is, whatever its
+ *  wording: compacting would not help it. */
+export function isContextOverflow(err: unknown): boolean {
+  if (err === undefined || err === null) return false;
+  const e = err as { statusCode?: unknown; lastError?: { statusCode?: unknown } };
+  if (e.statusCode === 429 || e.lastError?.statusCode === 429) return false;
+  return CONTEXT_OVERFLOW.test(err instanceof Error ? err.message : String(err));
+}
+
+const SUMMARY_PROMPT =
+  'Summarize the following conversation history into a dense context brief ' +
+  '(decisions, open threads, key facts) for an AI agent:\n\n';
+const MERGE_PROMPT =
+  'These are summaries of consecutive parts of one conversation, oldest first. ' +
+  'Merge them into one dense context brief (decisions, open threads, key facts) for an AI agent, ' +
+  'keeping later decisions over earlier ones:\n\n';
+
+/** The token estimate of one line of text, counted as the Go runtime counts
+ *  it: about four characters (UTF-16 units) a token. */
+const lineTokens = (line: string) => Math.ceil(line.length / 4);
+
+/** How much history one summary call carries: half the compaction model's
+ *  own window, leaving room for its answer and for the estimate being rough.
+ *  The history can be larger than the summarizer's window, and a call past it
+ *  would be refused. */
+export function summaryChunkTokens(deps: RuntimePorts): number {
+  return Math.max(Math.floor(contextBudget(deps, deps.config.compactionModel) / 2), 1_000);
+}
+
+/** Summarizes the lines in as many calls as fit the compaction model, then
+ *  merges the partial summaries the same way until one is left. */
+async function summarizeLines(
+  deps: RuntimePorts,
+  threadId: string,
+  opts: CompactOptions,
+  lines: string[],
+): Promise<string> {
+  const limit = summaryChunkTokens(deps);
+  let prompt = SUMMARY_PROMPT;
+  for (;;) {
+    const parts: string[] = [];
+    for (const chunk of chunkLines(lines, limit)) {
+      parts.push(await summaryCall(deps, threadId, opts, prompt + chunk));
+    }
+    if (parts.length === 1) return parts[0]!;
+    // A third of a chunk per part fits at least two per merge call, so every
+    // round at least halves the parts and the loop ends.
+    lines = parts.map((part, i) => trimMiddle(`Part ${i + 1}:\n${part}\n\n`, Math.floor(limit / 3)));
+    prompt = MERGE_PROMPT;
+  }
+}
+
+/** Packs lines in order into chunks of at most `limit` tokens. A line larger
+ *  than a chunk keeps its start and end; its middle goes. */
+export function chunkLines(lines: string[], limit: number): string[] {
+  const chunks: string[] = [];
+  let current = '';
+  let used = 0;
+  for (const raw of lines) {
+    const line = trimMiddle(raw, limit);
+    const t = lineTokens(line);
+    if (used > 0 && used + t > limit) {
+      chunks.push(current);
+      current = '';
+      used = 0;
+    }
+    current += line;
+    used += t;
+  }
+  if (used > 0 || chunks.length === 0) chunks.push(current);
+  return chunks;
+}
+
+/** Cuts a line past `limit` tokens down to its start and end. */
+export function trimMiddle(line: string, limit: number): string {
+  if (lineTokens(line) <= limit) return line;
+  const chars = Array.from(line);
+  const keep = Math.floor((limit * 4) / 2); // about four characters a token
+  if (keep * 2 >= chars.length) return line;
+  return chars.slice(0, keep).join('') + '\n[... cut ...]\n' + chars.slice(chars.length - keep).join('');
+}
+
+/** One summary call, recorded on its own priced row. */
+async function summaryCall(
+  deps: RuntimePorts,
+  threadId: string,
+  opts: CompactOptions,
+  prompt: string,
+): Promise<string> {
+  // The compaction model is named in config so a registry that has never
+  // heard of 'gpt-4o-mini' can point this at its own (§2.6). Naming the key in
+  // the error matters: resolveModel throws from deep inside compaction, on a
+  // run that never mentioned this model, so the bare "Unknown model" says
+  // nothing about where it came from.
+  const compactionModel = deps.config.compactionModel;
+  let compactor;
+  try {
+    compactor = deps.resolveModel(compactionModel);
+  } catch (err) {
+    throw new Error(
+      `compactionModel ${JSON.stringify(compactionModel)} could not be resolved: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  const { text, finalStep } = await generateText({
+    model: compactor.instance(),
+    prompt,
+    ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
+  });
+
+  // Compaction is a model call the platform made on its own account (§2.6),
+  // so it gets its own priced row like any other (§4). Kind 'compaction' keeps
+  // it separable: nobody asked for this call, and it is worth being able to
+  // see what the platform's own housekeeping costs. It is billed to the run it
+  // served, so it is on that run's bill and under its cap.
+  const meta = finalStep.providerMetadata;
+  const usageRow: NewUsage = {
+    ...(opts.runId ? { runId: opts.runId } : {}),
+    agentId: null,
+    kind: 'compaction',
+    step: 0,
+    model: compactionModel,
+    modelId: wireId(compactor, compactionModel),
+    outcome: 'finished',
+    providerMetadata: providerMeta(meta, finalStep.response),
+    ...fillTokens(finalStep.usage, meta),
+  };
+  if (opts.ledger) await opts.ledger.record(deps, threadId, usageRow);
+  else await recordCall(deps, threadId, usageRow);
+  return text;
 }

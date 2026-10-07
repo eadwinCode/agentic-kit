@@ -55,6 +55,35 @@ const usage = await runtime.getThreadUsage(threadId);
 usage.context; // { usedTokens, budgetTokens, compactAtTokens, messages }
 ```
 
+### When the provider says the prompt is too long
+
+The estimate is rough, so a provider can still refuse a prompt the platform
+thought would fit ("prompt is too long", `context_length_exceeded`, …). The
+run does not fail on it: the thread is compacted at once, keeping only the
+latest user turn verbatim, and the run goes on from the steps it already
+saved. This happens once per segment; a second refusal fails the step like
+any other error. `isContextOverflow(err)` (Go: `core.IsContextOverflow`) is
+the check.
+
+### Compacting on request
+
+`compactThread` (Go: `CompactThread`) summarizes a thread now, whatever its
+size, for a `/compact` command. Only the latest user turn stays as it is. It
+is refused while a run is queued or running, and the summary call is recorded
+without a run.
+
+```ts
+const { compacted, reason } = await runtime.compactThread(threadId, state);
+```
+
+### A history larger than the summarizer
+
+A thread that was never compacted can be larger than the compaction model's
+own window. The older history then goes in parts of half that window, each
+summarized on its own billed call, and the parts are merged the same way
+until one summary is left. A single message larger than a part keeps its
+start and end.
+
 ## Prompt caching
 
 On by default. The engine stamps cache breakpoints on the stable prefix of the
