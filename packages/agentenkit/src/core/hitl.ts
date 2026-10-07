@@ -7,6 +7,8 @@ import { currentRunId } from './keys.js';
 import { reclaimIfOrphaned } from './reclaim.js';
 import { enqueueJob } from './lease.js';
 import { DuplicateJobError, PRIORITY_LOW } from '../ports/queue.js';
+import { callWithSandboxHook } from './builtin/sandbox.js';
+import { TOOL_RUN, toolRunOf } from './builtin/run.js';
 
 export const HITL_TTL_MS = 15 * 60_000;
 
@@ -207,7 +209,15 @@ export function withHitl(
       ...t,
       execute: async (args: unknown, opts: { toolCallId?: string; approval?: unknown }) => {
         try {
-          return await execute(args, opts);
+          // Around the tool's own work, so the hook sees its real error, and
+          // an error from the hook is handled below like the tool's own.
+          return await callWithSandboxHook(
+            toolRunOf(opts),
+            name,
+            opts?.toolCallId,
+            (e) => e instanceof ToolParkedError,
+            (run) => execute(args, run ? { ...opts, [TOOL_RUN]: run } : opts),
+          );
         } catch (err) {
           // A tool that fails is news for the model, not the end of the run:
           // the error goes back as the call's result, worded exactly as the

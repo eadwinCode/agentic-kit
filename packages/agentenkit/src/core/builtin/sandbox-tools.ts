@@ -58,15 +58,29 @@ export interface TextEditorOptions {
   approval?: ApprovalRule<TextEditorInput>;
 }
 
-/** Where the tools keep their own files, in the sandbox's work folder: the
- *  bash folder, the programs code_execution ran, the editor's undo history.
- *  Hidden, so a plain `ls` does not show it. */
-const STATE_DIR = '.agentenkit';
+/** Where the tools keep their own files: the bash folder, the programs
+ *  code_execution ran, the editor's undo history. By default `.agentenkit` in
+ *  the work folder, hidden so a plain `ls` does not show it;
+ *  `sandboxStateDir` can move it, out of the work folder too. */
+const stateDir = (run: ToolRun) => run.deps.config.sandboxStateDir?.replace(/\/+$/, '') || '.agentenkit';
+
+/** Quotes text for sh. */
+const shellQuote = (text: string) => `'${text.replace(/'/g, `'\\''`)}'`;
 /** Changes the editor can take back, per file. */
 const UNDO_DEPTH = 10;
 
 const LOST_NOTE =
   "The sandbox this conversation used before has ended, so files from earlier are gone. This is a fresh one.";
+
+/** Replaces LOST_NOTE when the provider gives a new sandbox the work folder
+ *  back (`restoresWorkdir`). */
+const RESTORED_NOTE =
+  'The sandbox restarted. The project files are back as they were; anything outside the work folder (installed tools, temp files, running processes) is gone.';
+
+/** What a call tells the model about its sandbox: nothing, unless the one
+ *  before it is gone. */
+const sandboxNote = ({ lost, restored }: ThreadSandbox): { note?: string } =>
+  !lost ? {} : { note: restored ? RESTORED_NOTE : LOST_NOTE };
 
 const failed = (error: string, note?: string) => (note ? { error, note } : { error });
 
@@ -146,9 +160,10 @@ const seconds = (ms: number) => Math.round(ms) / 1000;
 /** The folder a bash call ends in is kept in the sandbox, and the next call
  *  starts there: the "session" the model expects, without a shell that has
  *  to outlive the process. */
-function bashScript(command: string, restart: boolean): string {
+function bashScript(command: string, restart: boolean, dir: string): string {
+  const ak = dir.startsWith('/') ? shellQuote(dir) : `"$PWD"/${shellQuote(dir)}`;
   return [
-    `__ak="$PWD/${STATE_DIR}"; mkdir -p "$__ak"`,
+    `__ak=${ak}; mkdir -p "$__ak"`,
     ...(restart ? ['rm -f "$__ak/bash-cwd"'] : []),
     `if [ -f "$__ak/bash-cwd" ]; then cd -- "$(cat "$__ak/bash-cwd")" 2>/dev/null; fi`,
     `trap 'pwd > "$__ak/bash-cwd"' EXIT`,
@@ -174,8 +189,9 @@ export async function runBash(
   if (await overLimit(run, 'bash', options.maxUses)) return failed(`bash: this run has used its ${options.maxUses} commands`);
   const live = liveOutput(run, 'bash', opts.toolCallId);
   try {
-    return await withThreadSandbox(run, async ({ sandbox, lost }) => {
-      const r = await sandbox.runCommand(bashScript(command || ':', restart), {
+    return await withThreadSandbox(run, async (ts) => {
+      const { sandbox } = ts;
+      const r = await sandbox.runCommand(bashScript(command || ':', restart, stateDir(run)), {
         timeoutMs: options.timeoutMs ?? 120_000,
         onStdout: live.onStdout,
         onStderr: live.onStderr,
@@ -189,7 +205,7 @@ export async function runBash(
         exitCode: r.exitCode,
         ...(out.truncated ? { truncated: true } : {}),
         ...(r.timedOut ? { timedOut: true, error: `bash: the command was stopped after ${seconds(options.timeoutMs ?? 120_000)} s` } : {}),
-        ...(lost ? { note: LOST_NOTE } : {}),
+        ...sandboxNote(ts),
       };
     });
   } finally {
@@ -236,19 +252,23 @@ export async function runCodeExecution(
   const limit = options.timeoutMs ?? 60_000;
   const live = liveOutput(run, 'code_execution', opts.toolCallId);
   try {
-    return await withThreadSandbox(run, async ({ sandbox, lost }) => {
+    return await withThreadSandbox(run, async (ts) => {
+      const { sandbox } = ts;
       const name = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const file = `${STATE_DIR}/code/${name}.${runner.ext}`;
+      const dir = stateDir(run);
+      const base = `${dir}/code/${name}`;
+      const file = `${base}.${runner.ext}`;
       await sandbox.filesystem.writeFile(file, code);
       // A marker made just before the run: the files newer than it are the
       // ones the program made or changed.
       // The program is read from stdin, so its imports (Python) and relative
       // requires (Node) resolve from the work folder, not the hidden one.
       const script = [
-        `touch "${STATE_DIR}/code/${name}.start"`,
-        `${runner.run} - < "${file}"`,
+        `mkdir -p ${shellQuote(`${dir}/code`)}`,
+        `touch ${shellQuote(`${base}.start`)}`,
+        `${runner.run} - < ${shellQuote(file)}`,
         '__ec=$?',
-        `find . -path "./${STATE_DIR}" -prune -o -type f -newer "${STATE_DIR}/code/${name}.start" -print > "${STATE_DIR}/code/${name}.files" 2>/dev/null`,
+        madeFilesCommand(dir, base),
         'exit $__ec',
       ].join('\n');
       const r = await sandbox.runCommand(script, {
@@ -258,7 +278,7 @@ export async function runCodeExecution(
         ...(opts.abortSignal ? { signal: opts.abortSignal } : {}),
       });
       await recordToolUsage(run, toolUseRow('code_execution', sandbox.provider, 1, seconds(r.durationMs)));
-      const listed = await sandbox.filesystem.readFile(`${STATE_DIR}/code/${name}.files`).catch(() => '');
+      const listed = await sandbox.filesystem.readFile(`${base}.files`).catch(() => '');
       const files = listed
         .split('\n')
         .map((l) => l.replace(/^\.\//, ''))
@@ -278,7 +298,7 @@ export async function runCodeExecution(
         ...(error ? { error } : {}),
         files,
         ...(out.truncated ? { truncated: true } : {}),
-        ...(lost ? { note: LOST_NOTE } : {}),
+        ...sandboxNote(ts),
       };
     });
   } finally {
@@ -290,22 +310,29 @@ export async function runCodeExecution(
 
 const EDITS = new Set(['create', 'str_replace', 'insert', 'undo_edit']);
 
+/** Lists the files newer than the run's start marker into `base.files`,
+ *  leaving out the tools' own folder when it is in the work folder. */
+function madeFilesCommand(dir: string, base: string): string {
+  const prune = dir.startsWith('/') ? '' : `-path ${shellQuote(`./${dir.replace(/^\.\//, '')}`)} -prune -o `;
+  return `find . ${prune}-type f -newer ${shellQuote(`${base}.start`)} -print > ${shellQuote(`${base}.files`)} 2>/dev/null`;
+}
+
 /** The editor's undo history for one file: earlier versions, newest last;
  *  null where the file did not exist yet. */
-const historyPath = (path: string) =>
-  `${STATE_DIR}/history/${createHash('sha256').update(path).digest('hex').slice(0, 32)}.json`;
+const historyPath = (dir: string, path: string) =>
+  `${dir}/history/${createHash('sha256').update(path).digest('hex').slice(0, 32)}.json`;
 
-async function readHistory(sandbox: Sandbox, path: string): Promise<Array<string | null>> {
+async function readHistory(sandbox: Sandbox, dir: string, path: string): Promise<Array<string | null>> {
   try {
-    return JSON.parse(await sandbox.filesystem.readFile(historyPath(path))) as Array<string | null>;
+    return JSON.parse(await sandbox.filesystem.readFile(historyPath(dir, path))) as Array<string | null>;
   } catch {
     return [];
   }
 }
 
-async function remember(sandbox: Sandbox, path: string, before: string | null) {
-  const history = [...(await readHistory(sandbox, path)), before].slice(-UNDO_DEPTH);
-  await sandbox.filesystem.writeFile(historyPath(path), JSON.stringify(history));
+async function remember(sandbox: Sandbox, dir: string, path: string, before: string | null) {
+  const history = [...(await readHistory(sandbox, dir, path)), before].slice(-UNDO_DEPTH);
+  await sandbox.filesystem.writeFile(historyPath(dir, path), JSON.stringify(history));
 }
 
 async function readOrNull(sandbox: Sandbox, path: string): Promise<string | null> {
@@ -381,7 +408,7 @@ async function edit(sandbox: Sandbox, run: ToolRun, input: TextEditorInput): Pro
     case 'create': {
       if (typeof input.file_text !== 'string') return failed('text_editor: create needs file_text');
       const before = await readOrNull(sandbox, path);
-      await remember(sandbox, path, before);
+      await remember(sandbox, stateDir(run), path, before);
       await sandbox.filesystem.writeFile(path, input.file_text);
       return { ok: true, message: `${before === null ? 'Created' : 'Replaced'} ${path}.` };
     }
@@ -392,7 +419,7 @@ async function edit(sandbox: Sandbox, run: ToolRun, input: TextEditorInput): Pro
       const n = count(text, input.old_str);
       if (n === 0) return failed(`text_editor: old_str was not found in ${path}; it must match exactly, whitespace included`);
       if (n > 1) return failed(`text_editor: old_str matches ${n} places in ${path}; include more of the text around it so it matches one`);
-      await remember(sandbox, path, text);
+      await remember(sandbox, stateDir(run), path, text);
       const i = text.indexOf(input.old_str);
       await sandbox.filesystem.writeFile(path, text.slice(0, i) + (input.new_str ?? '') + text.slice(i + input.old_str.length));
       return { ok: true, message: `Replaced 1 place in ${path}.` };
@@ -406,18 +433,18 @@ async function edit(sandbox: Sandbox, run: ToolRun, input: TextEditorInput): Pro
       if (!Number.isInteger(at) || at! < 0 || at! > lines.length) {
         return failed(`text_editor: insert_line must be within 0 and ${lines.length}`);
       }
-      await remember(sandbox, path, text);
+      await remember(sandbox, stateDir(run), path, text);
       lines.splice(at!, 0, ...input.new_str.split('\n'));
       await sandbox.filesystem.writeFile(path, lines.join('\n'));
       return { ok: true, message: `Inserted after line ${at} of ${path}.` };
     }
     case 'undo_edit': {
-      const history = await readHistory(sandbox, path);
+      const history = await readHistory(sandbox, stateDir(run), path);
       if (history.length === 0) return failed(`text_editor: there is no change to ${path} to undo`);
       const before = history.pop()!;
       if (before === null) await sandbox.filesystem.remove(path);
       else await sandbox.filesystem.writeFile(path, before);
-      await sandbox.filesystem.writeFile(historyPath(path), JSON.stringify(history));
+      await sandbox.filesystem.writeFile(historyPath(stateDir(run), path), JSON.stringify(history));
       return { ok: true, message: before === null ? `Removed ${path}, which the change had created.` : `Undid the last change to ${path}.` };
     }
     default:
@@ -440,9 +467,9 @@ export async function runTextEditor(
   if (await overLimit(run, 'text_editor', options.maxUses)) {
     return failed(`text_editor: this run has used its ${options.maxUses} edits and views`);
   }
-  return withThreadSandbox(run, async ({ sandbox, lost }: ThreadSandbox) => {
-    const result = await edit(sandbox, run, input);
-    await recordToolUsage(run, toolUseRow('text_editor', sandbox.provider, 1, 0));
-    return lost ? { ...result, note: LOST_NOTE } : result;
+  return withThreadSandbox(run, async (ts: ThreadSandbox) => {
+    const result = await edit(ts.sandbox, run, input);
+    await recordToolUsage(run, toolUseRow('text_editor', ts.sandbox.provider, 1, 0));
+    return { ...result, ...sandboxNote(ts) };
   });
 }

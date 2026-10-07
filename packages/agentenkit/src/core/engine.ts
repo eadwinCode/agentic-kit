@@ -23,6 +23,7 @@ import { closeNested, nestedRawTools, RunSlots, runNestedAgent, spawnSubagentToo
 import { attemptsKey, COUNTER_TTL_SECONDS, counterScope, redriveKey, runIdKey } from './keys.js';
 import { withRunState, type AgentRunState } from './state.js';
 import { TOOL_RUN, withToolRun, type ToolRun } from './builtin/run.js';
+import { callWithSandboxHook, releaseRunSandbox } from './builtin/sandbox.js';
 import { isPermanentError } from './permanent.js';
 import { runLoop, seedRunLedger, type LoopOutcome } from './loop.js';
 import { enqueueJob, Lease, parseLockValue, runLockKey, RunLockLostError } from './lease.js';
@@ -112,20 +113,23 @@ async function settleVerdict(
 
   let result: unknown;
   try {
-    result = await target.execute(pending.arguments, {
-      toolCallId: pending.toolCallId,
-      abortSignal: signal,
-      // The resumed tool gets the same context a live one does (§2.10).
-      state,
-      publishEvent: (type: string, payload: unknown, options?: { durable?: boolean }) =>
-        publishEvent(deps, threadId, type, payload, options),
-      // What the human sent back with the approval (§2.5): answers to
-      // the questions the tool asked, a corrected value, a reason.
-      approval: { payload: answer.payload },
-      threadId,
-      runId: toolRun.runId,
-      [TOOL_RUN]: toolRun,
-    });
+    // The approved call is a sandbox call like a live one: the hook runs
+    // after it the same way.
+    result = await callWithSandboxHook(toolRun, pending.toolName, pending.toolCallId, () => false, (run) =>
+      target.execute!(pending.arguments, {
+        toolCallId: pending.toolCallId,
+        abortSignal: signal,
+        // The resumed tool gets the same context a live one does (§2.10).
+        state,
+        publishEvent: (type: string, payload: unknown, options?: { durable?: boolean }) =>
+          publishEvent(deps, threadId, type, payload, options),
+        // What the human sent back with the approval (§2.5): answers to
+        // the questions the tool asked, a corrected value, a reason.
+        approval: { payload: answer.payload },
+        threadId,
+        runId: toolRun.runId,
+        [TOOL_RUN]: run ?? toolRun,
+      }));
   } catch (err) {
     result = { error: err instanceof Error ? err.message : String(err) };
   }
@@ -334,6 +338,9 @@ async function failRun(
   runId: string | undefined,
   error: string,
 ): Promise<void> {
+  // A run that fails is done with its sandbox. Only one this run made is
+  // ended, so a newer run that got the thread keeps its own.
+  await releaseRunSandbox(deps, threadId, runId, false);
   // A failed run still spent money on the steps it did make (§4), so it
   // settles like any other end. Settled even with no hook, so the late sweep
   // does not keep coming back to it.
@@ -798,6 +805,7 @@ export async function execute(
           // Still parked, or parked again one level down while unwinding: the
           // new park's step is saved by now, so it is written here.
           await commitParks(deps, parks);
+          await releaseRunSandbox(deps, threadId, runId, true);
           segEnd = { type: 'RUN_FINISHED', status: 'parked' };
           return 'executed';
         }
@@ -903,6 +911,8 @@ export async function execute(
             .increment(runId, deltasOf(loop.steps, attribution))
             .catch(() => undefined); // operational history must not fail a parked run
         }
+        // A park can wait for hours; a run's sandbox is not held for it.
+        await releaseRunSandbox(deps, threadId, runId, true);
         segEnd = { type: 'RUN_FINISHED', status: 'parked' };
         return 'executed';
       }
@@ -958,6 +968,7 @@ export async function execute(
         steps: loop.steps,
         ...(error ? { error } : {}),
       });
+      await releaseRunSandbox(deps, threadId, runId, false);
       segEnd = state === 'FAILED'
         ? { type: 'RUN_ERROR', status: 'error', error: error ?? 'the run failed' }
         : {

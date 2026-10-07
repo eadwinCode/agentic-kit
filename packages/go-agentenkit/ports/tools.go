@@ -71,6 +71,28 @@ type Fetcher interface {
 type BuiltinToolPorts struct {
 	Search  Search
 	Fetcher Fetcher
-	// Sandbox is where commands run and files live: one sandbox per thread.
+	// Sandbox is where commands run and files live: one sandbox per thread,
+	// or per run (AgentConfig.SandboxScope).
 	Sandbox SandboxProvider
+	// AfterSandboxCall, when set, is called once after every tool call that
+	// used the sandbox: the built-in bash, code_execution and text_editor,
+	// and a tool of your own that called SandboxFor or WithSandbox. Save the
+	// work there, for example. An error it returns becomes the call's error,
+	// so the model knows; a call that already failed keeps its own error.
+	AfterSandboxCall func(ctx context.Context, call SandboxCall) error
+}
+
+// SandboxCall is one tool call that used the sandbox, as AfterSandboxCall
+// gets it.
+type SandboxCall struct {
+	ThreadID string
+	// RunID is the dispatched run; a nested run's calls carry their parent's.
+	RunID string
+	// AgentID is empty for the main agent, the nested run's id otherwise.
+	AgentID    string
+	ToolName   string
+	ToolCallID string
+	Sandbox    Sandbox
+	// Err is the call's own error, nil when it went through.
+	Err error
 }

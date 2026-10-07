@@ -4,6 +4,7 @@ import type { ExecutionState, UsageTotals } from './types.js';
 import type { RegisteredAgent } from './agent.js';
 import { emptyTotals } from './usage.js';
 import { Lease } from './lease.js';
+import { releaseRunSandbox } from './builtin/sandbox.js';
 
 /** How long a settle claim holds (§5.6). A claim older than this belongs to a
  *  settler that died, and the next settle takes the run over. */
@@ -148,7 +149,10 @@ export async function settleEndedRun(
 ): Promise<boolean> {
   if (!agent || !runId) return false;
   const rec = await deps.admin.runs.get(runId).catch(() => null);
-  if (!rec || rec.settledAt || !isTerminal(rec.state)) return false;
+  if (!rec || !isTerminal(rec.state)) return false;
+  // The run has ended, so it is done with its sandbox, settled or not.
+  await releaseRunSandbox(deps, threadId, runId, false);
+  if (rec.settledAt) return false;
   const bill = await runBill(deps, threadId, runId);
   const info: RunFinishInfo = {
     threadId, runId, state: rec.state, stopReason: rec.stopReason || 'cancelled',

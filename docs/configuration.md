@@ -75,6 +75,10 @@ start from `DefaultConfig()` to keep them on.
 | `builtinToolResultCapChars` | `20000` | The most characters a built-in tool hands the model in one result: a page's text, a reader's answer. Past it the text is cut and the result says `truncated: true`. See [Web tools](./web-tools.md). |
 | `sandboxIdleTtlMs` | `1800000` (30 min) | A thread's sandbox ends after it has sat unused this long; the next call makes a fresh one. Go: `SandboxIdleTTL`. See [Sandboxes](./sandboxes.md). |
 | `sandboxMaxLifetimeMs` | `86400000` (24 h) | A thread's sandbox ends this long after it was made, however much it is used. Go: `SandboxMaxLifetime`. |
+| `sandboxScope` | `'thread'` | `'thread'` keeps one sandbox per thread; `'run'` gives each run its own, ended with the run. Go: `SandboxScope`. See [Sandboxes](./sandboxes.md#one-sandbox-per-run). |
+| `sandboxKeepOnPark` | `false` | With `sandboxScope: 'run'`, keep the sandbox while the run waits for an approval or an answer. Go: `SandboxKeepOnPark`. |
+| `sandboxDefaults` | `{}` | Merged into every sandbox made: network, envs, template, image, resources, extra. Go: `SandboxDefaults`. |
+| `sandboxStateDir` | `'.agentenkit'` | Where the sandbox tools keep their own files. An absolute path keeps them out of the work folder. Go: `SandboxStateDir`. |
 
 ### Context and caching
 

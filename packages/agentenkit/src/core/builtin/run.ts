@@ -18,6 +18,8 @@ export interface ToolRun {
   ledger?: RunLedger;
   /** The run's state (§2.10), for adapters that pick per tenant. */
   state?: AgentRunState;
+  /** Told the sandbox a call used, for `afterSandboxCall`. Set per call. */
+  onSandbox?: (sandbox: import('../../ports/sandbox.js').Sandbox) => void;
 }
 
 /** Where a tool call's options carry its ToolRun. A symbol, so it never

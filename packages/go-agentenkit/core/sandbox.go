@@ -10,7 +10,8 @@ import (
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/ports"
 )
 
-// One sandbox per thread, kept between messages.
+// One sandbox per thread, kept between messages (SandboxScopeThread, the
+// default), or one per run (SandboxScopeRun).
 //
 // The first sandbox call in a thread makes it and keeps its id in the kv
 // under the thread. Every later call, in this run or the next (a new
@@ -24,6 +25,14 @@ import (
 // even when no app is running to end it. The next call then makes a fresh
 // one and says the old files are lost. The TS runtime does the same
 // (src/core/builtin/sandbox.ts).
+//
+// With SandboxScopeRun the record also names the run that made the sandbox.
+// The run's later calls and its subagents share it; when the run ends
+// (finished, failed, stopped) the runtime ends it (ReleaseRunSandbox), and
+// when the run parks it does too, unless SandboxKeepOnPark. The next run, or
+// the resumed one, makes a fresh one. A sandbox an earlier run left behind
+// (a crash, a stop with no worker) is ended by the next run that finds it,
+// and by its own timeout before that.
 
 // ThreadSandbox is a thread's sandbox, as a call gets it.
 type ThreadSandbox struct {
@@ -34,6 +43,10 @@ type ThreadSandbox struct {
 	// long, past its lifetime, or ended on its own. Its files are lost, and
 	// a tool should tell the model so it does not expect them.
 	Lost bool
+	// Restored is true when the provider gives every new sandbox the work
+	// folder back (ports.WorkdirRestorer): after Lost, the project files are
+	// there again and only what was outside the work folder is gone.
+	Restored bool
 }
 
 // sandboxRecord is what the kv keeps for a thread's sandbox. Times are Unix
@@ -43,6 +56,11 @@ type sandboxRecord struct {
 	Provider   string `json:"provider"`
 	CreatedAt  int64  `json:"createdAt"`
 	LastUsedAt int64  `json:"lastUsedAt"`
+	// RunID is the run that made the sandbox (SandboxScopeRun only).
+	RunID string `json:"runId,omitempty"`
+	// Released marks a sandbox the run gave back when it parked: it is gone,
+	// and the resumed run's next call must say so.
+	Released bool `json:"released,omitempty"`
 }
 
 // SandboxKey is where the kv keeps a thread's sandbox.
@@ -142,6 +160,9 @@ func GetThreadSandbox(ctx context.Context, run ToolRun) (ThreadSandbox, error) {
 		sandboxes.Unlock()
 		select {
 		case <-call.done:
+			if call.err == nil {
+				noteSandboxUse(ctx, call.ts.Sandbox)
+			}
 			return call.ts, call.err
 		case <-ctx.Done():
 			return ThreadSandbox{}, ctx.Err()
@@ -156,6 +177,9 @@ func GetThreadSandbox(ctx context.Context, run ToolRun) (ThreadSandbox, error) {
 	delete(sandboxes.pending, run.ThreadID)
 	sandboxes.Unlock()
 	close(call.done)
+	if call.err == nil {
+		noteSandboxUse(ctx, call.ts.Sandbox)
+	}
 	return call.ts, call.err
 }
 
@@ -175,6 +199,19 @@ func acquireSandbox(ctx context.Context, run ToolRun, provider ports.SandboxProv
 	}
 
 	lost := false
+	if rec != nil && deps.Config.SandboxScope == ports.SandboxScopeRun {
+		switch {
+		case rec.Released:
+			// Given back at a park: for the same run, its files are gone.
+			lost = rec.RunID == run.RunID
+			rec = nil
+		case rec.RunID != run.RunID:
+			// Left by an earlier run that never gave it back. This run
+			// starts fresh; that is the normal case here, not a loss.
+			destroyQuietly(ctx, deps, provider, rec.ID)
+			rec = nil
+		}
+	}
 	if rec != nil && (now.Sub(time.UnixMilli(rec.LastUsedAt)) > idle || now.Sub(time.UnixMilli(rec.CreatedAt)) > lifetime) {
 		destroyQuietly(ctx, deps, provider, rec.ID)
 		rec = nil
@@ -201,23 +238,27 @@ func acquireSandbox(ctx context.Context, run ToolRun, provider ports.SandboxProv
 		}
 	}
 	if rec == nil {
-		s, err := provider.Create(ctx, ports.CreateSandboxOptions{
-			Timeout:  min(idle+pushEvery, lifetime),
-			Metadata: ports.SandboxMetadata{ThreadID: run.ThreadID, RunID: run.RunID, State: run.State},
-		})
+		// The app's defaults, then the two the runtime owns.
+		opts := deps.Config.SandboxDefaults
+		opts.Timeout = min(idle+pushEvery, lifetime)
+		opts.Metadata = ports.SandboxMetadata{ThreadID: run.ThreadID, RunID: run.RunID, State: run.State}
+		s, err := provider.Create(ctx, opts)
 		if err != nil {
 			return ThreadSandbox{}, err
 		}
 		remember(s, now)
 		sandbox = s
 		rec = &sandboxRecord{ID: s.ID(), Provider: provider.Name(), CreatedAt: now.UnixMilli(), LastUsedAt: now.UnixMilli()}
+		if deps.Config.SandboxScope == ports.SandboxScopeRun {
+			rec.RunID = run.RunID
+		}
 		created = true
 	}
 	raw, _ := json.Marshal(rec)
 	if _, err := deps.Kv.Set(ctx, key, string(raw), ports.SetOptions{Expiry: lifetime}); err != nil {
 		return ThreadSandbox{}, err
 	}
-	return ThreadSandbox{Sandbox: sandbox, Created: created, Lost: lost}, nil
+	return ThreadSandbox{Sandbox: sandbox, Created: created, Lost: lost, Restored: ports.RestoresWorkdir(provider)}, nil
 }
 
 // connectHeld reuses a handle this process holds, or connects.
@@ -312,6 +353,42 @@ func DestroyThreadSandbox(ctx context.Context, deps ports.RuntimePorts, threadID
 		destroyQuietly(ctx, deps, provider, rec.ID)
 	}
 	_ = deps.Kv.Del(ctx, key)
+}
+
+// ReleaseRunSandbox ends the sandbox a run made, when the run is done with
+// it (SandboxScopeRun only; otherwise it does nothing). parked says the run
+// is waiting rather than ended: then the sandbox is kept when
+// SandboxKeepOnPark, and otherwise a mark is left so the resumed run is told
+// its files are gone. A sandbox another run made is left alone. It never
+// fails: the sandbox's own timeout ends it anyway.
+func ReleaseRunSandbox(ctx context.Context, deps ports.RuntimePorts, threadID, runID string, parked bool) {
+	provider := deps.Tools.Sandbox
+	if provider == nil || runID == "" || deps.Config.SandboxScope != ports.SandboxScopeRun {
+		return
+	}
+	if parked && deps.Config.SandboxKeepOnPark {
+		return
+	}
+	ctx = context.WithoutCancel(ctx)
+	key := SandboxKey(threadID)
+	raw, ok, err := deps.Kv.Get(ctx, key)
+	if err != nil || !ok {
+		return
+	}
+	rec, _ := readSandboxRecord(ctx, deps.Kv, key)
+	if rec == nil || rec.Released || rec.RunID != runID || rec.Provider != provider.Name() {
+		return
+	}
+	destroyQuietly(ctx, deps, provider, rec.ID)
+	if !parked {
+		_, _ = deps.Kv.DelIfValue(ctx, key, raw)
+		return
+	}
+	rec.Released = true
+	mark, _ := json.Marshal(rec)
+	if _, err := deps.Kv.Set(ctx, key, string(mark), ports.SetOptions{Expiry: deps.Config.SandboxMaxLifetime}); err != nil {
+		Logger(deps).Error("sandbox release not recorded", "thread", threadID, "run", runID, "err", err)
+	}
 }
 
 func readSandboxRecord(ctx context.Context, kv ports.Kv, key string) (*sandboxRecord, error) {

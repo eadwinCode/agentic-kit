@@ -936,6 +936,27 @@ type AgentConfig struct {
 	// made, however much it is used: the backstop on what one sandbox can
 	// cost. Default 24 hours.
 	SandboxMaxLifetime time.Duration
+	// SandboxScope is how long a sandbox is kept: SandboxScopeThread (the
+	// default) keeps one per thread, between messages; SandboxScopeRun gives
+	// each run its own, ended when the run ends, so a sandbox is held only
+	// while the agent works.
+	SandboxScope SandboxScope
+	// SandboxKeepOnPark keeps a run's sandbox while the run waits for an
+	// approval or an answer. Only with SandboxScopeRun. Off by default: a
+	// park can wait for hours, so the sandbox is ended and the resumed run
+	// gets a fresh one. Unless the provider restores the work folder (see
+	// WorkdirRestorer), the files made before the park are then gone.
+	SandboxKeepOnPark bool
+	// SandboxDefaults are merged into every sandbox the runtime makes:
+	// Network, Envs, Template, Image, Resources, Extra. The runtime still
+	// sets Timeout and Metadata itself.
+	SandboxDefaults CreateSandboxOptions
+	// SandboxStateDir is where the sandbox tools keep their own files (the
+	// bash folder, the programs code_execution ran, the editor's undo
+	// history). A relative path is inside the work folder; an absolute one,
+	// such as /home/app/.agentenkit, keeps them out of it. Default
+	// ".agentenkit".
+	SandboxStateDir string
 	// RecordPayloads records prompts, state, step text and tool payloads into
 	// the operational store (§2.9). Turn it off when those carry anything
 	// that should not sit in an operational database.
@@ -1003,6 +1024,12 @@ func mergeConfig(c, d AgentConfig) AgentConfig {
 	orInt(&c.BuiltinToolResultCapChars, d.BuiltinToolResultCapChars)
 	orDur(&c.SandboxIdleTTL, d.SandboxIdleTTL)
 	orDur(&c.SandboxMaxLifetime, d.SandboxMaxLifetime)
+	if c.SandboxScope == "" {
+		c.SandboxScope = d.SandboxScope
+	}
+	if c.SandboxStateDir == "" {
+		c.SandboxStateDir = d.SandboxStateDir
+	}
 	orInt(&c.PayloadCapChars, d.PayloadCapChars)
 	orDur(&c.StreamGrace, d.StreamGrace)
 	orDur(&c.StreamTTL, d.StreamTTL)
@@ -1032,6 +1059,8 @@ func DefaultConfig() AgentConfig {
 		BuiltinToolResultCapChars:  20_000,
 		SandboxIdleTTL:             30 * time.Minute,
 		SandboxMaxLifetime:         24 * time.Hour,
+		SandboxScope:               SandboxScopeThread,
+		SandboxStateDir:            ".agentenkit",
 		RecordPayloads:             true,
 		PayloadCapChars:            2_000,
 		ContextCeilingTokens:       265_000,
@@ -1089,6 +1118,9 @@ func ResolveConfig(partial *AgentConfig) (AgentConfig, error) {
 	}
 	if config.SandboxIdleTTL < time.Millisecond || config.SandboxMaxLifetime < time.Millisecond {
 		return config, errors.New("invalid config: SandboxIdleTTL and SandboxMaxLifetime must be at least 1ms")
+	}
+	if config.SandboxScope != SandboxScopeThread && config.SandboxScope != SandboxScopeRun {
+		return config, fmt.Errorf("invalid config: SandboxScope (%q) must be %q or %q", config.SandboxScope, SandboxScopeThread, SandboxScopeRun)
 	}
 	if config.BuiltinToolResultCapChars < 1 {
 		return config, fmt.Errorf("invalid config: BuiltinToolResultCapChars (%d) must be at least 1", config.BuiltinToolResultCapChars)

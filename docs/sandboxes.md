@@ -70,6 +70,87 @@ expect them.
 | --- | --- | --- | --- |
 | Idle time before it ends | `sandboxIdleTtlMs` | `SandboxIdleTTL` | 30 minutes |
 | Longest it lives | `sandboxMaxLifetimeMs` | `SandboxMaxLifetime` | 24 hours |
+| One per thread or per run | `sandboxScope` | `SandboxScope` | `'thread'` |
+| Keep it while a run is parked | `sandboxKeepOnPark` | `SandboxKeepOnPark` | `false` |
+| Options for every sandbox made | `sandboxDefaults` | `SandboxDefaults` | none |
+| Where the tools keep their files | `sandboxStateDir` | `SandboxStateDir` | `.agentenkit` |
+
+## One sandbox per run
+
+When sandboxes come from a small shared pool, hold one only while the agent
+works. With `sandboxScope: 'run'` (Go: `SandboxScope: agentenkit.SandboxScopeRun`):
+
+- The first sandbox call in a run makes it. The run's later calls and its
+  subagents share it.
+- When the run ends (finished, failed or stopped), the runtime ends the
+  sandbox. The next run in the thread starts with a fresh one, with no
+  "lost" note: that is the normal case here.
+- **When the run parks** (waiting for an approval, an answer, or a job), the
+  sandbox is ended too, and the resumed run gets a fresh one. An approval can
+  wait for hours; the sandbox does not wait with it. Set `sandboxKeepOnPark:
+  true` to keep it through the park.
+- A crash before the end is covered by the sandbox's own timeout, and the next
+  run that finds an old sandbox ends it.
+
+> [!WARNING]
+> `bash` asks for approval before every command by default, and each approval
+> is a park. With `sandboxScope: 'run'` and a provider that does not restore
+> the work folder, every approved command starts in a fresh sandbox, without
+> the files the earlier ones made. Use `sandboxKeepOnPark: true`, an approval
+> rule that does not ask for every command, or a provider that restores the
+> work folder.
+
+## A provider that restores the work folder
+
+Some apps keep the project somewhere else (a Git service, a bucket) and load
+it into every new sandbox. Say so on the provider, and the tools tell the
+model the files are back rather than gone:
+
+```ts
+const sandbox: SandboxProvider = { name: 'clevix', restoresWorkdir: true, create, connect };
+```
+
+```go
+// A provider that implements agentenkit.WorkdirRestorer.
+func (p *Provider) RestoresWorkdir() bool { return true }
+```
+
+The note then reads: "The sandbox restarted. The project files are back as
+they were; anything outside the work folder (installed tools, temp files,
+running processes) is gone." With `sandboxScope: 'run'`, a new run's fresh
+sandbox gets no note at all.
+
+## Options for every sandbox
+
+`sandboxDefaults` (Go: `SandboxDefaults`) is merged into every sandbox the
+runtime makes: `network`, `envs`, `template`, `image`, `resources`, `extra`.
+The runtime still sets the timeout and the metadata itself.
+
+```ts
+config: { sandboxDefaults: { network: 'all', envs: { CI: '1' } } }
+```
+
+## A hook after each sandbox call
+
+`afterSandboxCall` (Go: `BuiltinToolPorts.AfterSandboxCall`) is called once
+after every tool call that used the sandbox: the built-in tools, and your own
+tools that call `withSandbox` or `sandboxFor`. It gets the thread, the run,
+the tool name, the call id, the sandbox, and the call's own error if it had
+one. Save the work there, for example.
+
+What the hook throws (Go: returns) becomes the call's error, so the model
+knows the change was not saved. A call that already failed keeps its own
+error.
+
+```ts
+tools: {
+  sandbox,
+  afterSandboxCall: async ({ sandbox, toolName }) => {
+    const r = await sandbox.runCommand(`git add -A && git commit -qm ${JSON.stringify(toolName)} || true`);
+    if (r.exitCode !== 0) throw new Error(`your change was not saved: ${r.stderr}`);
+  },
+},
+```
 
 ## The adapters
 
@@ -133,7 +214,10 @@ tools, err := rt.BuiltinTools([]string{"bash", "code_execution", "text_editor"},
   can be undone, up to 10 per file.
 
 The tools keep their own files (the bash folder, the programs, the undo
-history) in a hidden `.agentenkit` folder in the start folder.
+history) in a hidden `.agentenkit` folder in the start folder. When the work
+folder is a Git checkout, that folder shows up in `git status`; set
+`sandboxStateDir` (Go: `SandboxStateDir`) to an absolute path, such as
+`/home/app/.agentenkit`, to keep it out.
 
 **Approval.** A call that asks waits for `respond` like any approval, then
 runs when approved; a denied one tells the model it was denied. Pass
@@ -159,7 +243,8 @@ middle cut. `maxUses` caps the calls in one run.
 stream, so a UI can show it as it comes. They are not kept in the thread.
 
 **Lost files.** When the thread's sandbox had ended and a fresh one was made,
-the result carries a `note` saying the earlier files are gone.
+the result carries a `note` saying the earlier files are gone, or, from a
+provider that restores the work folder, that they are back.
 
 **Cost.** Each call books a usage row (`kind: 'tool'`, `model: 'tool:bash'`,
 the sandbox adapter as `modelId`) with the seconds its command ran. Price it

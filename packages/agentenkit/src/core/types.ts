@@ -1,5 +1,6 @@
 import type { LanguageModel, ToolSet } from 'ai';
 import type { AgentRunState } from './state.js';
+import type { SandboxDefaults, SandboxScope } from '../ports/sandbox.js';
 
 /** Lifecycle of a thread. Durable truth lives in Storage.threads; the kv copy
  *  (`agent:state:{threadId}`) is a hot cache the engine polls (§2.1, §3.4). */
@@ -655,6 +656,25 @@ export interface AgentConfig {
   /** A thread's sandbox ends this long after it was made, however much it
    *  is used: the backstop on what one sandbox can cost. Default 24 hours. */
   sandboxMaxLifetimeMs: number;
+  /** How long a sandbox is kept: `'thread'` (the default) keeps one per
+   *  thread, between messages; `'run'` gives each run its own, ended when
+   *  the run ends, so a sandbox is held only while the agent works. */
+  sandboxScope: SandboxScope;
+  /** Keep a run's sandbox while the run waits for an approval or an answer.
+   *  Only with `sandboxScope: 'run'`. Off by default: a park can wait for
+   *  hours, so the sandbox is ended and the resumed run gets a fresh one.
+   *  Unless the provider restores the work folder (`restoresWorkdir`), the
+   *  files made before the park are then gone. */
+  sandboxKeepOnPark: boolean;
+  /** Merged into every sandbox the runtime makes: network, envs, template,
+   *  image, resources, extra. The runtime still sets `timeoutMs` and
+   *  `metadata` itself. */
+  sandboxDefaults: SandboxDefaults;
+  /** Where the sandbox tools keep their own files (the bash folder, the
+   *  programs code_execution ran, the editor's undo history). A relative
+   *  path is inside the work folder; an absolute one, such as
+   *  `/home/app/.agentenkit`, keeps them out of it. Default `.agentenkit`. */
+  sandboxStateDir: string;
   /** Refuse a new run (RUN_REFUSED, reason `queue_full`) once this many jobs
    *  are ready and waiting (§2.8). Needs a queue that can count; one that
    *  cannot is never refused on. 0 means no cap. */
@@ -735,6 +755,10 @@ export const DEFAULT_CONFIG: AgentConfig = {
   builtinToolResultCapChars: 20_000,
   sandboxIdleTtlMs: 30 * 60_000,
   sandboxMaxLifetimeMs: 24 * 60 * 60_000,
+  sandboxScope: 'thread',
+  sandboxKeepOnPark: false,
+  sandboxDefaults: {},
+  sandboxStateDir: '.agentenkit',
 };
 
 export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
@@ -771,6 +795,10 @@ export function resolveConfig(partial?: Partial<AgentConfig>): AgentConfig {
       throw new Error(`Invalid config: ${key} (${config[key]}) must be an integer of at least 1`);
     }
   }
+  if (config.sandboxScope !== 'thread' && config.sandboxScope !== 'run') {
+    throw new Error(`Invalid config: sandboxScope (${JSON.stringify(config.sandboxScope)}) must be "thread" or "run"`);
+  }
+  if (!config.sandboxStateDir) config.sandboxStateDir = DEFAULT_CONFIG.sandboxStateDir;
   for (const key of ['stepTimeoutMs', 'segmentTimeoutMs', 'maxQueueWaitMs', 'maxQueueDepth', 'streamFlushMs'] as const) {
     if (!Number.isFinite(config[key]) || config[key] < 0) {
       throw new Error(`Invalid config: ${key} (${config[key]}) must not be negative`);

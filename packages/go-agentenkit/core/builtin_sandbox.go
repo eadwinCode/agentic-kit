@@ -64,15 +64,43 @@ type TextEditorOptions struct {
 	Approval ApprovalRule
 }
 
-// stateDir is where the tools keep their own files, in the sandbox's work
-// folder: the bash folder, the programs code_execution ran, the editor's
-// undo history. Hidden, so a plain ls does not show it.
-const stateDir = ".agentenkit"
+// stateDir is where the tools keep their own files: the bash folder, the
+// programs code_execution ran, the editor's undo history. By default
+// ".agentenkit" in the work folder, hidden so a plain ls does not show it;
+// AgentConfig.SandboxStateDir can move it, out of the work folder too.
+func stateDir(run ToolRun) string {
+	if d := strings.TrimRight(run.Deps.Config.SandboxStateDir, "/"); d != "" {
+		return d
+	}
+	return ".agentenkit"
+}
+
+// shellQuote quotes s for sh.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
 
 // undoDepth is the changes the editor can take back, per file.
 const undoDepth = 10
 
 const lostNote = "The sandbox this conversation used before has ended, so files from earlier are gone. This is a fresh one."
+
+// restoredNote replaces lostNote when the provider gives a new sandbox the
+// work folder back (ports.WorkdirRestorer).
+const restoredNote = "The sandbox restarted. The project files are back as they were; anything outside the work folder (installed tools, temp files, running processes) is gone."
+
+// sandboxNote is what a call tells the model about its sandbox: nothing,
+// unless the one before it is gone.
+func sandboxNote(ts ThreadSandbox) string {
+	switch {
+	case !ts.Lost:
+		return ""
+	case ts.Restored:
+		return restoredNote
+	default:
+		return lostNote
+	}
+}
 
 // needsApproval asks the rule, unless this call is the approved one coming
 // back.
@@ -207,8 +235,12 @@ func randomSuffix() string {
 // bashScript keeps the folder a bash call ends in, in the sandbox, and the
 // next call starts there: the "session" the model expects, without a shell
 // that has to outlive the process.
-func bashScript(command string, restart bool) string {
-	lines := []string{`__ak="$PWD/` + stateDir + `"; mkdir -p "$__ak"`}
+func bashScript(command string, restart bool, dir string) string {
+	ak := `"$PWD"/` + shellQuote(dir)
+	if strings.HasPrefix(dir, "/") {
+		ak = shellQuote(dir)
+	}
+	lines := []string{`__ak=` + ak + `; mkdir -p "$__ak"`}
 	if restart {
 		lines = append(lines, `rm -f "$__ak/bash-cwd"`)
 	}
@@ -253,7 +285,7 @@ func RunBash(ctx context.Context, opts BashOptions, args map[string]any, run Too
 	live := newLiveOutput(ctx, run, "bash")
 	defer live.done()
 	return WithThreadSandbox(ctx, run, func(ts ThreadSandbox) (string, error) {
-		r, err := ts.Sandbox.RunCommand(ctx, bashScript(command, restart), ports.RunCommandOptions{
+		r, err := ts.Sandbox.RunCommand(ctx, bashScript(command, restart, stateDir(run)), ports.RunCommandOptions{
 			Timeout: limit, OnStdout: live.push("stdout"), OnStderr: live.push("stderr"),
 		})
 		if err != nil {
@@ -265,9 +297,7 @@ func RunBash(ctx context.Context, opts BashOptions, args map[string]any, run Too
 			res.TimedOut = true
 			res.Error = "bash: the command was stopped after " + secondsOf(limit) + " s"
 		}
-		if ts.Lost {
-			res.Note = lostNote
-		}
+		res.Note = sandboxNote(ts)
 		return resultJSON(res)
 	})
 }
@@ -336,7 +366,8 @@ func RunCodeExecution(ctx context.Context, opts CodeExecutionOptions, args map[s
 	return WithThreadSandbox(ctx, run, func(ts ThreadSandbox) (string, error) {
 		fs := ts.Sandbox.Filesystem()
 		name := fmt.Sprintf("%d-%s", time.Now().UnixMilli(), randomSuffix())
-		base := stateDir + "/code/" + name
+		dir := stateDir(run)
+		base := dir + "/code/" + name
 		file := base + "." + runner.ext
 		if err := fs.WriteFile(ctx, file, []byte(code)); err != nil {
 			return "", err
@@ -347,10 +378,11 @@ func RunCodeExecution(ctx context.Context, opts CodeExecutionOptions, args map[s
 		// relative requires (Node) resolve from the work folder, not the
 		// hidden one.
 		script := strings.Join([]string{
-			`touch "` + base + `.start"`,
-			runner.run + ` - < "` + file + `"`,
+			`mkdir -p ` + shellQuote(dir+"/code"),
+			`touch ` + shellQuote(base+".start"),
+			runner.run + ` - < ` + shellQuote(file),
 			`__ec=$?`,
-			`find . -path "./` + stateDir + `" -prune -o -type f -newer "` + base + `.start" -print > "` + base + `.files" 2>/dev/null`,
+			madeFilesCommand(dir, base),
 			`exit $__ec`,
 		}, "\n")
 		r, err := ts.Sandbox.RunCommand(ctx, script, ports.RunCommandOptions{
@@ -388,9 +420,7 @@ func RunCodeExecution(ctx context.Context, opts CodeExecutionOptions, args map[s
 		case r.ExitCode != 0:
 			res.Error = fmt.Sprintf("code_execution: the program exited with code %d", r.ExitCode)
 		}
-		if ts.Lost {
-			res.Note = lostNote
-		}
+		res.Note = sandboxNote(ts)
 		return resultJSON(res)
 	})
 }
@@ -405,33 +435,44 @@ var askForChanges ApprovalRule = func(_ context.Context, input map[string]any) (
 	return editCommands[c], nil
 }
 
-// historyPath is the editor's undo history for one file: earlier versions,
-// newest last; null where the file did not exist yet.
-func historyPath(path string) string {
-	sum := sha256.Sum256([]byte(path))
-	return stateDir + "/history/" + hex.EncodeToString(sum[:])[:32] + ".json"
+// madeFilesCommand lists the files newer than the run's start marker into
+// base.files, leaving out the tools' own folder when it is in the work
+// folder.
+func madeFilesCommand(dir, base string) string {
+	prune := ""
+	if !strings.HasPrefix(dir, "/") {
+		prune = `-path ` + shellQuote("./"+strings.TrimPrefix(dir, "./")) + ` -prune -o `
+	}
+	return `find . ` + prune + `-type f -newer ` + shellQuote(base+".start") + ` -print > ` + shellQuote(base+".files") + ` 2>/dev/null`
 }
 
-func readHistory(ctx context.Context, s ports.Sandbox, path string) []*string {
+// historyPath is the editor's undo history for one file: earlier versions,
+// newest last; null where the file did not exist yet.
+func historyPath(dir, path string) string {
+	sum := sha256.Sum256([]byte(path))
+	return dir + "/history/" + hex.EncodeToString(sum[:])[:32] + ".json"
+}
+
+func readHistory(ctx context.Context, s ports.Sandbox, dir, path string) []*string {
 	var h []*string
-	raw, err := s.Filesystem().ReadFile(ctx, historyPath(path))
+	raw, err := s.Filesystem().ReadFile(ctx, historyPath(dir, path))
 	if err != nil || json.Unmarshal([]byte(raw), &h) != nil {
 		return []*string{}
 	}
 	return h
 }
 
-func writeHistory(ctx context.Context, s ports.Sandbox, path string, h []*string) error {
+func writeHistory(ctx context.Context, s ports.Sandbox, dir, path string, h []*string) error {
 	raw, _ := json.Marshal(h)
-	return s.Filesystem().WriteFile(ctx, historyPath(path), raw)
+	return s.Filesystem().WriteFile(ctx, historyPath(dir, path), raw)
 }
 
-func rememberVersion(ctx context.Context, s ports.Sandbox, path string, before *string) error {
-	h := append(readHistory(ctx, s, path), before)
+func rememberVersion(ctx context.Context, s ports.Sandbox, dir, path string, before *string) error {
+	h := append(readHistory(ctx, s, dir, path), before)
 	if len(h) > undoDepth {
 		h = h[len(h)-undoDepth:]
 	}
-	return writeHistory(ctx, s, path, h)
+	return writeHistory(ctx, s, dir, path, h)
 }
 
 func readOrNil(ctx context.Context, s ports.Sandbox, path string) (*string, error) {
@@ -557,7 +598,7 @@ func runEdit(ctx context.Context, s ports.Sandbox, run ToolRun, command, path st
 		if err != nil {
 			return nil, err
 		}
-		if err := rememberVersion(ctx, s, path, before); err != nil {
+		if err := rememberVersion(ctx, s, stateDir(run), path, before); err != nil {
 			return nil, err
 		}
 		if err := fs.WriteFile(ctx, path, []byte(fileText)); err != nil {
@@ -586,7 +627,7 @@ func runEdit(ctx context.Context, s ports.Sandbox, run ToolRun, command, path st
 		case n > 1:
 			return editFailed(fmt.Sprintf("text_editor: old_str matches %d places in %s; include more of the text around it so it matches one", n, path)), nil
 		}
-		if err := rememberVersion(ctx, s, path, text); err != nil {
+		if err := rememberVersion(ctx, s, stateDir(run), path, text); err != nil {
 			return nil, err
 		}
 		newStr, _ := args["new_str"].(string)
@@ -611,7 +652,7 @@ func runEdit(ctx context.Context, s ports.Sandbox, run ToolRun, command, path st
 		if !ok || at < 0 || at > len(lines) {
 			return editFailed(fmt.Sprintf("text_editor: insert_line must be within 0 and %d", len(lines))), nil
 		}
-		if err := rememberVersion(ctx, s, path, text); err != nil {
+		if err := rememberVersion(ctx, s, stateDir(run), path, text); err != nil {
 			return nil, err
 		}
 		merged := append(append(append([]string{}, lines[:at]...), strings.Split(newStr, "\n")...), lines[at:]...)
@@ -620,7 +661,7 @@ func runEdit(ctx context.Context, s ports.Sandbox, run ToolRun, command, path st
 		}
 		return editResult{"ok": true, "message": fmt.Sprintf("Inserted after line %d of %s.", at, path)}, nil
 	case "undo_edit":
-		h := readHistory(ctx, s, path)
+		h := readHistory(ctx, s, stateDir(run), path)
 		if len(h) == 0 {
 			return editFailed("text_editor: there is no change to " + path + " to undo"), nil
 		}
@@ -633,7 +674,7 @@ func runEdit(ctx context.Context, s ports.Sandbox, run ToolRun, command, path st
 		} else if err := fs.WriteFile(ctx, path, []byte(*before)); err != nil {
 			return nil, err
 		}
-		if err := writeHistory(ctx, s, path, h); err != nil {
+		if err := writeHistory(ctx, s, stateDir(run), path, h); err != nil {
 			return nil, err
 		}
 		if before == nil {
@@ -679,8 +720,8 @@ func RunTextEditor(ctx context.Context, opts TextEditorOptions, args map[string]
 			return "", err
 		}
 		RecordToolUsage(ctx, run, ToolUseRow("text_editor", ts.Sandbox.Provider(), 1, 0))
-		if ts.Lost {
-			res["note"] = lostNote
+		if note := sandboxNote(ts); note != "" {
+			res["note"] = note
 		}
 		return resultJSON(res)
 	})

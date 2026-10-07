@@ -108,7 +108,11 @@ func settleVerdict(ctx, genCtx context.Context, deps ports.RuntimePorts, threadI
 	result := json.RawMessage(nil)
 	if err := CallSafely(func() error {
 		var err error
-		output, err = target.Execute(toolCtx, args)
+		// The approved call is a sandbox call like a live one: the hook runs
+		// after it the same way.
+		output, err = callWithSandboxHook(toolCtx, toolRun, pending.ToolName, func(ctx context.Context) (string, error) {
+			return target.Execute(ctx, args)
+		})
 		return err
 	}); err != nil {
 		result = MarshalPayload(map[string]any{"error": err.Error()})
@@ -397,7 +401,12 @@ func settleEndedRun(ctx context.Context, deps ports.RuntimePorts, agent *Registe
 		return false
 	}
 	rec, err := deps.Admin.Runs().Get(ctx, runID)
-	if err != nil || rec == nil || rec.SettledAt != nil || !isTerminal(rec.State) {
+	if err != nil || rec == nil || !isTerminal(rec.State) {
+		return false
+	}
+	// The run has ended, so it is done with its sandbox, settled or not.
+	ReleaseRunSandbox(ctx, deps, threadID, runID, false)
+	if rec.SettledAt != nil {
 		return false
 	}
 	// A late settle (the sweep, a stop of a dead worker) runs outside the
@@ -482,6 +491,9 @@ func closeIfOpen(ctx context.Context, deps ports.RuntimePorts, runID, stopReason
 // this run must get to close them as failed. Its own error cannot change
 // the outcome, which is already a failure.
 func failRun(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgent, threadID, runID, reason string) error {
+	// A run that fails is done with its sandbox. Only one this run made is
+	// ended, so a newer run that got the thread keeps its own.
+	ReleaseRunSandbox(ctx, deps, threadID, runID, false)
 	// A failed run still spent money on the steps it did make (§4), so it
 	// settles like any other end. Settled even with no hook, so the late
 	// sweep does not keep coming back to it.
@@ -998,6 +1010,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			if err := CommitParks(ctx, deps, parks); err != nil {
 				return "", err
 			}
+			ReleaseRunSandbox(ctx, deps, threadID, runID, true)
 			segEnd = &ports.RunFinishedEvent{Status: "parked"}
 			return OutcomeExecuted, nil
 		}
@@ -1104,6 +1117,8 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		if runID != "" {
 			accrueRunRecord(ctx, deps, runID, loop)
 		}
+		// A park can wait for hours; a run's sandbox is not held for it.
+		ReleaseRunSandbox(ctx, deps, threadID, runID, true)
 		segEnd = &ports.RunFinishedEvent{Status: "parked"}
 		return OutcomeExecuted, nil
 	}
@@ -1155,6 +1170,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 	if err := Finalize(ctx, deps, agent, threadID, f); err != nil {
 		return "", err
 	}
+	ReleaseRunSandbox(ctx, deps, threadID, runID, false)
 	segEnd = segmentEnd(state, f.Error, bill, string(loop.FinishReason), seg)
 	if agent.Args.OnFinish != nil {
 		agent.Args.OnFinish(ports.RunFinishInfo{

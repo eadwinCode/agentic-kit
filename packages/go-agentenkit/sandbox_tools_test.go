@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -415,4 +416,57 @@ func TestSandboxTools_ToolPricesCanBePerSecondPerUseOrBoth(t *testing.T) {
 	mustEqual(t, price("e2b", 2.5), int64(250), "per second")
 	mustEqual(t, price("docker", 2.5), int64(1_250), "per use and per second")
 	mustEqual(t, price("e2b", 0), int64(0), "no time")
+}
+
+// restoringLocal is the local provider, saying its new sandboxes get the
+// work folder back.
+type restoringLocal struct{ ports.SandboxProvider }
+
+func (restoringLocal) RestoresWorkdir() bool { return true }
+
+func TestSandboxTools_AFreshSandboxFromAProviderThatRestoresTheWorkFolderSaysTheFilesAreBack(t *testing.T) {
+	h := toolsRuntime(t, [][]toolCall{
+		{editCall("e1", map[string]any{"command": "create", "path": "a.txt", "file_text": "x"})},
+		{},
+		{editCall("e2", map[string]any{"command": "view", "path": "a.txt"})},
+	}, []string{"text_editor"}, noApproval, func(o *agentenkit.RuntimeOptions) {
+		o.Tools.Sandbox = restoringLocal{o.Tools.Sandbox}
+	})
+	threadID := h.runIn(t, "")
+	var rec map[string]any
+	_ = json.Unmarshal([]byte(h.kvGet(core.SandboxKey(threadID))), &rec)
+	rec["lastUsedAt"] = 0
+	raw, _ := json.Marshal(rec)
+	_, _ = h.kv.Set(h.ctx, core.SandboxKey(threadID), string(raw), ports.SetOptions{})
+	h.runIn(t, threadID)
+	// The local sandbox does not really restore; the note is what is tested.
+	mustEqual(t, h.resultMap(t, threadID, "e2")["note"],
+		"The sandbox restarted. The project files are back as they were; anything outside the work folder (installed tools, temp files, running processes) is gone.", "note")
+}
+
+func TestSandboxTools_SandboxStateDirKeepsTheToolsOwnFilesOutOfTheWorkFolder(t *testing.T) {
+	state := t.TempDir() + "/agentenkit-state"
+	code := "open('out.txt', 'w').write('1')"
+	h := toolsRuntime(t, [][]toolCall{
+		{editCall("e1", map[string]any{"command": "create", "path": "a.txt", "file_text": "one\n"})},
+		{editCall("e2", map[string]any{"command": "str_replace", "path": "a.txt", "old_str": "one", "new_str": "two"})},
+		{editCall("e3", map[string]any{"command": "undo_edit", "path": "a.txt"})},
+		{bashCall("b1", "mkdir -p sub && cd sub")},
+		{bashCall("b2", "basename \"$PWD\"")},
+		{{id: "c1", name: "code_execution", args: map[string]any{"code": code}}},
+		{bashCall("b3", "cd .. && ls -A")},
+	}, []string{"bash", "code_execution", "text_editor"}, noApproval, nil, func(c *agentenkit.AgentConfig) {
+		c.SandboxStateDir = state
+	})
+	threadID := h.runIn(t, "")
+	mustEqual(t, h.resultMap(t, threadID, "e3")["error"], nil, "undo works from the state folder")
+	mustEqual(t, h.resultMap(t, threadID, "b2")["stdout"], "sub\n", "bash keeps its folder in the state folder")
+	files, _ := h.resultMap(t, threadID, "c1")["files"].([]any)
+	mustEqual(t, len(files), 1, "files made")
+	mustEqual(t, files[0].(map[string]any)["path"], "out.txt", "the program's file, and nothing of the tools'")
+	mustEqual(t, h.resultMap(t, threadID, "b3")["stdout"], "a.txt\nout.txt\nsub\n", "no .agentenkit in the work folder")
+	entries, err := os.ReadDir(state + "/history")
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("no history in the state folder: %v", err)
+	}
 }

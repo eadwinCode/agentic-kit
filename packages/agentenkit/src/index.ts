@@ -179,7 +179,7 @@ export { BraveWebSearch, type BraveWebSearchOptions } from './adapters/brave.js'
 export { JinaWebSearch, JinaReader, type JinaOptions } from './adapters/jina.js';
 export { PageReader, BlockedUrlError, isPrivateAddress, type PageReaderOptions } from './adapters/page-reader.js';
 export type {
-  BuiltinToolPorts, FetchedPage, Fetcher, FetchOptions, Search, SearchHit, SearchOptions, SearchRecency,
+  BuiltinToolPorts, SandboxCall, FetchedPage, Fetcher, FetchOptions, Search, SearchHit, SearchOptions, SearchRecency,
 } from './ports/tools.js';
 export { LocalSandbox, type LocalSandboxOptions } from './adapters/local-sandbox.js';
 export { DockerSandbox, type DockerSandboxOptions } from './adapters/docker.js';
@@ -192,6 +192,7 @@ export {
   SandboxFileNotFoundError, SandboxGoneError, SandboxUnsupportedError,
   type CommandResult, type CreateSandboxOptions, type FileEntry, type RunCommandOptions, type Sandbox,
   type SandboxFileSystem, type SandboxInfo, type SandboxNetwork, type SandboxProvider,
+  type SandboxScope, type SandboxDefaults,
 } from './ports/sandbox.js';
 export { sandboxFor, withSandbox, type ThreadSandbox } from './core/builtin/sandbox.js';
 export {
