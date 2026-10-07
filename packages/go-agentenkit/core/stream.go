@@ -10,7 +10,8 @@ import (
 )
 
 // usageJSON is the usage shape a CHUNK payload carries. Same field names the
-// TypeScript package (AI SDK v4) publishes, so the React client reads both.
+// TypeScript package publishes (the AI SDK v4 names, which it keeps on newer
+// SDKs), so the React client reads both.
 func usageJSON(u provider.Usage) map[string]any {
 	return map[string]any{
 		"promptTokens":      u.InputTokens,

@@ -97,13 +97,11 @@ describe('markPromptCaching (§2.6)', () => {
     const stamp = { anthropic: { cacheControl: { type: 'ephemeral' } } };
 
     // cacheControl attaches to the last content part of the marked messages.
-    // The SDK reads `providerOptions ?? experimental_providerMetadata`; a bare
-    // `providerMetadata` on a part is read by nothing, so asserting only that
-    // one passes while the breakpoint does nothing.
+    // The SDK reads `providerOptions`; a bare `providerMetadata` on a part is
+    // read by nothing, so asserting only that one passes while the breakpoint
+    // does nothing.
     expect((out[0] as any).providerOptions).toEqual(stamp);
     expect((out.at(-1) as any).content.at(-1).providerOptions).toEqual(stamp);
-    expect((out[0] as any).experimental_providerMetadata).toEqual(stamp);
-    expect((out.at(-1) as any).content.at(-1).experimental_providerMetadata).toEqual(stamp);
     // Middle messages are untouched
     expect((out[1] as any).providerOptions).toBeUndefined();
     expect((out[2] as any).providerOptions).toBeUndefined();
@@ -122,7 +120,6 @@ describe('markPromptCaching (§2.6)', () => {
 
     expect((out[0] as any).content).toBe('you are helpful');
     expect((out[0] as any).providerOptions).toEqual(stamp);
-    expect((out[0] as any).experimental_providerMetadata).toEqual(stamp);
     // ... while a user message still stamps its last content part
     expect(Array.isArray((out[1] as any).content)).toBe(true);
     expect((out[1] as any).content.at(-1).providerOptions).toEqual(stamp);

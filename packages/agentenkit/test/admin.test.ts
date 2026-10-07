@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { simulateReadableStream, tool } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
-import { MockLanguageModelV1 } from 'ai/test';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
@@ -166,7 +166,7 @@ describe('what a step produced (§2.9)', () => {
       name: 'chat', model: 'gpt-4o',
       tools: {
         lookup: tool({
-          parameters: z.object({ q: z.string() }),
+          inputSchema: z.object({ q: z.string() }),
           execute: async ({ q }) => ({ found: `${q}: Sn, atomic number 50` }),
         }),
       },

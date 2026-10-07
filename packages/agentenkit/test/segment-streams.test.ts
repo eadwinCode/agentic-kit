@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { simulateReadableStream } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
-import { MockLanguageModelV1 } from 'ai/test';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
@@ -106,7 +106,7 @@ describe('segment streams', () => {
     ]));
     const chat = r.runtime.createStreamTextAgent({
       name: 'chat', model: 'gpt-4o',
-      tools: { lookup: agentTool({ parameters: z.object({ q: z.string() }), execute: async ({ q }) => `result for ${q}` }) },
+      tools: { lookup: agentTool({ inputSchema: z.object({ q: z.string() }), execute: async ({ q }) => `result for ${q}` }) },
     });
     const ran = await chat.run({ prompt: 'hi' });
     await r.runtime.worker.handleJob(r.queue.items.shift()!);
@@ -131,7 +131,7 @@ describe('segment streams', () => {
       name: 'chat', model: 'gpt-4o',
       tools: {
         render: agentTool({
-          parameters: z.object({}),
+          inputSchema: z.object({}),
           execute: async (_args, { publishEvent }) => {
             await publishEvent('SEARCH_PROGRESS', { done: 3, of: 10 }, { durable: false });
             return 'ok';
@@ -150,7 +150,7 @@ describe('segment streams', () => {
       { toolCalls: [{ toolCallId: 'c1', toolName: 'wipe', args: {} }] },
       { text: ['wiped'] },
     ]), { hitlTtlMs: 60 * 60_000 });
-    const wipe = markRequiresConfirmation(agentTool({ parameters: z.object({}), execute: async () => 'gone' }));
+    const wipe = markRequiresConfirmation(agentTool({ inputSchema: z.object({}), execute: async () => 'gone' }));
     const chat = r.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', tools: { wipe } });
     const ran = await chat.run({ prompt: 'wipe it' });
     await r.runtime.worker.handleJob(r.queue.items.shift()!);

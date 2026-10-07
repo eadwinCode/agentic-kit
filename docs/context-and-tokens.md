@@ -67,8 +67,8 @@ config: { promptCaching: true }
 
 Three details worth knowing, because each was a bug before it was a feature:
 
-- **The system prompt is carried as a stamped message, not the SDK's `system:`
-  string.** That string reaches the provider with no metadata channel, so a
+- **The system prompt is carried as a stamped message, not the SDK's
+  `instructions` string.** That string reaches the provider with no metadata channel, so a
   system prompt passed that way can never hold a breakpoint — and it is usually
   the largest, most stable part of the prompt.
 - **Nested runs are stamped too.** A child re-sends its whole brief and history
@@ -77,7 +77,8 @@ Three details worth knowing, because each was a bug before it was a feature:
   tokens. The markers are for providers that require them, Anthropic in
   particular.
 
-Turning it off (`promptCaching: false`) restores the plain `system:` parameter.
+Turning it off (`promptCaching: false`) sends the system prompt as the SDK's
+plain `instructions` parameter.
 
 ## Token attribution
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { simulateReadableStream, tool } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
-import { MockLanguageModelV1 } from 'ai/test';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
@@ -93,7 +93,7 @@ async function delegatingRuntime(config: Partial<AgentConfig> = {}) {
       tools: {
         sendEmail: markRequiresConfirmation(
           tool({
-            parameters: z.object({ to: z.string() }),
+            inputSchema: z.object({ to: z.string() }),
             execute: async ({ to }) => { sent.push({ to }); return { status: 'SENT', to }; },
           }),
         ),
@@ -386,7 +386,7 @@ async function twoSiblingsRuntime(config: Partial<AgentConfig> = {}) {
       tools: {
         sendEmail: markRequiresConfirmation(
           tool({
-            parameters: z.object({ to: z.string() }),
+            inputSchema: z.object({ to: z.string() }),
             execute: async ({ to }) => { sent.push(to); return { status: 'SENT', to }; },
           }),
         ),
@@ -639,7 +639,7 @@ async function threeLevelRuntime() {
       tools: {
         sendEmail: markRequiresConfirmation(
           tool({
-            parameters: z.object({ to: z.string() }),
+            inputSchema: z.object({ to: z.string() }),
             execute: async ({ to }) => { sent.push(to); return { status: 'SENT', to }; },
           }),
         ),

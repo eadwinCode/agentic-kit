@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { simulateReadableStream } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
-import { MockLanguageModelV1 } from 'ai/test';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
@@ -115,7 +115,7 @@ describe('stop while parked (§2.5)', () => {
       name: 'chat', model: 'gpt-4o',
       tools: {
         wipe: markRequiresConfirmation(agentTool({
-          parameters: z.object({}),
+          inputSchema: z.object({}),
           execute: async () => { executed.push('ran'); return 'gone'; },
         })),
       },
@@ -158,7 +158,7 @@ describe('stop while parked (§2.5)', () => {
     const chat = r.runtime.createStreamTextAgent({
       name: 'chat', model: 'gpt-4o',
       subagents: {
-        tools: { wipe: markRequiresConfirmation(agentTool({ parameters: z.object({}), execute: async () => 'gone' })) },
+        tools: { wipe: markRequiresConfirmation(agentTool({ inputSchema: z.object({}), execute: async () => 'gone' })) },
       },
     });
     const ran = await chat.run({ prompt: 'go' });
@@ -183,7 +183,7 @@ describe('stop while parked (§2.5)', () => {
     const r = await makeRuntime(model);
     const chat = r.runtime.createStreamTextAgent({
       name: 'chat', model: 'gpt-4o', tools: {
-        wipe: markRequiresConfirmation(agentTool({ parameters: z.object({}), execute: async () => 'ok' })),
+        wipe: markRequiresConfirmation(agentTool({ inputSchema: z.object({}), execute: async () => 'ok' })),
       },
     });
     const ran = await chat.run({ prompt: 'go' });

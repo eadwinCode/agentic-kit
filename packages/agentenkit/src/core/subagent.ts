@@ -168,7 +168,7 @@ function spawnDescription(ctx: SubagentCtx): string {
 export function spawnSubagentTool(ctx: SubagentCtx) {
   return tool({
     description: spawnDescription(ctx),
-    parameters: z.object({
+    inputSchema: z.object({
       name: z.string().describe('Short name for the sub-task'),
       instructions: z
         .string()

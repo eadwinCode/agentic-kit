@@ -27,8 +27,8 @@ without it you cannot answer "what happened last Tuesday".
 ## The loop is the platform's, not the SDK's
 
 The AI SDK can loop on its own, taking tool results and calling the model again.
-This library does not let it: each step runs with `maxSteps: 1`, and the
-platform decides what happens next.
+This library does not let it: each step stops after one model call
+(`stopWhen: isStepCount(1)`), and the platform decides what happens next.
 
 ```
   dispatch → [ step → persist → decide ] → … → finalize

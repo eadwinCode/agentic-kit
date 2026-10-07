@@ -105,7 +105,7 @@ import { z } from 'zod';
 
 const lookup = tool({
   description: 'Look something up',
-  parameters: z.object({ query: z.string() }),
+  inputSchema: z.object({ query: z.string() }),
   execute: async ({ query }) => search(query),
 });
 ```
@@ -122,7 +122,7 @@ import { markRequiresConfirmation } from 'agentenkit';
 const sendEmail = markRequiresConfirmation(
   tool({
     description: 'Sends an email (destructive)',
-    parameters: z.object({ to: z.string().email(), subject: z.string(), body: z.string() }),
+    inputSchema: z.object({ to: z.string().email(), subject: z.string(), body: z.string() }),
     execute: async (args) => send(args),
   }),
 );
@@ -148,7 +148,7 @@ import { agentTool } from 'agentenkit';
 
 const lookupInvoice = agentTool({
   description: 'Find one invoice',
-  parameters: z.object({ invoiceId: z.string() }),
+  inputSchema: z.object({ invoiceId: z.string() }),
   execute: async ({ invoiceId }, { state, toolCallId }) =>
     db.invoice.findFirst({ where: { id: invoiceId, orgId: state.orgId } }),
 });
@@ -160,7 +160,7 @@ composes with `markRequiresConfirmation`:
 ```ts
 const sendEmail = markRequiresConfirmation(
   agentTool({
-    parameters: z.object({ to: z.string().email() }),
+    inputSchema: z.object({ to: z.string().email() }),
     execute: async ({ to }, { state }) => send(to, state.orgId),
   }),
 );
@@ -365,9 +365,11 @@ not the handle. One durable write; the worker notices within `stopPollMs`.
 
 ## Streaming callbacks
 
-`onChunk`, `onFinish` and `onStepFinish` from the AI SDK still fire. The
+`onChunk`, `onFinish` and `onStepEnd` (or its older name, `onStepFinish`) still
+fire. The
 platform chains its own handlers around yours rather than replacing them, so
 your callback runs *and* the event still reaches the run stream.
 
-Platform-owned keys — `model`, `messages`, `tools`, `maxSteps`, `abortSignal` —
-are set by the engine and cannot be overridden from the spec.
+Platform-owned keys — `model`, `messages`, `tools`, `stopWhen`, `abortSignal` —
+are set by the engine and cannot be overridden from the spec. The persona goes
+in `system`; the SDK's newer name for it, `instructions`, is read the same way.

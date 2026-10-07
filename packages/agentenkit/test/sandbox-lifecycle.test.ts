@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { simulateReadableStream, tool } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
-import { MockLanguageModelV1 } from 'ai/test';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
@@ -54,7 +54,7 @@ async function harness(calls = 1) {
   });
   const touch = tool({
     description: 'Write a file in the sandbox',
-    parameters: z.object({ name: z.string() }),
+    inputSchema: z.object({ name: z.string() }),
     execute: (args, opts) =>
       withSandbox(opts, async ({ sandbox, created, lost }) => {
         await sandbox.filesystem.writeFile(`${args.name}.txt`, 'x');

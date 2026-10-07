@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'bun:test';
 import { tool, simulateReadableStream } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
 import { z } from 'zod';
-import { MockLanguageModelV1 } from 'ai/test';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
 import { bindStorage } from '../src/core/state.js';
@@ -141,7 +141,7 @@ describe('reconnecting mid-run (§2.2)', () => {
       tools: {
         // Runs during step 2 — after step 1's messages are durable.
         probe: tool({
-          parameters: z.object({ n: z.number() }),
+          inputSchema: z.object({ n: z.number() }),
           execute: async ({ n }: any) => {
             if (n === 2) snap = await r.runtime.getThreadSnapshot(threadId!);
             return { ok: true };
@@ -179,7 +179,7 @@ describe('reconnecting mid-run (§2.2)', () => {
       model: 'gpt-4o',
       tools: {
         probe: tool({
-          parameters: z.object({ n: z.number() }),
+          inputSchema: z.object({ n: z.number() }),
           execute: async ({ n }: any) => {
             if (n === 1) snap = await r.runtime.getThreadSnapshot(threadId!);
             return { ok: true };
@@ -212,7 +212,7 @@ describe('reconnecting mid-run (§2.2)', () => {
       tools: {
         sendEmail: markRequiresConfirmation(
           tool({
-            parameters: z.object({ to: z.string() }),
+            inputSchema: z.object({ to: z.string() }),
             execute: async ({ to }: any) => ({ sent: to }),
           }),
         ),
@@ -319,7 +319,7 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
       model: 'gpt-4o',
       tools: {
         lookup: tool({
-          parameters: z.object({ q: z.string() }),
+          inputSchema: z.object({ q: z.string() }),
           execute: async ({ q }) => {
             executed.push(q);
             return { ok: true };
@@ -384,7 +384,7 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
       model: 'gpt-4o',
       tools: {
         lookup: tool({
-          parameters: z.object({ q: z.string() }),
+          inputSchema: z.object({ q: z.string() }),
           execute: async ({ q }) => {
             executed.push(q);
             return { ok: true };
@@ -425,7 +425,7 @@ describe('engine loop (§2.1, §5.6): platform-owned continuation', () => {
       model: 'gpt-4o',
       tools: {
         lookup: tool({
-          parameters: z.object({ q: z.string() }),
+          inputSchema: z.object({ q: z.string() }),
           execute: async () => ({ ok: true }),
         }),
       },
@@ -472,7 +472,7 @@ describe('HITL run-segment park (§2.5)', () => {
         sendEmail: markRequiresConfirmation(
           tool({
             description: 'sends',
-            parameters: z.object({ to: z.string() }),
+            inputSchema: z.object({ to: z.string() }),
             execute: async () => {
               sent.push(1);
               return { status: 'SENT' };
@@ -719,7 +719,7 @@ describe('a tool that parks itself (§2.5)', () => {
       tools: {
         render: tool({
           description: 'renders',
-          parameters: z.object({ scene: z.string() }),
+          inputSchema: z.object({ scene: z.string() }),
           execute: async ({ scene }, opts: any) => {
             if (opts.approval) {
               resumedWith.push(opts.approval.payload);
@@ -771,7 +771,7 @@ describe('a tool that parks itself (§2.5)', () => {
       tools: {
         render: tool({
           description: 'renders',
-          parameters: z.object({}),
+          inputSchema: z.object({}),
           execute: async (_args, opts: any): Promise<unknown> => {
             if (opts.approval) throw new Error('an expired park must not run the tool again');
             throw parkForInput({ reason: 'job', ttlMs: 20 });

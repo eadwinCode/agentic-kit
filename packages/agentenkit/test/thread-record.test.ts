@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { simulateReadableStream } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
-import { MockLanguageModelV1 } from 'ai/test';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
@@ -49,7 +49,7 @@ describe('thread record', () => {
     const r = await makeRuntime(scriptedModel([{ text: 'looking', call: { id: 'c1', name: 'look' } }, { text: 'done' }]));
     const chat = r.runtime.createStreamTextAgent({
       name: 'chat', model: 'gpt-4o',
-      tools: { look: agentTool({ parameters: z.object({}), execute: async () => 'seen' }) },
+      tools: { look: agentTool({ inputSchema: z.object({}), execute: async () => 'seen' }) },
     });
     const ran = await chat.run({ prompt: 'hi' });
     await r.runtime.worker.handleJob(r.queue.items.shift()!);
@@ -121,7 +121,7 @@ describe('thread record', () => {
       name: 'chat', model: 'gpt-4o',
       tools: {
         go: agentTool({
-          parameters: z.object({}),
+          inputSchema: z.object({}),
           execute: async (_a, { publishEvent }) => {
             await publishEvent('INVOICE_CREATED', { id: 'inv_1' }, { durable: true });
             await publishEvent('PROGRESS', { pct: 50 });

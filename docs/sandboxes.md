@@ -176,7 +176,7 @@ import { withSandbox } from 'agentenkit';
 
 const runTests = tool({
   description: 'Run the test suite',
-  parameters: z.object({}),
+  inputSchema: z.object({}),
   execute: (_args, opts) =>
     withSandbox(opts, async ({ sandbox, lost }) => {
       const r = await sandbox.runCommand('pytest -q', { timeoutMs: 60_000 });

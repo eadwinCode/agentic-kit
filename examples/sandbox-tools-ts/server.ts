@@ -27,7 +27,7 @@ if (!openaiKey) {
   process.exit(1);
 }
 const model = process.env.MODEL || 'gpt-4o-mini';
-const openai = createOpenAI({ apiKey: openaiKey, compatibility: 'strict' });
+const openai = createOpenAI({ apiKey: openaiKey });
 // The models this app prices, per million tokens.
 const modelPrices = {
   'gpt-4o-mini': { inputPerMillion: 0.15, cacheReadPerMillion: 0.075, outputPerMillion: 0.6 },
@@ -79,7 +79,7 @@ const runtime = await setupAgentCore({
   // back to the parent's model, so no call goes out unpriced.
   resolveModel: (name) => {
     if (!(name in modelPrices) && name !== model) throw new Error(`unknown model ${name}`);
-    return { instance: () => openai(name), contextWindow: 128_000 };
+    return { instance: () => openai.chat(name), contextWindow: 128_000 };
   },
   tools: { sandbox },
   // Money on every usage row: the model calls, and E2B time per second (2

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { simulateReadableStream, tool } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
-import { MockLanguageModelV1 } from 'ai/test';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
@@ -118,8 +118,8 @@ describe('events (§2.2)', () => {
         [say('done'), finish()],
       ]),
       {
-        lookup: tool({ parameters: z.object({}), execute: async () => ({ found: true }) }),
-        broken: tool({ parameters: z.object({}), execute: async () => { throw new Error('boom'); } }),
+        lookup: tool({ inputSchema: z.object({}), execute: async () => ({ found: true }) }),
+        broken: tool({ inputSchema: z.object({}), execute: async (): Promise<string> => { throw new Error('boom'); } }),
       },
     );
     const ran = await r.chat.run({ prompt: 'go' });

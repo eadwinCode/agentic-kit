@@ -156,7 +156,7 @@ export const runtime = await setupAgentCore({
 const sendEmail = markRequiresConfirmation(
   tool({
     description: 'Sends an email (destructive — requires user approval)',
-    parameters: z.object({
+    inputSchema: z.object({
       to: z.string().email(),
       subject: z.string(),
       body: z.string(),

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { simulateReadableStream, tool } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
-import { MockLanguageModelV1 } from 'ai/test';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
@@ -100,7 +100,7 @@ describe('a queue that cannot schedule the HITL expiry (§2.5)', () => {
       model: 'gpt-4o',
       tools: {
         sendEmail: markRequiresConfirmation(
-          tool({ parameters: z.object({ to: z.string() }), execute: async () => ({ status: 'SENT' }) }),
+          tool({ inputSchema: z.object({ to: z.string() }), execute: async () => ({ status: 'SENT' }) }),
         ),
       },
     });

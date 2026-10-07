@@ -346,8 +346,9 @@ export type StreamTextAgentSpec = {
    *  from the AI SDK. Per-provider namespace; the execute input wins. */
   providerOptions?: ProviderOptions;
 } & Omit<Parameters<typeof import('ai').streamText>[0],
-    'model' | 'messages' | 'prompt' | 'system' | 'abortSignal'
-    | 'maxSteps' | 'onStepFinish' | 'onError' | 'onFinish' | 'onChunk'> & {
+    'model' | 'messages' | 'prompt' | 'system' | 'instructions' | 'allowSystemInMessages'
+    | 'abortSignal' | 'stopWhen' | 'onStepFinish' | 'onStepEnd' | 'onError' | 'onFinish'
+    | 'onEnd' | 'onChunk' | 'tools' | 'prepareStep'> & {
   /** `system` is allowed here (static persona); per-run system is not. */
   system?: string;
   /** The persona built per step with the run's state; wins over `system`. */
@@ -372,7 +373,11 @@ export type GenerateTextAgentSpec = {
   costBudgetMicros?: number;
   providerOptions?: ProviderOptions;
 } & Omit<Parameters<typeof import('ai').generateText>[0],
-    'model' | 'messages' | 'prompt' | 'abortSignal' | 'onFinish' | 'onStepFinish'> & {
+    'model' | 'messages' | 'prompt' | 'system' | 'instructions' | 'allowSystemInMessages'
+    | 'abortSignal' | 'stopWhen' | 'onFinish' | 'onEnd' | 'onStepFinish' | 'onStepEnd'
+    | 'tools' | 'prepareStep'> & {
+  /** `system` is allowed here (static persona); per-run system is not. */
+  system?: string;
   tools?: ToolSet;
   /** The persona built per step with the run's state; wins over `system`. */
   systemFn?: SystemFn;

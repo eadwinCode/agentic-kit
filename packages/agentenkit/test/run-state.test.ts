@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { simulateReadableStream, tool } from 'ai';
-import type { LanguageModelV1StreamPart } from '@ai-sdk/provider';
-import { MockLanguageModelV1 } from 'ai/test';
+import type { LanguageModelV1StreamPart } from './v1-mock.js';
+import { MockLanguageModelV1 } from './v1-mock.js';
 import { z } from 'zod';
 import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
@@ -200,7 +200,7 @@ describe('run state survives a park (§2.10, §2.5)', () => {
       tools: {
         sendEmail: markRequiresConfirmation(
           tool({
-            parameters: z.object({ to: z.string() }),
+            inputSchema: z.object({ to: z.string() }),
             execute: async ({ to }: any) => ({ sent: to }),
           }),
         ),
@@ -298,7 +298,7 @@ describe('agentTool types the run state (§2.10)', () => {
       tools: {
         // No cast anywhere in this block — that is the point.
         whoami: agentTool({
-          parameters: z.object({}),
+          inputSchema: z.object({}),
           execute: async (_args, { state, toolCallId }) => {
             seen.push({ org: state.orgId, hasToolCallId: typeof toolCallId === 'string' });
             return { ok: true };
@@ -317,7 +317,7 @@ describe('agentTool types the run state (§2.10)', () => {
   it('still composes with markRequiresConfirmation', () => {
     const marked = markRequiresConfirmation(
       agentTool({
-        parameters: z.object({ to: z.string() }),
+        inputSchema: z.object({ to: z.string() }),
         execute: async ({ to }, { state }) => ({ to, org: state.orgId }),
       }),
     );
@@ -365,7 +365,7 @@ describe('run state reaches tools (§2.10)', () => {
         // A plain tool: not marked for approval, still needs to know which
         // tenant it is acting for.
         whoami: tool({
-          parameters: z.object({}),
+          inputSchema: z.object({}),
           execute: async (_args: unknown, opts: any) => {
             seen.push(opts?.state);
             return { ok: true };

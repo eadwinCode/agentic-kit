@@ -23,7 +23,8 @@ echo "--- packing"
 (cd "$root/packages/use-agentenkit" && npm pack --silent --pack-destination "$work")
 
 echo "--- installing"
-bun add ./agentenkit-*.tgz ./use-agentenkit-*.tgz react
+# `ai` is a peer dependency: a consumer installs it next to agentenkit.
+bun add ./agentenkit-*.tgz ./use-agentenkit-*.tgz ai react
 
 cat > check.mjs <<'JS'
 const fail = (m) => { console.error('FAIL: ' + m); process.exit(1); };

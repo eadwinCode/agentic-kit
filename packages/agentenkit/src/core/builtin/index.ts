@@ -50,7 +50,7 @@ export function buildBuiltinTools(
     const def = BUILTIN_TOOL_DEFINITIONS[name];
     out[name] = tool({
       description: def.description,
-      parameters: jsonSchema(def.inputSchema as Parameters<typeof jsonSchema>[0]),
+      inputSchema: jsonSchema(def.inputSchema as Parameters<typeof jsonSchema>[0]),
       execute: async (
         args: unknown,
         opts: { abortSignal?: AbortSignal; toolCallId?: string; approval?: unknown },

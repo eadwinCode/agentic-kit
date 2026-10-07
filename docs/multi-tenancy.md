@@ -211,7 +211,7 @@ integration. It turns a silent cross-tenant read into a stack trace.
 import { agentTool } from 'agentenkit';
 
 const lookupInvoice = agentTool({
-  parameters: z.object({ invoiceId: z.string() }),
+  inputSchema: z.object({ invoiceId: z.string() }),
   execute: async ({ invoiceId }, { state }) =>
     db.invoice.findFirst({ where: { id: invoiceId, orgId: state.orgId } }),
 });

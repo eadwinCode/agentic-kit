@@ -1,4 +1,4 @@
-import { tool, type ToolExecutionOptions } from 'ai';
+import { tool, type Tool, type ToolExecutionOptions } from 'ai';
 import type { z } from 'zod';
 import type { AgentRunState } from './state.js';
 import type { ToolPublishEvent } from './publish.js';
@@ -10,7 +10,7 @@ import type { ToolPublishEvent } from './publish.js';
  *  `ToolExecutionOptions` has no field for it — and a plain `tool()` cannot be
  *  told about it, because narrowing the options parameter is rejected as
  *  unsound. Hence `agentTool`. */
-export interface ToolContext extends ToolExecutionOptions {
+export interface ToolContext extends ToolExecutionOptions<any> {
   /** Whatever the caller attached to this run. Present for every tool of every
    *  run, including a nested one and a segment resumed after an approval. */
   state: AgentRunState;
@@ -36,7 +36,7 @@ export interface ToolContext extends ToolExecutionOptions {
  * ```ts
  * const lookupInvoice = agentTool({
  *   description: 'Find one invoice',
- *   parameters: z.object({ invoiceId: z.string() }),
+ *   inputSchema: z.object({ invoiceId: z.string() }),
  *   execute: async ({ invoiceId }, { state }) =>
  *     db.invoice.findFirst({ where: { id: invoiceId, orgId: state.orgId } }),
  * });
@@ -44,18 +44,18 @@ export interface ToolContext extends ToolExecutionOptions {
  *
  *  The result is an ordinary AI SDK tool — it composes with
  *  `markRequiresConfirmation` and can be passed anywhere `tool()` can. */
-export function agentTool<PARAMETERS extends z.ZodTypeAny, RESULT>(spec: {
+export function agentTool<INPUT extends z.ZodTypeAny, RESULT>(spec: {
   description?: string;
-  parameters: PARAMETERS;
-  execute: (args: z.infer<PARAMETERS>, ctx: ToolContext) => PromiseLike<RESULT>;
+  inputSchema: INPUT;
+  execute: (input: z.infer<INPUT>, ctx: ToolContext) => PromiseLike<RESULT>;
 }) {
-  const { execute, ...rest } = spec;
+  const { execute, description, inputSchema } = spec;
+  // Cast: the SDK's tool() types branch on whether RESULT is `never`, which
+  // cannot be decided while RESULT is still generic.
   return tool({
-    ...rest,
-    execute: ((args: z.infer<PARAMETERS>, options: ToolExecutionOptions) =>
-      execute(args, options as ToolContext)) as (
-      args: z.infer<PARAMETERS>,
-      options: ToolExecutionOptions,
-    ) => PromiseLike<RESULT>,
-  });
+    ...(description !== undefined ? { description } : {}),
+    inputSchema,
+    execute: (input: z.infer<INPUT>, options: ToolExecutionOptions<any>) =>
+      execute(input, options as ToolContext),
+  } as any) as Tool<z.infer<INPUT>, RESULT>;
 }
