@@ -142,6 +142,19 @@ func TestEnqueueSingleton(t *testing.T) {
 	}
 }
 
+func TestEnqueueThrowsWhenNoRunStarts(t *testing.T) {
+	freeing := map[string]any{"started": false, "reason": "singleton", "activeRunId": nil}
+	c, e := newClient(t, freeing, freeing)
+	err := New(c, Options{}).Enqueue(context.Background(), job, &ports.EnqueueOptions{Key: "k"})
+	if err == nil || !strings.Contains(err.Error(), "no run started for key k") || len(e.calls) != 2 {
+		t.Fatalf("keyed: err = %v, calls = %d", err, len(e.calls))
+	}
+	c, _ = newClient(t, freeing, freeing)
+	if err := New(c, Options{}).Enqueue(context.Background(), job, nil); err == nil || !strings.Contains(err.Error(), "no run started for key d1") {
+		t.Fatalf("unkeyed: err = %v", err)
+	}
+}
+
 func TestEnqueuePausedOrMissing(t *testing.T) {
 	c, _ := newClient(t, map[string]any{"started": false, "reason": "paused"})
 	if err := New(c, Options{}).Enqueue(context.Background(), job, nil); err == nil || !strings.Contains(err.Error(), "paused") {

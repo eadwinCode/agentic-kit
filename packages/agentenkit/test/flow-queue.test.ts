@@ -83,6 +83,15 @@ describe('FlowQueue.enqueue', () => {
     expect(calls).toHaveLength(2);
   });
 
+  it('throws when no run starts after two tries', async () => {
+    const freeing = { started: false, reason: 'singleton', activeRunId: null };
+    const keyed = fakeFlow([freeing, freeing]);
+    await expect(new FlowQueue(keyed.flow).enqueue(job, { key: 'k' })).rejects.toThrow('no run started for key k');
+    expect(keyed.calls).toHaveLength(2);
+    const unkeyed = fakeFlow([freeing, freeing]);
+    await expect(new FlowQueue(unkeyed.flow).enqueue(job)).rejects.toThrow('no run started for key d1');
+  });
+
   it('throws when the function is paused or missing', async () => {
     const paused = fakeFlow([{ started: false, reason: 'paused' }]);
     await expect(new FlowQueue(paused.flow).enqueue(job)).rejects.toThrow('paused');

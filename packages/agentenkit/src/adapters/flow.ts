@@ -89,7 +89,9 @@ export class FlowQueue implements Queue {
       if (res.reason === 'paused') throw new Error(`flow: function ${this.functionId} is paused`);
       throw new Error(`flow: no function ${this.functionId}; is the app served and synced?`);
     }
-    if (opts?.key) throw new DuplicateJobError(opts.key);
+    // Both tries found the key held by a run that had just ended. No run
+    // started, so the caller must hear it, or the job is lost.
+    throw new Error(`flow: no run started for key ${key}; the key was still being freed`);
   }
 
   async cancel(key: string): Promise<void> {
@@ -146,8 +148,11 @@ export interface AgentRunFunctionOptions {
   concurrency?: number;
   /** Flow's retries for a job that throws. Flow's default when unset. */
   retries?: number;
-  /** The longest one job may run. Defaults to 14 minutes, Flow's most. A
-   *  segment that runs longer is cut and retried. */
+  /** How long Flow waits for one job. Defaults to 14 minutes, Flow's most.
+   *  When a job runs longer, Flow stops waiting and tries the step again,
+   *  but nothing stops the first call: it keeps running. The retry finds the
+   *  run lock held and does nothing, so keep segments shorter than this
+   *  (`segmentTimeoutMs`). */
   stepTimeout?: Duration;
 }
 

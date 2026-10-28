@@ -129,10 +129,9 @@ func (q *Queue) Enqueue(ctx context.Context, job ports.RunJob, opts *ports.Enque
 			return fmt.Errorf("flow: no function %s; is the app served and synced?", q.functionID)
 		}
 	}
-	if opts.Key != "" {
-		return ports.ErrDuplicateJob
-	}
-	return nil
+	// Both tries found the key held by a run that had just ended. No run
+	// started, so the caller must hear it, or the job is lost.
+	return fmt.Errorf("flow: no run started for key %s; the key was still being freed", key)
 }
 
 // Cancel cancels the run that holds key, if any.
@@ -209,8 +208,11 @@ type FunctionOpts struct {
 	Concurrency int
 	// Retries is Flow's retries for a job that fails. Flow's default when nil.
 	Retries *int
-	// StepTimeout is the longest one job may run. Defaults to 14 minutes,
-	// Flow's most. A segment that runs longer is cut and retried.
+	// StepTimeout is how long Flow waits for one job. Defaults to 14 minutes,
+	// Flow's most. When a job runs longer, Flow stops waiting and tries the
+	// step again, but nothing stops the first call: it keeps running. The
+	// retry finds the run lock held and does nothing, so keep segments
+	// shorter than this (SegmentTimeout).
 	StepTimeout time.Duration
 }
 

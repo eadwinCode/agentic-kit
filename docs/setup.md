@@ -91,8 +91,11 @@ In Go, `clevixflow.New(client, clevixflow.Options{})` is the queue, and
 `clevixflow.Functions(client, rt.Worker, clevixflow.FunctionOpts{})` gives the
 functions to serve with `client.Serve()`.
 
-- One job runs in one Flow step. A step can take at most 14 minutes, so keep
-  segments shorter (`segmentTimeoutMs`), or a long one is cut and retried.
+- One job runs in one Flow step. Flow waits at most 14 minutes for a step.
+  When a job runs longer, Flow tries the step again, but the first call keeps
+  running, and the retry finds the run lock held and does nothing. So keep
+  segments shorter (`segmentTimeoutMs`). On serverless, the host may also kill
+  the first call.
 - `concurrency` limits the jobs of one `partitionKey` that run at once. Job
   priorities only take effect under such a limit.
 - Flow retries a job that throws. When it gives up, the run is failed through
