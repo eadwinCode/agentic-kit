@@ -9,6 +9,21 @@
         "vitepress": "^1.6.4",
       },
     },
+    "examples/flow-queue-ts": {
+      "name": "@agent/example-flow-queue-ts",
+      "version": "0.1.0",
+      "dependencies": {
+        "@ai-sdk/openai": "^4.0.0",
+        "@clevix/flow": "https://github.com/eadwinCode/flow-sdk/releases/download/v0.7.0/clevix-flow-0.7.0.tgz",
+        "agentenkit": "workspace:*",
+        "ai": "^7.0.0",
+        "zod": "^3.25.76",
+      },
+      "devDependencies": {
+        "@types/bun": "^1.2.0",
+        "typescript": "^5.6.3",
+      },
+    },
     "examples/go-app/web": {
       "name": "@agent/example-go-web",
       "version": "0.1.0",
@@ -112,6 +127,7 @@
         "typescript": "^5.6.3",
       },
       "peerDependencies": {
+        "@clevix/flow": ">=0.7.0",
         "@prisma/client": ">=5.0.0",
         "@upstash/qstash": ">=2.6.0",
         "@upstash/redis": ">=1.31.0",
@@ -120,6 +136,7 @@
         "redis": ">=4.7.0",
       },
       "optionalPeers": [
+        "@clevix/flow",
         "@prisma/client",
         "@upstash/qstash",
         "@upstash/redis",
@@ -148,6 +165,8 @@
     "@upstash/qstash-cli",
   ],
   "packages": {
+    "@agent/example-flow-queue-ts": ["@agent/example-flow-queue-ts@workspace:examples/flow-queue-ts"],
+
     "@agent/example-go-web": ["@agent/example-go-web@workspace:examples/go-app/web"],
 
     "@agent/example-nextjs": ["@agent/example-nextjs@workspace:examples/nextjs-app"],

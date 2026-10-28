@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["bun"],
+    // The package's source, straight from the workspace: Bun follows these
+    // too, so the app runs with no build step in between.
+    "paths": {
+      "agentenkit": ["../../packages/agentenkit/src/index.ts"],
+      "agentenkit/adapters/*": ["../../packages/agentenkit/src/adapters/*"],
+      "agentenkit/admin/*": ["../../packages/agentenkit/src/admin/*"]
+    }
+  },
+  "include": ["*.ts"]
+}

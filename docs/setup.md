@@ -102,6 +102,10 @@ functions to serve with `client.Serve()`.
   `handleDeadJob`.
 - It needs a Flow engine at v2.1.1 or later.
 
+A whole app on Flow, in TS and Go:
+[flow-queue-ts](https://github.com/eadwinCode/agentic-kit/tree/main/examples/flow-queue-ts) and
+[flow-queue-go](https://github.com/eadwinCode/agentic-kit/tree/main/examples/flow-queue-go).
+
 > An adapter must never **throw** for `delaySeconds`. Delivering immediately is
 > an acceptable degradation; rejecting the option breaks approval expiry, which
 > is scheduled from inside a parked tool call.
