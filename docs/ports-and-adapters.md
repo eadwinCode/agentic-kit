@@ -6,7 +6,7 @@ stack; implement any of them for anything.
 | Port | Role | Reference adapters |
 | :--- | :--- | :--- |
 | `Storage` | threads, messages, the thread record, usage | `PrismaStorage`, `SqliteStorage`, `MemoryStorage` |
-| `Queue` | durable run dispatch | `QStashQueue`, `InlineQueue`, `MemoryQueue` |
+| `Queue` | durable run dispatch | `QStashQueue`, `FlowQueue`, `InlineQueue`, `MemoryQueue` |
 | `EventBus` | live fan-out | `RedisBus`, `UpstashBus`, `MemoryBus` |
 | `Kv` | hot state, handoff keys, counters | `RedisKv`, `UpstashKv`, `MemoryKv` |
 | `RunStreams` | one short-lived stream per run segment | `RedisRunStreams`, `UpstashRunStreams`, `PrismaRunStreams`, `SqliteRunStreams`, `MemoryRunStreams` |
@@ -196,6 +196,14 @@ is ignored, `cancel` does nothing (a delivered job is a correct no-op) and
 whether a job is still waiting, so it goes by time instead: a queued run with
 no lock is treated as lost once it has been quiet for longer than the lock
 lease, `maxQueueWaitMs` and the longest retry delay.
+
+`FlowQueue` runs each job as one run of a [Clevix Flow](https://eadwincode.github.io/flow-sdk/)
+function. A key is the function's singleton key, so a second enqueue with a
+live key throws `DuplicateJobError`, and the key is free again once its run
+ends. A delay is a sleep at the start of the run. Priority maps to Flow's run
+priority, which only takes effect under a concurrency limit. `cancel` cancels
+the run that holds a key. `find` and `stats` read Flow's runs index, which lags
+by a few seconds.
 
 An adapter that cannot honour `delaySeconds` may deliver immediately, but **must
 never throw for it** — a HITL expiry is scheduled from inside a parked tool call,

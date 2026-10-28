@@ -1,6 +1,6 @@
 module github.com/eadwinCode/agentic-kit/packages/go-agentenkit
 
-go 1.25.0
+go 1.27
 
 require (
 	github.com/lib/pq v1.10.9
@@ -11,7 +11,9 @@ require (
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/coder/websocket v1.8.15 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/eadwinCode/flow-sdk v0.7.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
