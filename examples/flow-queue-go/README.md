@@ -1,14 +1,17 @@
 # Flow queue, in Go
 
-agentic-kit with [Clevix Flow](https://eadwincode.github.io/flow-sdk/) as its
-queue. Every job (a new message, a resume after an approval, a park's expiry)
-is a Flow run that you can watch in the Flow dashboard. The agent reads pages
-with `web_fetch` and saves notes with `saveNote`, which waits for your
-approval.
+agentic-kit on [Clevix Flow](https://eadwincode.github.io/flow-sdk/). Flow is
+the queue: every job (a new message, a resume after an approval, a park's
+expiry) is a Flow run that you can watch in the Flow dashboard. Flow is also
+the bus (live events go over realtime, one channel per thread) and the run
+streams (a run's output is kept in a Flow stream, so a page that reloads picks
+up where it left off). The agent reads pages with `web_fetch` and saves notes
+with `saveNote`, which waits for your approval.
 
-It is one small app: SQLite on disk, `clevixflow` for the queue, and the shared
-page from [`tools-ui`](../tools-ui). The setup is in [`main.go`](./main.go). The
-same app in TypeScript is [`flow-queue-ts`](../flow-queue-ts), on the same page.
+It is one small app: threads and the kv in SQLite on disk, `clevixflow`'s
+queue, bus and streams for the rest, and the shared page from
+[`tools-ui`](../tools-ui). The setup is in [`main.go`](./main.go). The same
+app in TypeScript is [`flow-queue-ts`](../flow-queue-ts), on the same page.
 
 ## Run it
 

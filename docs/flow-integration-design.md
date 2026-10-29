@@ -1,7 +1,8 @@
 # Design: running agentic-kit on Clevix Flow
 
 Status: draft for discussion. First written 2026-10-27; updated 2026-10-28 for
-Flow v0.7.0. Part 1 (`FlowQueue`) is built, in TS and Go; the rest is not.
+Flow v0.7.0. Parts 1 to 3 (`FlowQueue`, `FlowBus`, `FlowStreams`) are built,
+in TS and Go, and tested on a local engine (2026-10-29). Part 4 is not.
 
 ## Goal
 
@@ -201,14 +202,17 @@ hashed, as for the bus.
 ### Limits to handle
 
 1. **64 KB per item.** A big tool output in one item would be refused. The
-   adapter splits a large text item into several, or parks it in the kv and
-   appends a reference, as the bus does.
+   adapter parks an item over about 60 KB in the kv (for 8 days, past Flow's
+   longest time to live) and appends a reference; readers get the event back.
+   This is what was built: splitting would need every reader to join the
+   pieces.
 2. **20,000 items and 32 MB per stream.** A stream is one segment. Text goes
    out in 50 ms windows, so nonstop text fills 20,000 items in about 16
    minutes. In `await` mode a segment ends before that (the 14-minute step).
    In `detach` mode a very long segment could hit it. The append then fails
    with `413 StreamFull`. Options: end the segment and start a new stream, or
-   make the text window larger on Flow. To decide when we build it.
+   make the text window larger on Flow. Not handled yet: the append fails, and
+   the docs say to keep segments short.
 
 ## Part 4: agents from Flow workflows (optional)
 
@@ -254,20 +258,24 @@ stream that fills up (see Part 3, limit 2).
 
 ## Questions to decide
 
-1. Ship all three adapters together, or `FlowQueue` first?
-2. `await` or `detach` as the default worker mode?
-3. What should `enqueue` do when the function is paused (`"paused"`)? Throw so
+1. `await` or `detach` as the default worker mode?
+2. What should `enqueue` do when the function is paused (`"paused"`)? Throw so
    the caller sees it, or treat it like `QueueFullError` for fresh dispatches
    only?
-4. A full stream: end the segment, or a larger text window?
-5. Is Part 4 worth shipping now, or later?
+3. A full stream: end the segment, or a larger text window?
+4. Is Part 4 worth shipping now, or later?
 
-## Build order (if agreed)
+## Build order
 
-1. `FlowQueue` and the function helper, in TS and Go, with `find`, `stats` and
-   `cancel`. Test against a local engine at v2.1.1 or later.
-2. `FlowBus` in TS and Go, with the kv reference for big events.
-3. `FlowStreams` in TS and Go, with item splitting.
-4. An example app on Flow (queue, bus and streams), and a section in
-   [Ports and adapters](./ports-and-adapters.md).
+1. Done: `FlowQueue` and the function helper, in TS and Go, with `find`,
+   `stats` and `cancel`.
+2. Done: `FlowBus` in TS and Go, with the kv reference for big events.
+3. Done: `FlowStreams` in TS and Go, with the kv reference for big items.
+4. Done: the example apps on Flow (`examples/flow-queue-ts`, `flow-queue-go`),
+   and sections in [Ports and adapters](./ports-and-adapters.md) and
+   [Setup](./setup.md#on-clevix-flow).
 5. Part 4, if wanted.
+
+The engine tests (`TEST_FLOW_BASE_URL`, `TEST_FLOW_APP_ID`,
+`TEST_FLOW_SIGNING_KEY`) run the shared run streams suite and the bus against a
+real engine, in both runtimes. CI has no engine, so they skip there.

@@ -358,10 +358,10 @@ tc := agentenkit.ToolContextFrom(ctx) // state, tool call id, and PublishEvent
 | Port | Role | Reference adapters |
 | :--- | :--- | :--- |
 | `Storage` | threads / messages / the thread record / usage, incl. atomic `ClaimState` | `adapters/postgres`, `adapters/sqlite`, `adapters/memory` |
-| `EventBus` | live fan-out + HITL death notices (at-most-once) | `adapters/redis`, `adapters/upstash`, `adapters/memory` |
+| `EventBus` | live fan-out + HITL death notices (at-most-once) | `adapters/redis`, `adapters/upstash`, `adapters/clevixflow`, `adapters/memory` |
 | `Queue` | durable run dispatch (at-least-once) | `adapters/qstash`, `adapters/clevixflow`, `adapters/inline` (dev), `adapters/memory` |
 | `Kv` | hot state cache, HITL handoff keys, segment/attempt counters, run locks | `adapters/redis`, `adapters/upstash`, `adapters/sqlite`, `adapters/memory` |
-| `RunStreams` | one short-lived stream per run segment | `adapters/redis`, `adapters/upstash`, `adapters/postgres`, `adapters/sqlite`, `adapters/memory` (each `NewRunStreams`) |
+| `RunStreams` | one short-lived stream per run segment | `adapters/redis`, `adapters/upstash`, `adapters/postgres`, `adapters/sqlite`, `adapters/memory` (each `NewRunStreams`), `adapters/clevixflow` (`NewStreams`) |
 
 Implement any of them for your own stack; `core/` imports nothing else. The
 [memory adapters](./adapters/memory/memory.go) are a complete implementation used by the

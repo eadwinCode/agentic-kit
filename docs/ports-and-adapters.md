@@ -7,9 +7,9 @@ stack; implement any of them for anything.
 | :--- | :--- | :--- |
 | `Storage` | threads, messages, the thread record, usage | `PrismaStorage`, `SqliteStorage`, `MemoryStorage` |
 | `Queue` | durable run dispatch | `QStashQueue`, `FlowQueue`, `InlineQueue`, `MemoryQueue` |
-| `EventBus` | live fan-out | `RedisBus`, `UpstashBus`, `MemoryBus` |
+| `EventBus` | live fan-out | `RedisBus`, `UpstashBus`, `FlowBus`, `MemoryBus` |
 | `Kv` | hot state, handoff keys, counters | `RedisKv`, `UpstashKv`, `MemoryKv` |
-| `RunStreams` | one short-lived stream per run segment | `RedisRunStreams`, `UpstashRunStreams`, `PrismaRunStreams`, `SqliteRunStreams`, `MemoryRunStreams` |
+| `RunStreams` | one short-lived stream per run segment | `RedisRunStreams`, `UpstashRunStreams`, `PrismaRunStreams`, `SqliteRunStreams`, `FlowStreams`, `MemoryRunStreams` |
 
 The `Memory*` adapters are a complete implementation used by the test suite, and
 double as a template.
@@ -234,6 +234,13 @@ yields N+1, so a client never misses an event and never sees one twice.
 The reference buses keep one subscriber connection per process, shared by every
 subscription, and give each subscription its own queue, so one slow client
 holds up nobody.
+
+`FlowBus` runs on [Clevix Flow](https://eadwincode.github.io/flow-sdk/)
+realtime instead: one channel per thread, and one socket per followed thread
+per process, shared by that thread's subscribers. Realtime keeps nothing and
+drops what comes while a socket reconnects, which the gap read above covers.
+An event over about 60 KB waits in the kv for a minute, and the channel
+carries its key.
 
 During a run, the bus carries little: record entries and notices such as
 `STATE_CHANGE`. Text, reasoning and tool activity go to the run stream.

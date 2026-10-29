@@ -1,7 +1,8 @@
-// agentic-kit with Clevix Flow as its queue: every job is a Flow run you can
-// watch in the Flow dashboard. The agent reads pages with web_fetch and saves
-// notes with saveNote, which waits for your approval. SQLite on disk, and
-// the shared page from ../tools-ui.
+// agentic-kit on Clevix Flow: Flow is the queue (every job is a Flow run you
+// can watch in the Flow dashboard), the bus, and the run streams. The agent
+// reads pages with web_fetch and saves notes with saveNote, which waits for
+// your approval. Threads and the kv are in SQLite on disk, and the page is
+// the shared one from ../tools-ui.
 //
 // The same app in TypeScript is ../flow-queue-ts.
 package main
@@ -25,7 +26,6 @@ import (
 
 	agentenkit "github.com/eadwinCode/agentic-kit/packages/go-agentenkit"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/clevixflow"
-	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/memory"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/pagereader"
 	"github.com/eadwinCode/agentic-kit/packages/go-agentenkit/adapters/sqlite"
 	sqliteadmin "github.com/eadwinCode/agentic-kit/packages/go-agentenkit/admin/sqlite"
@@ -75,7 +75,15 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	streams, err := sqlite.NewRunStreams(ctx, db, 0)
+	// Live events go over Flow realtime, one channel per thread. The kv
+	// holds the few that are too big for one message.
+	bus, err := clevixflow.NewBus(client, clevixflow.BusOptions{Kv: kv})
+	if err != nil {
+		log.Fatal(err)
+	}
+	// A run's output is kept in Flow streams, so a page that reloads picks
+	// up where it left off.
+	streams, err := clevixflow.NewStreams(client, clevixflow.StreamsOptions{Kv: kv})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -86,9 +94,7 @@ func main() {
 	// that. A longer run goes on in a new segment.
 	cfg.SegmentTimeout = 13 * time.Minute
 	rt, err := agentenkit.SetupAgentCore(ctx, agentenkit.RuntimeOptions{
-		Storage: storage, Admin: admin, Kv: kv, Streams: streams,
-		// One process, so an in-memory bus is enough.
-		Bus: memory.NewBus(),
+		Storage: storage, Admin: admin, Kv: kv, Streams: streams, Bus: bus,
 		// Each job starts a run of the Flow function below.
 		Queue:  clevixflow.New(client, clevixflow.Options{}),
 		Config: &cfg,
@@ -134,7 +140,7 @@ func main() {
 
 	s := &server{rt: rt, chat: chat, info: map[string]any{
 		"title":    "Flow queue",
-		"subtitle": "agentic-kit on Clevix Flow: each job is a Flow run.",
+		"subtitle": "agentic-kit on Clevix Flow: the queue, the bus and the run streams.",
 		"runtime":  "go",
 		"tools":    []string{"web_fetch", "saveNote"},
 		"prompts": []string{

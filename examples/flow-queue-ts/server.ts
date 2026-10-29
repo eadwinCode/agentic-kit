@@ -1,8 +1,9 @@
 /**
- * agentic-kit with Clevix Flow as its queue: every job is a Flow run you can
- * watch in the Flow dashboard. The agent reads pages with web_fetch and saves
- * notes with saveNote, which waits for your approval. SQLite on disk, and the
- * shared page from ../tools-ui.
+ * agentic-kit on Clevix Flow: Flow is the queue (every job is a Flow run you
+ * can watch in the Flow dashboard), the bus, and the run streams. The agent
+ * reads pages with web_fetch and saves notes with saveNote, which waits for
+ * your approval. Threads and the kv are in SQLite on disk, and the page is
+ * the shared one from ../tools-ui.
  *
  * The same app in Go is ../flow-queue-go.
  */
@@ -14,9 +15,8 @@ import { Flow, serve } from '@clevix/flow';
 import { tool } from 'ai';
 import { z } from 'zod';
 import { PageReader, markRequiresConfirmation, pricing, setupAgentCore } from 'agentenkit';
-import { FlowQueue, agentRunFunction } from 'agentenkit/adapters/flow';
-import { MemoryBus } from 'agentenkit/adapters/memory';
-import { SqliteKv, SqliteRunStreams, SqliteStorage } from 'agentenkit/adapters/sqlite';
+import { FlowBus, FlowQueue, FlowStreams, agentRunFunction } from 'agentenkit/adapters/flow';
+import { SqliteKv, SqliteStorage } from 'agentenkit/adapters/sqlite';
 import { SqliteAdminStore } from 'agentenkit/admin/sqlite';
 
 // Keys come from this folder's .env, then the repo's root .env. A key
@@ -47,16 +47,20 @@ const flow = new Flow({ id: process.env.FLOW_APP_ID || 'agentenkit-flow-ts' });
 
 const db = new Database(process.env.DB_FILE || join(import.meta.dir, 'flow-queue.sqlite'));
 const storage = new SqliteStorage(db);
+const kv = new SqliteKv(db);
 
 const runtime = await setupAgentCore({
   storage,
-  streams: new SqliteRunStreams(db),
   admin: SqliteAdminStore.open(db),
-  // One process, so an in-memory bus is enough.
-  bus: new MemoryBus(),
-  kv: new SqliteKv(db),
+  kv,
   // Each job starts a run of the Flow function below.
   queue: new FlowQueue(flow),
+  // Live events go over Flow realtime, one channel per thread. The kv holds
+  // the few that are too big for one message.
+  bus: new FlowBus(flow, { kv }),
+  // A run's output is kept in Flow streams, so a page that reloads picks up
+  // where it left off.
+  streams: new FlowStreams(flow, { kv }),
   resolveModel: (name) => {
     if (!(name in modelPrices) && name !== model) throw new Error(`unknown model ${name}`);
     return { instance: () => openai.chat(name), contextWindow: 128_000 };
@@ -97,7 +101,7 @@ const chat = runtime.createStreamTextAgent({
 /** What the shared page shows about this app. */
 const info = {
   title: 'Flow queue',
-  subtitle: 'agentic-kit on Clevix Flow: each job is a Flow run.',
+  subtitle: 'agentic-kit on Clevix Flow: the queue, the bus and the run streams.',
   runtime: 'ts',
   tools: ['web_fetch', 'saveNote'],
   prompts: [
