@@ -17,6 +17,86 @@ describe('flow names', () => {
   });
 });
 
+// A stand-in for the Flow client: only the calls a test needs.
+const fakeFlow = (parts: Record<string, unknown>) => parts as unknown as Flow;
+
+/** A kv whose reads take a while, like a remote one. */
+class SlowKv extends MemoryKv {
+  override async get(key: string) {
+    await sleep(30);
+    return super.get(key);
+  }
+}
+
+describe('FlowBus, without an engine', () => {
+  it('subscribe throws when the socket cannot start, and a later subscribe tries again', async () => {
+    let calls = 0;
+    const flow = fakeFlow({
+      realtime: {
+        subscribe: (opts: { onState: (s: string) => void }) => {
+          calls++;
+          if (calls === 1) throw new Error('realtime needs a WebSocket');
+          opts.onState('open');
+          return () => {};
+        },
+      },
+    });
+    const bus = new FlowBus(flow, { kv: new MemoryKv(), openTimeoutMs: 5_000 });
+    const started = Date.now();
+    await expect(bus.subscribe('t', () => {})).rejects.toThrow('realtime needs a WebSocket');
+    expect(Date.now() - started).toBeLessThan(1_000); // not the open timeout
+    const unsubscribe = await bus.subscribe('t', () => {});
+    expect(calls).toBe(2);
+    unsubscribe();
+  });
+
+  it('keeps the order when an earlier event waits on the kv', async () => {
+    let send!: (data: unknown) => void;
+    const flow = fakeFlow({
+      realtime: {
+        subscribe: (opts: { onState: (s: string) => void; onMessage: (m: { data: unknown }) => void }) => {
+          send = (data) => opts.onMessage({ data });
+          opts.onState('open');
+          return () => {};
+        },
+      },
+    });
+    const kv = new SlowKv();
+    const bus = new FlowBus(flow, { kv });
+    const event = (seq: number) => ({ threadId: 't', seq, type: 'TEXT', payload: null, createdAt: new Date() }) as unknown as AgentEvent;
+    await kv.set('ref-1', JSON.stringify(event(1)));
+    const seqs: number[] = [];
+    const unsubscribe = await bus.subscribe('t', (e) => seqs.push(e.seq));
+    send({ ref: 'ref-1' }); // big: read from the kv
+    send({ event: event(2) }); // small: inline
+    await sleep(100);
+    expect(seqs).toEqual([1, 2]);
+    unsubscribe();
+  });
+});
+
+describe('FlowStreams.snapshot, without an engine', () => {
+  const streams = (items: Array<{ offset: string; item: unknown }>) =>
+    new FlowStreams(
+      fakeFlow({ streams: { snapshot: async () => ({ meta: { threadId: 't', runId: 'r' }, items, ended: true }) } }),
+      { kv: new MemoryKv() },
+    );
+
+  it('gives the end item as the event, without its offset', async () => {
+    const snap = await streams([
+      { offset: '1', item: { type: 'TEXT_MESSAGE_CONTENT', messageId: 'm', delta: 'hi' } },
+      { offset: '2', item: { type: 'RUN_FINISHED', status: 'finished' } },
+    ]).snapshot('s');
+    expect(snap?.end).toEqual({ type: 'RUN_FINISHED', status: 'finished' });
+    expect(snap?.items.at(-1)?.offset).toBe('2');
+  });
+
+  it('has no end when the last item is not an end item', async () => {
+    const snap = await streams([{ offset: '1', item: { type: 'TEXT_MESSAGE_CONTENT', messageId: 'm', delta: 'hi' } }]).snapshot('s');
+    expect(snap?.end).toBeNull();
+  });
+});
+
 // Against a real engine: set TEST_FLOW_BASE_URL, TEST_FLOW_APP_ID and
 // TEST_FLOW_SIGNING_KEY (an app's signing key). With none, these skip.
 const baseUrl = process.env.TEST_FLOW_BASE_URL;
