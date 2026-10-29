@@ -137,6 +137,9 @@ process) and the same page:
 | `web_search`, `web_fetch` | [web-tools-ts](./examples/web-tools-ts) | [web-tools-go](./examples/web-tools-go) |
 | `bash`, `code_execution`, `text_editor` | [sandbox-tools-ts](./examples/sandbox-tools-ts) | [sandbox-tools-go](./examples/sandbox-tools-go) |
 
+The same page also runs agentic-kit on [Clevix Flow](https://eadwincode.github.io/flow-sdk/), where every job is a Flow run:
+[flow-queue-ts](./examples/flow-queue-ts) and [flow-queue-go](./examples/flow-queue-go).
+
 ```bash
 bun install && bun run --cwd examples/tools-ui build
 cd examples/web-tools-ts && bun server.ts     # needs OPENAI_API_KEY, and BRAVE_API_KEY or JINA_API_KEY to search
@@ -197,7 +200,9 @@ examples/
   web-tools-go/       the same, in Go
   sandbox-tools-ts/   bash, code_execution and text_editor alone, on a Docker (or E2B) sandbox
   sandbox-tools-go/   the same, in Go
-  tools-ui/           the one page those four share
+  flow-queue-ts/      agentic-kit on Clevix Flow: each job is a Flow run
+  flow-queue-go/      the same, in Go
+  tools-ui/           the one page those six share
 docs/                 the documentation
 ```
 

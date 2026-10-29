@@ -107,7 +107,8 @@ jobs:
       - name: Build the Go example's SPA
         run: bun run --cwd examples/go-app/web build
 
-      # The four tool examples: one shared page, two small apps per runtime.
+      # The tool examples and the Flow example: one shared page, small apps
+      # in each runtime.
       - name: Build the tool examples' page
         run: bun run --cwd examples/tools-ui build
 
@@ -115,6 +116,7 @@ jobs:
         run: |
           (cd examples/web-tools-ts && bunx tsc --noEmit)
           (cd examples/sandbox-tools-ts && bunx tsc --noEmit)
+          (cd examples/flow-queue-ts && bunx tsc --noEmit)
 
   go:
     name: go-agentenkit (go ${{ matrix.go }})
@@ -123,7 +125,7 @@ jobs:
       fail-fast: false
       matrix:
         # The minimum the module declares, plus the current release to catch drift.
-        go: ['1.25', 'stable']
+        go: ['1.27', 'stable']
 
     # The Postgres store and storage adapter are tested for real, like the
     # TypeScript suite: an unreachable database skips loudly rather than
@@ -172,10 +174,11 @@ jobs:
         working-directory: examples/go-app
         run: go vet ./... && go build -o /dev/null .
 
-      # So must the two Go tool examples (web-tools-go, sandbox-tools-go).
+      # So must the Go tool examples (web-tools-go, sandbox-tools-go) and the
+      # Flow example (flow-queue-go).
       - name: Build the Go tool examples
         working-directory: examples
         run: |
-          for d in web-tools-go sandbox-tools-go; do
+          for d in web-tools-go sandbox-tools-go flow-queue-go; do
             (cd "$d" && test -z "$(gofmt -l .)" && go vet ./... && go build -o /dev/null .)
           done

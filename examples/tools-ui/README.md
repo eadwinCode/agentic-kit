@@ -3,6 +3,8 @@
 The one page the four tool examples share:
 [web-tools-ts](../web-tools-ts), [web-tools-go](../web-tools-go),
 [sandbox-tools-ts](../sandbox-tools-ts) and [sandbox-tools-go](../sandbox-tools-go).
+The two Flow examples, [flow-queue-ts](../flow-queue-ts) and
+[flow-queue-go](../flow-queue-go), use it too.
 
 It is a chat over [`use-agentenkit`](../../packages/use-agentenkit): threads,
 each tool call with its input and result, a command's output as it runs,

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -298,7 +299,10 @@ func TestBuiltin_WebFetchWithOnlyKnownURLsOpensOnlySearchResultsAndTheUsersLinks
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "Find b, and read user.example/menu."})
 	h.handleNext(t)
 
-	mustStrings(t, fetcher.Fetched(), []string{"https://www.beta.example/b/", "https://user.example/menu"}, "the known links only")
+	// The calls of one step run at the same time, so they fetch in any order.
+	fetched := fetcher.Fetched()
+	sort.Strings(fetched)
+	mustStrings(t, fetched, []string{"https://user.example/menu", "https://www.beta.example/b/"}, "the known links only")
 	mustJSON(t, h.toolResult(t, ran.ThreadID, "c4"), map[string]any{
 		"error": "web_fetch can only open a link from your web_search results or one the user gave; https://evil.example/x?leak=1 is neither",
 	}, "refused")

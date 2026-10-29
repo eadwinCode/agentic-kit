@@ -10,7 +10,7 @@
 //
 //	ports/     the four ports you implement, the admin store, every DTO
 //	core/      the behaviors (engine, loop, HITL, subagents, follow, admin reads)
-//	adapters/  memory, inline, sqlite, postgres, redis, qstash, upstash
+//	adapters/  memory, inline, sqlite, postgres, redis, qstash, clevixflow, upstash
 //	admin/     memory, sqlite, postgres operational stores
 //
 // This root package re-exports the public surface, the way index.ts does,

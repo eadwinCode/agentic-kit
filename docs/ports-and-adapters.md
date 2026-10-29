@@ -6,10 +6,10 @@ stack; implement any of them for anything.
 | Port | Role | Reference adapters |
 | :--- | :--- | :--- |
 | `Storage` | threads, messages, the thread record, usage | `PrismaStorage`, `SqliteStorage`, `MemoryStorage` |
-| `Queue` | durable run dispatch | `QStashQueue`, `InlineQueue`, `MemoryQueue` |
-| `EventBus` | live fan-out | `RedisBus`, `UpstashBus`, `MemoryBus` |
+| `Queue` | durable run dispatch | `QStashQueue`, `FlowQueue`, `InlineQueue`, `MemoryQueue` |
+| `EventBus` | live fan-out | `RedisBus`, `UpstashBus`, `FlowBus`, `MemoryBus` |
 | `Kv` | hot state, handoff keys, counters | `RedisKv`, `UpstashKv`, `MemoryKv` |
-| `RunStreams` | one short-lived stream per run segment | `RedisRunStreams`, `UpstashRunStreams`, `PrismaRunStreams`, `SqliteRunStreams`, `MemoryRunStreams` |
+| `RunStreams` | one short-lived stream per run segment | `RedisRunStreams`, `UpstashRunStreams`, `PrismaRunStreams`, `SqliteRunStreams`, `FlowStreams`, `MemoryRunStreams` |
 
 The `Memory*` adapters are a complete implementation used by the test suite, and
 double as a template.
@@ -197,6 +197,14 @@ whether a job is still waiting, so it goes by time instead: a queued run with
 no lock is treated as lost once it has been quiet for longer than the lock
 lease, `maxQueueWaitMs` and the longest retry delay.
 
+`FlowQueue` runs each job as one run of a [Clevix Flow](https://eadwincode.github.io/flow-sdk/)
+function. A key is the function's singleton key, so a second enqueue with a
+live key throws `DuplicateJobError`, and the key is free again once its run
+ends. A delay is a sleep at the start of the run. Priority maps to Flow's run
+priority, which only takes effect under a concurrency limit. `cancel` cancels
+the run that holds a key. `find` and `stats` read Flow's runs index, which lags
+by a few seconds.
+
 An adapter that cannot honour `delaySeconds` may deliver immediately, but **must
 never throw for it** — a HITL expiry is scheduled from inside a parked tool call,
 and an adapter that rejects the option breaks approvals rather than degrading
@@ -226,6 +234,13 @@ yields N+1, so a client never misses an event and never sees one twice.
 The reference buses keep one subscriber connection per process, shared by every
 subscription, and give each subscription its own queue, so one slow client
 holds up nobody.
+
+`FlowBus` runs on [Clevix Flow](https://eadwincode.github.io/flow-sdk/)
+realtime instead: one channel per thread, and one socket per followed thread
+per process, shared by that thread's subscribers. Realtime keeps nothing and
+drops what comes while a socket reconnects, which the gap read above covers.
+An event over about 60 KB waits in the kv for a minute, and the channel
+carries its key.
 
 During a run, the bus carries little: record entries and notices such as
 `STATE_CHANGE`. Text, reasoning and tool activity go to the run stream.

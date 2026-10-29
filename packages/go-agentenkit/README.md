@@ -28,7 +28,7 @@ approvals, subagents and custom events, lives in
 go get github.com/eadwinCode/agentic-kit/packages/go-agentenkit
 ```
 
-Requires Go 1.25+. Adapters live in their own packages, so a program only compiles the
+Requires Go 1.27+. Adapters live in their own packages, so a program only compiles the
 drivers it imports.
 
 ## Running locally, with nothing to stand up
@@ -358,10 +358,10 @@ tc := agentenkit.ToolContextFrom(ctx) // state, tool call id, and PublishEvent
 | Port | Role | Reference adapters |
 | :--- | :--- | :--- |
 | `Storage` | threads / messages / the thread record / usage, incl. atomic `ClaimState` | `adapters/postgres`, `adapters/sqlite`, `adapters/memory` |
-| `EventBus` | live fan-out + HITL death notices (at-most-once) | `adapters/redis`, `adapters/upstash`, `adapters/memory` |
-| `Queue` | durable run dispatch (at-least-once) | `adapters/qstash`, `adapters/inline` (dev), `adapters/memory` |
+| `EventBus` | live fan-out + HITL death notices (at-most-once) | `adapters/redis`, `adapters/upstash`, `adapters/clevixflow`, `adapters/memory` |
+| `Queue` | durable run dispatch (at-least-once) | `adapters/qstash`, `adapters/clevixflow`, `adapters/inline` (dev), `adapters/memory` |
 | `Kv` | hot state cache, HITL handoff keys, segment/attempt counters, run locks | `adapters/redis`, `adapters/upstash`, `adapters/sqlite`, `adapters/memory` |
-| `RunStreams` | one short-lived stream per run segment | `adapters/redis`, `adapters/upstash`, `adapters/postgres`, `adapters/sqlite`, `adapters/memory` (each `NewRunStreams`) |
+| `RunStreams` | one short-lived stream per run segment | `adapters/redis`, `adapters/upstash`, `adapters/postgres`, `adapters/sqlite`, `adapters/memory` (each `NewRunStreams`), `adapters/clevixflow` (`NewStreams`) |
 
 Implement any of them for your own stack; `core/` imports nothing else. The
 [memory adapters](./adapters/memory/memory.go) are a complete implementation used by the
@@ -445,6 +445,7 @@ cycle between `core` and `ports`, so the shared types (`core/types.ts`, the type
 | `src/ports/*.ts`, `src/core/types.ts`, `src/core/state.ts` (types) | `ports/*.go` |
 | `src/core/*.ts` | `core/*.go` (`core/messages.go` is new: JSON ⇄ goai messages) |
 | `src/adapters/memory.ts`, `inline.ts`, `sqlite.ts`, `redis.ts`, `qstash.ts`, `upstash.ts` | `adapters/<name>/<name>.go` |
+| `src/adapters/flow.ts` | `adapters/clevixflow/clevixflow.go` |
 | `src/adapters/prisma.ts` | `adapters/postgres/postgres.go` |
 | `src/adapters/brave.ts`, `jina.ts`, `page-reader.ts` | `adapters/brave`, `adapters/jina`, `adapters/pagereader` |
 | `src/adapters/docker.ts`, `e2b.ts`, `local-sandbox.ts` | `adapters/docker`, `adapters/e2b`, `adapters/localsandbox` |

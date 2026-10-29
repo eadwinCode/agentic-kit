@@ -89,7 +89,8 @@
     "@upstash/qstash": ">=2.6.0",
     "@upstash/redis": ">=1.31.0",
     "redis": ">=4.7.0",
-    "pg": ">=8.0.0"
+    "pg": ">=8.0.0",
+    "@clevix/flow": ">=0.7.0"
   },
   "peerDependenciesMeta": {
     "@prisma/client": {
@@ -106,12 +107,16 @@
     },
     "pg": {
       "optional": true
+    },
+    "@clevix/flow": {
+      "optional": true
     }
   },
   "devDependencies": {
+    "@ai-sdk/provider": "^4.0.0",
+    "@clevix/flow": "https://github.com/eadwinCode/flow-sdk/releases/download/v0.7.0/clevix-flow-0.7.0.tgz",
     "@types/bun": "^1.2.0",
     "@types/node": "^22.10.0",
-    "@ai-sdk/provider": "^4.0.0",
     "@types/pg": "^8.23.1",
     "ai": "^7.0.0",
     "pg": "^8.13.0",

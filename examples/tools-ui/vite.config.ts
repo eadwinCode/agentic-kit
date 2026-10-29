@@ -3,7 +3,8 @@ import react from '@vitejs/plugin-react';
 import { fileURLToPath } from 'node:url';
 
 // One page for the four tool examples (web-tools-ts, web-tools-go,
-// sandbox-tools-ts, sandbox-tools-go). Each server serves this build and
+// sandbox-tools-ts, sandbox-tools-go) and the two Flow examples
+// (flow-queue-ts, flow-queue-go). Each server serves this build and
 // says, at /api/info, what it is and what to try.
 export default defineConfig({
   plugins: [react()],

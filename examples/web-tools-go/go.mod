@@ -1,6 +1,6 @@
 module github.com/eadwinCode/agentic-kit/examples/web-tools-go
 
-go 1.25.0
+go 1.27
 
 require (
 	github.com/eadwinCode/agentic-kit/packages/go-agentenkit v0.0.0

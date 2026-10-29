@@ -149,6 +149,9 @@ export function runStreamsSuite(name: string, make: () => Promise<RunStreams>, o
       await s.open(id, meta, HOUR);
       await s.append(id, [text('a')]);
       const got = collect(s.read(id, null));
+      // A store that pushes the deletion may end the read before delete
+      // returns: handle the rejection now, and check it below.
+      got.catch(() => undefined);
       await sleep(settle);
       await s.delete(id);
       await expect(got).rejects.toBeInstanceOf(StreamGoneError);

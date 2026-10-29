@@ -50,6 +50,7 @@ run lock.
 | Adapter | Use |
 | :--- | :--- |
 | `QStashQueue` | production, serverless |
+| `FlowQueue` | production, on [Clevix Flow](#on-clevix-flow) |
 | `InlineQueue` | development — dispatches on a later tick, honours delays, does not survive a restart |
 | `MemoryQueue` | tests |
 
@@ -63,6 +64,63 @@ queue.bind((job) => runtime.worker.handleJob(job));
 ```
 
 Nothing dispatches until `bind` runs.
+
+### On Clevix Flow
+
+`FlowQueue` runs each job as a run of one [Clevix Flow](https://eadwincode.github.io/flow-sdk/)
+function. Install `@clevix/flow` 0.7.0 or later from the flow-sdk release. Then
+serve the function that `agentRunFunction` makes along with your other Flow
+functions:
+
+```ts
+import { Flow } from '@clevix/flow';
+import { serve } from '@clevix/flow/next';
+import { FlowQueue, agentRunFunction } from 'agentenkit/adapters/flow';
+
+const flow = new Flow({ id: 'my-app' });
+const runtime = await setupAgentCore({ queue: new FlowQueue(flow), /* … */ });
+
+// app/api/flow/route.ts
+export const { GET, POST, PUT } = serve({
+  client: flow,
+  functions: [agentRunFunction(flow, runtime, { concurrency: 10 })],
+});
+```
+
+Flow can also be the bus and the run streams. Both take the kv, which holds
+the few events and items too big for Flow (over about 60 KB):
+
+```ts
+import { FlowBus, FlowStreams } from 'agentenkit/adapters/flow';
+
+const kv = new RedisKv(redis);
+setupAgentCore({ queue: new FlowQueue(flow), bus: new FlowBus(flow, { kv }), streams: new FlowStreams(flow, { kv }), kv, /* … */ });
+```
+
+In Go, `clevixflow.New(client, clevixflow.Options{})` is the queue, and
+`clevixflow.Functions(client, rt.Worker, clevixflow.FunctionOpts{})` gives the
+functions to serve with `client.Serve()`. `clevixflow.NewBus` and
+`clevixflow.NewStreams` are the bus and the run streams.
+
+- One job runs in one Flow step. Flow waits at most 14 minutes for a step.
+  When a job runs longer, Flow tries the step again, but the first call keeps
+  running, and the retry finds the run lock held and does nothing. So keep
+  segments shorter (`segmentTimeoutMs`). On serverless, the host may also kill
+  the first call.
+- `concurrency` limits the jobs of one `partitionKey` that run at once. Job
+  priorities only take effect under such a limit.
+- Flow retries a job that throws. When it gives up, the run is failed through
+  `handleDeadJob`.
+- It needs a Flow engine at v2.1.1 or later.
+- `FlowStreams`: Flow keeps a stream at most 7 days, and holds at most 20,000
+  items and 32 MB in one. A segment of nonstop text fills 20,000 items in about
+  16 minutes, so keep segments short (see above); an append past the limit
+  fails.
+- `FlowBus`: each process opens one socket per thread it follows.
+
+A whole app on Flow, in TS and Go:
+[flow-queue-ts](https://github.com/eadwinCode/agentic-kit/tree/main/examples/flow-queue-ts) and
+[flow-queue-go](https://github.com/eadwinCode/agentic-kit/tree/main/examples/flow-queue-go).
 
 > An adapter must never **throw** for `delaySeconds`. Delivering immediately is
 > an acceptable degradation; rejecting the option breaks approval expiry, which
@@ -112,6 +170,7 @@ ends) to its own short-lived stream. A client reads it through
 | `RedisRunStreams`, `UpstashRunStreams` | production; keep `streamGraceMs` short, since Redis holds it in memory |
 | `PrismaRunStreams` | production on your SQL database; needs the `RunStream` and `RunStreamEvent` models |
 | `SqliteRunStreams` | one machine, or development |
+| `FlowStreams` | production, on [Clevix Flow](#on-clevix-flow) |
 | `MemoryRunStreams` | tests |
 
 Leave it out and the runtime keeps streams in memory, and logs a warning once.
