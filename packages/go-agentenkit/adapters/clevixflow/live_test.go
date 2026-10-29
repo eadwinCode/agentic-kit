@@ -42,6 +42,31 @@ func TestNewNeedsAKv(t *testing.T) {
 	}
 }
 
+func TestSnapshotEndIsTheEndItem(t *testing.T) {
+	text := map[string]any{"offset": "1", "item": map[string]any{"type": "TEXT_MESSAGE_CONTENT", "messageId": "m", "delta": "hi"}}
+	snapshot := func(items ...any) *ports.StreamSnapshot {
+		t.Helper()
+		c, _ := newClient(t, map[string]any{"meta": map[string]any{"threadId": "t", "runId": "r"}, "items": items, "ended": true})
+		s, err := NewStreams(c, StreamsOptions{Kv: memory.NewKv()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		snap, err := s.Snapshot(context.Background(), "s", "")
+		if err != nil || snap == nil {
+			t.Fatalf("snapshot = %v, %v", snap, err)
+		}
+		return snap
+	}
+
+	snap := snapshot(text, map[string]any{"offset": "2", "item": map[string]any{"type": "RUN_FINISHED", "status": "finished"}})
+	if end, ok := snap.End.(*ports.RunFinishedEvent); !ok || end.Status != "finished" {
+		t.Errorf("end = %#v, want the RUN_FINISHED item", snap.End)
+	}
+	if snap := snapshot(text); snap.End != nil {
+		t.Errorf("end = %#v, want none when the last item is not an end item", snap.End)
+	}
+}
+
 // liveClient is a client on a real engine: TEST_FLOW_BASE_URL,
 // TEST_FLOW_APP_ID and TEST_FLOW_SIGNING_KEY. The test skips without them.
 func liveClient(t *testing.T) *flow.Client {

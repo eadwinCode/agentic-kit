@@ -7,6 +7,7 @@ import {
   StreamClosedError, StreamGoneError, type RunStreams, type StreamEnd, type StreamEvent, type StreamItem,
   type StreamMeta, type StreamSnapshot,
 } from '../ports/streams.js';
+import { isStreamEnd } from '../core/stream-events.js';
 import type { AgentEvent, JobKind, RunJob } from '../core/types.js';
 
 /** The function ID the queue starts and the worker serves, unless both are
@@ -254,6 +255,11 @@ interface BusChannel {
   handlers: Set<(event: AgentEvent) => void>;
   stop: () => void;
   open: Promise<void>;
+  /** Set when the socket could not be started: `subscribe` throws it. */
+  failed?: { error: unknown };
+  /** The frames being read, one after another, so events keep their order
+   *  even when one waits on the kv. */
+  queue: Promise<void>;
 }
 
 /** EventBus over Clevix Flow realtime.
@@ -295,6 +301,11 @@ export class FlowBus implements EventBus {
     ch.handlers.add(handler);
     this.startHeartbeat();
     await ch.open;
+    if (ch.failed) {
+      ch.handlers.delete(handler);
+      if (this.channels.size === 0) this.stopHeartbeat();
+      throw ch.failed.error;
+    }
 
     let done = false;
     const mine = ch;
@@ -323,6 +334,7 @@ export class FlowBus implements EventBus {
     const ch: BusChannel = {
       handlers: new Set(),
       open,
+      queue: Promise.resolve(),
       stop: () => {
         stopped = true;
         clearTimeout(timer);
@@ -331,22 +343,33 @@ export class FlowBus implements EventBus {
       },
     };
     this.channels.set(threadId, ch);
-    void flowThreadChannel(threadId).then((channel) => {
-      if (stopped) return;
-      stop = this.flow.realtime.subscribe<BusFrame>({
-        channel,
-        topics: [BUS_TOPIC],
-        ...this.env,
-        ...(this.opts.WebSocket ? { WebSocket: this.opts.WebSocket } : {}),
-        onState: (state) => {
-          if (state === 'open') {
-            clearTimeout(timer);
-            opened();
-          }
-        },
-        onMessage: (message) => void this.receive(ch, message.data),
+    flowThreadChannel(threadId)
+      .then((channel) => {
+        if (stopped) return;
+        stop = this.flow.realtime.subscribe<BusFrame>({
+          channel,
+          topics: [BUS_TOPIC],
+          ...this.env,
+          ...(this.opts.WebSocket ? { WebSocket: this.opts.WebSocket } : {}),
+          onState: (state) => {
+            if (state === 'open') {
+              clearTimeout(timer);
+              opened();
+            }
+          },
+          onMessage: (message) => {
+            ch.queue = ch.queue.then(() => this.receive(ch, message.data));
+          },
+        });
+      })
+      .catch((error: unknown) => {
+        // No socket (no WebSocket class, bad options): every subscriber
+        // waiting on it gets the error, as Go's Subscribe returns it.
+        ch.failed = { error };
+        if (this.channels.get(threadId) === ch) this.channels.delete(threadId);
+        clearTimeout(timer);
+        opened();
       });
-    });
     return ch;
   }
 
@@ -505,12 +528,18 @@ export class FlowStreams implements RunStreams {
       const decoded = await this.decode(item);
       if (decoded) items.push(decoded);
     }
+    // The end item is the last one; `end` is the event, without its offset.
+    let end: StreamEnd | null = null;
     const last = items[items.length - 1];
+    if (snap.ended && last && isStreamEnd(last)) {
+      const { offset: _, ...event } = last;
+      end = event as StreamEnd;
+    }
     const meta = snap.meta as unknown as StreamMeta | null;
     return {
       meta: { threadId: meta?.threadId ?? '', runId: meta?.runId ?? '' },
       items,
-      end: snap.ended && last ? (last as unknown as StreamEnd) : null,
+      end,
     };
   }
 
