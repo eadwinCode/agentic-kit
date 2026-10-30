@@ -205,6 +205,47 @@ priority, which only takes effect under a concurrency limit. `cancel` cancels
 the run that holds a key. `find` and `stats` read Flow's runs index, which lags
 by a few seconds.
 
+### QueueAdmin
+
+What an operator does to a queue sits in a second port, beside `Queue`:
+
+```ts
+interface QueueAdmin {
+  pause(): Promise<void>;
+  resume(): Promise<void>;
+  /** Drop waiting jobs that match. An empty filter is refused. */
+  purge(filter: PurgeFilter): Promise<number>;
+  /** Dead jobs, newest first. */
+  listDead(limit?: number): Promise<DeadJob[]>;
+  /** Run a dead job again. */
+  redrive(id: string): Promise<boolean>;
+  /** Drop dead jobs older than this. */
+  purgeDead(olderThanMs: number): Promise<number>;
+}
+```
+
+```go
+type QueueAdmin interface {
+	Pause(ctx context.Context) error
+	Resume(ctx context.Context) error
+	Purge(ctx context.Context, f PurgeFilter) (int64, error)
+	ListDead(ctx context.Context, limit int) ([]DeadJob, error)
+	Redrive(ctx context.Context, id string) (bool, error)
+	PurgeDead(ctx context.Context, olderThan time.Duration) (int64, error)
+}
+```
+
+The Go Postgres queue and `FlowQueue` (both runtimes) have it, so admin code
+can work with either. Check for it with a type assertion
+(`q.(ports.QueueAdmin)`) in Go.
+
+On `FlowQueue`, `pause` pauses the Flow function: jobs enqueued meanwhile wait,
+paused, and start on `resume`. A dead job is a failed run, and its ID is the
+run ID. `redrive` retries the run from where it stopped. `purge` cancels
+waiting runs, and `purgeDead` deletes failed ones, but not a run kept for
+debugging in the Flow dashboard. `purge` and the dead-job calls read the runs
+index, so they can miss a job from the last few seconds.
+
 An adapter that cannot honour `delaySeconds` may deliver immediately, but **must
 never throw for it** — a HITL expiry is scheduled from inside a parked tool call,
 and an adapter that rejects the option breaks approvals rather than degrading

@@ -14,7 +14,7 @@
       "version": "0.1.0",
       "dependencies": {
         "@ai-sdk/openai": "^4.0.0",
-        "@clevix/flow": "https://github.com/eadwinCode/flow-sdk/releases/download/v0.7.0/clevix-flow-0.7.0.tgz",
+        "@clevix/flow": "https://github.com/eadwinCode/flow-sdk/releases/download/v0.8.0/clevix-flow-0.8.0.tgz",
         "agentenkit": "workspace:*",
         "ai": "^7.0.0",
         "zod": "^3.25.76",
@@ -117,7 +117,7 @@
       },
       "devDependencies": {
         "@ai-sdk/provider": "^4.0.0",
-        "@clevix/flow": "https://github.com/eadwinCode/flow-sdk/releases/download/v0.7.0/clevix-flow-0.7.0.tgz",
+        "@clevix/flow": "https://github.com/eadwinCode/flow-sdk/releases/download/v0.8.0/clevix-flow-0.8.0.tgz",
         "@types/bun": "^1.2.0",
         "@types/node": "^22.10.0",
         "@types/pg": "^8.23.1",
@@ -127,7 +127,7 @@
         "typescript": "^5.6.3",
       },
       "peerDependencies": {
-        "@clevix/flow": ">=0.7.0",
+        "@clevix/flow": ">=0.8.0",
         "@prisma/client": ">=5.0.0",
         "@upstash/qstash": ">=2.6.0",
         "@upstash/redis": ">=1.31.0",
@@ -261,7 +261,7 @@
 
     "@babel/types": ["@babel/types@7.29.8", "", { "dependencies": { "@babel/helper-string-parser": "^7.29.7", "@babel/helper-validator-identifier": "^7.29.7" } }, "sha512-Vj1jF3cPfxg7OAfoI7QnVKLoILlm2JF9pnVHrX8qx7AHMiYWT+NDAA7jChlNgRS4WTLc/fD1lXLmPixluj+3Gg=="],
 
-    "@clevix/flow": ["@clevix/flow@https://github.com/eadwinCode/flow-sdk/releases/download/v0.7.0/clevix-flow-0.7.0.tgz", { "peerDependencies": { "express": "^5.0.0", "hono": "^4.0.0", "react": ">=18.0.0" }, "optionalPeers": ["express", "hono", "react"] }, "sha512-5l8aNYRMsMo7i1t+tkD0r9+juDIKBNgaWGtN2+cr3knK4yubZn07w7rJ8m3j9g6GX9FKKbAViIVFtI1BNE6WAw=="],
+    "@clevix/flow": ["@clevix/flow@https://github.com/eadwinCode/flow-sdk/releases/download/v0.8.0/clevix-flow-0.8.0.tgz", { "peerDependencies": { "express": "^5.0.0", "hono": "^4.0.0", "react": ">=18.0.0" }, "optionalPeers": ["express", "hono", "react"] }, "sha512-d1fP41J4AbsV25yxFI49W3L5pzRHt68T7q0ZbJWitqcY0BrKEi5G67/wMNLLDcymGxXUHrMZcWLxGQfUpU/I2w=="],
 
     "@docsearch/css": ["@docsearch/css@3.8.2", "", {}, "sha512-y05ayQFyUmCXze79+56v/4HpycYF3uFqB78pLPrSV5ZKAlDuIAAJNhaRi8tTdRNXh05yxX/TyNnzD6LwSM89vQ=="],
 

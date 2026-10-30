@@ -11,6 +11,9 @@ export {
   type Queue,
   type QueueStats,
   type QueuedJob,
+  type QueueAdmin,
+  type PurgeFilter,
+  type DeadJob,
 } from './ports/queue.js';
 export type { Kv } from './ports/kv.js';
 export {

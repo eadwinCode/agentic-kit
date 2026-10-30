@@ -1,5 +1,9 @@
-import type { ActiveRunStatus, Duration, Flow, FlowEnv, FlowFunction, Json, RunSummary, StreamItem as FlowStreamItem } from '@clevix/flow';
-import { DuplicateJobError, PayloadTooLargeError, type EnqueueOptions, type Queue, type QueueStats, type QueuedJob } from '../ports/queue.js';
+import { RetryAfterError } from '@clevix/flow';
+import type { ActiveRunStatus, Duration, Flow, FlowEnv, FlowFunction, Json, RunStatus, RunSummary, StreamItem as FlowStreamItem } from '@clevix/flow';
+import {
+  DuplicateJobError, PayloadTooLargeError, QueueFullError, type DeadJob, type EnqueueOptions, type PurgeFilter, type Queue,
+  type QueueAdmin, type QueueStats, type QueuedJob,
+} from '../ports/queue.js';
 import type { AgentCore } from '../ports/runtime.js';
 import type { EventBus } from '../ports/bus.js';
 import type { Kv } from '../ports/kv.js';
@@ -27,6 +31,13 @@ const MAX_PRIORITY = 600;
 
 const ACTIVE: ActiveRunStatus[] = ['queued', 'running', 'sleeping', 'waiting', 'waiting_for_app', 'paused'];
 
+/** A run that has not started its job, or waits between tries. `purge`
+ *  cancels only these. */
+const WAITING: ActiveRunStatus[] = ['queued', 'sleeping', 'waiting', 'paused'];
+
+/** The most runs one list call gives. */
+const PAGE_SIZE = 200;
+
 /** What one run of the function carries. */
 export interface FlowJobData {
   job: RunJob;
@@ -42,8 +53,24 @@ export interface FlowQueueOptions {
   /** The function to start. Defaults to `agentenkit-run`. Must match the
    *  ID given to `agentRunFunction`. */
   functionId?: string;
+  /** Lets two deployments share one Flow app: it goes in front of the
+   *  function ID, as `<namespace>-<id>`. Singleton keys belong to one
+   *  function, so the keys are apart too. Must match `agentRunFunction`'s
+   *  `namespace`. */
+  namespace?: string;
+  /** Refuses a fresh dispatch (`QueueFullError`) once this many runs wait to
+   *  start. Retries, redrives, resumes and expiries always go in. The count
+   *  comes from Flow's runs index, which lags a few seconds, so a burst can
+   *  go a little past it. Unset: no limit. */
+  maxDepth?: number;
   /** Cloudflare Workers: the handler's `env`, where the Flow keys live. */
   env?: FlowEnv;
+}
+
+/** The function's ID: `id`, or `agentenkit-run`, after the namespace. */
+function functionName(namespace: string | undefined, id: string | undefined): string {
+  const name = id || FLOW_FUNCTION_ID;
+  return namespace ? `${namespace}-${name}` : name;
 }
 
 /** Queue adapter over Clevix Flow.
@@ -56,12 +83,15 @@ export interface FlowQueueOptions {
  *  key. `find` and `stats` read Flow's runs index, which lags the runs by a
  *  few seconds.
  *
- *  Needs Flow SDK 0.7.0 or later and an engine with the run routes. */
-export class FlowQueue implements Queue {
+ *  It is also a `QueueAdmin`: `pause` and `resume` pause the function, and
+ *  the dead jobs are its failed runs.
+ *
+ *  Needs Flow SDK 0.8.0 or later and an engine with the run control routes. */
+export class FlowQueue implements Queue, QueueAdmin {
   private readonly functionId: string;
 
   constructor(private readonly flow: Flow, private readonly opts: FlowQueueOptions = {}) {
-    this.functionId = opts.functionId ?? FLOW_FUNCTION_ID;
+    this.functionId = functionName(opts.namespace, opts.functionId);
   }
 
   private get env(): { env?: FlowEnv } {
@@ -82,11 +112,19 @@ export class FlowQueue implements Queue {
         : {}),
     };
     if (new TextEncoder().encode(JSON.stringify(data)).length > MAX_DATA_BYTES) throw new PayloadTooLargeError();
+    // Only new work is refused: a retry or a resume belongs to a run that is
+    // already under way, and refusing it would strand that run.
+    if (this.opts.maxDepth && this.opts.maxDepth > 0 && !job.kind) {
+      const counts = await this.flow.runs.counts({ function: this.functionId, ...this.env });
+      if (counts.queued + counts.waiting_for_app + counts.paused >= this.opts.maxDepth) throw new QueueFullError();
+    }
 
     // Twice at most: a singleton answer with no active run means the run that
     // held the key ended in between, so the key is free now.
     for (let i = 0; i < 2; i++) {
-      const res = await this.flow.start(this.functionId, { data: data as never, ...this.env });
+      // "hold": while the queue is paused, the job waits in it, as it would
+      // in any queue, and starts on `resume`.
+      const res = await this.flow.start(this.functionId, { data: data as never, whenPaused: 'hold', ...this.env });
       if (res.started) return;
       if (res.reason === 'singleton') {
         if (res.activeRunId === null) continue;
@@ -117,11 +155,9 @@ export class FlowQueue implements Queue {
   async stats(): Promise<QueueStats> {
     const [counts, queued] = await Promise.all([
       this.flow.runs.counts({ function: this.functionId, ...this.env }),
-      this.flow.runs.list({ function: this.functionId, status: ['queued'], limit: 200, ...this.env }),
+      this.flow.runs.list({ function: this.functionId, status: ['queued'], limit: 1, order: 'oldest', ...this.env }),
     ]);
-    // Newest first. With more than one page this is the oldest of the
-    // newest 200, so it can read low.
-    const oldest = queued.items[queued.items.length - 1];
+    const oldest = queued.items[0];
     return {
       ready: counts.queued + counts.waiting_for_app,
       delayed: counts.sleeping + counts.waiting,
@@ -131,6 +167,105 @@ export class FlowQueue implements Queue {
       paused: counts.paused > 0,
       claimErrors: 0,
     };
+  }
+
+  /** Pause the function. Jobs enqueued meanwhile wait, paused, and jobs
+   *  already started pause at their next step. `resume` lets them all go. */
+  async pause(): Promise<void> {
+    await this.flow.functions.pause(this.functionId, this.env);
+  }
+
+  /** Resume the function and its paused runs. */
+  async resume(): Promise<void> {
+    await this.flow.functions.resume(this.functionId, this.env);
+  }
+
+  /** Cancel the waiting runs that match. Running runs are left alone. With
+   *  `includeDead` it deletes the failed runs that match too. It reads Flow's
+   *  runs index, so a job enqueued in the last few seconds can be missed. */
+  async purge(filter: PurgeFilter): Promise<number> {
+    if (!filter.threadId && !filter.runId && filter.kind === undefined && !(filter.olderThanMs && filter.olderThanMs > 0)) {
+      throw new Error('flow queue: purge needs a filter');
+    }
+    const tags: Record<string, string> = {};
+    if (filter.threadId) tags.threadId = filter.threadId;
+    if (filter.runId) tags.runId = filter.runId;
+    // The kind tag of a fresh dispatch is empty, which a tag filter cannot ask
+    // for, so the kind is checked here.
+    const match = (run: RunSummary) =>
+      (filter.kind === undefined || (run.tags.kind ?? '') === (filter.kind ?? '')) &&
+      (!filter.olderThanMs || Date.now() - run.createdAt > filter.olderThanMs);
+    let n = 0;
+    await this.eachRun(WAITING, tags, async (run) => {
+      if (!match(run)) return;
+      const res = await this.flow.runs.cancel({ runId: run.id }, this.env);
+      n += res.cancelled.length;
+    });
+    if (!filter.includeDead) return n;
+    await this.eachRun(['failed'], tags, async (run) => {
+      if (!match(run)) return;
+      if ((await this.flow.runs.delete(run.id, this.env)).deleted) n++;
+    });
+    return n;
+  }
+
+  /** The failed runs, newest first, with the job each carried. It asks each
+   *  run for its error, so it makes one call per job. */
+  async listDead(limit = 100): Promise<DeadJob[]> {
+    if (limit <= 0) limit = 100;
+    const out: DeadJob[] = [];
+    await this.eachRun(['failed'], {}, async (run) => {
+      if (out.length >= limit) return false;
+      const detail = await this.flow.runs.get(run.id, this.env);
+      // Gone since the list: deleted, or past its retention.
+      if (!detail) return;
+      const data = detail.event.data as unknown as FlowJobData | null;
+      out.push({
+        id: run.id,
+        job: data?.job ?? ({} as RunJob),
+        attempts: detail.attempts,
+        deadAt: new Date(run.endedAt ?? 0),
+        lastError: detail.error?.message ?? '',
+      });
+    });
+    return out;
+  }
+
+  /** Retry a failed run from where it stopped, under the same run ID. False
+   *  when there is no such failed run, the queue is paused, or another run
+   *  holds the job's key now. */
+  async redrive(id: string): Promise<boolean> {
+    return (await this.flow.runs.retry(id, this.env)).retried;
+  }
+
+  /** Delete the failed runs that ended longer ago than `olderThanMs`. Runs
+   *  kept for debugging in the dashboard stay. */
+  async purgeDead(olderThanMs: number): Promise<number> {
+    let n = 0;
+    await this.eachRun(['failed'], {}, async (run) => {
+      if (Date.now() - (run.endedAt ?? 0) <= olderThanMs) return;
+      if ((await this.flow.runs.delete(run.id, this.env)).deleted) n++;
+    });
+    return n;
+  }
+
+  /** Calls `fn` for each of the function's runs in these statuses, newest
+   *  first, page by page. `fn` gives back false to stop. */
+  private async eachRun(
+    status: RunStatus[], tags: Record<string, string>, fn: (run: RunSummary) => Promise<boolean | void>,
+  ): Promise<void> {
+    let before: string | undefined;
+    for (;;) {
+      const page = await this.flow.runs.list({
+        function: this.functionId, status: status as ActiveRunStatus[], limit: PAGE_SIZE,
+        ...(Object.keys(tags).length ? { tags } : {}), ...(before ? { before } : {}), ...this.env,
+      });
+      for (const run of page.items) {
+        if ((await fn(run)) === false) return;
+      }
+      if (!page.next) return;
+      before = page.next;
+    }
   }
 }
 
@@ -148,11 +283,17 @@ function queuedJob(run: RunSummary): QueuedJob {
 
 export interface AgentRunFunctionOptions {
   /** Defaults to `agentenkit-run`. Must match `FlowQueue`'s `functionId`.
-   *  At most 56 characters, since the failure function adds `-failure`. */
+   *  At most 56 characters with the namespace, since the failure function
+   *  adds `-failure`. */
   id?: string;
+  /** Goes in front of the ID. Must match `FlowQueue`'s `namespace`. */
+  namespace?: string;
   /** How many jobs of one `partitionKey` run at once. Unset: no limit.
    *  Job priorities only take effect under a limit. */
   concurrency?: number;
+  /** How many jobs run at once in all, whatever their `partitionKey`. Unset:
+   *  no limit. It can be set with `concurrency`. */
+  globalConcurrency?: number;
   /** Flow's retries for a job that throws. Flow's default when unset. */
   retries?: number;
   /** How long Flow waits for one job. Defaults to 14 minutes, Flow's most.
@@ -161,6 +302,37 @@ export interface AgentRunFunctionOptions {
    *  run lock held and does nothing, so keep segments shorter than this
    *  (`segmentTimeoutMs`). */
   stepTimeout?: Duration;
+  /** The longest `segmentTimeoutMs` of the agents this function runs. When
+   *  set, `agentRunFunction` throws if it is not shorter than `stepTimeout`,
+   *  since a longer segment breaks Flow's retries. */
+  segmentTimeoutMs?: number;
+  /** The wait in ms before a failed job is tried again, doubled on every
+   *  further failure up to `retryBackoffMaxMs`, as on the Postgres queue.
+   *  Unset: Flow's own backoff. `retryBackoffMaxMs` defaults to one minute. */
+  retryBackoffMs?: number;
+  retryBackoffMaxMs?: number;
+}
+
+/** The wait before try `attempt + 1`: `base` doubled `attempt` times, up to
+ *  `max`. */
+export function retryBackoff(base: number, max: number, attempt: number): number {
+  let d = base;
+  for (let i = 0; i < attempt && d < max; i++) d *= 2;
+  return Math.min(d, max);
+}
+
+/** A Flow duration in ms, read as Flow reads it: a number is ms, a string is
+ *  like "14m" or "1h30m". NaN when it is not one. */
+function durationMs(d: Duration): number {
+  if (typeof d === 'number') return d;
+  const unit: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
+  let total = 0;
+  let consumed = 0;
+  for (const m of d.trim().matchAll(/(\d+(?:\.\d+)?)(ms|s|m|h|d|w)/g)) {
+    total += Number(m[1]) * unit[m[2]!]!;
+    consumed += m[0].length;
+  }
+  return consumed > 0 && consumed === d.trim().length ? total : Number.NaN;
 }
 
 /** The Flow function that runs `FlowQueue`'s jobs. Serve it with the app's
@@ -175,15 +347,26 @@ export function agentRunFunction(
   core: Pick<AgentCore, 'worker'>,
   opts: AgentRunFunctionOptions = {},
 ): FlowFunction {
+  const stepTimeout = opts.stepTimeout ?? '14m';
+  if (opts.segmentTimeoutMs && opts.segmentTimeoutMs > 0 && !(opts.segmentTimeoutMs < durationMs(stepTimeout))) {
+    throw new Error(
+      `flow: segmentTimeoutMs ${opts.segmentTimeoutMs} must be shorter than stepTimeout ${String(stepTimeout)}, or a long segment is tried again while it still runs`,
+    );
+  }
+  const backoffMax = opts.retryBackoffMaxMs && opts.retryBackoffMaxMs > 0 ? opts.retryBackoffMaxMs : 60_000;
+  const concurrency = [
+    ...(opts.concurrency ? [{ limit: opts.concurrency, key: 'event.data.job.partitionKey' }] : []),
+    ...(opts.globalConcurrency ? [{ limit: opts.globalConcurrency }] : []),
+  ];
   return flow.createFunction(
     {
-      id: opts.id ?? FLOW_FUNCTION_ID,
+      id: functionName(opts.namespace, opts.id),
       singleton: { key: 'event.data.key', mode: 'skip' },
       tags: { runId: 'event.data.job.runId', threadId: 'event.data.job.threadId', kind: 'event.data.job.kind' },
       priority: { run: 'event.data.priority' },
-      ...(opts.concurrency ? { concurrency: { limit: opts.concurrency, key: 'event.data.job.partitionKey' } } : {}),
+      ...(concurrency.length ? { concurrency } : {}),
       ...(opts.retries !== undefined ? { retries: opts.retries } : {}),
-      timeouts: { step: opts.stepTimeout ?? '14m' },
+      timeouts: { step: stepTimeout },
       onFailure: async ({ event, error, attempts }) => {
         const data = (event.data?.event as { data?: FlowJobData } | undefined)?.data;
         if (!data?.job) return;
@@ -194,7 +377,15 @@ export function agentRunFunction(
     async ({ event, step }) => {
       const data = event.data as unknown as FlowJobData;
       if (data.notBefore) await step.sleepUntil('delay', data.notBefore);
-      return step.run('handle', () => core.worker.handleJob(data.job));
+      return step.run('handle', async ({ attempt }) => {
+        try {
+          return await core.worker.handleJob(data.job);
+        } catch (err) {
+          if (!opts.retryBackoffMs || opts.retryBackoffMs <= 0) throw err;
+          throw new RetryAfterError(err instanceof Error ? err.message : String(err),
+            Date.now() + retryBackoff(opts.retryBackoffMs, backoffMax, attempt), { cause: err });
+        }
+      });
     },
   );
 }

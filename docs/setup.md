@@ -68,7 +68,7 @@ Nothing dispatches until `bind` runs.
 ### On Clevix Flow
 
 `FlowQueue` runs each job as a run of one [Clevix Flow](https://eadwincode.github.io/flow-sdk/)
-function. Install `@clevix/flow` 0.7.0 or later from the flow-sdk release. Then
+function. Install `@clevix/flow` 0.8.0 or later from the flow-sdk release. Then
 serve the function that `agentRunFunction` makes along with your other Flow
 functions:
 
@@ -106,12 +106,29 @@ functions to serve with `client.Serve()`. `clevixflow.NewBus` and
   When a job runs longer, Flow tries the step again, but the first call keeps
   running, and the retry finds the run lock held and does nothing. So keep
   segments shorter (`segmentTimeoutMs`). On serverless, the host may also kill
-  the first call.
-- `concurrency` limits the jobs of one `partitionKey` that run at once. Job
-  priorities only take effect under such a limit.
-- Flow retries a job that throws. When it gives up, the run is failed through
-  `handleDeadJob`.
-- It needs a Flow engine at v2.1.1 or later.
+  the first call. Pass your longest segment as `agentRunFunction`'s
+  `segmentTimeoutMs` (Go: `SegmentTimeout`), and it throws when the segment
+  is not shorter than the step.
+- `concurrency` limits the jobs of one `partitionKey` that run at once, and
+  `globalConcurrency` limits all jobs at once. You can set both. Job
+  priorities only take effect under a limit.
+- Flow retries a job that throws. `retryBackoffMs` and `retryBackoffMaxMs`
+  (Go: `RetryBackoff`, `RetryBackoffMax`) set the wait between tries, as on
+  the Postgres queue; unset, Flow's own wait is used. When Flow gives up, the
+  run is failed through `handleDeadJob`.
+- `FlowQueue`'s `maxDepth` refuses a fresh dispatch with `QueueFullError` once
+  that many jobs wait. The count lags a few seconds, so a burst can go a
+  little past it.
+- `namespace` (on both `FlowQueue` and `agentRunFunction`) puts a prefix on
+  the function ID, so two environments can share one Flow app.
+- `FlowQueue` is also a `QueueAdmin`: pause, resume, purge, and the dead jobs
+  (see [ports and adapters](ports-and-adapters.md#queueadmin)).
+- **Rollouts.** A job runs inside an HTTP request from Flow to your app. A
+  rollout that stops a pod cuts the requests it is serving, and Flow then runs
+  those jobs again. Give pods a shutdown grace time longer than your longest
+  segment, so a segment can finish before the pod goes. A cut job is not lost,
+  but its segment starts over.
+- It needs Flow SDK v0.8.0 and a Flow engine with the run control routes.
 - `FlowStreams`: Flow keeps a stream at most 7 days, and holds at most 20,000
   items and 32 MB in one. A segment of nonstop text fills 20,000 items in about
   16 minutes, so keep segments short (see above); an append past the limit

@@ -215,7 +215,7 @@ func TestFind(t *testing.T) {
 
 func TestStats(t *testing.T) {
 	now := time.Now().UnixMilli()
-	c, _ := newClient(t,
+	c, e := newClient(t,
 		map[string]any{"queued": 3, "running": 2, "sleeping": 4, "waiting": 1, "waiting_for_app": 1, "paused": 0, "completed": 9, "failed": 5, "cancelled": 1, "since": 0},
 		map[string]any{"items": []any{map[string]any{"id": "run_q", "functionId": "agentenkit-run", "status": "queued", "createdAt": now - 5000, "endedAt": nil, "tags": map[string]string{}}}, "next": nil},
 	)
@@ -226,6 +226,10 @@ func TestStats(t *testing.T) {
 	if s.Ready != 4 || s.Delayed != 5 || s.InFlight != 2 || s.Dead != 5 || s.Paused || s.OldestReadyMs < 5000 {
 		t.Fatalf("stats = %+v", s)
 	}
+	// The oldest queued run is asked for, not searched among the newest.
+	if q := e.calls[1].query; q.Get("order") != "oldest" || q.Get("limit") != "1" {
+		t.Fatalf("list query = %v", q)
+	}
 }
 
 // fakeWorker records what the function hands it.
@@ -235,6 +239,8 @@ type fakeWorker struct {
 	dead    []ports.RunJob
 	tries   []int
 	causes  []error
+	// err is what the handler gives back.
+	err error
 }
 
 func (w *fakeWorker) Handler() func(context.Context, ports.RunJob) error {
@@ -242,7 +248,7 @@ func (w *fakeWorker) Handler() func(context.Context, ports.RunJob) error {
 		w.mu.Lock()
 		defer w.mu.Unlock()
 		w.handled = append(w.handled, job)
-		return nil
+		return w.err
 	}
 }
 
@@ -289,9 +295,15 @@ func TestFunctionsConfig(t *testing.T) {
 // invoke calls one function the way the engine does, with no steps done yet.
 func invoke(t *testing.T, c *flow.Client, fnID string, event any) []map[string]any {
 	t.Helper()
+	return invokeAt(t, c, fnID, event, 0)
+}
+
+// invokeAt is invoke on a given attempt, counted from 0.
+func invokeAt(t *testing.T, c *flow.Client, fnID string, event any, attempt int) []map[string]any {
+	t.Helper()
 	body, _ := json.Marshal(map[string]any{
 		"fnId": fnID, "runId": "run_1", "event": event, "events": []any{event},
-		"memo": map[string]any{}, "attempt": 0, "maxAttempts": 5,
+		"memo": map[string]any{}, "attempt": attempt, "maxAttempts": 5,
 	})
 	w := httptest.NewRecorder()
 	c.Serve().ServeHTTP(w, httptest.NewRequest(http.MethodPost, "https://app.example.com/api/flow", bytes.NewReader(body)))

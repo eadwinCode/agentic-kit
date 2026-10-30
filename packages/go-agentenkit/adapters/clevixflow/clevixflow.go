@@ -8,7 +8,10 @@
 // cancels the run that holds a key. Find and Stats read Flow's runs index,
 // which lags the runs by a few seconds.
 //
-// Needs Flow SDK v0.7.0 or later and an engine with the run routes.
+// Queue is also a ports.QueueAdmin: Pause and Resume pause the function,
+// and the dead jobs are its failed runs.
+//
+// Needs Flow SDK v0.8.0 or later and an engine with the run control routes.
 package clevixflow
 
 import (
@@ -45,6 +48,13 @@ const (
 
 var active = []string{"queued", "running", "sleeping", "waiting", "waiting_for_app", "paused"}
 
+// waiting are the statuses of a run that has not started its job, or waits
+// between tries. Purge cancels only these.
+var waiting = []string{"queued", "sleeping", "waiting", "paused"}
+
+// pageSize is the most runs one list call gives.
+const pageSize = 200
+
 // JobData is what one run of the function carries.
 type JobData struct {
 	Job ports.RunJob `json:"job"`
@@ -61,20 +71,43 @@ type Options struct {
 	// FunctionID is the function to start. Defaults to FunctionID. Must match
 	// the ID given to Functions.
 	FunctionID string
+	// Namespace lets two deployments share one Flow app: it goes in front of
+	// the function ID, as "<namespace>-<id>". Singleton keys belong to one
+	// function, so the keys are apart too. Must match Functions' Namespace.
+	Namespace string
+	// MaxDepth refuses a fresh dispatch (ports.ErrQueueFull) once this many
+	// runs wait to start. Retries, redrives, resumes and expiries always go
+	// in. The count comes from Flow's runs index, which lags a few seconds,
+	// so a burst can go a little past it. Zero means no limit.
+	MaxDepth int
 }
 
 // Queue is a Queue over Clevix Flow.
 type Queue struct {
 	client     *flow.Client
 	functionID string
+	maxDepth   int
 }
+
+var (
+	_ ports.Queue      = (*Queue)(nil)
+	_ ports.QueueAdmin = (*Queue)(nil)
+)
 
 // New makes a queue.
 func New(client *flow.Client, opts Options) *Queue {
-	if opts.FunctionID == "" {
-		opts.FunctionID = FunctionID
+	return &Queue{client: client, functionID: functionName(opts.Namespace, opts.FunctionID), maxDepth: opts.MaxDepth}
+}
+
+// functionName is the function's ID: id, or FunctionID, after the namespace.
+func functionName(namespace, id string) string {
+	if id == "" {
+		id = FunctionID
 	}
-	return &Queue{client: client, functionID: opts.FunctionID}
+	if namespace == "" {
+		return id
+	}
+	return namespace + "-" + id
 }
 
 // Enqueue starts one run for the job.
@@ -104,10 +137,23 @@ func (q *Queue) Enqueue(ctx context.Context, job ports.RunJob, opts *ports.Enque
 	if len(body) > maxDataBytes {
 		return ports.ErrPayloadTooLarge
 	}
+	// Only new work is refused: a retry or a resume belongs to a run that is
+	// already under way, and refusing it would strand that run.
+	if q.maxDepth > 0 && job.Kind == ports.JobDispatch {
+		counts, err := q.client.Runs().Counts(ctx, q.functionID)
+		if err != nil {
+			return err
+		}
+		if counts.Queued+counts.WaitingForApp+counts.Paused >= q.maxDepth {
+			return ports.ErrQueueFull
+		}
+	}
 	// Twice at most: a singleton answer with no active run means the run that
 	// held the key ended in between, so the key is free now.
 	for range 2 {
-		res, err := q.client.Start(ctx, q.functionID, flow.StartOpts{Data: json.RawMessage(body)})
+		// "hold": while the queue is paused, the job waits in it, as it
+		// would in any queue, and starts on Resume.
+		res, err := q.client.Start(ctx, q.functionID, flow.StartOpts{Data: json.RawMessage(body), WhenPaused: "hold"})
 		if err != nil {
 			return err
 		}
@@ -165,15 +211,13 @@ func (q *Queue) Stats(ctx context.Context) (ports.QueueStats, error) {
 	if err != nil {
 		return ports.QueueStats{}, err
 	}
-	queued, err := q.client.Runs().List(ctx, flow.ListRunsOpts{Function: q.functionID, Status: []string{"queued"}, Limit: 200})
+	oldest, err := q.client.Runs().List(ctx, flow.ListRunsOpts{Function: q.functionID, Status: []string{"queued"}, Limit: 1, Order: "oldest"})
 	if err != nil {
 		return ports.QueueStats{}, err
 	}
 	var oldestMs int64
-	// Newest first. With more than one page this is the oldest of the newest
-	// 200, so it can read low.
-	if n := len(queued.Items); n > 0 {
-		oldestMs = max(0, time.Now().UnixMilli()-queued.Items[n-1].CreatedAt)
+	if len(oldest.Items) > 0 {
+		oldestMs = max(0, time.Now().UnixMilli()-oldest.Items[0].CreatedAt)
 	}
 	return ports.QueueStats{
 		Ready:         counts.Queued + counts.WaitingForApp,
@@ -183,6 +227,151 @@ func (q *Queue) Stats(ctx context.Context) (ports.QueueStats, error) {
 		OldestReadyMs: oldestMs,
 		Paused:        counts.Paused > 0,
 	}, nil
+}
+
+// Pause pauses the function. Jobs enqueued meanwhile wait, paused, and jobs
+// already started pause at their next step. Resume lets them all go.
+func (q *Queue) Pause(ctx context.Context) error {
+	_, err := q.client.Functions().Pause(ctx, q.functionID)
+	return err
+}
+
+// Resume resumes the function and its paused runs.
+func (q *Queue) Resume(ctx context.Context) error {
+	_, err := q.client.Functions().Resume(ctx, q.functionID)
+	return err
+}
+
+// Purge cancels the waiting runs that match. Running runs are left alone. With
+// IncludeDead it deletes the failed runs that match too. It reads Flow's runs
+// index, so a job enqueued in the last few seconds can be missed.
+func (q *Queue) Purge(ctx context.Context, f ports.PurgeFilter) (int64, error) {
+	if f.ThreadID == "" && f.RunID == "" && f.Kind == nil && f.OlderThan <= 0 {
+		return 0, errors.New("flow queue: purge needs a filter")
+	}
+	tags := map[string]string{}
+	if f.ThreadID != "" {
+		tags["threadId"] = f.ThreadID
+	}
+	if f.RunID != "" {
+		tags["runId"] = f.RunID
+	}
+	// The kind tag of a fresh dispatch is empty, which a tag filter cannot
+	// ask for, so the kind is checked here.
+	match := func(run flow.RunSummary) bool {
+		if f.Kind != nil && run.Tags["kind"] != string(*f.Kind) {
+			return false
+		}
+		return f.OlderThan <= 0 || time.Since(time.UnixMilli(run.CreatedAt)) > f.OlderThan
+	}
+	var n int64
+	err := q.eachRun(ctx, waiting, tags, func(run flow.RunSummary) error {
+		if !match(run) {
+			return nil
+		}
+		res, err := q.client.Runs().Cancel(ctx, flow.CancelOpts{RunID: run.ID})
+		n += int64(len(res.Cancelled))
+		return err
+	})
+	if err != nil || !f.IncludeDead {
+		return n, err
+	}
+	err = q.eachRun(ctx, []string{"failed"}, tags, func(run flow.RunSummary) error {
+		if !match(run) {
+			return nil
+		}
+		deleted, err := q.client.Runs().Delete(ctx, run.ID)
+		if deleted {
+			n++
+		}
+		return err
+	})
+	return n, err
+}
+
+// ListDead lists the failed runs, newest first, with the job each carried.
+// It asks each run for its error, so it makes one call per job.
+func (q *Queue) ListDead(ctx context.Context, limit int) ([]ports.DeadJob, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	out := []ports.DeadJob{}
+	err := q.eachRun(ctx, []string{"failed"}, nil, func(run flow.RunSummary) error {
+		if len(out) >= limit {
+			return errStop
+		}
+		detail, err := q.client.Runs().Get(ctx, run.ID)
+		if err != nil || detail == nil {
+			// Gone since the list: deleted, or past its retention.
+			return err
+		}
+		d := ports.DeadJob{ID: run.ID, Attempts: detail.Attempts, DeadAt: time.UnixMilli(run.EndedAt)}
+		var data JobData
+		if json.Unmarshal(detail.Event.Data, &data) == nil {
+			d.Job = data.Job
+		}
+		if detail.Error != nil {
+			d.LastError = detail.Error.Message
+		}
+		out = append(out, d)
+		return nil
+	})
+	return out, err
+}
+
+// Redrive retries a failed run from where it stopped, under the same run ID.
+// False when there is no such failed run, the queue is paused, or another
+// run holds the job's key now.
+func (q *Queue) Redrive(ctx context.Context, id string) (bool, error) {
+	res, err := q.client.Runs().Retry(ctx, id)
+	return res.Retried, err
+}
+
+// PurgeDead deletes the failed runs that ended longer ago than olderThan.
+// Runs kept for debugging in the dashboard stay.
+func (q *Queue) PurgeDead(ctx context.Context, olderThan time.Duration) (int64, error) {
+	var n int64
+	err := q.eachRun(ctx, []string{"failed"}, nil, func(run flow.RunSummary) error {
+		if time.Since(time.UnixMilli(run.EndedAt)) <= olderThan {
+			return nil
+		}
+		deleted, err := q.client.Runs().Delete(ctx, run.ID)
+		if deleted {
+			n++
+		}
+		return err
+	})
+	return n, err
+}
+
+// errStop ends eachRun early without an error.
+var errStop = errors.New("stop")
+
+// eachRun calls fn for each of the function's runs in these statuses, newest
+// first, page by page.
+func (q *Queue) eachRun(ctx context.Context, status []string, tags map[string]string, fn func(flow.RunSummary) error) error {
+	opts := flow.ListRunsOpts{Function: q.functionID, Status: status, Limit: pageSize}
+	if len(tags) > 0 {
+		opts.Tags = tags
+	}
+	for {
+		page, err := q.client.Runs().List(ctx, opts)
+		if err != nil {
+			return err
+		}
+		for _, run := range page.Items {
+			if err := fn(run); err != nil {
+				if errors.Is(err, errStop) {
+					return nil
+				}
+				return err
+			}
+		}
+		if page.Next == "" {
+			return nil
+		}
+		opts.Before = page.Next
+	}
 }
 
 func randomKey() string {
@@ -201,11 +390,17 @@ type Worker interface {
 // FunctionOpts tune the Flow function.
 type FunctionOpts struct {
 	// ID defaults to FunctionID. Must match the queue's FunctionID. At most 56
-	// characters, since the failure function adds "-failure".
+	// characters with the namespace, since the failure function adds
+	// "-failure".
 	ID string
+	// Namespace goes in front of the ID. Must match the queue's Namespace.
+	Namespace string
 	// Concurrency is how many jobs of one PartitionKey run at once. Zero: no
 	// limit. Job priorities only take effect under a limit.
 	Concurrency int
+	// GlobalConcurrency is how many jobs run at once in all, whatever their
+	// PartitionKey. Zero: no limit. It can be set with Concurrency.
+	GlobalConcurrency int
 	// Retries is Flow's retries for a job that fails. Flow's default when nil.
 	Retries *int
 	// StepTimeout is how long Flow waits for one job. Defaults to 14 minutes,
@@ -214,6 +409,28 @@ type FunctionOpts struct {
 	// retry finds the run lock held and does nothing, so keep segments
 	// shorter than this (SegmentTimeout).
 	StepTimeout time.Duration
+	// SegmentTimeout is the longest SegmentTimeout of the agents this
+	// function runs. When set, Functions refuses one that is not shorter than
+	// StepTimeout, since a longer segment breaks Flow's retries.
+	SegmentTimeout time.Duration
+	// RetryBackoff is the wait before a failed job is tried again, doubled on
+	// every further failure up to RetryBackoffMax, as on the Postgres queue.
+	// Zero: Flow's own backoff. RetryBackoffMax zero means one minute.
+	RetryBackoff    time.Duration
+	RetryBackoffMax time.Duration
+}
+
+// backoff is the wait before try attempt+1: RetryBackoff doubled attempt
+// times, up to RetryBackoffMax.
+func (o FunctionOpts) backoff(attempt int) time.Duration {
+	d := o.RetryBackoff
+	for range attempt {
+		if d >= o.RetryBackoffMax {
+			break
+		}
+		d *= 2
+	}
+	return min(d, o.RetryBackoffMax)
 }
 
 // handled is the step's result.
@@ -229,11 +446,15 @@ type handled struct {
 // agentic-kit retries a failed run itself. When Flow gives up, the failure
 // function hands the job to HandleDeadJob, which fails the run.
 func Functions(client *flow.Client, worker Worker, opts FunctionOpts) ([]flow.ServableFunction, error) {
-	if opts.ID == "" {
-		opts.ID = FunctionID
-	}
+	opts.ID = functionName(opts.Namespace, opts.ID)
 	if opts.StepTimeout == 0 {
 		opts.StepTimeout = 14 * time.Minute
+	}
+	if opts.SegmentTimeout > 0 && opts.SegmentTimeout >= opts.StepTimeout {
+		return nil, fmt.Errorf("flow: SegmentTimeout %s must be shorter than StepTimeout %s, or a long segment is tried again while it still runs", opts.SegmentTimeout, opts.StepTimeout)
+	}
+	if opts.RetryBackoffMax <= 0 {
+		opts.RetryBackoffMax = time.Minute
 	}
 	fnOpts := flow.FunctionOpts{
 		ID:        opts.ID,
@@ -246,7 +467,10 @@ func Functions(client *flow.Client, worker Worker, opts FunctionOpts) ([]flow.Se
 		},
 	}
 	if opts.Concurrency > 0 {
-		fnOpts.Concurrency = []flow.Concurrency{{Limit: opts.Concurrency, Key: flow.StrPtr("event.data.job.partitionKey")}}
+		fnOpts.Concurrency = append(fnOpts.Concurrency, flow.Concurrency{Limit: opts.Concurrency, Key: flow.StrPtr("event.data.job.partitionKey")})
+	}
+	if opts.GlobalConcurrency > 0 {
+		fnOpts.Concurrency = append(fnOpts.Concurrency, flow.Concurrency{Limit: opts.GlobalConcurrency})
 	}
 	handle := worker.Handler()
 	run, err := flow.CreateFunction(client, fnOpts, flow.EventTrigger(JobEvent, nil),
@@ -259,6 +483,9 @@ func Functions(client *flow.Client, worker Worker, opts FunctionOpts) ([]flow.Se
 			}
 			return step.Run(ctx, "handle", func(ctx context.Context) (handled, error) {
 				if err := handle(ctx, data.Job); err != nil {
+					if opts.RetryBackoff > 0 {
+						return handled{}, flow.RetryAtError(err, time.Now().Add(opts.backoff(in.InputCtx.Attempt)))
+					}
 					return handled{}, err
 				}
 				return handled{Accepted: true}, nil
