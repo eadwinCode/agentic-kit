@@ -33,7 +33,7 @@ const ACTIVE: ActiveRunStatus[] = ['queued', 'running', 'sleeping', 'waiting', '
 
 /** A run that has not started its job, or waits between tries. `purge`
  *  cancels only these. */
-const WAITING: ActiveRunStatus[] = ['queued', 'sleeping', 'waiting', 'paused'];
+const WAITING: ActiveRunStatus[] = ['queued', 'sleeping', 'waiting', 'waiting_for_app', 'paused'];
 
 /** The most runs one list call gives. */
 const PAGE_SIZE = 200;
@@ -232,9 +232,11 @@ export class FlowQueue implements Queue, QueueAdmin {
   }
 
   /** Retry a failed run from where it stopped, under the same run ID. False
-   *  when there is no such failed run, the queue is paused, or another run
-   *  holds the job's key now. */
+   *  when there is no such failed run (a run `purge` cancelled is not dead),
+   *  the queue is paused, or another run holds the job's key now. */
   async redrive(id: string): Promise<boolean> {
+    const run = await this.flow.runs.get(id, this.env);
+    if (run?.status !== 'failed' || run.functionId !== this.functionId) return false;
     return (await this.flow.runs.retry(id, this.env)).retried;
   }
 
@@ -382,6 +384,8 @@ export function agentRunFunction(
           return await core.worker.handleJob(data.job);
         } catch (err) {
           if (!opts.retryBackoffMs || opts.retryBackoffMs <= 0) throw err;
+          // A job that must not be tried again, or names its own time, keeps it.
+          if (err instanceof Error && (err.name === 'NonRetriableError' || err.name === 'RetryAfterError')) throw err;
           throw new RetryAfterError(err instanceof Error ? err.message : String(err),
             Date.now() + retryBackoff(opts.retryBackoffMs, backoffMax, attempt), { cause: err });
         }

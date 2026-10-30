@@ -122,7 +122,8 @@ export interface Queue {
 export interface PurgeFilter {
   threadId?: string;
   runId?: string;
-  kind?: RunJob['kind'];
+  /** A kind, or null for a fresh dispatch (which has no kind). */
+  kind?: RunJob['kind'] | null;
   /** Keeps jobs enqueued more recently than this many ms ago. */
   olderThanMs?: number;
   /** Purges dead jobs too. Without it they are kept for their operator

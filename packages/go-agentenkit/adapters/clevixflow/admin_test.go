@@ -115,7 +115,7 @@ func TestPurge(t *testing.T) {
 	if err != nil || n != 2 {
 		t.Fatalf("n = %d, err = %v", n, err)
 	}
-	if q := e.calls[0].query; q.Get("tag.threadId") != "t1" || q.Get("status") != "queued,sleeping,waiting,paused" {
+	if q := e.calls[0].query; q.Get("tag.threadId") != "t1" || q.Get("status") != "queued,sleeping,waiting,waiting_for_app,paused" {
 		t.Fatalf("list query = %v", q)
 	}
 	if e.calls[1].path != "/v1/runs/cancel" || e.calls[1].body["runId"] != "run_a" {
@@ -152,7 +152,15 @@ func TestListDead(t *testing.T) {
 }
 
 func TestRedrive(t *testing.T) {
-	c, e := newClient(t, map[string]any{"retried": true}, map[string]any{"retried": false, "reason": "paused"})
+	detail := func(status string) any {
+		return map[string]any{"id": "run_f", "functionId": "agentenkit-run", "status": status, "createdAt": 1, "endedAt": 2,
+			"tags": map[string]string{}, "attempts": 1, "error": nil, "event": map[string]any{"id": "e", "name": "n", "data": map[string]any{}, "ts": 1}}
+	}
+	c, e := newClient(t,
+		detail("failed"), map[string]any{"retried": true},
+		detail("failed"), map[string]any{"retried": false, "reason": "paused"},
+		detail("cancelled"),
+	)
 	q := New(c, Options{})
 	if ok, err := q.Redrive(context.Background(), "run_f"); !ok || err != nil {
 		t.Fatalf("ok = %v, err = %v", ok, err)
@@ -160,8 +168,26 @@ func TestRedrive(t *testing.T) {
 	if ok, err := q.Redrive(context.Background(), "run_f"); ok || err != nil {
 		t.Fatalf("paused: ok = %v, err = %v", ok, err)
 	}
-	if e.calls[0].path != "/v1/runs/run_f/retry" {
-		t.Fatalf("path = %s", e.calls[0].path)
+	// A job Purge cancelled is not dead: it is not brought back.
+	if ok, err := q.Redrive(context.Background(), "run_f"); ok || err != nil {
+		t.Fatalf("cancelled: ok = %v, err = %v", ok, err)
+	}
+	if len(e.calls) != 5 || e.calls[1].path != "/v1/runs/run_f/retry" || e.calls[4].path != "/v1/runs/run_f" {
+		t.Fatalf("calls = %+v", e.calls)
+	}
+}
+
+func TestPurgeFreshDispatchesOnly(t *testing.T) {
+	now := time.Now().UnixMilli()
+	c, e := newClient(t,
+		page("", runItem("run_d", "queued", now, 0, map[string]string{"threadId": "t1", "kind": ""}),
+			runItem("run_r", "queued", now, 0, map[string]string{"threadId": "t1", "kind": "retry"})),
+		map[string]any{"cancelled": []string{"run_d"}, "notActive": []string{}},
+	)
+	dispatch := ports.JobDispatch
+	n, err := New(c, Options{}).Purge(context.Background(), ports.PurgeFilter{ThreadID: "t1", Kind: &dispatch})
+	if err != nil || n != 1 || e.calls[1].body["runId"] != "run_d" {
+		t.Fatalf("n = %d, err = %v, calls = %+v", n, err, e.calls)
 	}
 }
 

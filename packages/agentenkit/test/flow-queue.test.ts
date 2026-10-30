@@ -221,7 +221,7 @@ describe('FlowQueue admin', () => {
     const n = await new FlowQueue(flow).purge({ threadId: 't1', kind: 'retry', olderThanMs: 30_000, includeDead: true });
     expect(n).toBe(2);
     expect(calls[0]!.query.get('tag.threadId')).toBe('t1');
-    expect(calls[0]!.query.get('status')).toBe('queued,sleeping,waiting,paused');
+    expect(calls[0]!.query.get('status')).toBe('queued,sleeping,waiting,waiting_for_app,paused');
     expect(calls[1]!.path).toBe('/v1/runs/cancel');
     expect(calls[1]!.body.runId).toBe('run_a');
     expect(calls[2]!.query.get('before')).toBe('cur');
@@ -241,12 +241,31 @@ describe('FlowQueue admin', () => {
     expect(calls).toHaveLength(2);
   });
 
-  it('redrive retries the failed run', async () => {
-    const { flow, calls } = fakeFlow([{ retried: true }, { retried: false, reason: 'paused' }]);
+  it('redrive retries a failed run, and leaves a cancelled one', async () => {
+    const detail = (status: string) => ({ ...run('run_f', status, 1, 2), attempts: 1, error: null, event: { id: 'e', name: 'n', data: {}, ts: 1 } });
+    const { flow, calls } = fakeFlow([
+      detail('failed'), { retried: true },
+      detail('failed'), { retried: false, reason: 'paused' },
+      detail('cancelled'),
+    ]);
     const q = new FlowQueue(flow);
     expect(await q.redrive('run_f')).toBe(true);
     expect(await q.redrive('run_f')).toBe(false);
-    expect(calls[0]!.path).toBe('/v1/runs/run_f/retry');
+    // A job purge cancelled is not dead: it is not brought back.
+    expect(await q.redrive('run_f')).toBe(false);
+    expect(calls.map((c) => c.path)).toEqual([
+      '/v1/runs/run_f', '/v1/runs/run_f/retry', '/v1/runs/run_f', '/v1/runs/run_f/retry', '/v1/runs/run_f',
+    ]);
+  });
+
+  it('purge with kind null takes only fresh dispatches', async () => {
+    const now = Date.now();
+    const { flow, calls } = fakeFlow([
+      { items: [run('run_d', 'queued', now, null, { threadId: 't1', kind: '' }), run('run_r', 'queued', now, null, { threadId: 't1', kind: 'retry' })], next: null },
+      { cancelled: ['run_d'], notActive: [] },
+    ]);
+    expect(await new FlowQueue(flow).purge({ threadId: 't1', kind: null })).toBe(1);
+    expect(calls[1]!.body.runId).toBe('run_d');
   });
 
   it('purgeDead deletes failed runs past the age, and counts only what went', async () => {
@@ -334,6 +353,12 @@ describe('agentRunFunction', () => {
     expect(err.message).toBe('store down');
     expect(err.retryAt).toBeGreaterThanOrEqual(before + 8000);
     expect(err.retryAt).toBeLessThanOrEqual(Date.now() + 8000);
+
+    const { NonRetriableError } = await import('@clevix/flow');
+    const final = { worker: { handleJob: async () => { throw new NonRetriableError('bad job'); }, handleDeadJob: async () => {} } };
+    const kept: any = await Promise.resolve(agentRunFunction(flow, final, { retryBackoffMs: 2000 })
+      .handler({ event: { data }, step: step([], 2) } as never)).catch((e: unknown) => e);
+    expect(kept.name).toBe('NonRetriableError');
 
     const plain: any = await Promise.resolve(agentRunFunction(flow, failing)
       .handler({ event: { data }, step: step([], 2) } as never)).catch((e: unknown) => e);

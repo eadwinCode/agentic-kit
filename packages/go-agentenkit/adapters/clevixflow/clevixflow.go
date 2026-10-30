@@ -50,7 +50,7 @@ var active = []string{"queued", "running", "sleeping", "waiting", "waiting_for_a
 
 // waiting are the statuses of a run that has not started its job, or waits
 // between tries. Purge cancels only these.
-var waiting = []string{"queued", "sleeping", "waiting", "paused"}
+var waiting = []string{"queued", "sleeping", "waiting", "waiting_for_app", "paused"}
 
 // pageSize is the most runs one list call gives.
 const pageSize = 200
@@ -320,9 +320,13 @@ func (q *Queue) ListDead(ctx context.Context, limit int) ([]ports.DeadJob, error
 }
 
 // Redrive retries a failed run from where it stopped, under the same run ID.
-// False when there is no such failed run, the queue is paused, or another
-// run holds the job's key now.
+// False when there is no such failed run (a run Purge cancelled is not dead),
+// the queue is paused, or another run holds the job's key now.
 func (q *Queue) Redrive(ctx context.Context, id string) (bool, error) {
+	run, err := q.client.Runs().Get(ctx, id)
+	if err != nil || run == nil || run.Status != "failed" || run.FunctionID != q.functionID {
+		return false, err
+	}
 	res, err := q.client.Runs().Retry(ctx, id)
 	return res.Retried, err
 }
