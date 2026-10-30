@@ -3,7 +3,7 @@ module github.com/eadwinCode/agentic-kit/packages/go-agentenkit
 go 1.27
 
 require (
-	github.com/eadwinCode/flow-sdk v0.7.0
+	github.com/eadwinCode/flow-sdk v0.8.0
 	github.com/jackc/pgx/v5 v5.7.5
 	github.com/lib/pq v1.10.9
 	github.com/redis/go-redis/v9 v9.22.0

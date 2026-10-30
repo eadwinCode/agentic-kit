@@ -123,3 +123,45 @@ type Queue interface {
 	// Stats counts what waits, runs and died.
 	Stats(ctx context.Context) (QueueStats, error)
 }
+
+// PurgeFilter picks waiting jobs for QueueAdmin.Purge. Every set field
+// narrows it; an empty filter is refused, so a typo cannot empty the queue.
+type PurgeFilter struct {
+	ThreadID string
+	RunID    string
+	Kind     *JobKind
+	// OlderThan keeps jobs enqueued more recently than this.
+	OlderThan time.Duration
+	// IncludeDead purges dead jobs too. Without it they are kept for their
+	// operator (PurgeDead drops them by age).
+	IncludeDead bool
+}
+
+// DeadJob is a job the queue gave up on, kept with the reason.
+type DeadJob struct {
+	ID        string    `json:"id"`
+	Job       RunJob    `json:"job"`
+	Attempts  int       `json:"attempts"`
+	DeadAt    time.Time `json:"deadAt"`
+	LastError string    `json:"lastError"`
+}
+
+// QueueAdmin is what an operator does to a queue, beside the Queue port:
+// stop and start it, clear it, and look at and handle what died. A queue
+// that has these implements it, so admin code works with any of them.
+type QueueAdmin interface {
+	// Pause tells the queue to stop running jobs. Jobs enqueued meanwhile
+	// wait; Resume lets them go.
+	Pause(ctx context.Context) error
+	Resume(ctx context.Context) error
+	// Purge drops waiting jobs that match, and says how many. Jobs that are
+	// running are left alone.
+	Purge(ctx context.Context, f PurgeFilter) (int64, error)
+	// ListDead lists dead jobs, newest first. Zero limit means 100.
+	ListDead(ctx context.Context, limit int) ([]DeadJob, error)
+	// Redrive runs a dead job again. False when there is no such dead job,
+	// or the queue would not take it back now.
+	Redrive(ctx context.Context, id string) (bool, error)
+	// PurgeDead drops dead jobs older than the given age.
+	PurgeDead(ctx context.Context, olderThan time.Duration) (int64, error)
+}

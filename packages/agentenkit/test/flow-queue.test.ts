@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { Flow } from '@clevix/flow';
-import { FlowQueue, agentRunFunction, type FlowJobData } from '../src/adapters/flow.js';
-import { DuplicateJobError, PayloadTooLargeError, PRIORITY_LOW } from '../src/ports/queue.js';
+import { FlowQueue, agentRunFunction, retryBackoff, type FlowJobData } from '../src/adapters/flow.js';
+import { DuplicateJobError, PayloadTooLargeError, PRIORITY_LOW, QueueFullError } from '../src/ports/queue.js';
 import type { RunJob } from '../src/core/types.js';
 
 interface Call {
@@ -148,6 +148,136 @@ describe('FlowQueue reads', () => {
     expect(stats).toMatchObject({ ready: 4, delayed: 5, inFlight: 2, dead: 5, paused: false, claimErrors: 0 });
     expect(stats.oldestReadyMs).toBeGreaterThanOrEqual(5000);
   });
+
+  it('stats asks for the oldest queued run, not the newest page', async () => {
+    const { flow, calls } = fakeFlow([{ queued: 0, since: 0 }, { items: [], next: null }]);
+    await new FlowQueue(flow).stats();
+    expect(calls[1]!.query.get('order')).toBe('oldest');
+    expect(calls[1]!.query.get('limit')).toBe('1');
+  });
+});
+
+const run = (id: string, status: string, createdAt: number, endedAt: number | null, tags: Record<string, string> = {}) => ({
+  id, functionId: 'agentenkit-run', status, createdAt, endedAt, tags,
+});
+
+describe('FlowQueue options', () => {
+  const started = { started: true, runId: 'run_1', eventId: 'evt_1' };
+
+  it('holds a job while the function is paused', async () => {
+    const { flow, calls } = fakeFlow([started]);
+    await new FlowQueue(flow).enqueue(job);
+    expect(calls[0]!.body.whenPaused).toBe('hold');
+  });
+
+  it('puts the namespace in front of the function ID', async () => {
+    const { flow, calls } = fakeFlow([started]);
+    await new FlowQueue(flow, { namespace: 'staging' }).enqueue(job);
+    expect(calls[0]!.path).toBe('/v1/functions/staging-agentenkit-run/start');
+    const fn = agentRunFunction(flow, { worker: {} as never }, { namespace: 'staging' });
+    expect(fn.id).toBe('staging-agentenkit-run');
+    expect(fn.failure?.id).toBe('staging-agentenkit-run-failure');
+  });
+
+  it('refuses a fresh dispatch at maxDepth, and lets a retry in', async () => {
+    const counts = (queued: number) => ({ queued, waiting_for_app: 1, paused: 1, since: 0 });
+    let f = fakeFlow([counts(1)]);
+    await expect(new FlowQueue(f.flow, { maxDepth: 3 }).enqueue(job)).rejects.toBeInstanceOf(QueueFullError);
+    expect(f.calls).toHaveLength(1);
+
+    f = fakeFlow([counts(0), started]);
+    await new FlowQueue(f.flow, { maxDepth: 3 }).enqueue(job);
+    expect(f.calls).toHaveLength(2);
+
+    f = fakeFlow([started]);
+    await new FlowQueue(f.flow, { maxDepth: 3 }).enqueue({ ...job, kind: 'retry' });
+    expect(f.calls).toHaveLength(1);
+  });
+});
+
+describe('FlowQueue admin', () => {
+  it('pause and resume pause the function', async () => {
+    const { flow, calls } = fakeFlow([{ paused: true, runs: 2, more: false }, { paused: false, runs: 2, more: false }]);
+    const q = new FlowQueue(flow);
+    await q.pause();
+    await q.resume();
+    expect(calls.map((c) => c.path)).toEqual(['/v1/functions/agentenkit-run/pause', '/v1/functions/agentenkit-run/resume']);
+  });
+
+  it('purge refuses an empty filter', async () => {
+    const { flow } = fakeFlow([]);
+    await expect(new FlowQueue(flow).purge({ includeDead: true })).rejects.toThrow('needs a filter');
+  });
+
+  it('purge cancels matching waiting runs and deletes matching failed ones', async () => {
+    const now = Date.now();
+    const { flow, calls } = fakeFlow([
+      { items: [run('run_a', 'queued', now - 60_000, null, { threadId: 't1', kind: 'retry' }), run('run_new', 'queued', now, null, { threadId: 't1', kind: 'retry' })], next: 'cur' },
+      { cancelled: ['run_a'], notActive: [] },
+      { items: [run('run_b', 'sleeping', now - 60_000, null, { threadId: 't1', kind: '' })], next: null },
+      { items: [run('run_f', 'failed', now - 60_000, now - 50_000, { threadId: 't1', kind: 'retry' })], next: null },
+      { deleted: true },
+    ]);
+    const n = await new FlowQueue(flow).purge({ threadId: 't1', kind: 'retry', olderThanMs: 30_000, includeDead: true });
+    expect(n).toBe(2);
+    expect(calls[0]!.query.get('tag.threadId')).toBe('t1');
+    expect(calls[0]!.query.get('status')).toBe('queued,sleeping,waiting,waiting_for_app,paused');
+    expect(calls[1]!.path).toBe('/v1/runs/cancel');
+    expect(calls[1]!.body.runId).toBe('run_a');
+    expect(calls[2]!.query.get('before')).toBe('cur');
+    expect(calls[4]!.path).toBe('/v1/runs/run_f/delete');
+  });
+
+  it('listDead gives the failed runs with their job, attempts and error', async () => {
+    const now = Date.now();
+    const data: FlowJobData = { job, key: 'd1', priority: 0 };
+    const { flow, calls } = fakeFlow([
+      { items: [run('run_f', 'failed', now - 9000, now - 1000), run('run_g', 'failed', now - 9000, now - 2000)], next: null },
+      { ...run('run_f', 'failed', now - 9000, now - 1000), attempts: 4, error: { name: 'Error', message: 'store down' }, event: { id: 'e', name: 'agentenkit/job', data, ts: 1 } },
+    ]);
+    const dead = await new FlowQueue(flow).listDead(1);
+    expect(dead).toEqual([{ id: 'run_f', job, attempts: 4, deadAt: new Date(now - 1000), lastError: 'store down' }]);
+    expect(calls[0]!.query.get('status')).toBe('failed');
+    expect(calls).toHaveLength(2);
+  });
+
+  it('redrive retries a failed run, and leaves a cancelled one', async () => {
+    const detail = (status: string) => ({ ...run('run_f', status, 1, 2), attempts: 1, error: null, event: { id: 'e', name: 'n', data: {}, ts: 1 } });
+    const { flow, calls } = fakeFlow([
+      detail('failed'), { retried: true },
+      detail('failed'), { retried: false, reason: 'paused' },
+      detail('cancelled'),
+    ]);
+    const q = new FlowQueue(flow);
+    expect(await q.redrive('run_f')).toBe(true);
+    expect(await q.redrive('run_f')).toBe(false);
+    // A job purge cancelled is not dead: it is not brought back.
+    expect(await q.redrive('run_f')).toBe(false);
+    expect(calls.map((c) => c.path)).toEqual([
+      '/v1/runs/run_f', '/v1/runs/run_f/retry', '/v1/runs/run_f', '/v1/runs/run_f/retry', '/v1/runs/run_f',
+    ]);
+  });
+
+  it('purge with kind null takes only fresh dispatches', async () => {
+    const now = Date.now();
+    const { flow, calls } = fakeFlow([
+      { items: [run('run_d', 'queued', now, null, { threadId: 't1', kind: '' }), run('run_r', 'queued', now, null, { threadId: 't1', kind: 'retry' })], next: null },
+      { cancelled: ['run_d'], notActive: [] },
+    ]);
+    expect(await new FlowQueue(flow).purge({ threadId: 't1', kind: null })).toBe(1);
+    expect(calls[1]!.body.runId).toBe('run_d');
+  });
+
+  it('purgeDead deletes failed runs past the age, and counts only what went', async () => {
+    const now = Date.now();
+    const { flow, calls } = fakeFlow([
+      { items: [run('run_old', 'failed', now - 7_200_000, now - 7_200_000), run('run_new', 'failed', now - 1000, now - 1000), run('run_kept', 'failed', now - 7_200_000, now - 7_200_000)], next: null },
+      { deleted: true },
+      { deleted: false, reason: 'kept' },
+    ]);
+    expect(await new FlowQueue(flow).purgeDead(3_600_000)).toBe(1);
+    expect(calls.map((c) => c.path)).toEqual(['/v1/runs', '/v1/runs/run_old/delete', '/v1/runs/run_kept/delete']);
+  });
 });
 
 describe('agentRunFunction', () => {
@@ -171,11 +301,11 @@ describe('agentRunFunction', () => {
     };
   }
 
-  function step(log: string[]) {
+  function step(log: string[], attempt = 0) {
     return {
-      run: async (id: string, fn: () => unknown) => {
+      run: async (id: string, fn: (info: { attempt: number }) => unknown) => {
         log.push(`run:${id}`);
-        return fn();
+        return fn({ attempt });
       },
       sleepUntil: async (id: string, time: unknown) => {
         log.push(`sleepUntil:${id}:${time}`);
@@ -192,10 +322,47 @@ describe('agentRunFunction', () => {
       singleton: { key: 'event.data.key', mode: 'skip' },
       tags: { runId: 'event.data.job.runId', threadId: 'event.data.job.threadId', kind: 'event.data.job.kind' },
       priority: { run: 'event.data.priority' },
-      concurrency: { limit: 5, key: 'event.data.job.partitionKey' },
+      concurrency: [{ limit: 5, key: 'event.data.job.partitionKey' }],
       timeouts: { step: '14m' },
     });
     expect(fn.failure?.id).toBe('agentenkit-run-failure');
+  });
+
+  it('refuses a segment that is not shorter than the step', () => {
+    const { flow } = fakeFlow([]);
+    expect(() => agentRunFunction(flow, core().core, { segmentTimeoutMs: 60 * 60_000 })).toThrow('must be shorter');
+    expect(() => agentRunFunction(flow, core().core, { segmentTimeoutMs: 10 * 60_000, stepTimeout: '1h30m' })).not.toThrow();
+    expect(() => agentRunFunction(flow, core().core, { segmentTimeoutMs: 10 * 60_000 })).not.toThrow();
+  });
+
+  it('sets a global concurrency limit beside the partition one', () => {
+    const { flow } = fakeFlow([]);
+    const fn = agentRunFunction(flow, core().core, { concurrency: 2, globalConcurrency: 10 });
+    expect(fn.options.concurrency).toEqual([{ limit: 2, key: 'event.data.job.partitionKey' }, { limit: 10 }]);
+  });
+
+  it('waits the retry backoff before the next try', async () => {
+    expect([0, 1, 2, 3, 4].map((a) => retryBackoff(1000, 5000, a))).toEqual([1000, 2000, 4000, 5000, 5000]);
+    const { flow } = fakeFlow([]);
+    const failing = { worker: { handleJob: async () => { throw new Error('store down'); }, handleDeadJob: async () => {} } };
+    const data: FlowJobData = { job, key: 'd1', priority: 0 };
+    const before = Date.now();
+    const err: any = await Promise.resolve(agentRunFunction(flow, failing, { retryBackoffMs: 2000 })
+      .handler({ event: { data }, step: step([], 2) } as never)).catch((e: unknown) => e);
+    expect(err.name).toBe('RetryAfterError');
+    expect(err.message).toBe('store down');
+    expect(err.retryAt).toBeGreaterThanOrEqual(before + 8000);
+    expect(err.retryAt).toBeLessThanOrEqual(Date.now() + 8000);
+
+    const { NonRetriableError } = await import('@clevix/flow');
+    const final = { worker: { handleJob: async () => { throw new NonRetriableError('bad job'); }, handleDeadJob: async () => {} } };
+    const kept: any = await Promise.resolve(agentRunFunction(flow, final, { retryBackoffMs: 2000 })
+      .handler({ event: { data }, step: step([], 2) } as never)).catch((e: unknown) => e);
+    expect(kept.name).toBe('NonRetriableError');
+
+    const plain: any = await Promise.resolve(agentRunFunction(flow, failing)
+      .handler({ event: { data }, step: step([], 2) } as never)).catch((e: unknown) => e);
+    expect(plain.name).toBe('Error');
   });
 
   it('runs the job in one step', async () => {

@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/eadwinCode/agentic-kit/packages/go-agentenkit v0.0.0
-	github.com/eadwinCode/flow-sdk v0.7.0
+	github.com/eadwinCode/flow-sdk v0.8.0
 	github.com/zendev-sh/goai v0.10.0
 	modernc.org/sqlite v1.57.0
 )

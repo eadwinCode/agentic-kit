@@ -377,18 +377,8 @@ func (q *Queue) Resume(ctx context.Context) error {
 	return err
 }
 
-// PurgeFilter picks waiting rows for Purge. Every set field narrows it; an
-// empty filter is refused, so a typo cannot empty the queue.
-type PurgeFilter struct {
-	ThreadID string
-	RunID    string
-	Kind     *ports.JobKind
-	// OlderThan keeps rows enqueued more recently than this.
-	OlderThan time.Duration
-	// IncludeDead purges dead rows too. Without it they are kept for their
-	// operator (PurgeDead drops them by age).
-	IncludeDead bool
-}
+// PurgeFilter picks waiting rows for Purge.
+type PurgeFilter = ports.PurgeFilter
 
 // Purge deletes waiting rows that match. Rows a worker holds are left alone,
 // and dead rows unless the filter asks for them.
@@ -440,13 +430,7 @@ func (q *Queue) Delete(ctx context.Context, id string) (bool, error) {
 }
 
 // DeadJob is a row the queue gave up on, kept with the reason.
-type DeadJob struct {
-	ID        string       `json:"id"`
-	Job       ports.RunJob `json:"job"`
-	Attempts  int          `json:"attempts"`
-	DeadAt    time.Time    `json:"deadAt"`
-	LastError string       `json:"lastError"`
-}
+type DeadJob = ports.DeadJob
 
 // ListDead lists dead rows, newest first.
 func (q *Queue) ListDead(ctx context.Context, limit int) ([]DeadJob, error) {
@@ -921,3 +905,5 @@ func (q *Queue) execute(c claimed) {
 	}
 	log.Warn("job failed; redelivery scheduled", "err", err, "in", wait.Round(time.Millisecond), "attempts", c.attempts, "maxAttempts", q.opts.MaxAttempts)
 }
+
+var _ ports.QueueAdmin = (*Queue)(nil)

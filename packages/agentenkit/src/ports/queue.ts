@@ -116,3 +116,46 @@ export interface Queue {
   /** Count what waits, runs and died. */
   stats(): Promise<QueueStats>;
 }
+
+/** Picks waiting jobs for `QueueAdmin.purge`. Every set field narrows it; an
+ *  empty filter is refused, so a typo cannot empty the queue. */
+export interface PurgeFilter {
+  threadId?: string;
+  runId?: string;
+  /** A kind, or null for a fresh dispatch (which has no kind). */
+  kind?: RunJob['kind'] | null;
+  /** Keeps jobs enqueued more recently than this many ms ago. */
+  olderThanMs?: number;
+  /** Purges dead jobs too. Without it they are kept for their operator
+   *  (`purgeDead` drops them by age). */
+  includeDead?: boolean;
+}
+
+/** A job the queue gave up on, kept with the reason. */
+export interface DeadJob {
+  id: string;
+  job: RunJob;
+  attempts: number;
+  deadAt: Date;
+  lastError: string;
+}
+
+/** What an operator does to a queue, beside the `Queue` port: stop and start
+ *  it, clear it, and look at and handle what died. A queue that has these
+ *  implements it, so admin code works with any of them. */
+export interface QueueAdmin {
+  /** Tell the queue to stop running jobs. Jobs enqueued meanwhile wait;
+   *  `resume` lets them go. */
+  pause(): Promise<void>;
+  resume(): Promise<void>;
+  /** Drop waiting jobs that match, and say how many. Jobs that are running
+   *  are left alone. */
+  purge(filter: PurgeFilter): Promise<number>;
+  /** Dead jobs, newest first. Default limit 100. */
+  listDead(limit?: number): Promise<DeadJob[]>;
+  /** Run a dead job again. False when there is no such dead job, or the
+   *  queue would not take it back now. */
+  redrive(id: string): Promise<boolean>;
+  /** Drop dead jobs older than the given age. */
+  purgeDead(olderThanMs: number): Promise<number>;
+}
