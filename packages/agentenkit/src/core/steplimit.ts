@@ -11,7 +11,7 @@ export class StepLimit {
   limit: number;
   expired = false;
 
-  constructor(private readonly abort: AbortController, base: number) {
+  constructor(private readonly abort: AbortController, readonly base: number) {
     this.limit = base;
     if (base > 0) this.arm(Date.now() + base, base);
   }
@@ -53,27 +53,31 @@ export class StepLimit {
  *  `segmentTimeoutMs`, or the queue's own limit on a job: keep those longer
  *  than the longest tool. */
 export function withToolTimeout<T extends object>(t: T, timeoutMs: number): T {
-  return Object.assign(t, { timeoutMs });
+  return { ...t, timeoutMs }; // a copy, as in Go: the tool passed in keeps its own limit
 }
 
-/** Make each tool with its own `timeoutMs` keep to it inside the step. */
+const timed = (t: any) => typeof t?.execute === 'function' && typeof t?.timeoutMs === 'number' && t.timeoutMs > 0;
+
+/** Make each tool with its own `timeoutMs` keep to it inside the step. Once
+ *  the call returns, the step has at least `stepTimeoutMs` again to finish. */
 export function withStepLimit(tools: Record<string, any>, limit: StepLimit): Record<string, any> {
+  if (!Object.values(tools).some(timed)) return tools;
   const out: Record<string, any> = {};
   for (const [name, t] of Object.entries(tools)) {
-    const ms = t?.timeoutMs;
-    if (typeof t?.execute !== 'function' || typeof ms !== 'number' || !(ms > 0)) {
+    if (!timed(t)) {
       out[name] = t;
       continue;
     }
+    const ms: number = t.timeoutMs;
     out[name] = {
       ...t,
       execute: async (args: unknown, opts: { abortSignal?: AbortSignal } & Record<string, unknown>) => {
-        limit.extend(ms);
         const parent = opts?.abortSignal;
+        if (parent?.aborted) throw parent.reason; // the step is already over: do not start
+        limit.extend(ms);
         const own = new AbortController();
         const onParent = () => own.abort(parent?.reason);
-        if (parent?.aborted) onParent();
-        else parent?.addEventListener('abort', onParent, { once: true });
+        parent?.addEventListener('abort', onParent, { once: true });
         const timer = setTimeout(() => {
           if (parent?.aborted) return;
           own.abort(new Error('tool timed out'));
@@ -84,6 +88,7 @@ export function withStepLimit(tools: Record<string, any>, limit: StepLimit): Rec
         } finally {
           clearTimeout(timer);
           parent?.removeEventListener('abort', onParent);
+          limit.extend(limit.base);
         }
       },
     };

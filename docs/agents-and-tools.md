@@ -162,7 +162,8 @@ designSheet := agentenkit.WithToolTimeout(agentenkit.AgentTool("design_sheet", "
 How it works, the same in both runtimes:
 
 - While a call to the tool runs, its step has at least that long, even when
-  the step limit is shorter. A step with no limit keeps none.
+  the step limit is shorter. Once the call returns, the step has at least the
+  step limit again to finish. A step with no limit keeps none.
 - The tool's own call has that long. A call past it ends the step the way a
   step past the step limit ends: the same `step N ran longer than …` error
   (naming the tool's limit) and the same retry.
@@ -170,6 +171,10 @@ How it works, the same in both runtimes:
   they share its longer time.
 - The tool must stop when its `abortSignal` fires (Go: when its `ctx` is done),
   as with the step limit.
+- In Go, a step whose tools include one with a `Timeout` has a context that is
+  cancelled when time runs out, with no deadline of its own, since a deadline
+  cannot be moved: `context.Cause` says `DeadlineExceeded`. The timed call
+  itself gets a real deadline. Steps with no timed tool are as before.
 - It does not lift `segmentTimeoutMs` (`SegmentTimeout`), or a queue's own limit
   on one job (for example Flow's step timeout). Keep those longer than your
   slowest tool. For work that takes much longer, have the tool start a

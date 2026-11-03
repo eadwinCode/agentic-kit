@@ -570,7 +570,7 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		// any failed step, and the run takes the retry policy (§2.8). A tool
 		// with its own Timeout gets that long while it runs, and a call past
 		// it ends the step the same way.
-		stepCtx, limit := startStepLimit(genCtx, deps.Config.StepTimeout)
+		stepCtx, limit := startStepLimit(genCtx, deps.Config.StepTimeout, input.Tools)
 		step, err := ExecuteStep(stepCtx, agent, StepCall{
 			Kind: input.Kind, Model: input.Model, Messages: prompt, Tools: withStepLimit(input.Tools, limit),
 			ProviderOptions: input.ProviderOptions, OnChunk: onChunk,
@@ -582,8 +582,9 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			batcher.flush() // the step's text is out before anything below
 		}
 		if stepTimedOut {
-			// The step's context is cancelled, not past a deadline, so what
-			// came back may say "canceled". The error says what happened.
+			// With a timed tool in the step, its context is cancelled, not
+			// past a deadline, so what came back may say "canceled". The
+			// error says what happened.
 			if err == nil || errors.Is(err, context.Canceled) {
 				err = context.DeadlineExceeded
 			}

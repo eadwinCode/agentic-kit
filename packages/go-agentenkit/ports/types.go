@@ -767,6 +767,11 @@ type Tool struct {
 	// does, with the same error and the same retry. Zero keeps the step's
 	// limit. It does not lift SegmentTimeout, or the queue's own limit on a
 	// job: keep those longer than the longest tool.
+	//
+	// A context deadline cannot be moved, so a step whose tools include one
+	// with a Timeout has a context that is cancelled when time runs out,
+	// with no Deadline: context.Cause says DeadlineExceeded. The call to the
+	// timed tool itself has a real deadline.
 	Timeout time.Duration
 }
 
