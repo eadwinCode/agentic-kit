@@ -50,6 +50,8 @@ export type {
   FollowStartOptions,
   ThreadUsage,
   Pricer,
+  BudgetLeftFn,
+  BudgetLeftCheck,
   Logger,
   RunFinishInfo,
   CompactResult,

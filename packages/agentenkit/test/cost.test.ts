@@ -7,7 +7,7 @@ import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
-import type { Pricer, RunFinishInfo, RuntimeOptions } from '../src/ports/runtime.js';
+import type { BudgetLeftFn, Pricer, RunFinishInfo, RuntimeOptions } from '../src/ports/runtime.js';
 import * as pricing from '../src/pricing.js';
 import { isToolUse } from '../src/index.js';
 import { toolUseRow } from '../src/core/builtin/run.js';
@@ -62,7 +62,7 @@ function scriptedModel(steps: ScriptedStep[]) {
 
 async function makeRuntime(
   steps: ScriptedStep[],
-  opts: { pricer?: Pricer; config?: Partial<AgentConfig>; storage?: MemoryStorage } = {},
+  opts: { pricer?: Pricer; budgetLeft?: BudgetLeftFn; config?: Partial<AgentConfig>; storage?: MemoryStorage } = {},
 ) {
   const storage = opts.storage ?? new MemoryStorage();
   const bus = new MemoryBus();
@@ -89,6 +89,7 @@ async function makeRuntime(
       };
     },
     ...(opts.pricer ? { pricer: opts.pricer } : {}),
+    ...(opts.budgetLeft ? { budgetLeft: opts.budgetLeft } : {}),
     config: resolveConfig(opts.config ?? {}),
   };
   return { runtime: await setupAgentCore(deps), storage, bus, queue, resolved };
@@ -279,6 +280,53 @@ describe('cost as part of the usage store (§4)', () => {
     expect(terminal(bus).stopReason).toBe('cost_budget');
     expect(terminal(bus).state).toBe('COMPLETED');
     expect((await runtime.getThreadUsage(ran.threadId))!.tokens.totalTokens).toBe(30);
+  });
+});
+
+describe('live budget (§4)', () => {
+  it('stops the run between steps when the host says the money is gone', async () => {
+    const asked: Array<{ runId?: string; threadId: string; state?: unknown }> = [];
+    let left = 1_000;
+    const { runtime, bus, queue } = await makeRuntime(
+      [
+        { toolCalls: [{ toolCallId: 'c1', toolName: 'probe', args: {} }] },
+        { toolCalls: [{ toolCallId: 'c2', toolName: 'probe', args: {} }] },
+        { text: 'never reached' },
+      ],
+      {
+        pricer: priceList,
+        budgetLeft: (check) => {
+          asked.push(check);
+          // Other runs spend the balance down between this run's steps.
+          left -= 600;
+          return left;
+        },
+      },
+    );
+    const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', tools: probe });
+    const ran = await chat.run({ prompt: 'hi', state: { team: 't1' } });
+    await runtime.worker.handleJob(queue.items[0]!);
+
+    // 400 left after the first step, -200 after the second: no third step.
+    expect(asked.length).toBe(2);
+    expect(asked[0]).toMatchObject({ runId: ran.runId, threadId: ran.threadId, state: { team: 't1' } });
+    const exhausted = events(bus, 'COST_BUDGET_EXHAUSTED');
+    expect(exhausted.length).toBe(1);
+    expect(exhausted[0]!.payload).toMatchObject({ budgetLeftMicros: -200 });
+    expect(terminal(bus).stopReason).toBe('cost_budget');
+    expect(terminal(bus).state).toBe('COMPLETED');
+  });
+
+  it('lets the run go on when the host has no answer', async () => {
+    const { runtime, bus, queue } = await makeRuntime(
+      [{ toolCalls: [{ toolCallId: 'c1', toolName: 'probe', args: {} }] }, { text: 'done' }],
+      { pricer: priceList, budgetLeft: () => null },
+    );
+    const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', tools: probe });
+    await chat.run({ prompt: 'hi' });
+    await runtime.worker.handleJob(queue.items[0]!);
+    expect(events(bus, 'COST_BUDGET_EXHAUSTED').length).toBe(0);
+    expect(terminal(bus).stopReason).not.toBe('cost_budget');
   });
 });
 

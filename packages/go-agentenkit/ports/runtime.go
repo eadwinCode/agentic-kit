@@ -28,6 +28,9 @@ type RuntimePorts struct {
 	// Pricer puts a price on every model call before its usage row is
 	// stored (§4). Nil stores every row unpriced.
 	Pricer Pricer
+	// BudgetLeft reads what a run may still spend, live (§4). Nil checks
+	// only the fixed money cap.
+	BudgetLeft BudgetLeftFunc
 	// Log is where the platform reports what it could not do without
 	// failing the run, such as a usage row it failed to store.
 	Log    *slog.Logger
@@ -48,6 +51,32 @@ type Pricer interface {
 	// error is logged and treated the same way: an unpriceable call must
 	// never fail a run.
 	Price(ctx context.Context, usage NewUsage) (*Cost, error)
+}
+
+// BudgetLeftFunc says what a run may still spend, read live from the host's
+// own ledger (§4), in millionths of the pricer's currency. The loop asks it
+// after every step, in the same place as the fixed money cap
+// (CostBudgetMicros): a host whose balance other runs spend at the same
+// time, with nothing held for this run, can stop it as soon as the money is
+// gone rather than at its next dispatch.
+//
+// At zero or below, the run ends the way the money cap ends it
+// (COST_BUDGET_EXHAUSTED). ok false is no answer: the run goes on, so a
+// host that wants to fail closed returns ok true and zero on its own errors.
+//
+// It runs between steps on the run's own path: one read of a balance is the
+// intended shape.
+type BudgetLeftFunc func(ctx context.Context, check BudgetLeftCheck) (leftMicros int64, ok bool)
+
+// BudgetLeftCheck is the run a BudgetLeftFunc is asked about.
+type BudgetLeftCheck struct {
+	// RunID is the DISPATCHED run the spend is billed to: a nested run is
+	// asked about its parent (§4).
+	RunID    string
+	ThreadID string
+	// AgentID is empty for the main run, the nested run's id otherwise.
+	AgentID string
+	State   AgentRunState
 }
 
 // PricerFunc adapts a plain function into a Pricer.
@@ -79,6 +108,9 @@ type RuntimeOptions struct {
 	// pricing package for the three that ship: a price table, a provider
 	// receipt reader, and a chain of both.
 	Pricer Pricer
+	// BudgetLeft reads what a run may still spend, live, after every step
+	// (§4). Nil checks only the fixed money cap. See BudgetLeftFunc.
+	BudgetLeft BudgetLeftFunc
 	// Log is where the platform reports what it could not do without
 	// failing the run. Nil uses slog.Default().
 	Log *slog.Logger

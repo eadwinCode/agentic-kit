@@ -779,6 +779,27 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			}
 		}
 
+		// The host's live budget (§4), in the same place: what the run may
+		// still spend now, which other runs spending the same balance can
+		// bring to zero before this run reaches its own cap.
+		if deps.BudgetLeft != nil {
+			left, ok := deps.BudgetLeft(ctx, ports.BudgetLeftCheck{
+				RunID: input.BillingRunID, ThreadID: threadID, AgentID: input.AgentID, State: input.State,
+			})
+			if ok && left <= 0 {
+				spent, currency := ledger.Spent()
+				exhausted := map[string]any{
+					"agentId": nullable(input.AgentID), "costMicros": spent, "budgetLeftMicros": left,
+				}
+				if currency != "" {
+					exhausted["currency"] = currency
+				}
+				_, _ = Publish(ctx, deps, threadID, "COST_BUDGET_EXHAUSTED", exhausted)
+				out.CostExhausted = true
+				break
+			}
+		}
+
 		// tool-calls → goai executed the step's tools; the loop feeds the
 		// results back. Anything else (stop, length, …) ends the run.
 		if step.FinishReason != provider.FinishToolCalls {

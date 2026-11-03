@@ -161,6 +161,70 @@ func TestCost_BudgetStopsTheRunBetweenSteps(t *testing.T) {
 	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "state")
 }
 
+// The host's live budget is asked after every step, beside the money cap: a
+// balance other runs spent down stops this run before its next step, the
+// same clean way the cap does. No answer (ok false) lets the run go on.
+func TestCost_TheLiveBudgetStopsTheRunBetweenSteps(t *testing.T) {
+	var mu sync.Mutex
+	var asked []agentenkit.BudgetLeftCheck
+	left := int64(1_000)
+	h := makeRuntimeOpts(t, scripted(
+		step{calls: []call{{"c1", "probe", `{}`}}},
+		step{calls: []call{{"c2", "probe", `{}`}}},
+		step{text: "never reached"},
+	), func(o *agentenkit.RuntimeOptions) {
+		o.Pricer = testTable
+		o.BudgetLeft = func(_ context.Context, check agentenkit.BudgetLeftCheck) (int64, bool) {
+			mu.Lock()
+			defer mu.Unlock()
+			asked = append(asked, check)
+			// Other runs spend the balance down between this run's steps.
+			left -= 600
+			return left, true
+		}
+	})
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
+		Name: "chat", Model: "gpt-4o",
+		Tools: []agentenkit.Tool{tool("probe", func(context.Context, map[string]any) (string, error) {
+			return `{}`, nil
+		})},
+	})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi", State: agentenkit.AgentRunState{"team": "t1"}})
+	h.handleNext(t)
+
+	// 400 left after the first step, -200 after the second: no third step.
+	mustEqual(t, h.model.Calls(), 2, "model calls")
+	mustEqual(t, len(asked), 2, "asked after each step")
+	mustEqual(t, asked[0].RunID, ran.RunID, "asked about the run")
+	mustEqual(t, asked[0].ThreadID, ran.ThreadID, "with its thread")
+	mustEqual(t, asked[0].State["team"], "t1", "and its state")
+	ev := h.events(ran.ThreadID, "COST_BUDGET_EXHAUSTED")
+	mustEqual(t, len(ev), 1, "COST_BUDGET_EXHAUSTED")
+	mustEqual(t, payload(ev[0])["budgetLeftMicros"], float64(-200), "budget left")
+	mustEqual(t, h.lastTerminal(ran.ThreadID)["stopReason"], "cost_budget", "stopReason")
+	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "state")
+}
+
+func TestCost_ALiveBudgetWithNoAnswerLetsTheRunGoOn(t *testing.T) {
+	h := makeRuntimeOpts(t, scripted(
+		step{calls: []call{{"c1", "probe", `{}`}}},
+		step{text: "done"},
+	), func(o *agentenkit.RuntimeOptions) {
+		o.Pricer = testTable
+		o.BudgetLeft = func(context.Context, agentenkit.BudgetLeftCheck) (int64, bool) { return 0, false }
+	})
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
+		Name: "chat", Model: "gpt-4o",
+		Tools: []agentenkit.Tool{tool("probe", func(context.Context, map[string]any) (string, error) {
+			return `{}`, nil
+		})},
+	})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
+	h.handleNext(t)
+	mustEqual(t, h.model.Calls(), 2, "model calls")
+	mustEqual(t, len(h.events(ran.ThreadID, "COST_BUDGET_EXHAUSTED")), 0, "no stop")
+}
+
 func TestCost_AStoppedCallIsStillBilled(t *testing.T) {
 	h := makeRuntimeOpts(t, scripted(
 		step{calls: []call{{"c1", "probe", `{}`}}},

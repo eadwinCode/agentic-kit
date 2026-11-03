@@ -110,6 +110,8 @@ type (
 	Cost             = ports.Cost
 	Pricer           = ports.Pricer
 	PricerFunc       = ports.PricerFunc
+	BudgetLeftFunc   = ports.BudgetLeftFunc
+	BudgetLeftCheck  = ports.BudgetLeftCheck
 	ProviderOptions  = ports.ProviderOptions
 	RunJob           = ports.RunJob
 	NestedDescriptor = ports.NestedDescriptor

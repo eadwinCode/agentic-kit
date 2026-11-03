@@ -103,6 +103,7 @@ func (c *AgentCore) scope(state AgentRunState, runID string) ports.RuntimePorts 
 		Streams:      c.opts.Streams,
 		ResolveModel: c.opts.ResolveModel,
 		Pricer:       c.opts.Pricer,
+		BudgetLeft:   c.opts.BudgetLeft,
 		Log:          c.opts.Log,
 		Config:       c.config,
 		Tools:        c.opts.Tools,

@@ -75,6 +75,9 @@ export interface RuntimePorts {
   /** Puts a price on every model call before its usage row is stored (§4).
    *  Omitted, every row is stored unpriced. */
   pricer?: Pricer;
+  /** Reads what a run may still spend, live (§4). Omitted, only the fixed
+   *  money cap is checked. */
+  budgetLeft?: BudgetLeftFn;
   /** Where the platform reports what it could not do without failing the
    *  run, such as a usage row it failed to store. Defaults to `console`. */
   log?: Logger;
@@ -102,6 +105,32 @@ export interface Pricer {
   price(usage: NewUsage): Cost | null | Promise<Cost | null>;
 }
 
+/** The run a `BudgetLeftFn` is asked about. */
+export interface BudgetLeftCheck {
+  /** The DISPATCHED run the spend is billed to: a nested run is asked about
+   *  its parent (§4). */
+  runId?: string;
+  threadId: string;
+  /** Null for the main run, the nested run's id otherwise. */
+  agentId: string | null;
+  state?: AgentRunState;
+}
+
+/** Says what a run may still spend, read live from the host's own ledger
+ *  (§4), in millionths of the pricer's currency. The loop asks it after
+ *  every step, in the same place as the fixed money cap
+ *  (`costBudgetMicros`): a host whose balance other runs spend at the same
+ *  time, with nothing held for this run, can stop it as soon as the money
+ *  is gone rather than at its next dispatch.
+ *
+ *  At zero or below, the run ends the way the money cap ends it
+ *  (`COST_BUDGET_EXHAUSTED`). `null` is no answer: the run goes on, so a
+ *  host that wants to fail closed returns 0 on its own errors.
+ *
+ *  It runs between steps on the run's own path: one read of a balance is
+ *  the intended shape. */
+export type BudgetLeftFn = (check: BudgetLeftCheck) => number | null | Promise<number | null>;
+
 export interface RuntimeOptions {
   storage: Storage;
   /** Where operational history goes (§2.9). Omitted, it is chosen from the
@@ -123,6 +152,9 @@ export interface RuntimeOptions {
    *  module for the three that ship: a price table, a provider receipt
    *  reader, and a chain of both. */
   pricer?: Pricer;
+  /** Reads what a run may still spend, live, after every step (§4).
+   *  Omitted, only the fixed money cap is checked. See `BudgetLeftFn`. */
+  budgetLeft?: BudgetLeftFn;
   /** Where the platform reports what it could not do without failing the
    *  run. Defaults to `console`. */
   log?: Logger;

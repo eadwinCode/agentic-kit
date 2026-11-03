@@ -313,6 +313,46 @@ budget, and a nested run's calls count against the same cap.
 **It needs a pricer.** With none configured nothing is ever priced, so nothing
 is ever spent and the cap can never fire.
 
+### A live budget
+
+The cap above is a number fixed when the run is dispatched (or lowered at
+pickup by `billingPreCheck`). A host that bills from one shared balance, with
+nothing held for each run, needs more: other runs can spend that balance while
+this one is running. Give `setupAgentCore` a `budgetLeft` function and the loop
+asks it after every step, in the same place as the cap:
+
+```ts
+const runtime = await setupAgentCore({
+  // ...
+  pricer,
+  budgetLeft: async ({ runId, state }) => {
+    const balance = await readBalance(state.teamId); // one read
+    return balance === undefined ? null : balance;    // micros left
+  },
+});
+```
+
+```go
+agentenkit.RuntimeOptions{
+	// ...
+	BudgetLeft: func(ctx context.Context, c agentenkit.BudgetLeftCheck) (int64, bool) {
+		left, err := readBalance(ctx, c.State["teamId"])
+		if err != nil {
+			return 0, true // fail closed: stop the run
+		}
+		return left, true
+	},
+}
+```
+
+At zero or below the run ends exactly as the cap ends it:
+`COST_BUDGET_EXHAUSTED` (with `budgetLeftMicros` in place of
+`costBudgetMicros`), then `stopReason: 'cost_budget'`, and the run completes.
+`null` (Go: `ok` false) is no answer, and the run goes on; return zero on your
+own errors to fail closed instead. A nested run is asked about its parent's
+run id, since that is the run its calls are billed to. It runs between steps
+on the run's own path, so keep it to one read.
+
 ## Calls that were cut off
 
 A run stopped mid-stream was still billed by the provider for what it had

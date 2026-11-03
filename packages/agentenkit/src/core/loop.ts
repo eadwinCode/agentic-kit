@@ -594,6 +594,25 @@ export async function runLoop(
       break;
     }
 
+    // The host's live budget (§4), in the same place: what the run may still
+    // spend now, which other runs spending the same balance can bring to
+    // zero before this run reaches its own cap.
+    if (deps.budgetLeft) {
+      const left = await deps.budgetLeft({
+        runId: input.billingRunId, threadId, agentId: input.agentId, state: input.state,
+      });
+      if (left !== null && left <= 0) {
+        await publish(deps, threadId, 'COST_BUDGET_EXHAUSTED', {
+          agentId: input.agentId,
+          costMicros: ledger.costMicros,
+          budgetLeftMicros: left,
+          ...(ledger.currency ? { currency: ledger.currency } : {}),
+        });
+        costExhausted = true;
+        break;
+      }
+    }
+
     // 'tool-calls' → the SDK executed the step's tools; the loop feeds the
     // results back. Anything else ('stop', 'length', …) ends the run.
     if (step.finishReason !== 'tool-calls') break;

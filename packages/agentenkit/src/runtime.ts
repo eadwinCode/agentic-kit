@@ -88,6 +88,7 @@ export async function setupAgentCore(opts: RuntimeOptions): Promise<AgentCore> {
     streams: opts.streams ?? inMemoryStreams(opts.log),
     resolveModel: (modelName: string) => opts.resolveModel(modelName),
     pricer: opts.pricer,
+    ...(opts.budgetLeft ? { budgetLeft: opts.budgetLeft } : {}),
     log: opts.log,
     config: resolveConfig(opts.config),
     ...(opts.tools ? { tools: opts.tools } : {}),
