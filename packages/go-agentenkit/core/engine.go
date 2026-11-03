@@ -1147,7 +1147,7 @@ func Execute(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		stopReason, state = "cancelled", ports.StateCancelled
 	case loop.CostExhausted:
 		stopReason = "cost_budget" // the money cap (§4)
-	case tokenBudget > 0 && ledger.TokensUsed() >= tokenBudget:
+	case loop.TokenExhausted:
 		stopReason = "token_budget"
 	case loop.FinishReason == provider.FinishToolCalls:
 		stopReason = "max_steps" // step ceiling hit (§2.1)

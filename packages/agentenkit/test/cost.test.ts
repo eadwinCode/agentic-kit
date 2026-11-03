@@ -7,7 +7,7 @@ import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
-import type { Pricer, RunFinishInfo, RuntimeOptions } from '../src/ports/runtime.js';
+import type { CheckCostBudgetExhaustedFn, CheckTokenBudgetExhaustedFn, CostBudgetCheck, Pricer, RunFinishInfo, RuntimeOptions } from '../src/ports/runtime.js';
 import * as pricing from '../src/pricing.js';
 import { isToolUse } from '../src/index.js';
 import { toolUseRow } from '../src/core/builtin/run.js';
@@ -62,7 +62,7 @@ function scriptedModel(steps: ScriptedStep[]) {
 
 async function makeRuntime(
   steps: ScriptedStep[],
-  opts: { pricer?: Pricer; config?: Partial<AgentConfig>; storage?: MemoryStorage } = {},
+  opts: { pricer?: Pricer; checkTokenBudgetExhausted?: CheckTokenBudgetExhaustedFn; checkCostBudgetExhausted?: CheckCostBudgetExhaustedFn; config?: Partial<AgentConfig>; storage?: MemoryStorage } = {},
 ) {
   const storage = opts.storage ?? new MemoryStorage();
   const bus = new MemoryBus();
@@ -89,6 +89,8 @@ async function makeRuntime(
       };
     },
     ...(opts.pricer ? { pricer: opts.pricer } : {}),
+    ...(opts.checkTokenBudgetExhausted ? { checkTokenBudgetExhausted: opts.checkTokenBudgetExhausted } : {}),
+    ...(opts.checkCostBudgetExhausted ? { checkCostBudgetExhausted: opts.checkCostBudgetExhausted } : {}),
     config: resolveConfig(opts.config ?? {}),
   };
   return { runtime: await setupAgentCore(deps), storage, bus, queue, resolved };
@@ -279,6 +281,90 @@ describe('cost as part of the usage store (§4)', () => {
     expect(terminal(bus).stopReason).toBe('cost_budget');
     expect(terminal(bus).state).toBe('COMPLETED');
     expect((await runtime.getThreadUsage(ran.threadId))!.tokens.totalTokens).toBe(30);
+  });
+});
+
+describe('budget checks the host can replace (§2.1, §4)', () => {
+  it('stops the run when the cost check says so, with what the step did', async () => {
+    const asked: CostBudgetCheck[] = [];
+    let left = 1_000;
+    const { runtime, bus, queue } = await makeRuntime(
+      [
+        { toolCalls: [{ toolCallId: 'c1', toolName: 'probe', args: {} }] },
+        { toolCalls: [{ toolCallId: 'c2', toolName: 'probe', args: {} }] },
+        { text: 'never reached' },
+      ],
+      {
+        pricer: priceList,
+        // A live balance: other runs spend it down between this run's steps.
+        checkCostBudgetExhausted: async (check) => {
+          asked.push(check);
+          if (!check.willContinue) return false;
+          left -= 600;
+          if (left > 0) return false;
+          await check.publish('COST_BUDGET_EXHAUSTED', { agentId: check.agentId, balanceMicros: left });
+          return true;
+        },
+      },
+    );
+    const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', tools: probe });
+    const ran = await chat.run({ prompt: 'hi', state: { team: 't1' } });
+    await runtime.worker.handleJob(queue.items[0]!);
+
+    // 400 left after the first step, -200 after the second: no third step.
+    expect(asked.length).toBe(2);
+    expect(asked[0]).toMatchObject({
+      runId: ran.runId, threadId: ran.threadId, agentId: null, state: { team: 't1' }, willContinue: true,
+    });
+    expect(asked[0]!.costMicros).toBeGreaterThan(0);
+    expect(asked[0]!.step).toMatchObject({ index: 1, finishReason: 'tool-calls', tools: ['probe'] });
+    expect(asked[1]!.step.index).toBe(2);
+    const exhausted = events(bus, 'COST_BUDGET_EXHAUSTED');
+    expect(exhausted.length).toBe(1);
+    expect(exhausted[0]!.payload).toMatchObject({ balanceMicros: -200 });
+    expect(terminal(bus).stopReason).toBe('cost_budget');
+    expect(terminal(bus).state).toBe('COMPLETED');
+  });
+
+  it('tells the check when no step follows', async () => {
+    const willContinue: boolean[] = [];
+    const { runtime, bus, queue } = await makeRuntime(
+      [{ toolCalls: [{ toolCallId: 'c1', toolName: 'probe', args: {} }] }, { text: 'done' }],
+      { pricer: priceList, checkCostBudgetExhausted: (c) => { willContinue.push(c.willContinue); return false; } },
+    );
+    const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', tools: probe });
+    await chat.run({ prompt: 'hi' });
+    await runtime.worker.handleJob(queue.items[0]!);
+    expect(willContinue).toEqual([true, false]);
+    expect(terminal(bus).stopReason).not.toBe('cost_budget');
+  });
+
+  it('replaces the token check, which then decides alone', async () => {
+    const { runtime, bus, queue } = await makeRuntime(
+      [{ toolCalls: [{ toolCallId: 'c1', toolName: 'probe', args: {} }] }, { text: 'done' }],
+      { checkTokenBudgetExhausted: (c) => c.step.index >= 1 },
+    );
+    const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', tools: probe });
+    await chat.run({ prompt: 'hi' });
+    await runtime.worker.handleJob(queue.items[0]!);
+    // Stopped after the first step, with no budget set and no event, since
+    // this check sends none.
+    expect(events(bus, 'STEP_FINISHED').length).toBe(1);
+    expect(events(bus, 'TOKEN_BUDGET_EXHAUSTED').length).toBe(0);
+    expect(terminal(bus).stopReason).toBe('token_budget');
+    expect(terminal(bus).state).toBe('COMPLETED');
+  });
+
+  it('reads a check that throws as false, as a throwing pricer is', async () => {
+    const { runtime, bus, queue } = await makeRuntime(
+      [{ toolCalls: [{ toolCallId: 'c1', toolName: 'probe', args: {} }] }, { text: 'done' }],
+      { pricer: priceList, checkCostBudgetExhausted: () => { throw new Error('balance store down'); } },
+    );
+    const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', tools: probe });
+    await chat.run({ prompt: 'hi' });
+    await runtime.worker.handleJob(queue.items[0]!);
+    expect(events(bus, 'COST_BUDGET_EXHAUSTED').length).toBe(0);
+    expect(terminal(bus).state).toBe('COMPLETED');
   });
 });
 

@@ -75,6 +75,12 @@ export interface RuntimePorts {
   /** Puts a price on every model call before its usage row is stored (§4).
    *  Omitted, every row is stored unpriced. */
   pricer?: Pricer;
+  /** Says whether a run has spent its token budget, after every step
+   *  (§2.1). Omitted, `defaultCheckTokenBudgetExhausted` is used. */
+  checkTokenBudgetExhausted?: CheckTokenBudgetExhaustedFn;
+  /** Says whether a run has spent its money budget, after every step (§4).
+   *  Omitted, `defaultCheckCostBudgetExhausted` is used. */
+  checkCostBudgetExhausted?: CheckCostBudgetExhaustedFn;
   /** Where the platform reports what it could not do without failing the
    *  run, such as a usage row it failed to store. Defaults to `console`. */
   log?: Logger;
@@ -102,6 +108,62 @@ export interface Pricer {
   price(usage: NewUsage): Cost | null | Promise<Cost | null>;
 }
 
+/** What a budget check is told after a step (§2.1, §4). */
+export interface BudgetCheck {
+  /** The DISPATCHED run the spend is billed to: a nested run is checked
+   *  against its parent's run (§4). Absent for a run dispatched without one. */
+  runId?: string;
+  threadId: string;
+  /** Null for the main run, the nested run's id otherwise. */
+  agentId: string | null;
+  state?: AgentRunState;
+  /** The step that just finished. `text` and `toolCalls` are only set with
+   *  `recordPayloads`. */
+  step: StepRecord;
+  /** True when another step would follow if the check says no. A check that
+   *  does a costly read can skip it when this is false: a run that ends
+   *  here has nothing left to stop. */
+  willContinue: boolean;
+  /** Publishes a platform event on the run's thread. A check that stops the
+   *  run says why with it, as the defaults do: `TOKEN_BUDGET_EXHAUSTED` or
+   *  `COST_BUDGET_EXHAUSTED`. */
+  publish(type: string, payload: Record<string, unknown>): Promise<void>;
+}
+
+/** What `CheckTokenBudgetExhaustedFn` is told. */
+export interface TokenBudgetCheck extends BudgetCheck {
+  /** Tokens the run has used so far, nested runs included. */
+  tokensUsed: number;
+  /** The run's `tokenBudget`, when it has one. */
+  tokenBudget?: number;
+}
+
+/** What `CheckCostBudgetExhaustedFn` is told. */
+export interface CostBudgetCheck extends BudgetCheck {
+  /** What the run has spent so far, in millionths of the pricer's currency,
+   *  nested runs included. Only priced calls count. */
+  costMicros: number;
+  currency?: string;
+  /** The run's `costBudgetMicros`, when it has one. */
+  costBudgetMicros?: number;
+}
+
+/** Says whether a run has used up its tokens. The loop asks it after every
+ *  step; true ends the run cleanly before the next step starts. A throw is
+ *  logged and read as false: a check that fails must never fail a run. */
+export type CheckTokenBudgetExhaustedFn = (check: TokenBudgetCheck) => boolean | Promise<boolean>;
+
+/** Says whether a run has used up its money. The loop asks it after every
+ *  step, after the token check; true ends the run cleanly before the next
+ *  step starts, with `stopReason: 'cost_budget'`. A throw is logged and read
+ *  as false, so a host that wants to fail closed catches its own errors and
+ *  returns true.
+ *
+ *  Replace it to read a live balance that other runs spend at the same
+ *  time. It runs on the run's own path, and nested runs may call it at
+ *  once: keep it to one read. */
+export type CheckCostBudgetExhaustedFn = (check: CostBudgetCheck) => boolean | Promise<boolean>;
+
 export interface RuntimeOptions {
   storage: Storage;
   /** Where operational history goes (§2.9). Omitted, it is chosen from the
@@ -123,6 +185,13 @@ export interface RuntimeOptions {
    *  module for the three that ship: a price table, a provider receipt
    *  reader, and a chain of both. */
   pricer?: Pricer;
+  /** Says whether a run has spent its token budget, after every step
+   *  (§2.1). Omitted, `defaultCheckTokenBudgetExhausted` checks
+   *  `tokenBudget`. */
+  checkTokenBudgetExhausted?: CheckTokenBudgetExhaustedFn;
+  /** Says whether a run has spent its money budget, after every step (§4).
+   *  Omitted, `defaultCheckCostBudgetExhausted` checks `costBudgetMicros`. */
+  checkCostBudgetExhausted?: CheckCostBudgetExhaustedFn;
   /** Where the platform reports what it could not do without failing the
    *  run. Defaults to `console`. */
   log?: Logger;

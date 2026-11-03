@@ -477,6 +477,8 @@ type LoopOutcome struct {
 	Steps int
 	// CostExhausted: the run hit its money cap and stopped between steps (§4).
 	CostExhausted bool
+	// TokenExhausted: the token check said the run is out of tokens (§2.1).
+	TokenExhausted bool
 }
 
 // stripParked drops the park sentinels from a tool message. Unlike the
@@ -747,36 +749,41 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			break
 		}
 
-		// Budget check BETWEEN steps (§2.1): the step that crossed the line is
-		// kept in full; the next one never starts. Published before the break,
-		// so a client learns why the run ended the moment it does.
-		if input.TokenBudget > 0 && ledger.TokensUsed() >= input.TokenBudget {
-			_, _ = Publish(ctx, deps, threadID, "TOKEN_BUDGET_EXHAUSTED", map[string]any{
-				"agentId": nullable(input.AgentID), "tokensUsed": ledger.TokensUsed(), "tokenBudget": input.TokenBudget,
+		// Budget checks BETWEEN steps (§2.1, §4): tokens, then money. The
+		// defaults check the run's own caps; a host can give its own, such
+		// as a live balance.
+		check := ports.BudgetCheck{
+			RunID: input.BillingRunID, ThreadID: threadID, AgentID: input.AgentID, State: input.State,
+			Step: marker, WillContinue: step.FinishReason == provider.FinishToolCalls,
+			Publish: func(ctx context.Context, eventType string, payload map[string]any) error {
+				_, err := Publish(ctx, deps, threadID, eventType, payload)
+				return err
+			},
+		}
+		checkTokens := deps.CheckTokenBudgetExhausted
+		if checkTokens == nil {
+			checkTokens = DefaultCheckTokenBudgetExhausted
+		}
+		if budgetExhausted(ctx, deps, "token budget", input.BillingRunID, func() (bool, error) {
+			return checkTokens(ctx, ports.TokenBudgetCheck{
+				BudgetCheck: check, TokensUsed: ledger.TokensUsed(), TokenBudget: input.TokenBudget,
 			})
+		}) {
+			out.TokenExhausted = true
 			break
 		}
-
-		// The money cap (§4), checked in the same place and the same way,
-		// against the same shared ledger: a nested run's calls count against
-		// it, and a run that parked or retried starts from what it already
-		// spent (see SeedRunLedger).
-		//
-		// It only ever sees priced calls: with no Pricer configured nothing is
-		// ever spent and the cap never fires.
-		if input.CostBudgetMicros > 0 {
-			if spent, currency := ledger.Spent(); spent >= input.CostBudgetMicros {
-				exhausted := map[string]any{
-					"agentId": nullable(input.AgentID), "costMicros": spent,
-					"costBudgetMicros": input.CostBudgetMicros,
-				}
-				if currency != "" { // left out when unset, as TS does
-					exhausted["currency"] = currency
-				}
-				_, _ = Publish(ctx, deps, threadID, "COST_BUDGET_EXHAUSTED", exhausted)
-				out.CostExhausted = true
-				break
-			}
+		checkCost := deps.CheckCostBudgetExhausted
+		if checkCost == nil {
+			checkCost = DefaultCheckCostBudgetExhausted
+		}
+		spent, currency := ledger.Spent()
+		if budgetExhausted(ctx, deps, "cost budget", input.BillingRunID, func() (bool, error) {
+			return checkCost(ctx, ports.CostBudgetCheck{
+				BudgetCheck: check, CostMicros: spent, Currency: currency, CostBudgetMicros: input.CostBudgetMicros,
+			})
+		}) {
+			out.CostExhausted = true
+			break
 		}
 
 		// tool-calls → goai executed the step's tools; the loop feeds the

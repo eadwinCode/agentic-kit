@@ -50,6 +50,11 @@ export type {
   FollowStartOptions,
   ThreadUsage,
   Pricer,
+  BudgetCheck,
+  TokenBudgetCheck,
+  CostBudgetCheck,
+  CheckTokenBudgetExhaustedFn,
+  CheckCostBudgetExhaustedFn,
   Logger,
   RunFinishInfo,
   CompactResult,
@@ -76,6 +81,7 @@ export {
 } from './core/engine.js';
 export { agentTool, type ToolContext } from './core/tools.js';
 export { withToolTimeout } from './core/steplimit.js';
+export { defaultCheckCostBudgetExhausted, defaultCheckTokenBudgetExhausted } from './core/budget.js';
 export {
   followEvents,
   followThread,

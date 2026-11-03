@@ -827,7 +827,7 @@ export async function execute(
         loop = {
           text: earlier.text, finishReason: 'stop',
           attribution: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 },
-          tokensUsed: 0, parked: false, aborted: false, interrupted: false, steps: 0, costExhausted: false,
+          tokensUsed: 0, parked: false, aborted: false, interrupted: false, steps: 0, costExhausted: false, tokenExhausted: false,
         };
       } else {
         const model = deps.resolveModel(input.model);
@@ -957,7 +957,7 @@ export async function execute(
         ? 'cancelled'
         : loop.costExhausted
           ? 'cost_budget' // the money cap (§4)
-          : tokenBudget && tokensUsed >= tokenBudget
+          : loop.tokenExhausted
             ? 'token_budget'
             : lastFinishReason === 'tool-calls'
               ? 'max_steps' // step ceiling hit (§2.1)

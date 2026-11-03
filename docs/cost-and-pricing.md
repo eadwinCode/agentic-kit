@@ -313,6 +313,93 @@ budget, and a nested run's calls count against the same cap.
 **It needs a pricer.** With none configured nothing is ever priced, so nothing
 is ever spent and the cap can never fire.
 
+### Your own budget checks
+
+The token cap and the money cap are the two default budget checks. After every
+step the loop asks a token check and then a money check, and either one can end
+the run. Give `setupAgentCore` your own `checkTokenBudgetExhausted` or
+`checkCostBudgetExhausted` and it replaces that default.
+
+You need this when the cap is not one fixed number. Take a host that bills
+from one shared balance, with nothing held for each run. Other runs can spend
+that balance while this one is running, so the check reads the balance live:
+
+```ts
+import { defaultCheckCostBudgetExhausted } from 'agentenkit';
+
+const runtime = await setupAgentCore({
+  // ...
+  pricer,
+  checkCostBudgetExhausted: async (c) => {
+    if (await defaultCheckCostBudgetExhausted(c)) return true; // keep the cap
+    if (!c.willContinue) return false;   // no next step, nothing to stop
+    let left: number;
+    try {
+      left = await readBalance(c.state?.teamId); // one read, in micros
+    } catch {
+      left = 0;                            // fail closed: stop the run
+    }
+    if (left > 0) return false;
+    await c.publish('COST_BUDGET_EXHAUSTED', {
+      agentId: c.agentId, costMicros: c.costMicros, balanceMicros: left,
+    });
+    return true;
+  },
+});
+```
+
+```go
+agentenkit.RuntimeOptions{
+	// ...
+	CheckCostBudgetExhausted: func(ctx context.Context, c agentenkit.CostBudgetCheck) (bool, error) {
+		if stop, _ := agentenkit.DefaultCheckCostBudgetExhausted(ctx, c); stop {
+			return true, nil // keep the cap
+		}
+		if !c.WillContinue {
+			return false, nil // no next step, nothing to stop
+		}
+		left, err := readBalance(ctx, c.State["teamId"])
+		if err != nil {
+			left = 0 // fail closed: stop the run
+		}
+		if left > 0 {
+			return false, nil
+		}
+		return true, c.Publish(ctx, "COST_BUDGET_EXHAUSTED", map[string]any{
+			"agentId": c.AgentID, "costMicros": c.CostMicros, "balanceMicros": left,
+		})
+	},
+}
+```
+
+Each check is told:
+
+- the run (`runId`, `threadId`, `agentId`, `state`). A nested run is checked
+  against its parent's run id, since that is the run its calls are billed to.
+  `runId` can be empty for a run dispatched without one.
+- the step that just finished (`step`), the same record the admin store keeps.
+  Its `text` and `toolCalls` are only set with `recordPayloads`.
+- whether another step would follow (`willContinue`). The defaults ignore it.
+  A check that does a costly read can skip it when no step follows.
+- what the run has spent so far, nested runs included, and its cap if it has
+  one: `tokensUsed` and `tokenBudget`, or `costMicros`, `currency` and
+  `costBudgetMicros`.
+- `publish`, to say why the run stopped. The loop sends nothing itself, so a
+  check that returns true without publishing ends the run without saying why.
+
+True ends the run the way the cap does. That means `stopReason: 'token_budget'`
+or `'cost_budget'`, and the run completes. A check that throws (in Go, returns
+an error or panics) is logged and read as false, the same as a throwing
+pricer. A host that wants to fail closed catches its own errors and returns
+true. Nested runs may ask at the same time as their parent, so the check must
+be safe to call at once. It runs between steps on the run's own path, so keep
+it to one read.
+
+The checks run only after a step. So the **first** step of a segment runs
+without them. A run that is started, or resumed after a park, on a balance
+that is already gone must be refused before that, in `billingPreCheck` at
+pickup.
+
 ## Calls that were cut off
 
 A run stopped mid-stream was still billed by the provider for what it had

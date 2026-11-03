@@ -110,16 +110,22 @@ type (
 	Cost             = ports.Cost
 	Pricer           = ports.Pricer
 	PricerFunc       = ports.PricerFunc
-	ProviderOptions  = ports.ProviderOptions
-	RunJob           = ports.RunJob
-	NestedDescriptor = ports.NestedDescriptor
-	ResumeInfo       = ports.ResumeInfo
-	ResolvedModel    = ports.ResolvedModel
-	Tool             = ports.Tool
-	AgentConfig      = ports.AgentConfig
-	BillingCheck     = ports.BillingCheck
-	BillingStage     = ports.BillingStage
-	RunBudget        = ports.RunBudget
+	BudgetCheck      = ports.BudgetCheck
+	TokenBudgetCheck = ports.TokenBudgetCheck
+	CostBudgetCheck  = ports.CostBudgetCheck
+
+	CheckTokenBudgetExhaustedFunc = ports.CheckTokenBudgetExhaustedFunc
+	CheckCostBudgetExhaustedFunc  = ports.CheckCostBudgetExhaustedFunc
+	ProviderOptions               = ports.ProviderOptions
+	RunJob                        = ports.RunJob
+	NestedDescriptor              = ports.NestedDescriptor
+	ResumeInfo                    = ports.ResumeInfo
+	ResolvedModel                 = ports.ResolvedModel
+	Tool                          = ports.Tool
+	AgentConfig                   = ports.AgentConfig
+	BillingCheck                  = ports.BillingCheck
+	BillingStage                  = ports.BillingStage
+	RunBudget                     = ports.RunBudget
 
 	Search           = ports.Search
 	SearchOptions    = ports.SearchOptions
@@ -209,6 +215,12 @@ var (
 	DefaultConfig = ports.DefaultConfig
 	// ResolveConfig validates a config.
 	ResolveConfig = ports.ResolveConfig
+	// DefaultCheckTokenBudgetExhausted is the token budget check used when
+	// RuntimeOptions sets none: the run's TokenBudget.
+	DefaultCheckTokenBudgetExhausted = core.DefaultCheckTokenBudgetExhausted
+	// DefaultCheckCostBudgetExhausted is the money budget check used when
+	// RuntimeOptions sets none: the run's CostBudgetMicros.
+	DefaultCheckCostBudgetExhausted = core.DefaultCheckCostBudgetExhausted
 	// WrapTool lifts a plain goai tool into the platform's Tool.
 	WrapTool = ports.WrapTool
 	// WrapTools lifts several goai tools.

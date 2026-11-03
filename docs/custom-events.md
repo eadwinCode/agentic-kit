@@ -75,8 +75,8 @@ knows the moment:
 | Event | When | Payload |
 | :--- | :--- | :--- |
 | `RUN_REFUSED` | `billingPreCheck` said no, at dispatch or at pickup, or the queue is at `maxQueueDepth` | `{ reason: 'billing' \| 'queue_full', error, runId? }` |
-| `TOKEN_BUDGET_EXHAUSTED` | the run's spend crossed `tokenBudget` between steps, just before it stops | `{ agentId, tokensUsed, tokenBudget }` |
-| `COST_BUDGET_EXHAUSTED` | the run's spend crossed `costBudgetMicros` between steps, just before it stops | `{ agentId, costMicros, costBudgetMicros, currency }` |
+| `TOKEN_BUDGET_EXHAUSTED` | the run's spend crossed `tokenBudget` between steps, just before it stops (sent by the default check; your own `checkTokenBudgetExhausted` sends what it likes) | `{ agentId, tokensUsed, tokenBudget }` |
+| `COST_BUDGET_EXHAUSTED` | the run's spend crossed `costBudgetMicros` between steps, just before it stops (sent by the default check; your own `checkCostBudgetExhausted` sends what it likes) | `{ agentId, costMicros, costBudgetMicros, currency }` |
 
 All three are kept in the thread record. The pre-check also receives
 `publishEvent`, so it can say it in your own terms first: a reset date, a plan

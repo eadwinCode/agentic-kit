@@ -190,7 +190,9 @@ thread record. Your own event is kept only with `{ durable: true }`, as above.
 Mid-run, the budget is the credit check. When the run's cumulative spend
 crosses `tokenBudget` between steps, the platform publishes
 `TOKEN_BUDGET_EXHAUSTED` (`tokensUsed`, `tokenBudget`, `agentId`) and then
-finalizes with `stopReason: 'token_budget'`.
+finalizes with `stopReason: 'token_budget'`. To decide this yourself, give
+`setupAgentCore` a `checkTokenBudgetExhausted`; see
+[Your own budget checks](./cost-and-pricing.md#your-own-budget-checks).
 
 With a pricer configured you can cap the number the account actually cares
 about instead of deriving a token budget from it: pass the remaining credit as
