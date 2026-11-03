@@ -346,8 +346,10 @@ export async function runLoop(
     const onRunAbort = () => stepAbort.abort(input.abortSignal.reason);
     input.abortSignal.addEventListener('abort', onRunAbort, { once: true });
     const limit = new StepLimit(stepAbort, deps.config.stepTimeoutMs);
-    const timeoutError = () =>
-      new Error(`step ${stepsRun + 1} ran longer than ${limit.limit}ms`);
+    // The error that cut the call, when there is one, rides along as the
+    // cause: the message stays the same.
+    const timeoutError = (cause?: unknown) =>
+      new Error(`step ${stepsRun + 1} ran longer than ${limit.limit}ms`, cause === undefined ? undefined : { cause });
     const partial = { text: '' };
     let step: StepResult;
     const batcher = input.publishChunk ? new ChunkBatcher(input.publishChunk) : null;
@@ -395,7 +397,7 @@ export async function runLoop(
         tokensUsed += priced.totalTokens;
       }
       if (input.abortSignal.aborted) break; // user stop mid-step
-      if (limit.expired) throw timeoutError(); // → §2.8 retry policy
+      if (limit.expired) throw timeoutError(err); // → §2.8 retry policy
       throw err; // real failure → §2.8 redrive policy
     }
     limit.stop();
@@ -445,6 +447,14 @@ export async function runLoop(
       providerMetadata: providerMeta(step.providerMetadata, step.response),
       ...fillTokens(step.usage as any, step.providerMetadata),
     };
+    if (limit.expired && !input.abortSignal.aborted) {
+      // Time ran out as the finish came in: still a step past its limit, as
+      // in Go. The call did finish, so its real counters are billed.
+      const priced = await ledger.record(deps, threadId, { ...stepUsage, outcome: 'error' });
+      addAttribution(attribution, priced);
+      tokensUsed += priced.totalTokens;
+      throw timeoutError();
+    }
 
     // The step is done, and its messages are the first thing it writes. A
     // worker that lost the lock meanwhile must not write them: the next

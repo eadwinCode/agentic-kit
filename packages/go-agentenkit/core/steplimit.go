@@ -11,33 +11,45 @@ import (
 )
 
 // stepLimit is the wall-time limit of one step (§2.8). It starts at
-// Config.StepTimeout. A tool with its own Timeout moves the end out while it
-// runs, so one slow tool gets the time it needs without raising StepTimeout
-// for every step of every run.
+// Config.StepTimeout. While a call to a tool with its own Timeout runs, the
+// end moves out to cover it, so one slow tool gets the time it needs without
+// raising StepTimeout for every step of every run. Once the call returns,
+// the step is back to StepTimeout, counted from then.
 //
 // A context deadline cannot be moved, so when a step's tools include one
 // with a Timeout, the step's context is cancelled by a timer instead, and
 // the loop asks the limit (not the context) whether the step ran out of
 // time. A step with no such tool keeps a plain context deadline.
 type stepLimit struct {
-	mu     sync.Mutex
-	base   time.Duration
-	cancel context.CancelCauseFunc
+	mu   sync.Mutex
+	base time.Duration
+	// baseEnd is when StepTimeout runs out: from the step's start, or from
+	// the last timed call's return when that is later.
+	baseEnd time.Time
+	cancel  context.CancelCauseFunc
 	// fixed is the plain deadline context of a step with no timed tool.
 	fixed context.Context
-	timer *time.Timer
-	gen   int // a timer from an older end does nothing
-	end   time.Time
+	// calls are the timed calls running now, by id.
+	calls  map[int]timedCall
+	nextID int
+	timer  *time.Timer
+	gen    int // a timer from an older end does nothing
+	end    time.Time
 	// limit is what set end, and what the error says the step ran past.
 	limit   time.Duration
 	expired bool
 	done    bool
 }
 
+type timedCall struct {
+	end   time.Time
+	limit time.Duration
+}
+
 // startStepLimit starts a step's limit. base is Config.StepTimeout; zero
 // is no limit for the step, though a tool's own Timeout still holds.
 func startStepLimit(parent context.Context, base time.Duration, tools []ports.Tool) (context.Context, *stepLimit) {
-	s := &stepLimit{base: base, limit: base}
+	s := &stepLimit{base: base, limit: base, calls: map[int]timedCall{}}
 	if !hasTimedTool(tools) {
 		ctx, cancel := parent, context.CancelFunc(func() {})
 		if base > 0 {
@@ -50,14 +62,18 @@ func startStepLimit(parent context.Context, base time.Duration, tools []ports.To
 	ctx, cancel := context.WithCancelCause(parent)
 	s.cancel = cancel
 	if base > 0 {
-		s.arm(time.Now().Add(base), base)
+		s.baseEnd = time.Now().Add(base)
+		s.arm(s.baseEnd, base)
 	}
 	return ctx, s
 }
 
+// isTimed reports whether t has its own Timeout to keep to.
+func isTimed(t ports.Tool) bool { return t.Timeout > 0 && t.Execute != nil }
+
 func hasTimedTool(tools []ports.Tool) bool {
 	for _, t := range tools {
-		if t.Timeout > 0 && t.Execute != nil {
+		if isTimed(t) {
 			return true
 		}
 	}
@@ -83,17 +99,46 @@ func (s *stepLimit) arm(end time.Time, limit time.Duration) {
 	})
 }
 
-// extend gives the step at least d from now. It never brings the end in,
-// and a step with no limit keeps none: the tool's own timer still holds.
-func (s *stepLimit) extend(d time.Duration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.done || s.expired || s.end.IsZero() {
+// rearm sets the end to the latest of StepTimeout and the timed calls
+// running now. A step with no StepTimeout keeps no end of its own: each
+// timed call's own deadline still holds. Called with mu held.
+func (s *stepLimit) rearm() {
+	if s.done || s.expired || s.baseEnd.IsZero() {
 		return
 	}
-	if end := time.Now().Add(d); end.After(s.end) {
-		s.arm(end, d)
+	end, limit := s.baseEnd, s.base
+	for _, c := range s.calls {
+		if c.end.After(end) {
+			end, limit = c.end, c.limit
+		}
 	}
+	if !end.Equal(s.end) {
+		s.arm(end, limit)
+	}
+}
+
+// begin notes a timed call that may run for d, and returns its id.
+func (s *stepLimit) begin(d time.Duration) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextID++
+	s.calls[s.nextID] = timedCall{end: time.Now().Add(d), limit: d}
+	s.rearm()
+	return s.nextID
+}
+
+// finish notes the call has returned: the step has StepTimeout from now to
+// finish, unless other timed calls still run longer.
+func (s *stepLimit) finish(id int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.calls, id)
+	if !s.baseEnd.IsZero() {
+		if end := time.Now().Add(s.base); end.After(s.baseEnd) {
+			s.baseEnd = end
+		}
+	}
+	s.rearm()
 }
 
 // markExpired notes the step ran past limit, once. Called with mu held.
@@ -136,15 +181,14 @@ func (s *stepLimit) stop() (expired bool, limit time.Duration) {
 
 // withStepLimit makes each tool with its own Timeout keep to it inside the
 // step: while it runs the step has at least that long, and a call past it
-// ends the step the way a step past StepTimeout ends. Once the call returns,
-// the step has at least StepTimeout again to finish.
+// ends the step the way a step past StepTimeout ends.
 func withStepLimit(tools []ports.Tool, s *stepLimit) []ports.Tool {
 	if s.fixed != nil {
 		return tools // no tool here has a Timeout
 	}
 	out := make([]ports.Tool, 0, len(tools))
 	for _, t := range tools {
-		if t.Timeout <= 0 || t.Execute == nil {
+		if !isTimed(t) {
 			out = append(out, t)
 			continue
 		}
@@ -154,17 +198,26 @@ func withStepLimit(tools []ports.Tool, s *stepLimit) []ports.Tool {
 			if err := ctx.Err(); err != nil {
 				return "", err // the step is already over: do not start
 			}
-			s.extend(timeout)
-			defer s.extend(s.base)
+			id := s.begin(timeout)
+			defer s.finish(id)
 			callCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
-			stopTimer := context.AfterFunc(callCtx, func() {
+			// Ends the step as soon as the call runs out of time, so other
+			// calls in the step stop too.
+			stopEarly := context.AfterFunc(callCtx, func() {
 				if callCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
 					s.expire(timeout)
 				}
 			})
-			defer stopTimer()
-			return inner(callCtx, input)
+			defer stopEarly()
+			output, err := inner(callCtx, input)
+			// Checked here as well, before the call hands back its result:
+			// the early check runs on its own goroutine and may come too
+			// late, after the step is already over.
+			if errors.Is(callCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+				s.expire(timeout)
+			}
+			return output, err
 		}
 		out = append(out, wrapped)
 	}

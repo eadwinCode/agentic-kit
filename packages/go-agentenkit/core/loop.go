@@ -585,8 +585,11 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 			// With a timed tool in the step, its context is cancelled, not
 			// past a deadline, so what came back may say "canceled". The
 			// error says what happened.
-			if err == nil || errors.Is(err, context.Canceled) {
+			if err == nil {
 				err = context.DeadlineExceeded
+			} else if errors.Is(err, context.Canceled) {
+				// Kept as text, not as Canceled, which reads as a stop.
+				err = fmt.Errorf("%w (%v)", context.DeadlineExceeded, err)
 			}
 			err = fmt.Errorf("step %d ran longer than %s: %w", out.Steps+1, ranPast, err)
 			Logger(deps).Warn("step timed out", "run", input.RunID, "step", out.Steps+1, "after", ranPast)

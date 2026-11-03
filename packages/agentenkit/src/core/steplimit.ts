@@ -1,11 +1,18 @@
-/** The wall-time limit of one step (§2.8). It starts at `stepTimeoutMs`. A
- *  tool with its own `timeoutMs` moves the end out while it runs, so one slow
- *  tool gets the time it needs without raising `stepTimeoutMs` for every step
- *  of every run. */
+/** The wall-time limit of one step (§2.8). It starts at `stepTimeoutMs`.
+ *  While a call to a tool with its own `timeoutMs` runs, the end moves out to
+ *  cover it, so one slow tool gets the time it needs without raising
+ *  `stepTimeoutMs` for every step of every run. Once the call returns, the
+ *  step is back to `stepTimeoutMs`, counted from then. */
 export class StepLimit {
   private timer: ReturnType<typeof setTimeout> | undefined;
-  /** 0: no limit for the step, though a tool's own `timeoutMs` still holds. */
+  /** When `stepTimeoutMs` runs out: from the step's start, or from the last
+   *  timed call's return when that is later. 0: no limit for the step,
+   *  though each timed call's own limit still holds. */
+  private baseEnd = 0;
   private end = 0;
+  /** The timed calls running now, by id. */
+  private readonly calls = new Map<number, { end: number; limit: number }>();
+  private nextId = 0;
   private done = false;
   /** What set the end, and what the error says the step ran past. */
   limit: number;
@@ -13,7 +20,10 @@ export class StepLimit {
 
   constructor(private readonly abort: AbortController, readonly base: number) {
     this.limit = base;
-    if (base > 0) this.arm(Date.now() + base, base);
+    if (base > 0) {
+      this.baseEnd = Date.now() + base;
+      this.arm(this.baseEnd, base);
+    }
   }
 
   private arm(end: number, limit: number): void {
@@ -23,12 +33,32 @@ export class StepLimit {
     this.timer = setTimeout(() => this.expire(limit), end - Date.now());
   }
 
-  /** Give the step at least `ms` from now. It never brings the end in, and a
-   *  step with no limit keeps none: the tool's own timer still holds. */
-  extend(ms: number): void {
-    if (this.done || this.expired || this.end === 0) return;
-    const end = Date.now() + ms;
-    if (end > this.end) this.arm(end, ms);
+  /** Set the end to the latest of `stepTimeoutMs` and the timed calls
+   *  running now. */
+  private rearm(): void {
+    if (this.done || this.expired || this.baseEnd === 0) return;
+    let end = this.baseEnd;
+    let limit = this.base;
+    for (const c of this.calls.values()) {
+      if (c.end > end) ({ end, limit } = c);
+    }
+    if (end !== this.end) this.arm(end, limit);
+  }
+
+  /** Note a timed call that may run for `ms`, and return its id. */
+  begin(ms: number): number {
+    const id = ++this.nextId;
+    this.calls.set(id, { end: Date.now() + ms, limit: ms });
+    this.rearm();
+    return id;
+  }
+
+  /** The call has returned: the step has `stepTimeoutMs` from now to finish,
+   *  unless other timed calls still run longer. */
+  finish(id: number): void {
+    this.calls.delete(id);
+    if (this.baseEnd !== 0) this.baseEnd = Math.max(this.baseEnd, Date.now() + this.base);
+    this.rearm();
   }
 
   /** End the step as timed out, once. */
@@ -58,10 +88,12 @@ export function withToolTimeout<T extends object>(t: T, timeoutMs: number): T {
 
 const timed = (t: any) => typeof t?.execute === 'function' && typeof t?.timeoutMs === 'number' && t.timeoutMs > 0;
 
-/** Make each tool with its own `timeoutMs` keep to it inside the step. Once
- *  the call returns, the step has at least `stepTimeoutMs` again to finish. */
+/** Does this toolset have a tool with its own `timeoutMs`? */
+export const hasTimedTool = (tools: Record<string, any>) => Object.values(tools).some(timed);
+
+/** Make each tool with its own `timeoutMs` keep to it inside the step. */
 export function withStepLimit(tools: Record<string, any>, limit: StepLimit): Record<string, any> {
-  if (!Object.values(tools).some(timed)) return tools;
+  if (!hasTimedTool(tools)) return tools;
   const out: Record<string, any> = {};
   for (const [name, t] of Object.entries(tools)) {
     if (!timed(t)) {
@@ -74,7 +106,7 @@ export function withStepLimit(tools: Record<string, any>, limit: StepLimit): Rec
       execute: async (args: unknown, opts: { abortSignal?: AbortSignal } & Record<string, unknown>) => {
         const parent = opts?.abortSignal;
         if (parent?.aborted) throw parent.reason; // the step is already over: do not start
-        limit.extend(ms);
+        const id = limit.begin(ms);
         const own = new AbortController();
         const onParent = () => own.abort(parent?.reason);
         parent?.addEventListener('abort', onParent, { once: true });
@@ -88,7 +120,7 @@ export function withStepLimit(tools: Record<string, any>, limit: StepLimit): Rec
         } finally {
           clearTimeout(timer);
           parent?.removeEventListener('abort', onParent);
-          limit.extend(limit.base);
+          limit.finish(id);
         }
       },
     };

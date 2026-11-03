@@ -201,7 +201,7 @@ func spawnDescription(sctx *SubagentCtx) string {
 
 // SpawnSubagentTool builds the run-scoped delegation tool (§2.7).
 func SpawnSubagentTool(sctx *SubagentCtx) ports.Tool {
-	return ports.WrapTool(goai.NewTool("spawnSubagent",
+	t := ports.WrapTool(goai.NewTool("spawnSubagent",
 		spawnDescription(sctx),
 		func(ctx context.Context, in spawnInput) (string, error) {
 			cfg := sctx.Ports.Config
@@ -310,6 +310,10 @@ func SpawnSubagentTool(sctx *SubagentCtx) ports.Tool {
 				"agentId": run.ID, "result": capRunes(outcome.Text, cfg.SubagentResultCapChars),
 			}), nil
 		}))
+	// The whole nested run happens inside this one call, so inside the
+	// parent's step: Timeout gives it longer than StepTimeout.
+	t.Timeout = sctx.Sub.Timeout
+	return t
 }
 
 func capRunes(s string, limit int) string {

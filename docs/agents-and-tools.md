@@ -162,8 +162,8 @@ designSheet := agentenkit.WithToolTimeout(agentenkit.AgentTool("design_sheet", "
 How it works, the same in both runtimes:
 
 - While a call to the tool runs, its step has at least that long, even when
-  the step limit is shorter. Once the call returns, the step has at least the
-  step limit again to finish. A step with no limit keeps none.
+  the step limit is shorter. Once the call returns, the step is back to the
+  step limit, counted from then. A step with no limit keeps none.
 - The tool's own call has that long. A call past it ends the step the way a
   step past the step limit ends: the same `step N ran longer than …` error
   (naming the tool's limit) and the same retry.
@@ -182,6 +182,10 @@ How it works, the same in both runtimes:
   [Human in the loop](./human-in-the-loop.md).
 - It applies inside a step. An approved call that runs on resume (see
   [Human in the loop](./human-in-the-loop.md)) is not bounded by it.
+- A subagent's whole run happens inside one `spawnSubagent` call, so inside
+  one step of the parent. Give that call more time with `subagents.timeoutMs`
+  (Go: `SubagentsConfig.Timeout`). A timed tool inside the child can only run
+  as long as that allows.
 
 ### Tools see the run's state
 

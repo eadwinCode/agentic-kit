@@ -6,12 +6,22 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 describe('step limit', () => {
   it('a timed tool that returns in time leaves the step time to finish', async () => {
     const abort = new AbortController();
-    const limit = new StepLimit(abort, 50);
-    const slow = withToolTimeout({ execute: async () => { await sleep(90); return 'ok'; } }, 100);
-    const tools = withStepLimit({ slow }, limit);
-    await tools.slow.execute({}, { abortSignal: abort.signal });
-    await sleep(30); // past the tool's own end, within the step limit of its return
+    const limit = new StepLimit(abort, 290);
+    const slow = withToolTimeout({ execute: async () => { await sleep(150); return 'ok'; } }, 300);
+    await withStepLimit({ slow }, limit).slow.execute({}, { abortSignal: abort.signal });
+    await sleep(160); // past the tool's own end, within the step limit of its return
     expect(limit.expired).toBe(false);
+    limit.stop();
+  });
+
+  it('after a timed call the step is back to the step limit', async () => {
+    const abort = new AbortController();
+    const limit = new StepLimit(abort, 100);
+    const quick = withToolTimeout({ execute: async () => 'ok' }, 60_000);
+    await withStepLimit({ quick }, limit).quick.execute({}, { abortSignal: abort.signal });
+    await new Promise((resolve) => abort.signal.addEventListener('abort', resolve, { once: true }));
+    expect(limit.expired).toBe(true);
+    expect(limit.limit).toBe(100); // the error names the step limit, not the tool's
     limit.stop();
   });
 

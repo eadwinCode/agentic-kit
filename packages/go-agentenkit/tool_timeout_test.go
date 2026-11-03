@@ -88,3 +88,26 @@ func TestToolTimeout_AToolPastItsOwnLimitFailsLikeAStepTimeout(t *testing.T) {
 		t.Fatalf("error: %q", msg)
 	}
 }
+
+// A nested run happens inside one spawnSubagent call, so inside one parent
+// step: SubagentsConfig.Timeout gives it longer than StepTimeout, and a
+// child's own timed tool runs within that.
+func TestToolTimeout_ASubagentWithItsOwnLimitOutlastsTheParentStep(t *testing.T) {
+	h := makeRuntime(t, scripted(
+		step{calls: []call{{"s1", "spawnSubagent", spawnArgs}}},
+		step{calls: []call{{"c1", "render", `{}`}}}, // the child
+		step{text: "child done"},
+		step{text: "parent done"},
+	), func(c *agentenkit.AgentConfig) { c.StepTimeout = 50 * time.Millisecond; c.RunRetryBackoff = 0 })
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
+		Name: "chat", Model: "gpt-4o",
+		Subagents: &agentenkit.SubagentsConfig{
+			Timeout: 2 * time.Second,
+			Tools:   []agentenkit.Tool{agentenkit.WithToolTimeout(sleepTool("render", 200*time.Millisecond), time.Second)},
+		},
+	})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
+	h.handleNext(t)
+	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "the child had its time")
+	mustEqual(t, h.queue.Len(), 0, "no retry")
+}

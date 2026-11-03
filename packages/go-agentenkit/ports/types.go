@@ -797,6 +797,12 @@ type SubagentsConfig struct {
 	// Tools are merged into every spawned subagent's toolset (HITL-wrapped
 	// identically to the parent's tools).
 	Tools []Tool
+	// Timeout is spawnSubagent's own time limit (see Tool.Timeout). A
+	// nested run, all its steps and tools included, happens inside one call
+	// to it, so inside one step of the parent: without this it must fit in
+	// StepTimeout. A child's own timed tool can only run as long as this
+	// allows. Zero keeps the step's limit.
+	Timeout time.Duration
 	// Profiles are named specialists (§2.7). When set, spawnSubagent must
 	// name one of them: the child takes the profile's persona, model, tools
 	// and step cap instead of the shared defaults above. The model still

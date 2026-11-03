@@ -464,6 +464,23 @@ describe('tool timeouts (§2.8)', () => {
     expect(term.state).toBe('FAILED'); // out of attempts
     expect(term.error).toContain('step 1 ran longer than 50ms');
   });
+
+  it('a subagent with its own limit outlasts the parent step', async () => {
+    const h = await harness([
+      { calls: [{ id: 's1', name: 'spawnSubagent', args: { name: 'researcher', instructions: 'find it' } }] },
+      { calls: [{ id: 'c1', name: 'render' }] }, // the child
+      { text: 'child done' },
+      { text: 'parent done' },
+    ], { stepTimeoutMs: 50 });
+    const chat = h.runtime.createStreamTextAgent({
+      name: 'chat', model: 'gpt-4o',
+      subagents: { timeoutMs: 2_000, tools: { render: withToolTimeout(sleepTool(200), 1_000) } },
+    });
+    const ran = await chat.run({ prompt: 'go' });
+    await h.next();
+    expect(h.lastTerminal(ran.threadId)?.state).toBe('COMPLETED');
+    expect(h.queue.items).toHaveLength(0); // no retry
+  });
 });
 
 describe('billing (§4)', () => {
