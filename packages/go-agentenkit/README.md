@@ -396,7 +396,9 @@ Every total carries `CostMicros`, `Currency`, `Unpriced` and `Lines` — the sam
 spend grouped by agent and model, which is what a credit system charges for. A
 spec's `OnFinish` receives it ready-made as `info.Usage`, and
 `RunInput.CostBudgetMicros` caps a run by money the way `TokenBudget` caps it by
-tokens.
+tokens. To decide for yourself, such as from a live balance, set
+`RuntimeOptions.CheckCostBudgetExhausted` or `CheckTokenBudgetExhausted`; it
+gets the default as `Super`, to keep the cap.
 
 `pricing` also ships `Receipt`, for the figure a gateway already computed, and
 `Chain`, to try one then the other. See

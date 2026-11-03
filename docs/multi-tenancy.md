@@ -323,6 +323,11 @@ Per-tenant token ceilings ride on the run:
 await chat.run({ prompt, state, tokenBudget: org.plan.perRunTokenBudget });
 ```
 
+When tenants pay from one shared balance, read it live instead: give
+`setupAgentCore` a `checkCostBudgetExhausted` that looks up the tenant from
+`state` and stops the run when the balance is gone. See
+[Your own budget checks](./cost-and-pricing.md#your-own-budget-checks).
+
 ## Isolating further
 
 Run state is row-level isolation, which suits most products. Two stronger

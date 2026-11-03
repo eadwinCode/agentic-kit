@@ -212,7 +212,9 @@ Every total carries `costMicros`, `currency`, `unpriced` and `lines` — the sam
 spend grouped by agent and model, which is what a credit system charges for. A
 spec's `onFinish` receives it ready-made as `info.usage`, and
 `run({ costBudgetMicros })` caps a run by money the way `tokenBudget` caps it by
-tokens.
+tokens. To decide for yourself, such as from a live balance, give
+`setupAgentCore` a `checkCostBudgetExhausted` or `checkTokenBudgetExhausted`;
+it gets the default as `super`, to keep the cap.
 
 `pricing` also ships `receipt`, for the figure a gateway already computed, and
 `chain`, to try one then the other. See
