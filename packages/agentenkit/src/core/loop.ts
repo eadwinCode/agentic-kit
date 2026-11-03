@@ -594,6 +594,7 @@ export async function runLoop(
     const checkTokens = deps.checkTokenBudgetExhausted ?? defaultCheckTokenBudgetExhausted;
     if (await exhausted('token budget', () => checkTokens({
       ...check,
+      super: defaultCheckTokenBudgetExhausted,
       tokensUsed: ledger.tokensUsed,
       ...(input.tokenBudget ? { tokenBudget: input.tokenBudget } : {}),
     }))) {
@@ -603,6 +604,7 @@ export async function runLoop(
     const checkCost = deps.checkCostBudgetExhausted ?? defaultCheckCostBudgetExhausted;
     if (await exhausted('cost budget', () => checkCost({
       ...check,
+      super: defaultCheckCostBudgetExhausted,
       costMicros: ledger.costMicros,
       ...(ledger.currency ? { currency: ledger.currency } : {}),
       ...(input.costBudgetMicros ? { costBudgetMicros: input.costBudgetMicros } : {}),

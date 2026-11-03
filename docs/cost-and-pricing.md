@@ -325,13 +325,11 @@ from one shared balance, with nothing held for each run. Other runs can spend
 that balance while this one is running, so the check reads the balance live:
 
 ```ts
-import { defaultCheckCostBudgetExhausted } from 'agentenkit';
-
 const runtime = await setupAgentCore({
   // ...
   pricer,
   checkCostBudgetExhausted: async (c) => {
-    if (await defaultCheckCostBudgetExhausted(c)) return true; // keep the cap
+    if (await c.super(c)) return true;   // keep the cap
     if (!c.willContinue) return false;   // no next step, nothing to stop
     let left: number;
     try {
@@ -352,7 +350,7 @@ const runtime = await setupAgentCore({
 agentenkit.RuntimeOptions{
 	// ...
 	CheckCostBudgetExhausted: func(ctx context.Context, c agentenkit.CostBudgetCheck) (bool, error) {
-		if stop, _ := agentenkit.DefaultCheckCostBudgetExhausted(ctx, c); stop {
+		if stop, _ := c.Super(ctx, c); stop {
 			return true, nil // keep the cap
 		}
 		if !c.WillContinue {
@@ -384,6 +382,10 @@ Each check is told:
 - what the run has spent so far, nested runs included, and its cap if it has
   one: `tokensUsed` and `tokenBudget`, or `costMicros`, `currency` and
   `costBudgetMicros`.
+- `super`, the default check (Go: `Super`). Call it with the same check to
+  keep the cap and add your own rule on top, as above. The defaults are also
+  exported as `defaultCheckTokenBudgetExhausted` and
+  `defaultCheckCostBudgetExhausted` (Go: `DefaultCheck…`).
 - `publish`, to say why the run stopped. The loop sends nothing itself, so a
   check that returns true without publishing ends the run without saying why.
 

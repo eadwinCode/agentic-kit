@@ -136,6 +136,9 @@ export interface TokenBudgetCheck extends BudgetCheck {
   tokensUsed: number;
   /** The run's `tokenBudget`, when it has one. */
   tokenBudget?: number;
+  /** The default check, `defaultCheckTokenBudgetExhausted`. Call it with
+   *  this same check to keep the token cap and add your own rule on top. */
+  super: CheckTokenBudgetExhaustedFn;
 }
 
 /** What `CheckCostBudgetExhaustedFn` is told. */
@@ -146,6 +149,9 @@ export interface CostBudgetCheck extends BudgetCheck {
   currency?: string;
   /** The run's `costBudgetMicros`, when it has one. */
   costBudgetMicros?: number;
+  /** The default check, `defaultCheckCostBudgetExhausted`. Call it with
+   *  this same check to keep the money cap and add your own rule on top. */
+  super: CheckCostBudgetExhaustedFn;
 }
 
 /** Says whether a run has used up its tokens. The loop asks it after every
