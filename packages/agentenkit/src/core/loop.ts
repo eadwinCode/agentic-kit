@@ -1,6 +1,6 @@
 import { generateText, isStepCount, streamText } from 'ai';
 import type { LanguageModel } from 'ai';
-import type { RuntimePorts } from '../ports/runtime.js';
+import type { RuntimePorts, StepRecord } from '../ports/runtime.js';
 import type { AgentKind, ProviderOptions } from './types.js';
 import type { AgentRunState } from './state.js';
 import type { PrepareStepFn, SystemFn } from '../ports/runtime.js';
@@ -16,6 +16,7 @@ import { estimateTokens } from './context.js';
 import type { NewUsage } from './types.js';
 import { ChunkBatcher, chunkPayload, drainOrThrow } from './stream.js';
 import { publish, publishNotice } from './publish.js';
+import { defaultCheckCostBudgetExhausted, defaultCheckTokenBudgetExhausted } from './budget.js';
 import { HITL_PARKED } from './hitl.js';
 import { RunLockLostError } from './lease.js';
 import { StepLimit, withStepLimit } from './steplimit.js';
@@ -288,6 +289,8 @@ export interface LoopOutcome {
   steps: number;
   /** The run hit its money cap and stopped between steps (§4). */
   costExhausted: boolean;
+  /** The token check said the run is out of tokens (§2.1). */
+  tokenExhausted: boolean;
 }
 
 /** The platform-owned loop (§2.1, §5.6), run by the main agent and by every
@@ -322,6 +325,7 @@ export async function runLoop(
   let stepsLeft = input.maxSteps;
   let stepsRun = 0;
   let costExhausted = false;
+  let tokenExhausted = false;
   let interrupted = false;
   // The input count of the last finished call. A call cut off before its
   // finish never reports one, and its prompt was the same size as the
@@ -525,7 +529,7 @@ export async function runLoop(
     // §2.9: one row per step in the platform's OWN store, plus a bus-only
     // notice so live dashboards see it. The notice is not persisted to the
     // caller's event log — operational history is not their data to carry.
-    const marker = {
+    const marker: StepRecord = {
       runId: input.runId ?? '',
       threadId,
       agentId: input.agentId,
@@ -564,61 +568,47 @@ export async function runLoop(
       break;
     }
 
-    // Budget check BETWEEN steps (§2.1) — the step that crossed the line is
-    // kept in full; the next one never starts. Published before the break, so
-    // a client learns why the run ended the moment it does.
-    if (input.tokenBudget && ledger.tokensUsed >= input.tokenBudget) {
-      await publish(deps, threadId, 'TOKEN_BUDGET_EXHAUSTED', {
-        agentId: input.agentId,
-        tokensUsed: ledger.tokensUsed,
-        tokenBudget: input.tokenBudget,
-      });
+    // Budget checks BETWEEN steps (§2.1, §4): tokens, then money. The
+    // defaults check the run's own caps; a host can give its own, such as
+    // a live balance. A check that throws is logged and read as false: a
+    // check that fails must never fail a run.
+    const check = {
+      ...(input.billingRunId ? { runId: input.billingRunId } : {}),
+      threadId,
+      agentId: input.agentId,
+      ...(input.state ? { state: input.state } : {}),
+      step: marker,
+      willContinue: step.finishReason === 'tool-calls',
+      publish: async (type: string, payload: Record<string, unknown>) => {
+        await publish(deps, threadId, type, payload);
+      },
+    };
+    const exhausted = async (name: string, run: () => boolean | Promise<boolean>) => {
+      try {
+        return await run();
+      } catch (err) {
+        (deps.log ?? console).error(`${name} check failed`, { run: input.billingRunId, err });
+        return false;
+      }
+    };
+    const checkTokens = deps.checkTokenBudgetExhausted ?? defaultCheckTokenBudgetExhausted;
+    if (await exhausted('token budget', () => checkTokens({
+      ...check,
+      tokensUsed: ledger.tokensUsed,
+      ...(input.tokenBudget ? { tokenBudget: input.tokenBudget } : {}),
+    }))) {
+      tokenExhausted = true;
       break;
     }
-
-    // The money cap (§4), checked in the same place and the same way, against
-    // the same shared ledger: a nested run's calls count against it, and a
-    // run that parked or retried starts from what it already spent (see
-    // seedRunLedger).
-    //
-    // It only ever sees priced calls: with no pricer configured nothing is
-    // ever spent and the cap never fires.
-    if (input.costBudgetMicros && ledger.costMicros >= input.costBudgetMicros) {
-      await publish(deps, threadId, 'COST_BUDGET_EXHAUSTED', {
-        agentId: input.agentId,
-        costMicros: ledger.costMicros,
-        costBudgetMicros: input.costBudgetMicros,
-        ...(ledger.currency ? { currency: ledger.currency } : {}),
-      });
+    const checkCost = deps.checkCostBudgetExhausted ?? defaultCheckCostBudgetExhausted;
+    if (await exhausted('cost budget', () => checkCost({
+      ...check,
+      costMicros: ledger.costMicros,
+      ...(ledger.currency ? { currency: ledger.currency } : {}),
+      ...(input.costBudgetMicros ? { costBudgetMicros: input.costBudgetMicros } : {}),
+    }))) {
       costExhausted = true;
       break;
-    }
-
-    // The host's live budget (§4), in the same place: what the run may still
-    // spend now, which other runs spending the same balance can bring to
-    // zero before this run reaches its own cap. Only when another step would
-    // follow: a run that ends here has nothing left to stop. A throw is
-    // logged and read as no answer, as the pricer's is: a budget the host
-    // cannot read must never fail a run.
-    if (deps.budgetLeft && step.finishReason === 'tool-calls') {
-      let left: number | null = null;
-      try {
-        left = await deps.budgetLeft({
-          runId: input.billingRunId, threadId, agentId: input.agentId, state: input.state,
-        });
-      } catch (err) {
-        (deps.log ?? console).error('budget not read', { run: input.billingRunId, err });
-      }
-      if (left !== null && left <= 0) {
-        await publish(deps, threadId, 'COST_BUDGET_EXHAUSTED', {
-          agentId: input.agentId,
-          costMicros: ledger.costMicros,
-          budgetLeftMicros: left,
-          ...(ledger.currency ? { currency: ledger.currency } : {}),
-        });
-        costExhausted = true;
-        break;
-      }
     }
 
     // 'tool-calls' → the SDK executed the step's tools; the loop feeds the
@@ -637,6 +627,7 @@ export async function runLoop(
     interrupted,
     steps: stepsRun,
     costExhausted,
+    tokenExhausted,
   };
 }
 

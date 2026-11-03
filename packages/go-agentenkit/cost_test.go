@@ -3,6 +3,7 @@ package agentenkit_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -161,12 +162,13 @@ func TestCost_BudgetStopsTheRunBetweenSteps(t *testing.T) {
 	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "state")
 }
 
-// The host's live budget is asked after every step, beside the money cap: a
-// balance other runs spent down stops this run before its next step, the
-// same clean way the cap does. No answer (ok false) lets the run go on.
-func TestCost_TheLiveBudgetStopsTheRunBetweenSteps(t *testing.T) {
+// A host can replace the cost check, here with a live balance that other
+// runs spend down between this run's steps. It is told the run, the step
+// and whether another step follows, and stops the run the same clean way
+// the money cap does.
+func TestCost_AReplacedCostCheckStopsTheRunBetweenSteps(t *testing.T) {
 	var mu sync.Mutex
-	var asked []agentenkit.BudgetLeftCheck
+	var asked []agentenkit.CostBudgetCheck
 	left := int64(1_000)
 	h := makeRuntimeOpts(t, scripted(
 		step{calls: []call{{"c1", "probe", `{}`}}},
@@ -174,13 +176,18 @@ func TestCost_TheLiveBudgetStopsTheRunBetweenSteps(t *testing.T) {
 		step{text: "never reached"},
 	), func(o *agentenkit.RuntimeOptions) {
 		o.Pricer = testTable
-		o.BudgetLeft = func(_ context.Context, check agentenkit.BudgetLeftCheck) (int64, bool) {
+		o.CheckCostBudgetExhausted = func(ctx context.Context, c agentenkit.CostBudgetCheck) (bool, error) {
 			mu.Lock()
 			defer mu.Unlock()
-			asked = append(asked, check)
-			// Other runs spend the balance down between this run's steps.
+			asked = append(asked, c)
+			if !c.WillContinue {
+				return false, nil
+			}
 			left -= 600
-			return left, true
+			if left > 0 {
+				return false, nil
+			}
+			return true, c.Publish(ctx, "COST_BUDGET_EXHAUSTED", map[string]any{"balanceMicros": left})
 		}
 	})
 	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
@@ -198,28 +205,33 @@ func TestCost_TheLiveBudgetStopsTheRunBetweenSteps(t *testing.T) {
 	mustEqual(t, asked[0].RunID, ran.RunID, "asked about the run")
 	mustEqual(t, asked[0].ThreadID, ran.ThreadID, "with its thread")
 	mustEqual(t, asked[0].State["team"], "t1", "and its state")
+	mustEqual(t, asked[0].WillContinue, true, "a step follows")
+	mustEqual(t, asked[0].CostMicros > 0, true, "spend so far")
+	mustEqual(t, asked[0].Step.Index, 1, "step index")
+	mustEqual(t, asked[0].Step.FinishReason, "tool-calls", "step finish")
+	mustEqual(t, len(asked[0].Step.Tools), 1, "step tools")
+	mustEqual(t, asked[1].Step.Index, 2, "second step index")
 	ev := h.events(ran.ThreadID, "COST_BUDGET_EXHAUSTED")
 	mustEqual(t, len(ev), 1, "COST_BUDGET_EXHAUSTED")
-	mustEqual(t, payload(ev[0])["budgetLeftMicros"], float64(-200), "budget left")
+	mustEqual(t, payload(ev[0])["balanceMicros"], float64(-200), "balance")
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["stopReason"], "cost_budget", "stopReason")
 	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "state")
 }
 
-// No answer lets the run go on, and a run that ends on its own is not asked
-// after its last step: there is nothing left to stop.
-func TestCost_ALiveBudgetWithNoAnswerLetsTheRunGoOn(t *testing.T) {
-	var asked int
+// The check is told when no step follows.
+func TestCost_TheCostCheckIsToldWhenNoStepFollows(t *testing.T) {
 	var mu sync.Mutex
+	var willContinue []bool
 	h := makeRuntimeOpts(t, scripted(
 		step{calls: []call{{"c1", "probe", `{}`}}},
 		step{text: "done"},
 	), func(o *agentenkit.RuntimeOptions) {
 		o.Pricer = testTable
-		o.BudgetLeft = func(context.Context, agentenkit.BudgetLeftCheck) (int64, bool) {
+		o.CheckCostBudgetExhausted = func(_ context.Context, c agentenkit.CostBudgetCheck) (bool, error) {
 			mu.Lock()
 			defer mu.Unlock()
-			asked++
-			return 0, false
+			willContinue = append(willContinue, c.WillContinue)
+			return false, nil
 		}
 	})
 	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
@@ -230,9 +242,65 @@ func TestCost_ALiveBudgetWithNoAnswerLetsTheRunGoOn(t *testing.T) {
 	})
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
 	h.handleNext(t)
-	mustEqual(t, h.model.Calls(), 2, "model calls")
-	mustEqual(t, asked, 1, "asked only when a step follows")
+	mustEqual(t, fmt.Sprint(willContinue), "[true false]", "willContinue")
 	mustEqual(t, len(h.events(ran.ThreadID, "COST_BUDGET_EXHAUSTED")), 0, "no stop")
+}
+
+// A replaced token check decides alone: it can stop a run with no budget.
+func TestCost_AReplacedTokenCheckDecidesAlone(t *testing.T) {
+	h := makeRuntimeOpts(t, scripted(
+		step{calls: []call{{"c1", "probe", `{}`}}},
+		step{text: "done"},
+	), func(o *agentenkit.RuntimeOptions) {
+		o.CheckTokenBudgetExhausted = func(_ context.Context, c agentenkit.TokenBudgetCheck) (bool, error) {
+			return c.Step.Index >= 1, nil
+		}
+	})
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
+		Name: "chat", Model: "gpt-4o",
+		Tools: []agentenkit.Tool{tool("probe", func(context.Context, map[string]any) (string, error) {
+			return `{}`, nil
+		})},
+	})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
+	h.handleNext(t)
+	mustEqual(t, h.model.Calls(), 1, "model calls")
+	mustEqual(t, len(h.events(ran.ThreadID, "TOKEN_BUDGET_EXHAUSTED")), 0, "no event, this check sends none")
+	mustEqual(t, h.lastTerminal(ran.ThreadID)["stopReason"], "token_budget", "stopReason")
+	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "state")
+}
+
+// A check that errors or panics is read as false, as a throw is in TS.
+func TestCost_ACheckThatFailsIsReadAsFalse(t *testing.T) {
+	for name, check := range map[string]agentenkit.CheckCostBudgetExhaustedFunc{
+		"error": func(context.Context, agentenkit.CostBudgetCheck) (bool, error) {
+			return true, errors.New("balance store down")
+		},
+		"panic": func(context.Context, agentenkit.CostBudgetCheck) (bool, error) {
+			panic("balance store down")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := makeRuntimeOpts(t, scripted(
+				step{calls: []call{{"c1", "probe", `{}`}}},
+				step{text: "done"},
+			), func(o *agentenkit.RuntimeOptions) {
+				o.Pricer = testTable
+				o.CheckCostBudgetExhausted = check
+			})
+			chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
+				Name: "chat", Model: "gpt-4o",
+				Tools: []agentenkit.Tool{tool("probe", func(context.Context, map[string]any) (string, error) {
+					return `{}`, nil
+				})},
+			})
+			ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
+			h.handleNext(t)
+			mustEqual(t, h.model.Calls(), 2, "model calls")
+			mustEqual(t, len(h.events(ran.ThreadID, "COST_BUDGET_EXHAUSTED")), 0, "no stop")
+			mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "state")
+		})
+	}
 }
 
 func TestCost_AStoppedCallIsStillBilled(t *testing.T) {

@@ -12,7 +12,8 @@ const runtime = await setupAgentCore({
   resolveModel,     // required — registry key → { instance, contextWindow, modelId }
   admin,            // optional — defaults to SQLite, or Postgres via env
   pricer,           // optional — prices every model call (§4)
-  budgetLeft,       // optional — what a run may still spend, asked after every step (§4)
+  checkTokenBudgetExhausted, // optional — replaces the token cap check (§4)
+  checkCostBudgetExhausted,  // optional — replaces the money cap check (§4)
   tools,            // optional — { search, fetcher } for the built-in web tools
   log,              // optional — defaults to console
   config,           // optional — everything below
@@ -129,7 +130,8 @@ SQLite it can be higher, since rows on disk cost little.
 
 Pricing is not a `config` setting — `pricer` sits on `setupAgentCore` beside the
 ports, because it decides what goes into the store rather than how the loop
-behaves. `budgetLeft` sits beside it: it reads the host's own ledger. See
+behaves. `checkTokenBudgetExhausted` and `checkCostBudgetExhausted` sit beside
+it: they can read the host's own ledger. See
 [Cost and pricing](./cost-and-pricing.md).
 
 ## Environment variables

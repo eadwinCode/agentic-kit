@@ -28,9 +28,14 @@ type RuntimePorts struct {
 	// Pricer puts a price on every model call before its usage row is
 	// stored (§4). Nil stores every row unpriced.
 	Pricer Pricer
-	// BudgetLeft reads what a run may still spend, live (§4). Nil checks
-	// only the fixed money cap.
-	BudgetLeft BudgetLeftFunc
+	// CheckTokenBudgetExhausted says whether a run has spent its token
+	// budget, after every step (§2.1). Nil uses the default, which checks
+	// TokenBudget.
+	CheckTokenBudgetExhausted CheckTokenBudgetExhaustedFunc
+	// CheckCostBudgetExhausted says whether a run has spent its money
+	// budget, after every step (§4). Nil uses the default, which checks
+	// CostBudgetMicros.
+	CheckCostBudgetExhausted CheckCostBudgetExhaustedFunc
 	// Log is where the platform reports what it could not do without
 	// failing the run, such as a usage row it failed to store.
 	Log    *slog.Logger
@@ -53,35 +58,65 @@ type Pricer interface {
 	Price(ctx context.Context, usage NewUsage) (*Cost, error)
 }
 
-// BudgetLeftFunc says what a run may still spend, read live from the host's
-// own ledger (§4), in millionths of the pricer's currency. The loop asks it
-// after every step, in the same place as the fixed money cap
-// (CostBudgetMicros): a host whose balance other runs spend at the same
-// time, with nothing held for this run, can stop it as soon as the money is
-// gone rather than at its next dispatch.
-//
-// At zero or below, the run ends the way the money cap ends it
-// (COST_BUDGET_EXHAUSTED). ok false is no answer: the run goes on, so a
-// host that wants to fail closed returns ok true and zero on its own errors.
-//
-// It runs between steps on the run's own path: one read of a balance is the
-// intended shape. It is only asked when another step would follow, so the
-// first step of a segment runs without it: a run started or resumed on an
-// empty balance must be refused before that (BillingPreCheck at pickup).
-// Nested runs ask it from their own goroutines, so it must be safe to call
-// at once. RunID can be empty for a run dispatched without one.
-type BudgetLeftFunc func(ctx context.Context, check BudgetLeftCheck) (leftMicros int64, ok bool)
-
-// BudgetLeftCheck is the run a BudgetLeftFunc is asked about.
-type BudgetLeftCheck struct {
+// BudgetCheck is what a budget check is told after a step (§2.1, §4).
+type BudgetCheck struct {
 	// RunID is the DISPATCHED run the spend is billed to: a nested run is
-	// asked about its parent (§4).
+	// checked against its parent's run (§4). Empty for a run dispatched
+	// without one.
 	RunID    string
 	ThreadID string
 	// AgentID is empty for the main run, the nested run's id otherwise.
 	AgentID string
 	State   AgentRunState
+	// Step is the step that just finished. Text and ToolCalls are only set
+	// with RecordPayloads.
+	Step StepRecord
+	// WillContinue is true when another step would follow if the check
+	// says no. A check that does a costly read can skip it when this is
+	// false: a run that ends here has nothing left to stop.
+	WillContinue bool
+	// Publish publishes a platform event on the run's thread. A check that
+	// stops the run says why with it, as the defaults do:
+	// TOKEN_BUDGET_EXHAUSTED or COST_BUDGET_EXHAUSTED.
+	Publish func(ctx context.Context, eventType string, payload map[string]any) error
 }
+
+// TokenBudgetCheck is what a CheckTokenBudgetExhaustedFunc is told.
+type TokenBudgetCheck struct {
+	BudgetCheck
+	// TokensUsed is what the run has used so far, nested runs included.
+	TokensUsed int
+	// TokenBudget is the run's cap; zero when it has none.
+	TokenBudget int
+}
+
+// CostBudgetCheck is what a CheckCostBudgetExhaustedFunc is told.
+type CostBudgetCheck struct {
+	BudgetCheck
+	// CostMicros is what the run has spent so far, in millionths of the
+	// pricer's currency, nested runs included. Only priced calls count.
+	CostMicros int64
+	Currency   string
+	// CostBudgetMicros is the run's cap; zero when it has none.
+	CostBudgetMicros int64
+}
+
+// CheckTokenBudgetExhaustedFunc says whether a run has used up its tokens.
+// The loop asks it after every step; true ends the run cleanly before the
+// next step starts. An error or a panic is logged and read as false: a
+// check that fails must never fail a run.
+type CheckTokenBudgetExhaustedFunc func(ctx context.Context, check TokenBudgetCheck) (bool, error)
+
+// CheckCostBudgetExhaustedFunc says whether a run has used up its money.
+// The loop asks it after every step, after the token check; true ends the
+// run cleanly before the next step starts, with stopReason cost_budget. An
+// error or a panic is logged and read as false, so a host that wants to
+// fail closed handles its own errors and returns true.
+//
+// Replace it to read a live balance that other runs spend at the same
+// time. It runs on the run's own path, and nested runs call it from their
+// own goroutines, so it must be safe to call at once: keep it to one read.
+type CheckCostBudgetExhaustedFunc func(ctx context.Context, check CostBudgetCheck) (bool, error)
 
 // PricerFunc adapts a plain function into a Pricer.
 type PricerFunc func(ctx context.Context, usage NewUsage) (*Cost, error)
@@ -112,9 +147,14 @@ type RuntimeOptions struct {
 	// pricing package for the three that ship: a price table, a provider
 	// receipt reader, and a chain of both.
 	Pricer Pricer
-	// BudgetLeft reads what a run may still spend, live, after every step
-	// (§4). Nil checks only the fixed money cap. See BudgetLeftFunc.
-	BudgetLeft BudgetLeftFunc
+	// CheckTokenBudgetExhausted says whether a run has spent its token
+	// budget, after every step (§2.1). Nil uses
+	// DefaultCheckTokenBudgetExhausted, which checks TokenBudget.
+	CheckTokenBudgetExhausted CheckTokenBudgetExhaustedFunc
+	// CheckCostBudgetExhausted says whether a run has spent its money
+	// budget, after every step (§4). Nil uses
+	// DefaultCheckCostBudgetExhausted, which checks CostBudgetMicros.
+	CheckCostBudgetExhausted CheckCostBudgetExhaustedFunc
 	// Log is where the platform reports what it could not do without
 	// failing the run. Nil uses slog.Default().
 	Log *slog.Logger

@@ -95,18 +95,19 @@ func inMemoryStreams(log *slog.Logger) ports.RunStreams {
 // state belongs to a run and a runtime outlives many.
 func (c *AgentCore) scope(state AgentRunState, runID string) ports.RuntimePorts {
 	return ports.RuntimePorts{
-		Storage:      BindStorage(c.opts.Storage, StorageContext{State: state, RunID: runID}),
-		Admin:        c.admin,
-		Bus:          c.opts.Bus,
-		Queue:        c.opts.Queue,
-		Kv:           c.opts.Kv,
-		Streams:      c.opts.Streams,
-		ResolveModel: c.opts.ResolveModel,
-		Pricer:       c.opts.Pricer,
-		BudgetLeft:   c.opts.BudgetLeft,
-		Log:          c.opts.Log,
-		Config:       c.config,
-		Tools:        c.opts.Tools,
+		Storage:                   BindStorage(c.opts.Storage, StorageContext{State: state, RunID: runID}),
+		Admin:                     c.admin,
+		Bus:                       c.opts.Bus,
+		Queue:                     c.opts.Queue,
+		Kv:                        c.opts.Kv,
+		Streams:                   c.opts.Streams,
+		ResolveModel:              c.opts.ResolveModel,
+		Pricer:                    c.opts.Pricer,
+		CheckTokenBudgetExhausted: c.opts.CheckTokenBudgetExhausted,
+		CheckCostBudgetExhausted:  c.opts.CheckCostBudgetExhausted,
+		Log:                       c.opts.Log,
+		Config:                    c.config,
+		Tools:                     c.opts.Tools,
 	}
 }
 
