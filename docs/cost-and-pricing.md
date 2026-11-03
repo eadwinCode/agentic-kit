@@ -350,8 +350,8 @@ const runtime = await setupAgentCore({
 agentenkit.RuntimeOptions{
 	// ...
 	CheckCostBudgetExhausted: func(ctx context.Context, c agentenkit.CostBudgetCheck) (bool, error) {
-		if stop, _ := c.Super(ctx, c); stop {
-			return true, nil // keep the cap
+		if stop, err := c.Super(ctx, c); stop || err != nil {
+			return stop, err // keep the cap
 		}
 		if !c.WillContinue {
 			return false, nil // no next step, nothing to stop
@@ -383,7 +383,9 @@ Each check is told:
   one: `tokensUsed` and `tokenBudget`, or `costMicros`, `currency` and
   `costBudgetMicros`.
 - `super`, the default check (Go: `Super`). Call it with the same check to
-  keep the cap and add your own rule on top, as above. The defaults are also
+  keep the cap and add your own rule on top, as above. When it returns true
+  it has already sent `TOKEN_BUDGET_EXHAUSTED` or `COST_BUDGET_EXHAUSTED`, so
+  don't send it again. The defaults are also
   exported as `defaultCheckTokenBudgetExhausted` and
   `defaultCheckCostBudgetExhausted` (Go: `DefaultCheck…`).
 - `publish`, to say why the run stopped. The loop sends nothing itself, so a

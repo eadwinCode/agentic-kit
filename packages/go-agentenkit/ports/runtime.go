@@ -90,7 +90,8 @@ type TokenBudgetCheck struct {
 	TokenBudget int
 	// Super is the default check, DefaultCheckTokenBudgetExhausted. Call it
 	// with this same check to keep the token cap and add your own rule on
-	// top.
+	// top. The loop always sets it; a check you build by hand, such as in a
+	// test, must set it too.
 	Super CheckTokenBudgetExhaustedFunc
 }
 
@@ -105,7 +106,8 @@ type CostBudgetCheck struct {
 	CostBudgetMicros int64
 	// Super is the default check, DefaultCheckCostBudgetExhausted. Call it
 	// with this same check to keep the money cap and add your own rule on
-	// top.
+	// top. The loop always sets it; a check you build by hand, such as in a
+	// test, must set it too.
 	Super CheckCostBudgetExhaustedFunc
 }
 

@@ -9,7 +9,7 @@ import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
 import type { CheckCostBudgetExhaustedFn, CheckTokenBudgetExhaustedFn, CostBudgetCheck, Pricer, RunFinishInfo, RuntimeOptions } from '../src/ports/runtime.js';
 import * as pricing from '../src/pricing.js';
-import { defaultCheckTokenBudgetExhausted, isToolUse } from '../src/index.js';
+import { defaultCheckCostBudgetExhausted, defaultCheckTokenBudgetExhausted, isToolUse } from '../src/index.js';
 import { toolUseRow } from '../src/core/builtin/run.js';
 import { bindStorage, type StorageContext } from '../src/core/state.js';
 import { recordCall, RunLedger } from '../src/core/usage.js';
@@ -385,6 +385,21 @@ describe('budget checks the host can replace (§2.1, §4)', () => {
       costMicros: 500, costBudgetMicros: 400, currency: 'USD',
     });
     expect(terminal(bus).stopReason).toBe('cost_budget');
+  });
+
+  it('lets a host call a default directly, without super', async () => {
+    const sent: string[] = [];
+    const stop = await defaultCheckCostBudgetExhausted({
+      threadId: 't', agentId: null, willContinue: true,
+      step: {
+        runId: 'r', threadId: 't', agentId: null, index: 1, durationMs: 0, finishReason: 'tool-calls',
+        inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0, tools: [], at: new Date(),
+      },
+      publish: async (type) => { sent.push(type); },
+      costMicros: 500, costBudgetMicros: 400,
+    });
+    expect(stop).toBe(true);
+    expect(sent).toEqual(['COST_BUDGET_EXHAUSTED']);
   });
 
   it('reads a check that throws as false, as a throwing pricer is', async () => {

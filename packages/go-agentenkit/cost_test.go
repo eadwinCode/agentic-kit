@@ -282,14 +282,20 @@ func TestCost_EachCheckIsHandedTheDefaultAsSuper(t *testing.T) {
 	), func(o *agentenkit.RuntimeOptions) {
 		o.Pricer = testTable
 		o.CheckTokenBudgetExhausted = func(ctx context.Context, c agentenkit.TokenBudgetCheck) (bool, error) {
-			if c.Super != nil {
-				mu.Lock()
-				tokenSuper++
-				mu.Unlock()
+			if c.Super == nil {
+				t.Error("token check got no Super")
+				return false, nil
 			}
+			mu.Lock()
+			tokenSuper++
+			mu.Unlock()
 			return c.Super(ctx, c)
 		}
 		o.CheckCostBudgetExhausted = func(ctx context.Context, c agentenkit.CostBudgetCheck) (bool, error) {
+			if c.Super == nil {
+				t.Error("cost check got no Super")
+				return false, nil
+			}
 			if stop, err := c.Super(ctx, c); stop || err != nil {
 				return stop, err
 			}
