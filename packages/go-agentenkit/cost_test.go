@@ -270,6 +270,59 @@ func TestCost_AReplacedTokenCheckDecidesAlone(t *testing.T) {
 	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "state")
 }
 
+// Each check is handed the default as Super, so a host can keep the cap and
+// add its own rule on top.
+func TestCost_EachCheckIsHandedTheDefaultAsSuper(t *testing.T) {
+	var mu sync.Mutex
+	var tokenSuper, extra int
+	h := makeRuntimeOpts(t, scripted(
+		step{calls: []call{{"c1", "probe", `{}`}}},
+		step{calls: []call{{"c2", "probe", `{}`}}},
+		step{text: "never reached"},
+	), func(o *agentenkit.RuntimeOptions) {
+		o.Pricer = testTable
+		o.CheckTokenBudgetExhausted = func(ctx context.Context, c agentenkit.TokenBudgetCheck) (bool, error) {
+			if c.Super == nil {
+				t.Error("token check got no Super")
+				return false, nil
+			}
+			mu.Lock()
+			tokenSuper++
+			mu.Unlock()
+			return c.Super(ctx, c)
+		}
+		o.CheckCostBudgetExhausted = func(ctx context.Context, c agentenkit.CostBudgetCheck) (bool, error) {
+			if c.Super == nil {
+				t.Error("cost check got no Super")
+				return false, nil
+			}
+			if stop, err := c.Super(ctx, c); stop || err != nil {
+				return stop, err
+			}
+			mu.Lock()
+			extra++ // the host's own rule, which never stops the run here
+			mu.Unlock()
+			return false, nil
+		}
+	})
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
+		Name: "chat", Model: "gpt-4o",
+		Tools: []agentenkit.Tool{tool("probe", func(context.Context, map[string]any) (string, error) {
+			return `{}`, nil
+		})},
+	})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi", CostBudgetMicros: 400})
+	h.handleNext(t)
+
+	mustEqual(t, h.model.Calls(), 2, "model calls")
+	mustEqual(t, tokenSuper, 2, "token check got Super each step")
+	mustEqual(t, extra, 1, "own rule ran once, under the cap")
+	ev := h.events(ran.ThreadID, "COST_BUDGET_EXHAUSTED")
+	mustEqual(t, len(ev), 1, "COST_BUDGET_EXHAUSTED")
+	mustEqual(t, payload(ev[0])["costBudgetMicros"], float64(400), "from the default")
+	mustEqual(t, h.lastTerminal(ran.ThreadID)["stopReason"], "cost_budget", "stopReason")
+}
+
 // A check that errors or panics is read as false, as a throw is in TS.
 func TestCost_ACheckThatFailsIsReadAsFalse(t *testing.T) {
 	for name, check := range map[string]agentenkit.CheckCostBudgetExhaustedFunc{

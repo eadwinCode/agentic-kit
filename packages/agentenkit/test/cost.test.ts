@@ -9,7 +9,7 @@ import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters
 import { resolveConfig, type AgentConfig } from '../src/core/types.js';
 import type { CheckCostBudgetExhaustedFn, CheckTokenBudgetExhaustedFn, CostBudgetCheck, Pricer, RunFinishInfo, RuntimeOptions } from '../src/ports/runtime.js';
 import * as pricing from '../src/pricing.js';
-import { isToolUse } from '../src/index.js';
+import { defaultCheckCostBudgetExhausted, defaultCheckTokenBudgetExhausted, isToolUse } from '../src/index.js';
 import { toolUseRow } from '../src/core/builtin/run.js';
 import { bindStorage, type StorageContext } from '../src/core/state.js';
 import { recordCall, RunLedger } from '../src/core/usage.js';
@@ -353,6 +353,53 @@ describe('budget checks the host can replace (§2.1, §4)', () => {
     expect(events(bus, 'TOKEN_BUDGET_EXHAUSTED').length).toBe(0);
     expect(terminal(bus).stopReason).toBe('token_budget');
     expect(terminal(bus).state).toBe('COMPLETED');
+  });
+
+  it('hands each check the default as super, to keep the cap', async () => {
+    let tokenSuper: unknown;
+    let extra = 0;
+    const { runtime, bus, queue } = await makeRuntime(
+      [
+        { toolCalls: [{ toolCallId: 'c1', toolName: 'probe', args: {} }] },
+        { toolCalls: [{ toolCallId: 'c2', toolName: 'probe', args: {} }] },
+        { text: 'never reached' },
+      ],
+      {
+        pricer: priceList,
+        checkTokenBudgetExhausted: (c) => { tokenSuper = c.super; return c.super(c); },
+        checkCostBudgetExhausted: async (c) => {
+          if (await c.super(c)) return true;
+          extra++; // the host's own rule, which never stops the run here
+          return false;
+        },
+      },
+    );
+    const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', tools: probe });
+    // 400 micros: the first step (250) stays under, the second crosses it.
+    await chat.run({ prompt: 'hi', costBudgetMicros: 400 });
+    await runtime.worker.handleJob(queue.items[0]!);
+
+    expect(tokenSuper).toBe(defaultCheckTokenBudgetExhausted);
+    expect(extra).toBe(1);
+    expect(events(bus, 'COST_BUDGET_EXHAUSTED')[0]!.payload).toMatchObject({
+      costMicros: 500, costBudgetMicros: 400, currency: 'USD',
+    });
+    expect(terminal(bus).stopReason).toBe('cost_budget');
+  });
+
+  it('lets a host call a default directly, without super', async () => {
+    const sent: string[] = [];
+    const stop = await defaultCheckCostBudgetExhausted({
+      threadId: 't', agentId: null, willContinue: true,
+      step: {
+        runId: 'r', threadId: 't', agentId: null, index: 1, durationMs: 0, finishReason: 'tool-calls',
+        inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0, tools: [], at: new Date(),
+      },
+      publish: async (type) => { sent.push(type); },
+      costMicros: 500, costBudgetMicros: 400,
+    });
+    expect(stop).toBe(true);
+    expect(sent).toEqual(['COST_BUDGET_EXHAUSTED']);
   });
 
   it('reads a check that throws as false, as a throwing pricer is', async () => {

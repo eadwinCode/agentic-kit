@@ -767,6 +767,7 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		if budgetExhausted(ctx, deps, "token budget", input.BillingRunID, func() (bool, error) {
 			return checkTokens(ctx, ports.TokenBudgetCheck{
 				BudgetCheck: check, TokensUsed: ledger.TokensUsed(), TokenBudget: input.TokenBudget,
+				Super: DefaultCheckTokenBudgetExhausted,
 			})
 		}) {
 			out.TokenExhausted = true
@@ -780,6 +781,7 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		if budgetExhausted(ctx, deps, "cost budget", input.BillingRunID, func() (bool, error) {
 			return checkCost(ctx, ports.CostBudgetCheck{
 				BudgetCheck: check, CostMicros: spent, Currency: currency, CostBudgetMicros: input.CostBudgetMicros,
+				Super: DefaultCheckCostBudgetExhausted,
 			})
 		}) {
 			out.CostExhausted = true

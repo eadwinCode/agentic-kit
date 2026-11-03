@@ -88,6 +88,11 @@ type TokenBudgetCheck struct {
 	TokensUsed int
 	// TokenBudget is the run's cap; zero when it has none.
 	TokenBudget int
+	// Super is the default check, DefaultCheckTokenBudgetExhausted. Call it
+	// with this same check to keep the token cap and add your own rule on
+	// top. The loop always sets it; a check you build by hand, such as in a
+	// test, must set it too.
+	Super CheckTokenBudgetExhaustedFunc
 }
 
 // CostBudgetCheck is what a CheckCostBudgetExhaustedFunc is told.
@@ -99,6 +104,11 @@ type CostBudgetCheck struct {
 	Currency   string
 	// CostBudgetMicros is the run's cap; zero when it has none.
 	CostBudgetMicros int64
+	// Super is the default check, DefaultCheckCostBudgetExhausted. Call it
+	// with this same check to keep the money cap and add your own rule on
+	// top. The loop always sets it; a check you build by hand, such as in a
+	// test, must set it too.
+	Super CheckCostBudgetExhaustedFunc
 }
 
 // CheckTokenBudgetExhaustedFunc says whether a run has used up its tokens.

@@ -1,11 +1,11 @@
-import type { CheckCostBudgetExhaustedFn, CheckTokenBudgetExhaustedFn } from '../ports/runtime.js';
+import type { CostBudgetCheck, TokenBudgetCheck } from '../ports/runtime.js';
 
 /** The token budget check the loop uses unless the host gives its own
  *  (§2.1): the run's `tokenBudget`, against what the run has used. The
  *  step that crossed the line is kept in full; the next one never starts.
  *  Published before the run stops, so a client learns why the moment it
  *  does. */
-export const defaultCheckTokenBudgetExhausted: CheckTokenBudgetExhaustedFn = async (c) => {
+export async function defaultCheckTokenBudgetExhausted(c: Omit<TokenBudgetCheck, 'super'>): Promise<boolean> {
   if (!c.tokenBudget || c.tokensUsed < c.tokenBudget) return false;
   await c.publish('TOKEN_BUDGET_EXHAUSTED', {
     agentId: c.agentId,
@@ -13,7 +13,7 @@ export const defaultCheckTokenBudgetExhausted: CheckTokenBudgetExhaustedFn = asy
     tokenBudget: c.tokenBudget,
   });
   return true;
-};
+}
 
 /** The money budget check the loop uses unless the host gives its own (§4):
  *  the run's `costBudgetMicros`, against the same shared ledger. A nested
@@ -22,7 +22,7 @@ export const defaultCheckTokenBudgetExhausted: CheckTokenBudgetExhaustedFn = asy
  *
  *  It only ever sees priced calls: with no pricer configured nothing is
  *  ever spent and the cap never fires. */
-export const defaultCheckCostBudgetExhausted: CheckCostBudgetExhaustedFn = async (c) => {
+export async function defaultCheckCostBudgetExhausted(c: Omit<CostBudgetCheck, 'super'>): Promise<boolean> {
   if (!c.costBudgetMicros || c.costMicros < c.costBudgetMicros) return false;
   await c.publish('COST_BUDGET_EXHAUSTED', {
     agentId: c.agentId,
@@ -31,4 +31,4 @@ export const defaultCheckCostBudgetExhausted: CheckCostBudgetExhaustedFn = async
     ...(c.currency ? { currency: c.currency } : {}),
   });
   return true;
-};
+}
