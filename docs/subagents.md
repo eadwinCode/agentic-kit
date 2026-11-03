@@ -109,6 +109,12 @@ The result handed back to the parent is capped at
 Depth 2 means a child may spawn a grandchild, and there it stops. Exceeding the
 cap is reported to the caller as a tool result, not raised as a crash.
 
+A child's whole run happens inside the parent's one `spawnSubagent` call, so
+inside one step of the parent, and that step's `stepTimeoutMs` covers all of
+it. To give children longer, set `timeoutMs` on the subagents config (Go:
+`SubagentsConfig.Timeout`): it is `spawnSubagent`'s own time limit, as in
+[Tools that need more time](./agents-and-tools.md#tools-that-need-more-time).
+
 The concurrency cap belongs to one run: another run's children never take its
 slots. And each depth has slots of its own. A parent keeps its slot while its
 child runs, so a single pool for every depth would let three children each wait

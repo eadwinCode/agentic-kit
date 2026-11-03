@@ -315,6 +315,7 @@ var (
 	IsParked                 = core.IsParked
 	MarkRequiresConfirmation = core.MarkRequiresConfirmation
 	RequireConfirmation      = core.RequireConfirmation
+	WithToolTimeout          = core.WithToolTimeout
 
 	FollowEvents = core.FollowEvents
 	ToSSEStream  = core.ToSSEStream

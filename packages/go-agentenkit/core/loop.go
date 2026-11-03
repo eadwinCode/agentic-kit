@@ -567,27 +567,32 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		}
 		// One round trip is bounded in wall time when StepTimeout is set: a
 		// model that accepts the call and never answers ends this step like
-		// any failed step, and the run takes the retry policy (§2.8).
-		stepCtx, cancelStep := genCtx, context.CancelFunc(func() {})
-		if deps.Config.StepTimeout > 0 {
-			stepCtx, cancelStep = context.WithTimeout(genCtx, deps.Config.StepTimeout)
-		}
+		// any failed step, and the run takes the retry policy (§2.8). A tool
+		// with its own Timeout gets that long while it runs, and a call past
+		// it ends the step the same way.
+		stepCtx, limit := startStepLimit(genCtx, deps.Config.StepTimeout, input.Tools)
 		step, err := ExecuteStep(stepCtx, agent, StepCall{
-			Kind: input.Kind, Model: input.Model, Messages: prompt, Tools: input.Tools,
+			Kind: input.Kind, Model: input.Model, Messages: prompt, Tools: withStepLimit(input.Tools, limit),
 			ProviderOptions: input.ProviderOptions, OnChunk: onChunk,
 			System: system, CacheSystemPrompt: input.CacheSystemPrompt,
 		})
-		stepTimedOut := deps.Config.StepTimeout > 0 && errors.Is(stepCtx.Err(), context.DeadlineExceeded) && genCtx.Err() == nil
-		cancelStep()
+		expired, ranPast := limit.stop()
+		stepTimedOut := expired && genCtx.Err() == nil
 		if batcher != nil {
 			batcher.flush() // the step's text is out before anything below
 		}
 		if stepTimedOut {
+			// With a timed tool in the step, its context is cancelled, not
+			// past a deadline, so what came back may say "canceled". The
+			// error says what happened.
 			if err == nil {
 				err = context.DeadlineExceeded
+			} else if errors.Is(err, context.Canceled) {
+				// Kept as text, not as Canceled, which reads as a stop.
+				err = fmt.Errorf("%w (%v)", context.DeadlineExceeded, err)
 			}
-			err = fmt.Errorf("step %d ran longer than %s: %w", out.Steps+1, deps.Config.StepTimeout, err)
-			Logger(deps).Warn("step timed out", "run", input.RunID, "step", out.Steps+1, "after", deps.Config.StepTimeout)
+			err = fmt.Errorf("step %d ran longer than %s: %w", out.Steps+1, ranPast, err)
+			Logger(deps).Warn("step timed out", "run", input.RunID, "step", out.Steps+1, "after", ranPast)
 		}
 		if err != nil || !step.Finished {
 			// The call ended without a finish: a user stop, or the provider

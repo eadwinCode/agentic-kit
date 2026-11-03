@@ -16,6 +16,7 @@ import { publish, withPublishEvent } from './publish.js';
 import { HITL_PARKED, RunStoppedError, withHitl, type HitlFrame, type ParkBox } from './hitl.js';
 import { withRunState, type AgentRunState } from './state.js';
 import { withToolRun } from './builtin/run.js';
+import { withToolTimeout } from './steplimit.js';
 import { markPromptCaching } from './cache.js';
 import { promptMessages, repairDanglingToolCalls } from './messages.js';
 import { runLoop, type LoopOutcome, type RunLedger } from './loop.js';
@@ -166,7 +167,7 @@ function spawnDescription(ctx: SubagentCtx): string {
 }
 
 export function spawnSubagentTool(ctx: SubagentCtx) {
-  return tool({
+  const spawn = tool({
     description: spawnDescription(ctx),
     inputSchema: z.object({
       name: z.string().describe('Short name for the sub-task'),
@@ -300,6 +301,9 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
       }
     },
   });
+  // The whole nested run happens inside this one call, so inside the
+  // parent's step: timeoutMs gives it longer than stepTimeoutMs.
+  return ctx.sub.timeoutMs && ctx.sub.timeoutMs > 0 ? withToolTimeout(spawn, ctx.sub.timeoutMs) : spawn;
 }
 
 /** Close a nested run's record with the same detail a dispatched run gets

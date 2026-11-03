@@ -18,6 +18,7 @@ import { ChunkBatcher, chunkPayload, drainOrThrow } from './stream.js';
 import { publish, publishNotice } from './publish.js';
 import { HITL_PARKED } from './hitl.js';
 import { RunLockLostError } from './lease.js';
+import { StepLimit, withStepLimit } from './steplimit.js';
 import {
   ChunkMapper,
   finishedByProvider,
@@ -338,17 +339,17 @@ export async function runLoop(
       : input.messages;
     // One round trip is bounded in wall time when stepTimeoutMs is set: a
     // model that accepts the call and never answers ends this step like any
-    // failed step, and the run takes the retry policy (§2.8).
+    // failed step, and the run takes the retry policy (§2.8). A tool with its
+    // own timeoutMs gets that long while it runs, and a call past it ends the
+    // step the same way.
     const stepAbort = new AbortController();
     const onRunAbort = () => stepAbort.abort(input.abortSignal.reason);
     input.abortSignal.addEventListener('abort', onRunAbort, { once: true });
-    let stepTimedOut = false;
-    const stepLimit = deps.config.stepTimeoutMs;
-    const stepTimer = stepLimit > 0
-      ? setTimeout(() => { stepTimedOut = true; stepAbort.abort(new Error('step timed out')); }, stepLimit)
-      : undefined;
-    const timeoutError = () =>
-      new Error(`step ${stepsRun + 1} ran longer than ${stepLimit}ms`);
+    const limit = new StepLimit(stepAbort, deps.config.stepTimeoutMs);
+    // The error that cut the call, when there is one, rides along as the
+    // cause: the message stays the same.
+    const timeoutError = (cause?: unknown) =>
+      new Error(`step ${stepsRun + 1} ran longer than ${limit.limit}ms`, cause === undefined ? undefined : { cause });
     const partial = { text: '' };
     let step: StepResult;
     const batcher = input.publishChunk ? new ChunkBatcher(input.publishChunk) : null;
@@ -357,7 +358,7 @@ export async function runLoop(
         kind: input.kind,
         model: input.model,
         messages: prompt,
-        tools: input.tools,
+        tools: withStepLimit(input.tools, limit),
         providerOptions: input.providerOptions,
         abortSignal: stepAbort.signal,
         onChunk:
@@ -375,7 +376,7 @@ export async function runLoop(
       await batcher?.flush(); // the step's text is out before anything below
     } catch (err) {
       await batcher?.flush();
-      clearTimeout(stepTimer);
+      limit.stop();
       input.abortSignal.removeEventListener('abort', onRunAbort);
       // The call ended without a finish: a user stop, or the provider failing
       // part way. Either way the provider billed for what it had already
@@ -396,12 +397,12 @@ export async function runLoop(
         tokensUsed += priced.totalTokens;
       }
       if (input.abortSignal.aborted) break; // user stop mid-step
-      if (stepTimedOut) throw timeoutError(); // → §2.8 retry policy
+      if (limit.expired) throw timeoutError(err); // → §2.8 retry policy
       throw err; // real failure → §2.8 redrive policy
     }
-    clearTimeout(stepTimer);
+    limit.stop();
     input.abortSignal.removeEventListener('abort', onRunAbort);
-    if (stepTimedOut && !step.finished && !input.abortSignal.aborted) {
+    if (limit.expired && !step.finished && !input.abortSignal.aborted) {
       // The step's own deadline cut the stream: billed like any cut call,
       // then a failure for the retry policy.
       const cut = unfinishedUsage(input, stepsRun + 1, partial.text, 'error', lastInput || estimateTokens(input.messages));
@@ -446,6 +447,14 @@ export async function runLoop(
       providerMetadata: providerMeta(step.providerMetadata, step.response),
       ...fillTokens(step.usage as any, step.providerMetadata),
     };
+    if (limit.expired && !input.abortSignal.aborted) {
+      // Time ran out as the finish came in: still a step past its limit, as
+      // in Go. The call did finish, so its real counters are billed.
+      const priced = await ledger.record(deps, threadId, { ...stepUsage, outcome: 'error' });
+      addAttribution(attribution, priced);
+      tokensUsed += priced.totalTokens;
+      throw timeoutError();
+    }
 
     // The step is done, and its messages are the first thing it writes. A
     // worker that lost the lock meanwhile must not write them: the next

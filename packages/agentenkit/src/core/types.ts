@@ -513,6 +513,12 @@ export interface SubagentsConfig {
   /** Extra tools merged into every spawned subagent's toolset
    *  (HITL-wrapped identically to the parent's tools). */
   tools?: ToolSet;
+  /** `spawnSubagent`'s own time limit in ms (see `withToolTimeout`). A nested
+   *  run, all its steps and tools included, happens inside one call to it, so
+   *  inside one step of the parent: without this it must fit in
+   *  `stepTimeoutMs`. A child's own timed tool can only run as long as this
+   *  allows. 0 or absent keeps the step's limit. */
+  timeoutMs?: number;
   /** Named specialists (§2.7). When set, `spawnSubagent` must name one of
    *  them: the child takes the profile's persona, model, tools and step cap
    *  instead of the shared defaults above. The model still writes the brief;

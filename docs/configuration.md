@@ -36,7 +36,7 @@ The same four settings in both runtimes (Go names in brackets, as durations):
 
 | Setting | Default | Meaning |
 | :--- | ---: | :--- |
-| `stepTimeoutMs` (`StepTimeout`) | `0` (off) | Bounds one model round trip; a step past it fails and the run takes the retry policy. |
+| `stepTimeoutMs` (`StepTimeout`) | `0` (off) | Bounds one model round trip, tools included; a step past it fails and the run takes the retry policy. A slow tool can have its own longer limit: see [Tools that need more time](./agents-and-tools.md#tools-that-need-more-time). |
 | `segmentTimeoutMs` (`SegmentTimeout`) | `0` (off) | Bounds one worker segment; a segment past it settles the run `FAILED` with stopReason `timeout`. |
 | `maxQueueWaitMs` (`MaxQueueWait`) | `0` (off) | A job picked up later than this fails with the reason instead of running. |
 | `maxQueueDepth` (`MaxQueueDepth`) | `0` (off) | A new run is refused (reason `queue_full`) before anything is written once this many jobs are ready and waiting. Needs a queue that can count. |

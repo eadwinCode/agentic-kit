@@ -32,6 +32,13 @@ func MarkRequiresConfirmation(t ports.Tool) ports.Tool {
 	return t
 }
 
+// WithToolTimeout gives a tool its own time limit inside a step (see
+// Tool.Timeout), for a tool that needs longer than StepTimeout.
+func WithToolTimeout(t ports.Tool, d time.Duration) ports.Tool {
+	t.Timeout = d
+	return t
+}
+
 // RequireConfirmation is MarkRequiresConfirmation for a plain goai tool.
 func RequireConfirmation(t goai.Tool) ports.Tool {
 	return MarkRequiresConfirmation(ports.WrapTool(t))
