@@ -7,6 +7,7 @@ import { setupAgentCore } from '../src/runtime.js';
 import { MemoryAdminStore } from '../src/admin/memory.js';
 import { MemoryBus, MemoryKv, MemoryQueue, MemoryStorage } from '../src/adapters/memory.js';
 import { markRequiresConfirmation } from '../src/core/engine.js';
+import { withToolTimeout } from '../src/core/steplimit.js';
 import { runLockKey } from '../src/core/lease.js';
 import { attemptsKey, runIdKey } from '../src/core/keys.js';
 import { DEFAULT_CONFIG, resolveConfig, type AgentConfig } from '../src/core/types.js';
@@ -403,6 +404,65 @@ describe('deadlines (§2.8)', () => {
     expect(settled[0]!.state).toBe('FAILED');
     expect(h.queue.items).toHaveLength(0); // not retried
     expect(await h.kv.get(runLockKey(ran.threadId))).toBeNull();
+  });
+});
+
+/** A tool that waits for `ms`, or until its call is aborted. */
+const sleepTool = (ms: number) =>
+  tool({
+    inputSchema: z.object({}),
+    execute: (_args, { abortSignal }) =>
+      new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => resolve('slept'), ms);
+        abortSignal?.addEventListener('abort', () => { clearTimeout(timer); reject(abortSignal.reason); }, { once: true });
+      }),
+  });
+
+describe('tool timeouts (§2.8)', () => {
+  it('a slow tool with a longer limit finishes', async () => {
+    const h = await harness([{ calls: [{ id: 'c1', name: 'render' }] }, { text: 'done' }], { stepTimeoutMs: 50 });
+    const chat = h.runtime.createStreamTextAgent({
+      name: 'chat', tools: { render: withToolTimeout(sleepTool(200), 2_000) },
+    });
+    const ran = await chat.run({ prompt: 'go' });
+    await h.next();
+    expect(h.lastTerminal(ran.threadId)?.state).toBe('COMPLETED');
+    expect(h.queue.items).toHaveLength(0); // no retry
+    expect(h.calls).toHaveLength(2);
+  });
+
+  it('a tool without one keeps the step limit', async () => {
+    const h = await harness([{ calls: [{ id: 'c1', name: 'lookup' }] }, { text: 'done' }], { stepTimeoutMs: 50 });
+    const chat = h.runtime.createStreamTextAgent({
+      name: 'chat', tools: { render: withToolTimeout(sleepTool(1), 2_000), lookup: sleepTool(2_000) },
+    });
+    const ran = await chat.run({ prompt: 'go' });
+    const started = Date.now();
+    await h.next();
+    expect(Date.now() - started).toBeLessThan(1_000); // ends at the step limit
+    expect(h.queue.items).toHaveLength(1);
+    expect(h.queue.items[0]!.kind).toBe('retry');
+    expect(await h.state(ran.threadId)).toBe('QUEUED');
+  });
+
+  it('a tool past its own limit fails like a step timeout', async () => {
+    const h = await harness(
+      [{ calls: [{ id: 'c1', name: 'render' }] }, { calls: [{ id: 'c2', name: 'render' }] }],
+      { stepTimeoutMs: 2_000, runMaxAttempts: 2 },
+    );
+    const chat = h.runtime.createStreamTextAgent({
+      name: 'chat', tools: { render: withToolTimeout(sleepTool(5_000), 50) },
+    });
+    const ran = await chat.run({ prompt: 'go' });
+    const started = Date.now();
+    await h.next();
+    expect(Date.now() - started).toBeLessThan(1_000); // ends at the tool's own limit
+    expect(h.queue.items).toHaveLength(1);
+    expect(h.queue.items[0]!.kind).toBe('retry');
+    await h.next();
+    const term = h.lastTerminal(ran.threadId)!;
+    expect(term.state).toBe('FAILED'); // out of attempts
+    expect(term.error).toContain('step 1 ran longer than 50ms');
   });
 });
 

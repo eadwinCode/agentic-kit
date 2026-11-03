@@ -761,6 +761,13 @@ func (m ResolvedModel) WireID(key string) string {
 type Tool struct {
 	goai.Tool
 	RequiresConfirmation bool
+	// Timeout is this tool's own time limit inside a step. While a call to
+	// it runs, the step has at least this long, even when StepTimeout is
+	// shorter; a call past it ends the step the way a step past StepTimeout
+	// does, with the same error and the same retry. Zero keeps the step's
+	// limit. It does not lift SegmentTimeout, or the queue's own limit on a
+	// job: keep those longer than the longest tool.
+	Timeout time.Duration
 }
 
 // WrapTool lifts a plain goai tool into the platform's Tool.
@@ -879,7 +886,8 @@ type AgentConfig struct {
 	RunRetryBackoffMax time.Duration
 	// StepTimeout bounds one model round trip, tools included. A step past
 	// it fails like any other failed step and the run takes the retry
-	// policy. Zero is no bound.
+	// policy. Zero is no bound. A slow tool can have more time of its own
+	// with Tool.Timeout, so this can stay short for every other step.
 	StepTimeout time.Duration
 	// SegmentTimeout bounds one worker segment: from pickup to finish or
 	// park. A segment past it settles the run FAILED with a reason the

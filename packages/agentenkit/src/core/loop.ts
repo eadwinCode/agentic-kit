@@ -18,6 +18,7 @@ import { ChunkBatcher, chunkPayload, drainOrThrow } from './stream.js';
 import { publish, publishNotice } from './publish.js';
 import { HITL_PARKED } from './hitl.js';
 import { RunLockLostError } from './lease.js';
+import { StepLimit, withStepLimit } from './steplimit.js';
 import {
   ChunkMapper,
   finishedByProvider,
@@ -338,17 +339,15 @@ export async function runLoop(
       : input.messages;
     // One round trip is bounded in wall time when stepTimeoutMs is set: a
     // model that accepts the call and never answers ends this step like any
-    // failed step, and the run takes the retry policy (§2.8).
+    // failed step, and the run takes the retry policy (§2.8). A tool with its
+    // own timeoutMs gets that long while it runs, and a call past it ends the
+    // step the same way.
     const stepAbort = new AbortController();
     const onRunAbort = () => stepAbort.abort(input.abortSignal.reason);
     input.abortSignal.addEventListener('abort', onRunAbort, { once: true });
-    let stepTimedOut = false;
-    const stepLimit = deps.config.stepTimeoutMs;
-    const stepTimer = stepLimit > 0
-      ? setTimeout(() => { stepTimedOut = true; stepAbort.abort(new Error('step timed out')); }, stepLimit)
-      : undefined;
+    const limit = new StepLimit(stepAbort, deps.config.stepTimeoutMs);
     const timeoutError = () =>
-      new Error(`step ${stepsRun + 1} ran longer than ${stepLimit}ms`);
+      new Error(`step ${stepsRun + 1} ran longer than ${limit.limit}ms`);
     const partial = { text: '' };
     let step: StepResult;
     const batcher = input.publishChunk ? new ChunkBatcher(input.publishChunk) : null;
@@ -357,7 +356,7 @@ export async function runLoop(
         kind: input.kind,
         model: input.model,
         messages: prompt,
-        tools: input.tools,
+        tools: withStepLimit(input.tools, limit),
         providerOptions: input.providerOptions,
         abortSignal: stepAbort.signal,
         onChunk:
@@ -375,7 +374,7 @@ export async function runLoop(
       await batcher?.flush(); // the step's text is out before anything below
     } catch (err) {
       await batcher?.flush();
-      clearTimeout(stepTimer);
+      limit.stop();
       input.abortSignal.removeEventListener('abort', onRunAbort);
       // The call ended without a finish: a user stop, or the provider failing
       // part way. Either way the provider billed for what it had already
@@ -396,12 +395,12 @@ export async function runLoop(
         tokensUsed += priced.totalTokens;
       }
       if (input.abortSignal.aborted) break; // user stop mid-step
-      if (stepTimedOut) throw timeoutError(); // → §2.8 retry policy
+      if (limit.expired) throw timeoutError(); // → §2.8 retry policy
       throw err; // real failure → §2.8 redrive policy
     }
-    clearTimeout(stepTimer);
+    limit.stop();
     input.abortSignal.removeEventListener('abort', onRunAbort);
-    if (stepTimedOut && !step.finished && !input.abortSignal.aborted) {
+    if (limit.expired && !step.finished && !input.abortSignal.aborted) {
       // The step's own deadline cut the stream: billed like any cut call,
       // then a failure for the retry policy.
       const cut = unfinishedUsage(input, stepsRun + 1, partial.text, 'error', lastInput || estimateTokens(input.messages));

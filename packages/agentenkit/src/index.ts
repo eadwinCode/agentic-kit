@@ -75,6 +75,7 @@ export {
   type StepResult,
 } from './core/engine.js';
 export { agentTool, type ToolContext } from './core/tools.js';
+export { withToolTimeout } from './core/steplimit.js';
 export {
   followEvents,
   followThread,

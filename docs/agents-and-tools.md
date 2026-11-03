@@ -135,6 +135,49 @@ A tool that throws (TS) or returns an error (Go) does not fail the run: the
 model gets `error: <message>` as the call's result and decides what to do next,
 in both runtimes. A user stop is the exception: it ends the run.
 
+### Tools that need more time
+
+`stepTimeoutMs` (`StepTimeout` in Go) bounds one model round trip, tools
+included. Keep it short, so a hung model call does not hold a worker for long,
+and give the one slow tool a limit of its own:
+
+```ts
+import { withToolTimeout } from 'agentenkit';
+
+const designSheet = withToolTimeout(
+  tool({
+    description: 'Makes a design sheet (slow)',
+    inputSchema: z.object({ brief: z.string() }),
+    execute: async ({ brief }, { abortSignal }) => makeSheet(brief, abortSignal),
+  }),
+  30 * 60_000, // 30 minutes
+);
+```
+
+```go
+designSheet := agentenkit.WithToolTimeout(agentenkit.AgentTool("design_sheet", "Makes a design sheet (slow)", makeSheet), 30*time.Minute)
+// or set the field: t.Timeout = 30 * time.Minute
+```
+
+How it works, the same in both runtimes:
+
+- While a call to the tool runs, its step has at least that long, even when
+  the step limit is shorter. A step with no limit keeps none.
+- The tool's own call has that long. A call past it ends the step the way a
+  step past the step limit ends: the same `step N ran longer than …` error
+  (naming the tool's limit) and the same retry.
+- Other tools keep the step limit. If they run in the same step as a slow tool,
+  they share its longer time.
+- The tool must stop when its `abortSignal` fires (Go: when its `ctx` is done),
+  as with the step limit.
+- It does not lift `segmentTimeoutMs` (`SegmentTimeout`), or a queue's own limit
+  on one job (for example Flow's step timeout). Keep those longer than your
+  slowest tool. For work that takes much longer, have the tool start a
+  background job and park the run with `parkForInput` (`ParkForInput`), as in
+  [Human in the loop](./human-in-the-loop.md).
+- It applies inside a step. An approved call that runs on resume (see
+  [Human in the loop](./human-in-the-loop.md)) is not bounded by it.
+
 ### Tools see the run's state
 
 Every tool receives the run's [state](./run-state.md) as part of its second
