@@ -126,7 +126,7 @@ export interface BudgetCheck {
   willContinue: boolean;
   /** Publishes a platform event on the run's thread. A check that stops the
    *  run says why with it, as the defaults do: `TOKEN_BUDGET_EXHAUSTED` or
-   *  `COST_BUDGET_EXHAUSTED`. */
+   *  `COST_BUDGET_EXHAUSTED`. A failure is logged, never thrown. */
   publish(type: string, payload: Record<string, unknown>): Promise<void>;
 }
 

@@ -323,6 +323,42 @@ func TestCost_EachCheckIsHandedTheDefaultAsSuper(t *testing.T) {
 	mustEqual(t, h.lastTerminal(ran.ThreadID)["stopReason"], "cost_budget", "stopReason")
 }
 
+// failingBus fails to publish one event type.
+type failingBus struct {
+	ports.EventBus
+	typ string
+}
+
+func (b failingBus) Publish(ctx context.Context, threadID string, event ports.AgentEvent) error {
+	if event.Type == b.typ {
+		return errors.New("bus down")
+	}
+	return b.EventBus.Publish(ctx, threadID, event)
+}
+
+// A budget event that fails to publish still stops the run at its cap, as
+// in TS.
+func TestCost_TheCapStopsTheRunWhenItsEventFailsToPublish(t *testing.T) {
+	h := makeRuntimeOpts(t, scripted(
+		step{calls: []call{{"c1", "probe", `{}`}}},
+		step{calls: []call{{"c2", "probe", `{}`}}},
+		step{text: "never reached"},
+	), func(o *agentenkit.RuntimeOptions) {
+		o.Pricer = testTable
+		o.Bus = failingBus{EventBus: o.Bus, typ: "COST_BUDGET_EXHAUSTED"}
+	})
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
+		Name: "chat", Model: "gpt-4o",
+		Tools: []agentenkit.Tool{tool("probe", func(context.Context, map[string]any) (string, error) {
+			return `{}`, nil
+		})},
+	})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi", CostBudgetMicros: 400})
+	h.handleNext(t)
+	mustEqual(t, h.model.Calls(), 2, "model calls")
+	mustEqual(t, h.lastTerminal(ran.ThreadID)["stopReason"], "cost_budget", "stopReason")
+}
+
 // A check that errors or panics is read as false, as a throw is in TS.
 func TestCost_ACheckThatFailsIsReadAsFalse(t *testing.T) {
 	for name, check := range map[string]agentenkit.CheckCostBudgetExhaustedFunc{

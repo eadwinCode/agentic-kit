@@ -388,7 +388,8 @@ Each check is told:
   don't send it again. The defaults are also
   exported as `defaultCheckTokenBudgetExhausted` and
   `defaultCheckCostBudgetExhausted` (Go: `DefaultCheck…`).
-- `publish`, to say why the run stopped. The loop sends nothing itself, so a
+- `publish`, to say why the run stopped. A failed publish is logged, never
+  thrown, so a check that decided to stop still stops. The loop sends nothing itself, so a
   check that returns true without publishing ends the run without saying why.
 
 True ends the run the way the cap does. That means `stopReason: 'token_budget'`

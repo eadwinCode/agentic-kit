@@ -402,6 +402,27 @@ describe('budget checks the host can replace (§2.1, §4)', () => {
     expect(sent).toEqual(['COST_BUDGET_EXHAUSTED']);
   });
 
+  it('still stops at the cap when the budget event fails to publish', async () => {
+    const { runtime, bus, queue } = await makeRuntime(
+      [
+        { toolCalls: [{ toolCallId: 'c1', toolName: 'probe', args: {} }] },
+        { toolCalls: [{ toolCallId: 'c2', toolName: 'probe', args: {} }] },
+        { text: 'never reached' },
+      ],
+      { pricer: priceList },
+    );
+    const send = bus.publish.bind(bus);
+    bus.publish = async (threadId, event) => {
+      if (event.type === 'COST_BUDGET_EXHAUSTED') throw new Error('bus down');
+      return send(threadId, event);
+    };
+    const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', tools: probe });
+    await chat.run({ prompt: 'hi', costBudgetMicros: 400 });
+    await runtime.worker.handleJob(queue.items[0]!);
+    expect(events(bus, 'STEP_FINISHED').length).toBe(2);
+    expect(terminal(bus).stopReason).toBe('cost_budget');
+  });
+
   it('reads a check that throws as false, as a throwing pricer is', async () => {
     const { runtime, bus, queue } = await makeRuntime(
       [{ toolCalls: [{ toolCallId: 'c1', toolName: 'probe', args: {} }] }, { text: 'done' }],

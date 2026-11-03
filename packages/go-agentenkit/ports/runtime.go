@@ -77,7 +77,8 @@ type BudgetCheck struct {
 	WillContinue bool
 	// Publish publishes a platform event on the run's thread. A check that
 	// stops the run says why with it, as the defaults do:
-	// TOKEN_BUDGET_EXHAUSTED or COST_BUDGET_EXHAUSTED.
+	// TOKEN_BUDGET_EXHAUSTED or COST_BUDGET_EXHAUSTED. A failure is logged,
+	// and it always returns nil.
 	Publish func(ctx context.Context, eventType string, payload map[string]any) error
 }
 
