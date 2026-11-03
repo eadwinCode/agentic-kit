@@ -755,9 +755,13 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 		check := ports.BudgetCheck{
 			RunID: input.BillingRunID, ThreadID: threadID, AgentID: input.AgentID, State: input.State,
 			Step: marker, WillContinue: step.FinishReason == provider.FinishToolCalls,
+			// A failed publish is logged, never returned: a check that decided
+			// to stop must stop, as in TS.
 			Publish: func(ctx context.Context, eventType string, payload map[string]any) error {
-				_, err := Publish(ctx, deps, threadID, eventType, payload)
-				return err
+				if _, err := Publish(ctx, deps, threadID, eventType, payload); err != nil {
+					Logger(deps).Error("budget event not published", "run", input.BillingRunID, "type", eventType, "err", err)
+				}
+				return nil
 			},
 		}
 		checkTokens := deps.CheckTokenBudgetExhausted

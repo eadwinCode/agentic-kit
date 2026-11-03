@@ -579,8 +579,14 @@ export async function runLoop(
       ...(input.state ? { state: input.state } : {}),
       step: marker,
       willContinue: step.finishReason === 'tool-calls',
+      // A failed publish is logged, never thrown: a check that decided to
+      // stop must stop, as in Go.
       publish: async (type: string, payload: Record<string, unknown>) => {
-        await publish(deps, threadId, type, payload);
+        try {
+          await publish(deps, threadId, type, payload);
+        } catch (err) {
+          (deps.log ?? console).error('budget event not published', { run: input.billingRunId, type, err });
+        }
       },
     };
     const exhausted = async (name: string, run: () => boolean | Promise<boolean>) => {

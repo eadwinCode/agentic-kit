@@ -323,6 +323,14 @@ Per-tenant token ceilings ride on the run:
 await chat.run({ prompt, state, tokenBudget: org.plan.perRunTokenBudget });
 ```
 
+When tenants pay from one shared balance, read it live instead: give
+`setupAgentCore` a `checkCostBudgetExhausted` (Go:
+`RuntimeOptions.CheckCostBudgetExhausted`) that looks up the tenant from
+`state` and stops the run when the balance is gone. It runs after each step,
+so the first step of a run segment runs before it: refuse a tenant with no
+balance in `billingPreCheck`. See
+[Your own budget checks](./cost-and-pricing.md#your-own-budget-checks).
+
 ## Isolating further
 
 Run state is row-level isolation, which suits most products. Two stronger
