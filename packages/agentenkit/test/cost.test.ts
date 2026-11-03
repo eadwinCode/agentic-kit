@@ -317,16 +317,30 @@ describe('live budget (§4)', () => {
     expect(terminal(bus).state).toBe('COMPLETED');
   });
 
-  it('lets the run go on when the host has no answer', async () => {
+  it('lets the run go on when the host has no answer, and asks only when a step follows', async () => {
+    let asked = 0;
     const { runtime, bus, queue } = await makeRuntime(
       [{ toolCalls: [{ toolCallId: 'c1', toolName: 'probe', args: {} }] }, { text: 'done' }],
-      { pricer: priceList, budgetLeft: () => null },
+      { pricer: priceList, budgetLeft: () => { asked++; return null; } },
+    );
+    const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', tools: probe });
+    await chat.run({ prompt: 'hi' });
+    await runtime.worker.handleJob(queue.items[0]!);
+    expect(asked).toBe(1);
+    expect(events(bus, 'COST_BUDGET_EXHAUSTED').length).toBe(0);
+    expect(terminal(bus).stopReason).not.toBe('cost_budget');
+  });
+
+  it('reads a budget that throws as no answer, as a throwing pricer is', async () => {
+    const { runtime, bus, queue } = await makeRuntime(
+      [{ toolCalls: [{ toolCallId: 'c1', toolName: 'probe', args: {} }] }, { text: 'done' }],
+      { pricer: priceList, budgetLeft: () => { throw new Error('balance store down'); } },
     );
     const chat = runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', tools: probe });
     await chat.run({ prompt: 'hi' });
     await runtime.worker.handleJob(queue.items[0]!);
     expect(events(bus, 'COST_BUDGET_EXHAUSTED').length).toBe(0);
-    expect(terminal(bus).stopReason).not.toBe('cost_budget');
+    expect(terminal(bus).state).toBe('COMPLETED');
   });
 });
 

@@ -349,9 +349,17 @@ At zero or below the run ends exactly as the cap ends it:
 `COST_BUDGET_EXHAUSTED` (with `budgetLeftMicros` in place of
 `costBudgetMicros`), then `stopReason: 'cost_budget'`, and the run completes.
 `null` (Go: `ok` false) is no answer, and the run goes on; return zero on your
-own errors to fail closed instead. A nested run is asked about its parent's
-run id, since that is the run its calls are billed to. It runs between steps
-on the run's own path, so keep it to one read.
+own errors to fail closed instead; a TypeScript function that throws is logged
+and read as no answer, as a throwing pricer is. A nested run is asked about
+its parent's run id, since that is the run its calls are billed to, and may
+ask at the same time as its parent, so the function must be safe to call at
+once. `runId` can be empty for a run dispatched without one.
+
+It is only asked when another step would follow: a run that ends on its own
+never pays for a read that could stop nothing. So the **first** step of a
+segment runs without it. A run started, or resumed after a park, on a balance
+that is already gone must be refused before that, in `billingPreCheck` at
+pickup. It runs between steps on the run's own path, so keep it to one read.
 
 ## Calls that were cut off
 

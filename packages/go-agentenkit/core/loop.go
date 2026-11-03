@@ -781,8 +781,10 @@ func RunLoop(ctx context.Context, deps ports.RuntimePorts, agent *RegisteredAgen
 
 		// The host's live budget (§4), in the same place: what the run may
 		// still spend now, which other runs spending the same balance can
-		// bring to zero before this run reaches its own cap.
-		if deps.BudgetLeft != nil {
+		// bring to zero before this run reaches its own cap. Only when
+		// another step would follow: a run that ends here has nothing left
+		// to stop.
+		if deps.BudgetLeft != nil && step.FinishReason == provider.FinishToolCalls {
 			left, ok := deps.BudgetLeft(ctx, ports.BudgetLeftCheck{
 				RunID: input.BillingRunID, ThreadID: threadID, AgentID: input.AgentID, State: input.State,
 			})

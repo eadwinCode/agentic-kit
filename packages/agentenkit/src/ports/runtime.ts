@@ -108,7 +108,7 @@ export interface Pricer {
 /** The run a `BudgetLeftFn` is asked about. */
 export interface BudgetLeftCheck {
   /** The DISPATCHED run the spend is billed to: a nested run is asked about
-   *  its parent (§4). */
+   *  its parent (§4). Absent for a run dispatched without one. */
   runId?: string;
   threadId: string;
   /** Null for the main run, the nested run's id otherwise. */
@@ -130,6 +130,10 @@ export interface BudgetLeftCheck {
  *  It runs between steps on the run's own path: one read of a balance is
  *  the intended shape. */
 export type BudgetLeftFn = (check: BudgetLeftCheck) => number | null | Promise<number | null>;
+// It is only asked when another step would follow, so the first step of a
+// segment runs without it: refuse a run started or resumed on an empty
+// balance in `billingPreCheck` at pickup. A throw is logged and read as no
+// answer. Nested runs ask it too, possibly at the same time.
 
 export interface RuntimeOptions {
   storage: Storage;

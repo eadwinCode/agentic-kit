@@ -205,13 +205,22 @@ func TestCost_TheLiveBudgetStopsTheRunBetweenSteps(t *testing.T) {
 	mustEqual(t, h.thread(t, ran.ThreadID).State, agentenkit.StateCompleted, "state")
 }
 
+// No answer lets the run go on, and a run that ends on its own is not asked
+// after its last step: there is nothing left to stop.
 func TestCost_ALiveBudgetWithNoAnswerLetsTheRunGoOn(t *testing.T) {
+	var asked int
+	var mu sync.Mutex
 	h := makeRuntimeOpts(t, scripted(
 		step{calls: []call{{"c1", "probe", `{}`}}},
 		step{text: "done"},
 	), func(o *agentenkit.RuntimeOptions) {
 		o.Pricer = testTable
-		o.BudgetLeft = func(context.Context, agentenkit.BudgetLeftCheck) (int64, bool) { return 0, false }
+		o.BudgetLeft = func(context.Context, agentenkit.BudgetLeftCheck) (int64, bool) {
+			mu.Lock()
+			defer mu.Unlock()
+			asked++
+			return 0, false
+		}
 	})
 	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
 		Name: "chat", Model: "gpt-4o",
@@ -222,6 +231,7 @@ func TestCost_ALiveBudgetWithNoAnswerLetsTheRunGoOn(t *testing.T) {
 	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "hi"})
 	h.handleNext(t)
 	mustEqual(t, h.model.Calls(), 2, "model calls")
+	mustEqual(t, asked, 1, "asked only when a step follows")
 	mustEqual(t, len(h.events(ran.ThreadID, "COST_BUDGET_EXHAUSTED")), 0, "no stop")
 }
 

@@ -596,11 +596,19 @@ export async function runLoop(
 
     // The host's live budget (§4), in the same place: what the run may still
     // spend now, which other runs spending the same balance can bring to
-    // zero before this run reaches its own cap.
-    if (deps.budgetLeft) {
-      const left = await deps.budgetLeft({
-        runId: input.billingRunId, threadId, agentId: input.agentId, state: input.state,
-      });
+    // zero before this run reaches its own cap. Only when another step would
+    // follow: a run that ends here has nothing left to stop. A throw is
+    // logged and read as no answer, as the pricer's is: a budget the host
+    // cannot read must never fail a run.
+    if (deps.budgetLeft && step.finishReason === 'tool-calls') {
+      let left: number | null = null;
+      try {
+        left = await deps.budgetLeft({
+          runId: input.billingRunId, threadId, agentId: input.agentId, state: input.state,
+        });
+      } catch (err) {
+        (deps.log ?? console).error('budget not read', { run: input.billingRunId, err });
+      }
       if (left !== null && left <= 0) {
         await publish(deps, threadId, 'COST_BUDGET_EXHAUSTED', {
           agentId: input.agentId,

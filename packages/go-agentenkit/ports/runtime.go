@@ -65,7 +65,11 @@ type Pricer interface {
 // host that wants to fail closed returns ok true and zero on its own errors.
 //
 // It runs between steps on the run's own path: one read of a balance is the
-// intended shape.
+// intended shape. It is only asked when another step would follow, so the
+// first step of a segment runs without it: a run started or resumed on an
+// empty balance must be refused before that (BillingPreCheck at pickup).
+// Nested runs ask it from their own goroutines, so it must be safe to call
+// at once. RunID can be empty for a run dispatched without one.
 type BudgetLeftFunc func(ctx context.Context, check BudgetLeftCheck) (leftMicros int64, ok bool)
 
 // BudgetLeftCheck is the run a BudgetLeftFunc is asked about.
