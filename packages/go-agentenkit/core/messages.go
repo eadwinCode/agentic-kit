@@ -20,7 +20,8 @@ import (
 //	[{"type":"text","text":"..."},
 //	 {"type":"reasoning","text":"...","signature":"..."},
 //	 {"type":"redacted-reasoning","data":"..."},
-//	 {"type":"tool-call","toolCallId":"c1","toolName":"lookup","args":{...}},
+//	 {"type":"tool-call","toolCallId":"c1","toolName":"lookup","args":{...},
+//	  "providerOptions":{"google":{"thoughtSignature":"..."}}},
 //	 {"type":"tool-result","toolCallId":"c1","toolName":"lookup","result":{...}},
 //	 {"type":"image","image":"https://…","mimeType":"image/png"}]
 
@@ -44,6 +45,60 @@ type ContentPart struct {
 	// Image is an image part's URL (or data: URL), the AI SDK field name.
 	Image    string `json:"image,omitempty"`
 	MimeType string `json:"mimeType,omitempty"`
+	// ProviderOptions is a provider's own data on a text, reasoning or
+	// tool-call part, keyed by provider: the AI SDK field, so both runtimes
+	// read the same rows. It goes back to the provider on the next call.
+	// Gemini needs this most: it rejects a tool call from the current turn
+	// that comes back without its {"google":{"thoughtSignature":...}}.
+	// OpenRouter keeps its reasoning_details here the same way.
+	ProviderOptions map[string]any `json:"providerOptions,omitempty"`
+}
+
+// goaiOwnOptions are keys goai puts on a part for itself, not for a
+// provider: the inline result of a web search the provider ran ("resultBlock"
+// from Anthropic, "rawItem" from OpenAI Responses). goai reads them to know
+// that no tool result follows the call. They are not stored: the AI SDK
+// would read them as provider names, and a search result can be large.
+var goaiOwnOptions = map[string]bool{"resultBlock": true, "rawItem": true}
+
+// storedOptions picks the entries of a goai part's ProviderOptions that are
+// keyed by provider (an object value, such as "google" or "openrouter").
+// The plain top-level values goai uses for Anthropic ("signature",
+// "redactedData") have their own stored fields, and the AI SDK reads
+// providerOptions as provider name -> object, so they are left out here. An
+// entry that cannot be written as JSON is left out too, so it can never
+// cost the whole row.
+func storedOptions(opts map[string]any) map[string]any {
+	var out map[string]any
+	for k, v := range opts {
+		if _, ok := v.(map[string]any); !ok || goaiOwnOptions[k] {
+			continue
+		}
+		if _, err := json.Marshal(v); err != nil {
+			continue
+		}
+		if out == nil {
+			out = map[string]any{}
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// loadedOptions is a stored part's provider options as goai reads them, with
+// extra top-level values laid on top. It is nil when there is nothing.
+func loadedOptions(stored map[string]any, extra map[string]any) map[string]any {
+	if len(stored) == 0 && len(extra) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(stored)+len(extra))
+	for k, v := range stored {
+		out[k] = v
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
 }
 
 // UserContent encodes a user turn: plain text alone, or text plus the
@@ -166,14 +221,15 @@ func ContentFromMessage(m provider.Message) json.RawMessage {
 	for _, p := range m.Content {
 		switch p.Type {
 		case provider.PartText:
-			parts = append(parts, ContentPart{Type: "text", Text: p.Text})
+			parts = append(parts, ContentPart{Type: "text", Text: p.Text, ProviderOptions: storedOptions(p.ProviderOptions)})
 		case provider.PartReasoning:
 			sig, _ := p.ProviderOptions["signature"].(string)
+			opts := storedOptions(p.ProviderOptions)
 			if data, _ := p.ProviderOptions["redactedData"].(string); data != "" && p.Text == "" {
-				parts = append(parts, ContentPart{Type: "redacted-reasoning", Data: data})
+				parts = append(parts, ContentPart{Type: "redacted-reasoning", Data: data, ProviderOptions: opts})
 				continue
 			}
-			parts = append(parts, ContentPart{Type: "reasoning", Text: p.Text, Signature: sig})
+			parts = append(parts, ContentPart{Type: "reasoning", Text: p.Text, Signature: sig, ProviderOptions: opts})
 		case provider.PartToolCall:
 			args := p.ToolInput
 			if len(bytes.TrimSpace(args)) == 0 || !json.Valid(args) {
@@ -181,6 +237,7 @@ func ContentFromMessage(m provider.Message) json.RawMessage {
 			}
 			parts = append(parts, ContentPart{
 				Type: "tool-call", ToolCallID: p.ToolCallID, ToolName: p.ToolName, Args: args,
+				ProviderOptions: storedOptions(p.ProviderOptions),
 			})
 		case provider.PartToolResult:
 			parts = append(parts, ContentPart{
@@ -255,16 +312,18 @@ func MessageFromDTO(m ports.MessageDTO) provider.Message {
 	for _, p := range ParseContent(m.Content) {
 		switch p.Type {
 		case "text":
-			out.Content = append(out.Content, provider.Part{Type: provider.PartText, Text: p.Text})
+			out.Content = append(out.Content, provider.Part{
+				Type: provider.PartText, Text: p.Text, ProviderOptions: loadedOptions(p.ProviderOptions, nil),
+			})
 		case "reasoning":
-			part := provider.Part{Type: provider.PartReasoning, Text: p.Text}
-			if p.Signature != "" {
-				part.ProviderOptions = map[string]any{"signature": p.Signature}
-			}
-			out.Content = append(out.Content, part)
+			out.Content = append(out.Content, provider.Part{
+				Type: provider.PartReasoning, Text: p.Text,
+				ProviderOptions: loadedOptions(p.ProviderOptions, anthropicReasoning(p.Signature, "", p.ProviderOptions)),
+			})
 		case "redacted-reasoning":
 			out.Content = append(out.Content, provider.Part{
-				Type: provider.PartReasoning, ProviderOptions: map[string]any{"redactedData": p.Data},
+				Type:            provider.PartReasoning,
+				ProviderOptions: loadedOptions(p.ProviderOptions, anthropicReasoning("", p.Data, p.ProviderOptions)),
 			})
 		case "tool-call":
 			args := p.Args
@@ -273,6 +332,7 @@ func MessageFromDTO(m ports.MessageDTO) provider.Message {
 			}
 			out.Content = append(out.Content, provider.Part{
 				Type: provider.PartToolCall, ToolCallID: p.ToolCallID, ToolName: p.ToolName, ToolInput: args,
+				ProviderOptions: loadedOptions(p.ProviderOptions, nil),
 			})
 		case "tool-result":
 			out.Content = append(out.Content, provider.Part{
@@ -284,6 +344,30 @@ func MessageFromDTO(m ports.MessageDTO) provider.Message {
 				out.Content = append(out.Content, provider.Part{Type: provider.PartImage, URL: p.Image, MediaType: p.MimeType})
 			}
 		}
+	}
+	return out
+}
+
+// anthropicReasoning is the top-level "signature" / "redactedData" goai's
+// Anthropic adapter reads on a reasoning part. Go stores them in their own
+// fields; the TypeScript package stores them as the AI SDK does, under
+// providerOptions.anthropic. Either one is read, so a thread written by one
+// runtime replays signed in the other.
+func anthropicReasoning(signature, data string, stored map[string]any) map[string]any {
+	if a, ok := stored["anthropic"].(map[string]any); ok {
+		if s, _ := a["signature"].(string); signature == "" && s != "" {
+			signature = s
+		}
+		if d, _ := a["redactedData"].(string); data == "" && d != "" {
+			data = d
+		}
+	}
+	out := map[string]any{}
+	if signature != "" {
+		out["signature"] = signature
+	}
+	if data != "" {
+		out["redactedData"] = data
 	}
 	return out
 }

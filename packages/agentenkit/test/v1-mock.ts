@@ -16,7 +16,14 @@ export type LanguageModelV1StreamPart =
   | { type: 'text-delta'; textDelta: string }
   | { type: 'reasoning'; textDelta: string }
   | { type: 'tool-call-delta'; toolCallType?: 'function'; toolCallId: string; toolName: string; argsTextDelta: string }
-  | { type: 'tool-call'; toolCallType?: 'function'; toolCallId: string; toolName: string; args: string }
+  | {
+      type: 'tool-call';
+      toolCallType?: 'function';
+      toolCallId: string;
+      toolName: string;
+      args: string;
+      providerMetadata?: Record<string, Record<string, unknown>>;
+    }
   | { type: 'source'; source: Record<string, unknown> }
   | { type: 'response-metadata'; id?: string; timestamp?: Date; modelId?: string }
   | {
@@ -150,6 +157,7 @@ function v4Stream(stream: ReadableStream<any>): ReadableStream<any> {
               toolCallId: p.toolCallId,
               toolName: p.toolName,
               input: typeof p.args === 'string' ? p.args : JSON.stringify(p.args ?? {}),
+              ...(p.providerMetadata ? { providerMetadata: p.providerMetadata } : {}),
             });
             return;
           case 'source':

@@ -181,6 +181,32 @@ describe('an answer (§2.5)', () => {
     expect(await r.kv.get(hitlDoneKey('a1'))).toBeNull();
   });
 
+  // Gemini rejects a tool call from the current turn that comes back without
+  // its thought signature. The resumed run reads the thread back from
+  // storage, so the signature has to be stored with the call. The same case
+  // runs in the Go package (provider_options_test.go).
+  it('a tool call keeps its thought signature across a park and resume', async () => {
+    const signature = { google: { thoughtSignature: 'sig_a1' } };
+    const r = await setup([
+      [{ ...call('a1', 'send', {}), providerMetadata: signature } as LanguageModelV1StreamPart, finish('tool-calls')],
+      [say('done'), finish('stop')],
+    ]);
+    const ran = await r.chat.run({ prompt: 'go' });
+    await r.next();
+    r.queue.items.shift(); // the park's expiry job
+    expect((await r.runtime.hitl.respond({ threadId: ran.threadId, toolCallId: 'a1', approved: true })).delivered).toBe(true);
+    await r.next();
+    expect(r.sent).toEqual(['sent']);
+    expect(await r.state(ran.threadId)).toBe('COMPLETED');
+    const stored = (r.rows(ran.threadId)[1]!.content as any[]).find((p) => p.type === 'tool-call');
+    expect(stored.providerOptions).toEqual(signature);
+    expect(r.prompts).toHaveLength(2);
+    const sentBack = r.prompts[1]
+      .flatMap((m: any) => (Array.isArray(m.content) ? m.content : []))
+      .find((p: any) => p.type === 'tool-call' && p.toolCallId === 'a1');
+    expect(sentBack.providerOptions).toEqual(signature);
+  });
+
   it('a second answer is refused', async () => {
     const r = await setup([[call('a1', 'send', {}), finish('tool-calls')]]);
     const ran = await r.chat.run({ prompt: 'go' });

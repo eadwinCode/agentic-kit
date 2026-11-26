@@ -134,3 +134,28 @@ The engine forwards the options as the SDK's `providerOptions`. Messages stored
 before the AI SDK 7 upgrade may carry the old v4 name,
 `experimental_providerMetadata`; those are read as `providerOptions` when the
 prompt is built.
+
+## Provider data on stored messages
+
+Some providers put their own data on the parts of a reply and need it back
+on the next call. Gemini puts a thought signature on each tool call, and
+refuses a tool call from the current turn that comes back without it.
+OpenRouter puts `reasoning_details` on reasoning.
+
+Both runtimes store this data with the part, under `providerOptions`, keyed
+by provider — the AI SDK's own field. Go keeps it on tool-call, reasoning and
+text parts when goai hands it over; today goai sets it on tool calls and
+reasoning, not on text. The TypeScript runtime keeps whatever the AI SDK puts
+on a part.
+
+For example:
+
+```json
+{ "type": "tool-call", "toolCallId": "c1", "toolName": "lookup", "args": {},
+  "providerOptions": { "google": { "thoughtSignature": "…" } } }
+```
+
+So it is still there when a run reads the thread back: on the next run, on a
+resume after an approval, and on a retry. Rows stored before this field was
+kept still load; they just have no provider data. Both runtimes read the same
+rows (pinned by `packages/parity/stored-parts.json`).

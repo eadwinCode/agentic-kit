@@ -15,6 +15,8 @@ import {
   toStoredMessage,
 } from '../src/core/sdk.js';
 import { ofType, runItems } from './stream-helpers.js';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 // The platform stores and publishes the v4 shape, shared with the Go runtime;
 // the SDK (v7) speaks its own. These cases pin the translation between them,
@@ -77,6 +79,40 @@ describe('stored messages ↔ SDK messages', () => {
       content: [{ type: 'tool-call', toolCallId: 'c1', toolName: 'lookup', input: { q: 'x' } }],
     }).content).toEqual([{ type: 'tool-call', toolCallId: 'c1', toolName: 'lookup', args: { q: 'x' } }]);
   });
+});
+
+// A provider's own data on a part (Gemini's thought signature above all)
+// must reach the next model call after the thread is read back from storage.
+// The same cases run in the Go package (provider_options_test.go).
+describe('stored provider options', () => {
+  it('keeps a tool call’s thought signature through a save and load', () => {
+    const signature = { google: { thoughtSignature: 'sig' } };
+    const stored = toStoredMessage({
+      role: 'assistant',
+      content: [{ type: 'tool-call', toolCallId: 'c1', toolName: 'lookup', input: { q: 'x' }, providerOptions: signature }],
+    });
+    expect(stored.content).toEqual([
+      { type: 'tool-call', toolCallId: 'c1', toolName: 'lookup', args: { q: 'x' }, providerOptions: signature },
+    ]);
+    const back = toModelMessage(JSON.parse(JSON.stringify(stored)));
+    expect((back.content as any[])[0]).toEqual({
+      type: 'tool-call', toolCallId: 'c1', toolName: 'lookup', input: { q: 'x' }, providerOptions: signature,
+    });
+  });
+
+  // parity/stored-parts.json: each stored part, written by either runtime,
+  // reaches the model call with the same provider options.
+  const cases = JSON.parse(readFileSync(join(import.meta.dir, '../../parity/stored-parts.json'), 'utf8')) as Array<{
+    name: string;
+    part: Record<string, unknown>;
+    providerOptions: Record<string, unknown> | null;
+  }>;
+  for (const c of cases) {
+    it(c.name, () => {
+      const m = toModelMessage({ role: 'assistant', content: [c.part] });
+      expect((m.content as any[])[0].providerOptions ?? null).toEqual(c.providerOptions);
+    });
+  }
 });
 
 describe('SDK stream parts → published chunks', () => {

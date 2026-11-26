@@ -41,6 +41,9 @@ type step struct {
 	// finishNoReason ends the stream with a finish chunk that has no reason
 	// and nothing before it saying why: a stream cut short.
 	finishNoReason bool
+	// callMeta is put on every tool call of the step, the way goai's Google
+	// adapter puts a thought signature on one.
+	callMeta map[string]any
 }
 
 // scriptedModel plays back one scripted step per round-trip. The platform
@@ -115,7 +118,7 @@ func (m *scriptedModel) DoGenerate(ctx context.Context, p provider.GenerateParam
 	}
 	res := &provider.GenerateResult{Text: s.text, Reasoning: s.reasoning, FinishReason: finishOf(s), Usage: usageOf(s)}
 	for _, c := range s.calls {
-		res.ToolCalls = append(res.ToolCalls, provider.ToolCall{ID: c.id, Name: c.name, Input: json.RawMessage(c.args)})
+		res.ToolCalls = append(res.ToolCalls, provider.ToolCall{ID: c.id, Name: c.name, Input: json.RawMessage(c.args), Metadata: s.callMeta})
 	}
 	return res, nil
 }
@@ -144,7 +147,7 @@ func (m *scriptedModel) DoStream(ctx context.Context, p provider.GenerateParams)
 			ch <- provider.StreamChunk{Type: provider.ChunkText, Text: s.text}
 		}
 		for _, c := range s.calls {
-			ch <- provider.StreamChunk{Type: provider.ChunkToolCall, ToolCallID: c.id, ToolName: c.name, ToolInput: c.args}
+			ch <- provider.StreamChunk{Type: provider.ChunkToolCall, ToolCallID: c.id, ToolName: c.name, ToolInput: c.args, Metadata: s.callMeta}
 		}
 		if s.noFinish {
 			return
