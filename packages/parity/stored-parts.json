@@ -1,0 +1,47 @@
+[
+  {
+    "name": "a Gemini tool call keeps its thought signature",
+    "part": {
+      "type": "tool-call", "toolCallId": "c1", "toolName": "lookup", "args": { "q": "x" },
+      "providerOptions": { "google": { "thoughtSignature": "sig_call" } }
+    },
+    "providerOptions": { "google": { "thoughtSignature": "sig_call" } }
+  },
+  {
+    "name": "a Gemini text part keeps its thought signature",
+    "part": { "type": "text", "text": "let me look", "providerOptions": { "google": { "thoughtSignature": "sig_text" } } },
+    "providerOptions": { "google": { "thoughtSignature": "sig_text" } }
+  },
+  {
+    "name": "OpenRouter reasoning keeps its reasoning details",
+    "part": {
+      "type": "reasoning", "text": "thinking",
+      "providerOptions": {
+        "openrouter": { "reasoning_details": [{ "type": "reasoning.encrypted", "data": "enc", "index": 0 }] }
+      }
+    },
+    "providerOptions": {
+      "openrouter": { "reasoning_details": [{ "type": "reasoning.encrypted", "data": "enc", "index": 0 }] }
+    }
+  },
+  {
+    "name": "an Anthropic signature the Go runtime stored",
+    "part": { "type": "reasoning", "text": "hm", "signature": "sig_go" },
+    "providerOptions": { "anthropic": { "signature": "sig_go" } }
+  },
+  {
+    "name": "an Anthropic signature the TypeScript runtime stored",
+    "part": { "type": "reasoning", "text": "hm", "providerOptions": { "anthropic": { "signature": "sig_ts" } } },
+    "providerOptions": { "anthropic": { "signature": "sig_ts" } }
+  },
+  {
+    "name": "a redacted reasoning block the Go runtime stored",
+    "part": { "type": "redacted-reasoning", "data": "enc_xyz" },
+    "providerOptions": { "anthropic": { "redactedData": "enc_xyz" } }
+  },
+  {
+    "name": "a tool call stored before provider options were kept",
+    "part": { "type": "tool-call", "toolCallId": "c2", "toolName": "lookup", "args": {} },
+    "providerOptions": null
+  }
+]
