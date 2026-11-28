@@ -206,6 +206,8 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
         return { error: `Unknown subagent ${JSON.stringify(name)}; use one of: ${profileNames(ctx).join(', ')}` };
       }
 
+      // Worked out once: the run record and the child must name the same model.
+      const childModel = nestedModelName(ctx, profile, model);
       const release = await ctx.slots.acquire(depth, opts.abortSignal ?? ctx.abortSignal);
       try {
         // A nested run is a run (§2.9): same table, distinguished by depth and
@@ -217,7 +219,7 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
           parentRunId: ctx.agentId ?? ctx.resume.runId ?? null,
           depth,
           agent: name,
-          model: nestedModelName(ctx, profile, model),
+          model: childModel,
           // A nested run's "prompt" is the brief it was delegated (§2.7).
           ...(ctx.ports.config.recordPayloads
             ? {
@@ -236,7 +238,7 @@ export function spawnSubagentTool(ctx: SubagentCtx) {
         const descriptor: NestedDescriptor = {
           agentId: run.id,
           name,
-          model: nestedModelName(ctx, profile, model),
+          model: childModel,
           depth,
         };
 
