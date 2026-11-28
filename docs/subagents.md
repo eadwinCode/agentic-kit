@@ -23,7 +23,8 @@ export const chat = runtime.createStreamTextAgent({
 ```
 
 The platform injects a scoped `spawnSubagent` tool. The model calls it with a
-name and instructions.
+name and instructions, and may name a `model` registry key. Without one, the
+child runs on `subagents.model`, then the default.
 
 ## Giving children tools
 
@@ -86,6 +87,12 @@ the model as a tool error, not a crash. The child takes the profile's
 persona (`systemFn` wins over `system`), model, tools and step cap. Everything
 else is unchanged: it is still a run, it still parks for approval, and it is
 re-entered under the same profile after one.
+
+With profiles, the calling model does not pick the child's model. The tool has
+no `model` field, and a `model` sent anyway is dropped. The child runs on the
+profile's `model`, then `subagents.model`, then the default. This keeps your
+choice of model in your hands: a model cannot copy its own key into the call,
+or ask for a costly one, to get around it.
 
 ## What a child gets
 

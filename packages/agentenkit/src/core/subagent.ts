@@ -142,8 +142,13 @@ export function nestedRawTools(ctx: SubagentCtx, d: NestedDescriptor | undefined
   return ((d && profileFor(ctx, d.name)?.tools) ?? ctx.sub.tools ?? {}) as Record<string, any>;
 }
 
+/** The child's model. A profile's model always wins: the app chose it, and a
+ *  model asking for another one (its own key, or a costly one) must not
+ *  override that. Only a free-form delegation (no profiles) may name its own
+ *  model. */
 function nestedModelName(ctx: SubagentCtx, profile: SubagentProfile | undefined, requested?: string): string {
-  return requested || profile?.model || ctx.sub.model || 'gpt-4o';
+  if (profile) return profile.model || ctx.sub.model || 'gpt-4o';
+  return requested || ctx.sub.model || 'gpt-4o';
 }
 
 /** The specialists, sorted, for the tool's description and its errors. */
@@ -166,16 +171,25 @@ function spawnDescription(ctx: SubagentCtx): string {
   return `${desc}. name MUST be one of the available subagents: ${list}`;
 }
 
+/** The delegation tool's input. With profiles there is no `model` field:
+ *  each profile's model is chosen by the app, not by the model making the
+ *  call, so the schema does not offer one. A model that sends one anyway has
+ *  it dropped when the input is parsed. */
+function spawnInputSchema(ctx: SubagentCtx) {
+  const base = z.object({
+    name: z.string().describe('Short name for the sub-task'),
+    instructions: z
+      .string()
+      .describe('Complete, self-contained brief: goal, constraints, expected output format'),
+  });
+  if (profileNames(ctx).length > 0) return base;
+  return base.extend({ model: z.string().optional().describe('Optional model registry key') });
+}
+
 export function spawnSubagentTool(ctx: SubagentCtx) {
   const spawn = tool({
     description: spawnDescription(ctx),
-    inputSchema: z.object({
-      name: z.string().describe('Short name for the sub-task'),
-      instructions: z
-        .string()
-        .describe('Complete, self-contained brief: goal, constraints, expected output format'),
-      model: z.string().optional(),
-    }),
+    inputSchema: spawnInputSchema(ctx),
     execute: async (
       args: { name: string; instructions: string; model?: string },
       opts: { toolCallId?: string; abortSignal?: AbortSignal },

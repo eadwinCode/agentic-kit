@@ -792,7 +792,8 @@ func WrapTools(ts ...goai.Tool) []Tool {
 type SubagentsConfig struct {
 	// Kind is the generation flavor for spawned subagents. Default: stream-text.
 	Kind AgentKind
-	// Model is the registry key used when a delegation call omits one.
+	// Model is the registry key used when a delegation call omits one, or
+	// for a profile that has no Model of its own.
 	Model string
 	// Tools are merged into every spawned subagent's toolset (HITL-wrapped
 	// identically to the parent's tools).
@@ -806,7 +807,8 @@ type SubagentsConfig struct {
 	// Profiles are named specialists (§2.7). When set, spawnSubagent must
 	// name one of them: the child takes the profile's persona, model, tools
 	// and step cap instead of the shared defaults above. The model still
-	// writes the brief; the profile says who reads it.
+	// writes the brief; the profile says who reads it. The tool then has no
+	// model field, so the calling model cannot pick the child's model.
 	Profiles map[string]SubagentProfile
 }
 
@@ -819,8 +821,9 @@ type SubagentProfile struct {
 	SystemFn SystemFunc
 	// PrepareStep edits the child's prompt per step; see PrepareStepFunc.
 	PrepareStep PrepareStepFunc
-	// Model is the registry key; empty falls back to the config's Model,
-	// then the parent's.
+	// Model is the registry key the child always runs on, whatever the
+	// calling model asks for. Empty falls back to the config's Model, then
+	// DefaultModel.
 	Model string
 	// Tools are the child's own set, HITL-wrapped like the parent's. They
 	// replace the shared Tools above.

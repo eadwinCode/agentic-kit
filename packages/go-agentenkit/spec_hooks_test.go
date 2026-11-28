@@ -2,6 +2,7 @@ package agentenkit_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -392,6 +393,78 @@ func TestSubagents_AProfileGivesTheChildItsOwnPersonaToolsAndModel(t *testing.T)
 	rec, _ := h.admin.Runs().Get(h.ctx, childID)
 	mustEqual(t, rec.Model, "gpt-4o-mini", "the profile's model")
 	mustEqual(t, rec.Agent, "researcher", "the profile's name")
+}
+
+// spawnSchemaProps is the property names of the spawnSubagent tool's input
+// schema, as the model was sent it on its first call.
+func spawnSchemaProps(t *testing.T, h *harness) map[string]any {
+	t.Helper()
+	for _, td := range h.model.Params()[0].Tools {
+		if td.Name == "spawnSubagent" {
+			var schema struct {
+				Properties map[string]any `json:"properties"`
+			}
+			if err := json.Unmarshal(td.InputSchema, &schema); err != nil {
+				t.Fatal(err)
+			}
+			return schema.Properties
+		}
+	}
+	t.Fatal("spawnSubagent was not offered")
+	return nil
+}
+
+func TestSubagents_AProfileRunsOnItsOwnModelWhateverTheCallAsksFor(t *testing.T) {
+	h := makeRuntime(t, scripted(
+		// The parent names a model anyway (its own key, or a costly one).
+		step{calls: []call{{"s1", "spawnSubagent", `{"name":"researcher","instructions":"find it","model":"gpt-4o"}`}}},
+		step{text: "child: found"},
+		step{text: "parent: done"},
+	))
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
+		Name: "chat", Model: "gpt-4o",
+		Subagents: &agentenkit.SubagentsConfig{Model: "gpt-4o", Profiles: map[string]agentenkit.SubagentProfile{
+			"researcher": {System: "You research.", Model: "gpt-4o-mini"},
+		}},
+	})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
+	h.handleNext(t)
+
+	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "state")
+	childID := subagentsOf(t, h, ran.ThreadID).started[0].SubagentID
+	rec, _ := h.admin.Runs().Get(h.ctx, childID)
+	mustEqual(t, rec.Model, "gpt-4o-mini", "the profile's model, not the requested one")
+	// With profiles the model is not offered a model field at all.
+	props := spawnSchemaProps(t, h)
+	if _, ok := props["model"]; ok {
+		t.Fatalf("spawn schema offers model: %v", props)
+	}
+	for _, want := range []string{"name", "instructions"} {
+		if _, ok := props[want]; !ok {
+			t.Fatalf("spawn schema lacks %q: %v", want, props)
+		}
+	}
+}
+
+func TestSubagents_AFreeFormDelegationRunsOnTheModelItAsksFor(t *testing.T) {
+	h := makeRuntime(t, scripted(
+		step{calls: []call{{"s1", "spawnSubagent", `{"name":"x","instructions":"y","model":"gpt-4o-mini"}`}}},
+		step{text: "child ok"},
+		step{text: "parent ok"},
+	))
+	chat := h.rt.CreateStreamTextAgent(agentenkit.StreamTextAgentSpec{
+		Name: "chat", Model: "gpt-4o", Subagents: &agentenkit.SubagentsConfig{Model: "gpt-4o"},
+	})
+	ran := h.run(t, chat, agentenkit.RunInput{Prompt: "go"})
+	h.handleNext(t)
+
+	mustEqual(t, h.lastTerminal(ran.ThreadID)["state"], "COMPLETED", "state")
+	childID := subagentsOf(t, h, ran.ThreadID).started[0].SubagentID
+	rec, _ := h.admin.Runs().Get(h.ctx, childID)
+	mustEqual(t, rec.Model, "gpt-4o-mini", "the requested model")
+	if _, ok := spawnSchemaProps(t, h)["model"]; !ok {
+		t.Fatal("without profiles the spawn schema offers model")
+	}
 }
 
 func TestSubagents_AnUnknownProfileIsReportedToTheModel(t *testing.T) {
