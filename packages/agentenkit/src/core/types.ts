@@ -508,7 +508,8 @@ export interface SubagentsConfig {
    *  Default: 'stream-text'. A 'generate-text' child publishes only
    *  SUBAGENT_STARTED / SUBAGENT_COMPLETED / SUBAGENT_FAILED. */
   kind?: AgentKind;
-  /** Registry key used when a delegation call omits `model`. */
+  /** Registry key used when a delegation call omits `model`, or for a
+   *  profile that has no `model` of its own. */
   model?: string;
   /** Extra tools merged into every spawned subagent's toolset
    *  (HITL-wrapped identically to the parent's tools). */
@@ -522,7 +523,8 @@ export interface SubagentsConfig {
   /** Named specialists (§2.7). When set, `spawnSubagent` must name one of
    *  them: the child takes the profile's persona, model, tools and step cap
    *  instead of the shared defaults above. The model still writes the brief;
-   *  the profile says who reads it. */
+   *  the profile says who reads it. The tool then has no `model` field, so
+   *  the calling model cannot pick the child's model. */
   profiles?: Record<string, SubagentProfile>;
 }
 
@@ -535,7 +537,8 @@ export interface SubagentProfile {
   systemFn?: import('../ports/runtime.js').SystemFn;
   /** Edits the child's prompt per step; see PrepareStepFn. */
   prepareStep?: import('../ports/runtime.js').PrepareStepFn;
-  /** Registry key; absent falls back to the config's `model`, then the
+  /** Registry key the child always runs on, whatever the calling model
+   *  asks for. Absent falls back to the config's `model`, then the
    *  default. */
   model?: string;
   /** The child's own tools, HITL-wrapped like the parent's. They replace the

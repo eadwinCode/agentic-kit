@@ -254,6 +254,48 @@ describe('subagent profiles (§2.7)', () => {
     expect(await h.admin.runs.get(childId)).toMatchObject({ model: 'gpt-4o-mini', agent: 'researcher' });
   });
 
+  /** The property names of the spawnSubagent tool's input schema, as the
+   *  model was sent it on its first call. */
+  const spawnSchemaProps = (h: { calls: Array<{ tools: any[] }> }) => {
+    const spawn = h.calls[0]!.tools.find((t: any) => t.name === 'spawnSubagent');
+    return Object.keys(spawn.parameters.properties ?? {});
+  };
+
+  it('a profile runs on its own model whatever the call asks for', async () => {
+    const h = await harness([
+      // The parent names a model anyway (its own key, or a costly one).
+      { calls: [{ id: 's1', name: 'spawnSubagent', args: { name: 'researcher', instructions: 'find it', model: 'gpt-4o' } }] },
+      { text: 'child: found' },
+      { text: 'parent: done' },
+    ]);
+    const chat = h.runtime.createStreamTextAgent({
+      name: 'chat', model: 'gpt-4o',
+      subagents: { model: 'gpt-4o', profiles: { researcher: { system: 'You research.', model: 'gpt-4o-mini' } } },
+    });
+    const ran = await chat.run({ prompt: 'go' });
+    await h.next();
+    expect(h.lastTerminal(ran.threadId)?.state).toBe('COMPLETED');
+    const childId = (await subagents(h.runtime.ports(), ran.threadId)).started[0]!.subagentId;
+    expect((await h.admin.runs.get(childId))?.model).toBe('gpt-4o-mini'); // not the requested one
+    // With profiles the model is not offered a model field at all.
+    expect(spawnSchemaProps(h).sort()).toEqual(['instructions', 'name']);
+  });
+
+  it('a free-form delegation runs on the model it asks for', async () => {
+    const h = await harness([
+      { calls: [{ id: 's1', name: 'spawnSubagent', args: { name: 'x', instructions: 'y', model: 'gpt-4o-mini' } }] },
+      { text: 'child ok' },
+      { text: 'parent ok' },
+    ]);
+    const chat = h.runtime.createStreamTextAgent({ name: 'chat', model: 'gpt-4o', subagents: { model: 'gpt-4o' } });
+    const ran = await chat.run({ prompt: 'go' });
+    await h.next();
+    expect(h.lastTerminal(ran.threadId)?.state).toBe('COMPLETED');
+    const childId = (await subagents(h.runtime.ports(), ran.threadId)).started[0]!.subagentId;
+    expect((await h.admin.runs.get(childId))?.model).toBe('gpt-4o-mini');
+    expect(spawnSchemaProps(h)).toContain('model');
+  });
+
   it('an unknown profile is reported to the model', async () => {
     const h = await harness([
       { calls: [{ id: 's1', name: 'spawnSubagent', args: { name: 'nobody', instructions: '?' } }] },

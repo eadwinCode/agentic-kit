@@ -121,6 +121,15 @@ type spawnInput struct {
 	Model        string `json:"model,omitempty" jsonschema:"description=Optional model registry key"`
 }
 
+// spawnProfileInput is the delegation tool's input when profiles are set.
+// It has no model field: each profile's model is chosen by the app, not by
+// the model making the call, so the schema does not offer one. A model
+// that sends one anyway has it dropped when the input is decoded.
+type spawnProfileInput struct {
+	Name         string `json:"name" jsonschema:"description=Short name for the sub-task"`
+	Instructions string `json:"instructions" jsonschema:"description=Complete self-contained brief: goal, constraints, expected output format"`
+}
+
 func jsonString(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
@@ -151,12 +160,17 @@ func nestedRawTools(sctx *SubagentCtx, d *ports.NestedDescriptor) []ports.Tool {
 	return sctx.Sub.Tools
 }
 
+// nestedModelName picks the child's model. A profile's model always wins:
+// the app chose it, and a model asking for another one (its own key, or a
+// costly one) must not override that. Only a free-form delegation (no
+// profiles) may name its own model.
 func nestedModelName(sctx *SubagentCtx, profile *ports.SubagentProfile, requested string) string {
-	if requested != "" {
+	if profile != nil {
+		if profile.Model != "" {
+			return profile.Model
+		}
+	} else if requested != "" {
 		return requested
-	}
-	if profile != nil && profile.Model != "" {
-		return profile.Model
 	}
 	if sctx.Sub.Model != "" {
 		return sctx.Sub.Model
@@ -199,121 +213,135 @@ func spawnDescription(sctx *SubagentCtx) string {
 	return b.String()
 }
 
-// SpawnSubagentTool builds the run-scoped delegation tool (§2.7).
+// SpawnSubagentTool builds the run-scoped delegation tool (§2.7). With
+// profiles its input has no model field (see spawnProfileInput).
 func SpawnSubagentTool(sctx *SubagentCtx) ports.Tool {
-	t := ports.WrapTool(goai.NewTool("spawnSubagent",
-		spawnDescription(sctx),
-		func(ctx context.Context, in spawnInput) (string, error) {
-			cfg := sctx.Ports.Config
-			depth := sctx.Depth + 1
-			if depth > cfg.SubagentMaxDepth {
-				return jsonString(map[string]any{"error": fmt.Sprintf("Max subagent depth (%d) reached", cfg.SubagentMaxDepth)}), nil
-			}
-			// With profiles, an unknown name is ordinary bad input reported
-			// to the model, never a crash (§2.7).
-			profile := profileFor(sctx, in.Name)
-			if len(sctx.Sub.Profiles) > 0 && profile == nil {
-				return jsonString(map[string]any{"error": fmt.Sprintf(
-					"Unknown subagent %q; use one of: %s", in.Name, strings.Join(profileNames(sctx), ", "))}), nil
-			}
-			release, err := sctx.Slots.Acquire(ctx, depth)
-			if err != nil {
-				return "", err
-			}
-			defer release()
-
-			io := sctx.IOCtx
-			toolCallID := goai.ToolCallIDFromContext(ctx)
-			// A nested run is a run (§2.9): same table, distinguished by depth
-			// and a parent. Its id is also the agentId its messages carry.
-			parent := sctx.AgentID
-			if parent == "" {
-				parent = sctx.Resume.RunID
-			}
-			rec := ports.NewRunRecord{
-				ID: NewID(), ThreadID: sctx.ThreadID, ParentRunID: parent, Depth: depth,
-				Agent: in.Name, Model: nestedModelName(sctx, profile, in.Model),
-			}
-			if cfg.RecordPayloads {
-				// A nested run's "prompt" is the brief it was delegated (§2.7).
-				rec.Prompt = capText(in.Instructions, cfg.PayloadCapChars)
-				rec.RunState = capRunState(sctx.State, cfg.PayloadCapChars)
-			}
-			run, err := sctx.Ports.Admin.Runs().Start(io, rec)
-			if err != nil {
-				return "", err
-			}
-			if toolCallID == "" {
-				toolCallID = run.ID
-			}
-			if _, err := Publish(io, sctx.Ports, sctx.ThreadID, "SUBAGENT_STARTED", map[string]any{
-				"agentId": run.ID, "name": in.Name, "depth": depth,
-			}); err != nil {
-				return "", err
-			}
-			descriptor := ports.NestedDescriptor{AgentID: run.ID, Name: in.Name, Model: rec.Model, Depth: depth}
-
-			// This call is now the innermost thing waiting on any approval the
-			// child raises (§2.7).
-			frames := append([]HitlFrame{{AgentID: sctx.AgentID, ToolCallID: toolCallID, Nested: sctx.Descriptor}}, sctx.Frames...)
-			instructions := in.Instructions
-			outcome, err := RunNestedAgent(ctx, sctx, descriptor, &instructions, frames)
-			if err == nil && outcome.Aborted {
-				err = context.Canceled
-			} else if err == nil && outcome.Interrupted {
-				// A child whose stream ended with no finish did not finish:
-				// it failed, and its partial text is not a result.
-				err = fmt.Errorf("step %d ended without a finish", outcome.Steps+1)
-			}
-			if err != nil {
-				cancelled := sctx.Aborted != nil && sctx.Aborted()
-				if !cancelled {
-					if st, _, _ := sctx.Ports.Kv.Get(io, StateKey(sctx.ThreadID)); st == string(ports.StateCancelled) {
-						cancelled = true
-					}
-				}
-				state := ports.StateFailed
-				if cancelled {
-					state = ports.StateCancelled
-				}
-				msg := err.Error()
-				closeNested(io, sctx, run, nil, ports.RunPatch{State: &state, Error: &msg})
-				// Carry the reason: a bare state tells an operator a child died
-				// but not why.
-				_, _ = Publish(io, sctx.Ports, sctx.ThreadID, "SUBAGENT_FAILED", map[string]any{
-					"agentId": run.ID, "state": state, "error": msg,
-				})
-				// A user stop tears the whole run down (§2.1), so that one
-				// keeps propagating.
-				if cancelled {
-					return "", err
-				}
-				// Anything else is reported TO THE PARENT as the delegation's
-				// result, the same way an approved tool's failure is reported
-				// to the model rather than thrown (§2.5).
-				return jsonString(map[string]any{"agentId": run.ID, "error": msg}), nil
-			}
-			if outcome.Parked {
-				// The child is suspended, not finished: leave its record
-				// RUNNING and hand the parent the sentinel so its segment ends
-				// too (§2.5). The child is re-entered on approval, from its own
-				// persisted turns; it never restarts.
-				return ParkedResult(toolCallID), nil
-			}
-			completed := ports.StateCompleted
-			closeNested(io, sctx, run, outcome, ports.RunPatch{
-				State: &completed, Result: MarshalPayload(map[string]any{"text": outcome.Text}),
+	var gt goai.Tool
+	if len(sctx.Sub.Profiles) > 0 {
+		gt = goai.NewTool("spawnSubagent", spawnDescription(sctx),
+			func(ctx context.Context, in spawnProfileInput) (string, error) {
+				return spawnSubagent(ctx, sctx, spawnInput{Name: in.Name, Instructions: in.Instructions})
 			})
-			_, _ = Publish(io, sctx.Ports, sctx.ThreadID, "SUBAGENT_COMPLETED", map[string]any{"agentId": run.ID})
-			// The parent receives a capped result, keeping its own context small (§2.6)
-			return jsonString(map[string]any{
-				"agentId": run.ID, "result": capRunes(outcome.Text, cfg.SubagentResultCapChars),
-			}), nil
-		}))
+	} else {
+		gt = goai.NewTool("spawnSubagent", spawnDescription(sctx),
+			func(ctx context.Context, in spawnInput) (string, error) {
+				return spawnSubagent(ctx, sctx, in)
+			})
+	}
+	t := ports.WrapTool(gt)
 	// The whole nested run happens inside this one call, so inside the
 	// parent's step: Timeout gives it longer than StepTimeout.
 	t.Timeout = sctx.Sub.Timeout
 	return t
+}
+
+// spawnSubagent runs one delegation: the body of the spawnSubagent tool.
+func spawnSubagent(ctx context.Context, sctx *SubagentCtx, in spawnInput) (string, error) {
+	cfg := sctx.Ports.Config
+	depth := sctx.Depth + 1
+	if depth > cfg.SubagentMaxDepth {
+		return jsonString(map[string]any{"error": fmt.Sprintf("Max subagent depth (%d) reached", cfg.SubagentMaxDepth)}), nil
+	}
+	// With profiles, an unknown name is ordinary bad input reported
+	// to the model, never a crash (§2.7).
+	profile := profileFor(sctx, in.Name)
+	if len(sctx.Sub.Profiles) > 0 && profile == nil {
+		return jsonString(map[string]any{"error": fmt.Sprintf(
+			"Unknown subagent %q; use one of: %s", in.Name, strings.Join(profileNames(sctx), ", "))}), nil
+	}
+	release, err := sctx.Slots.Acquire(ctx, depth)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+
+	io := sctx.IOCtx
+	toolCallID := goai.ToolCallIDFromContext(ctx)
+	// A nested run is a run (§2.9): same table, distinguished by depth
+	// and a parent. Its id is also the agentId its messages carry.
+	parent := sctx.AgentID
+	if parent == "" {
+		parent = sctx.Resume.RunID
+	}
+	rec := ports.NewRunRecord{
+		ID: NewID(), ThreadID: sctx.ThreadID, ParentRunID: parent, Depth: depth,
+		Agent: in.Name, Model: nestedModelName(sctx, profile, in.Model),
+	}
+	if cfg.RecordPayloads {
+		// A nested run's "prompt" is the brief it was delegated (§2.7).
+		rec.Prompt = capText(in.Instructions, cfg.PayloadCapChars)
+		rec.RunState = capRunState(sctx.State, cfg.PayloadCapChars)
+	}
+	run, err := sctx.Ports.Admin.Runs().Start(io, rec)
+	if err != nil {
+		return "", err
+	}
+	if toolCallID == "" {
+		toolCallID = run.ID
+	}
+	if _, err := Publish(io, sctx.Ports, sctx.ThreadID, "SUBAGENT_STARTED", map[string]any{
+		"agentId": run.ID, "name": in.Name, "depth": depth,
+	}); err != nil {
+		return "", err
+	}
+	descriptor := ports.NestedDescriptor{AgentID: run.ID, Name: in.Name, Model: rec.Model, Depth: depth}
+
+	// This call is now the innermost thing waiting on any approval the
+	// child raises (§2.7).
+	frames := append([]HitlFrame{{AgentID: sctx.AgentID, ToolCallID: toolCallID, Nested: sctx.Descriptor}}, sctx.Frames...)
+	instructions := in.Instructions
+	outcome, err := RunNestedAgent(ctx, sctx, descriptor, &instructions, frames)
+	if err == nil && outcome.Aborted {
+		err = context.Canceled
+	} else if err == nil && outcome.Interrupted {
+		// A child whose stream ended with no finish did not finish:
+		// it failed, and its partial text is not a result.
+		err = fmt.Errorf("step %d ended without a finish", outcome.Steps+1)
+	}
+	if err != nil {
+		cancelled := sctx.Aborted != nil && sctx.Aborted()
+		if !cancelled {
+			if st, _, _ := sctx.Ports.Kv.Get(io, StateKey(sctx.ThreadID)); st == string(ports.StateCancelled) {
+				cancelled = true
+			}
+		}
+		state := ports.StateFailed
+		if cancelled {
+			state = ports.StateCancelled
+		}
+		msg := err.Error()
+		closeNested(io, sctx, run, nil, ports.RunPatch{State: &state, Error: &msg})
+		// Carry the reason: a bare state tells an operator a child died
+		// but not why.
+		_, _ = Publish(io, sctx.Ports, sctx.ThreadID, "SUBAGENT_FAILED", map[string]any{
+			"agentId": run.ID, "state": state, "error": msg,
+		})
+		// A user stop tears the whole run down (§2.1), so that one
+		// keeps propagating.
+		if cancelled {
+			return "", err
+		}
+		// Anything else is reported TO THE PARENT as the delegation's
+		// result, the same way an approved tool's failure is reported
+		// to the model rather than thrown (§2.5).
+		return jsonString(map[string]any{"agentId": run.ID, "error": msg}), nil
+	}
+	if outcome.Parked {
+		// The child is suspended, not finished: leave its record
+		// RUNNING and hand the parent the sentinel so its segment ends
+		// too (§2.5). The child is re-entered on approval, from its own
+		// persisted turns; it never restarts.
+		return ParkedResult(toolCallID), nil
+	}
+	completed := ports.StateCompleted
+	closeNested(io, sctx, run, outcome, ports.RunPatch{
+		State: &completed, Result: MarshalPayload(map[string]any{"text": outcome.Text}),
+	})
+	_, _ = Publish(io, sctx.Ports, sctx.ThreadID, "SUBAGENT_COMPLETED", map[string]any{"agentId": run.ID})
+	// The parent receives a capped result, keeping its own context small (§2.6)
+	return jsonString(map[string]any{
+		"agentId": run.ID, "result": capRunes(outcome.Text, cfg.SubagentResultCapChars),
+	}), nil
 }
 
 func capRunes(s string, limit int) string {
